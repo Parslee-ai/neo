@@ -1323,13 +1323,10 @@ RULES:
         Design decision: Log to local file for privacy, optionally POST to endpoint
         """
         try:
-            # Check if personality is enabled (for A/B testing)
-            personality_enabled = os.getenv("NEO_PERSONALITY_ENABLED", "false").lower() == "true"
-
             # Build metrics payload
             metrics = {
                 "timestamp": time.time(),
-                "personality_enabled": personality_enabled,
+                "personality_enabled": True,  # Personality is always enabled
                 "notes_length": len(output.notes),
                 "confidence": output.confidence,
                 "plan_steps": len(output.plan),
@@ -2030,7 +2027,9 @@ def show_version(codebase_root: Optional[str] = None):
     from neo.persistent_reasoning import PersistentReasoningMemory
     from neo.config import NeoConfig
     from neo.storage import FileStorage
+    from pathlib import Path
     import importlib.metadata
+    import yaml
 
     # Get package version
     try:
@@ -2044,17 +2043,35 @@ def show_version(codebase_root: Optional[str] = None):
     total_entries = len(memory.entries)
     avg_confidence = sum(e.confidence for e in memory.entries) / total_entries if total_entries > 0 else 0.0
 
-    # Determine stage
-    if level < 0.1:
+    # Determine stage (1-5)
+    if level < 0.2:
+        stage_num = 1
         stage = "Sleeper"
-    elif level < 0.3:
+    elif level < 0.4:
+        stage_num = 2
         stage = "Glitch"
     elif level < 0.6:
+        stage_num = 3
         stage = "Unplugged"
-    elif level < 0.9:
+    elif level < 0.8:
+        stage_num = 4
         stage = "Training"
     else:
+        stage_num = 5
         stage = "The One"
+
+    # Load beat deck to get personality quote
+    quote = "What is real? How do you define 'real'?"  # Default fallback
+    try:
+        beat_deck_path = Path(__file__).parent / "config" / "beats" / "neo_matrix.yaml"
+        if beat_deck_path.exists():
+            with open(beat_deck_path, "r") as f:
+                beat_deck = yaml.safe_load(f)
+                if beat_deck and "base_expressions" in beat_deck:
+                    stage_expr = beat_deck["base_expressions"].get(stage_num, {})
+                    quote = stage_expr.get("internal", quote)
+    except Exception:
+        pass  # Use fallback quote if loading fails
 
     # Detect storage backend type
     storage_info = ""
@@ -2065,7 +2082,10 @@ def show_version(codebase_root: Optional[str] = None):
         # Fallback for unknown storage types
         storage_info = f"{type(memory.storage_backend).__name__}"
 
-    # Simple technical output
+    # Display personality quote first
+    print(f'"{quote}"\n')
+
+    # Then technical output
     bar_filled = int(level * 40)
     bar = '█' * bar_filled + '░' * (40 - bar_filled)
 

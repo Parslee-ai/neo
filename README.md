@@ -122,6 +122,7 @@ Core dependencies are automatically installed via `pyproject.toml`:
 - numpy >= 1.24.0
 - scikit-learn >= 1.3.0
 - datasketch >= 1.6.0
+- fastembed >= 0.3.0
 - faiss-cpu >= 1.7.0
 
 ### Optional: LM Provider
