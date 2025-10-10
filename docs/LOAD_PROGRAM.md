@@ -28,17 +28,20 @@ neo --load-program <dataset_id> \
 
 ### Examples
 ```bash
-# Load code problems from MBPP
-neo --load-program mbpp --split train --columns '{"text":"text","code":"code"}'
+# Load Python basics from MBPP (recommended starter)
+neo --load-program mbpp --split train --limit 1000
 
-# Load with limit
-neo --load-program code_search_net --split train --limit 1000
+# Load from OpenAI HumanEval (164 coding problems)
+neo --load-program openai_humaneval --split test
+
+# Load from BigCode HumanEvalPack (multi-language)
+neo --load-program bigcode/humanevalpack --split test --limit 500
 
 # Dry run preview
 neo --load-program mbpp --dry-run
 
-# Rebuild index instead of append
-neo --load-program humaneval --mode rebuild
+# Custom column mapping
+neo --load-program my_dataset --columns '{"text":"pattern","code":"solution"}'
 ```
 
 ### Required Parameters
@@ -66,6 +69,25 @@ neo --load-program humaneval --mode rebuild
 7. REPORT    → Matrix quote + counts
 ```
 
+## Recommended Datasets
+
+### Out-of-Box Support (No Custom Mapping Required)
+
+| Dataset | Size | Description | Best For |
+|---------|------|-------------|----------|
+| **mbpp** | 1,000 | Mostly Basic Programming Problems | Python basics, beginners |
+| **openai_humaneval** | 164 | Hand-written programming problems | Function-level Python |
+| **bigcode/humanevalpack** | Varies | Multi-language HumanEval variants | Cross-language patterns |
+| **Muennighoff/natural-instructions** | Large | Task instructions with examples | NLP/text tasks |
+
+### Usage
+```bash
+# All work without --columns flag
+neo --load-program mbpp --split train --limit 1000
+neo --load-program openai_humaneval --split test
+neo --load-program bigcode/humanevalpack --split test
+```
+
 ## Schema Mapping
 
 ### HuggingFace Row → ReasoningEntry
@@ -80,6 +102,19 @@ neo --load-program humaneval --mode rebuild
   "tags": entry.algorithm_type, # Algorithm category
   "difficulty": difficulty_affinity metadata
 }
+```
+
+### Pre-Configured Mappings
+
+```python
+# MBPP
+{"pattern": "text", "suggestion": "code"}
+
+# OpenAI HumanEval
+{"pattern": "prompt", "suggestion": "canonical_solution"}
+
+# BigCode HumanEvalPack
+{"pattern": "prompt", "suggestion": "canonical_solution"}
 ```
 
 ### Metadata Attached

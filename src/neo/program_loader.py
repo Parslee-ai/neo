@@ -228,15 +228,20 @@ class ProgramLoader:
                 "suggestion": "code",
                 "context": "text"
             },
-            "code_search_net": {
-                "pattern": "func_documentation_string",
-                "suggestion": "func_code_string",
-                "context": "func_name"
-            },
-            "humaneval": {
+            "openai_humaneval": {
                 "pattern": "prompt",
                 "suggestion": "canonical_solution",
                 "context": "entry_point"
+            },
+            "bigcode/humanevalpack": {
+                "pattern": "prompt",
+                "suggestion": "canonical_solution",
+                "context": "entry_point"
+            },
+            "Muennighoff/natural-instructions": {
+                "pattern": "definition",
+                "suggestion": "targets",
+                "context": "task_name"
             }
         }
 

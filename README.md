@@ -312,14 +312,17 @@ Neo can bootstrap its memory by importing patterns from HuggingFace datasets. Th
 # Install datasets library
 pip install datasets
 
-# Load patterns from MBPP (Python coding problems)
+# Load patterns from MBPP (recommended starter - 1000 Python problems)
 neo --load-program mbpp --split train --limit 1000
 
-# Load from code_search_net
-neo --load-program code_search_net --split train --limit 500
+# Load from OpenAI HumanEval (164 hand-written coding problems)
+neo --load-program openai_humaneval --split test
+
+# Load from BigCode HumanEvalPack (multi-language variants)
+neo --load-program bigcode/humanevalpack --split test --limit 500
 
 # Dry run to preview
-neo --load-program humaneval --dry-run
+neo --load-program mbpp --dry-run
 
 # Custom column mapping
 neo --load-program my_dataset \
