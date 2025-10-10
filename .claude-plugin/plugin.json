@@ -18,13 +18,13 @@
     "memory",
     "patterns"
   ],
-  "agents": ["./.claude-plugin/agents/neo.md"],
+  "agents": [".claude-plugin/agents/neo.md"],
   "commands": [
-    "./.claude-plugin/commands/neo.md",
-    "./.claude-plugin/commands/neo-review.md",
-    "./.claude-plugin/commands/neo-optimize.md",
-    "./.claude-plugin/commands/neo-architect.md",
-    "./.claude-plugin/commands/neo-debug.md",
-    "./.claude-plugin/commands/neo-pattern.md"
+    ".claude-plugin/commands/neo.md",
+    ".claude-plugin/commands/neo-review.md",
+    ".claude-plugin/commands/neo-optimize.md",
+    ".claude-plugin/commands/neo-architect.md",
+    ".claude-plugin/commands/neo-debug.md",
+    ".claude-plugin/commands/neo-pattern.md"
   ]
 }
