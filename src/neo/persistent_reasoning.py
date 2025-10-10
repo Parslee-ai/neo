@@ -67,7 +67,7 @@ EMBEDDING_DIM = 1536  # OpenAI text-embedding-3-small dimension
 EMBEDDING_CACHE_MAX_SIZE = 500  # LRU cache limit
 # Rationale: 500 entries × 1536 floats × 8 bytes = ~6MB memory
 # OrderedDict operations are O(1) up to 10K entries (performance OK)
-# Typical usage: 200 memory entries, each potentially embedded multiple times
+# Typical usage: 2000 memory entries, each potentially embedded multiple times
 MAX_TEXT_LENGTH = 32000  # ~8K tokens for OpenAI API
 ALLOWED_DIFFICULTIES = frozenset(["easy", "medium", "hard"])
 
@@ -548,7 +548,7 @@ class PersistentReasoningMemory:
         min_confidence: float = 0.3,
         similarity_threshold: float = 0.8,
         reference_quality: float = 500.0,  # Quality threshold for sigmoid midpoint
-        max_entries: int = 200,  # Hard cap on memory size
+        max_entries: int = 2000,  # Hard cap on memory size (FAISS handles this efficiently)
         storage_backend: Optional[StorageBackend] = None,  # Optional pluggable storage backend
         config: Optional[Any] = None,  # NeoConfig instance
     ):
@@ -1475,7 +1475,7 @@ class PersistentReasoningMemory:
 
         return float(dot_product / (norm1 * norm2))
 
-    def consolidate_memory(self, similarity_threshold: float = 0.85, max_entries: int = 200) -> int:
+    def consolidate_memory(self, similarity_threshold: float = 0.85, max_entries: int = 2000) -> int:
         """
         Consolidate similar reasoning entries using threshold-based clustering.
 
@@ -1498,7 +1498,7 @@ class PersistentReasoningMemory:
                                  - 0.85+: Very similar (near-duplicates)
                                  - 0.75: Reasonably similar (same algorithm pattern)
                                  - 0.65: Somewhat similar (related concepts)
-            max_entries: Maximum entries to cluster (default 200 for O(n²) performance)
+            max_entries: Maximum entries to cluster (default 2000, FAISS provides O(n log n) performance)
 
         Returns:
             Number of entries merged (original_count - new_count)
