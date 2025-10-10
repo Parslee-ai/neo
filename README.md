@@ -1,10 +1,74 @@
+![Neo Banner: Imagery from The Matrix film series](https://ik.imagekit.io/xvpgfijuw/parslee/bannerFor__Neo--Github.webp)
+***
+
+
 # Neo
+
+> A self-improving code reasoning engine that learns from experience using persistent semantic memory. Neo uses multi-agent reasoning to analyze code, generate solutions, and continuously improve through feedback loops.
+
+- **Persistent Memory**: Learns from every solution attempt
+- **Semantic Retrieval**: Vector search finds relevant patterns
+- **Code-First Generation**: No diff parsing failures
+- **Local Storage**: Privacy-first JSON storage in ~/.neo directory
+- **Model-Agnostic**: Works with any LM provider
+- **Available as a [Claude Code Plugin](#claude-code-plugin)**: Integrates seamlessly with Anthropic's Claude models and CLI.
+
+![Claude Code Plugin Banner: Background is an illustration of a terminal or console.](https://ik.imagekit.io/xvpgfijuw/parslee/bannerFor__Claude-Code.webp)
 
 [![PyPI version](https://img.shields.io/pypi/v/neo-reasoner.svg)](https://pypi.org/project/neo-reasoner/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/neo-reasoner.svg)](https://pypi.org/project/neo-reasoner/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A self-improving code reasoning engine that learns from experience using persistent semantic memory. Neo uses multi-agent reasoning to analyze code, generate solutions, and continuously improve through feedback loops.
+## Why Neo?  Why Care?  
+If you've been Vibe Coding, then Vibe Planning, then Context Engineering, and on and on, you have likely hit walls where the models are both powerful and limited, brilliant and incompetent, wise and ignorant, humble yet overconfident. 
+
+Worse, your speedy AI Code Assistant sometimes goes rogue and overwrites key code in a project, or writes redundant code even after just reading documentation and the source code, or violates your project's patterns and design philosophy....  _It can be infuriating._  Why doesn't the model remember?  Why doesn't it learn?  Why can't it keep the context of the code patterns and tech stack? ... -> This is what Neo is designed to solve.  
+
+Neo is **_the missing context layer_** for AI Code Assistants.  It learns from every solution attempt, using vector embeddings to retrieve relevant patterns for new problems.  It then applies the learned patterns to generate solutions, and continuously improves through feedback loops.
+
+
+# Table of Contents
+
+- [Design Philosophy](#design-philosophy)
+- [How It Works](#how-it-works)
+- [Quick Start](#quick-start)
+- [Claude Code Plugin](#claude-code-plugin)
+  - [Quick Examples](#quick-examples)
+- [Installation](#installation)
+  - [From PyPI (Recommended)](#from-pypi-recommended)
+  - [From Source (Development)](#from-source-development)
+  - [Dependencies](#dependencies)
+  - [Optional: LM Provider](#optional-lm-provider)
+- [Usage](#usage)
+  - [CLI Interface](#cli-interface)
+  - [Timeout Requirements](#timeout-requirements)
+  - [Output Format](#output-format)
+  - [Personality System](#personality-system)
+- [Architecture](#architecture)
+  - [Semantic Memory](#semantic-memory)
+  - [Code Block Schema (Phase 1)](#code-block-schema-phase-1)
+  - [Storage Architecture](#storage-architecture)
+- [Performance](#performance)
+- [Configuration](#configuration)
+  - [CLI Configuration Management](#cli-configuration-management)
+  - [Environment Variables](#environment-variables)
+- [LM Adapters](#lm-adapters)
+  - [OpenAI (Recommended)](#openai-recommended)
+  - [Anthropic](#anthropic)
+  - [Google](#google)
+  - [Ollama](#ollama)
+- [Extending Neo](#extending-neo)
+  - [Add a New LM Provider](#add-a-new-lm-provider)
+- [Key Features](#key-features)
+- [Development](#development)
+  - [Running Tests](#running-tests)
+- [Research & References](#research--references)
+  - [Academic Papers](#academic-papers)
+  - [Technologies](#technologies)
+- [License](#license)
+- [Contributing](#contributing)
+- [Changelog](#changelog)
+
 
 ## Design Philosophy
 
@@ -15,6 +79,7 @@ A self-improving code reasoning engine that learns from experience using persist
 **Local File Storage**: Semantic memory stored in ~/.neo directory for privacy and offline access.
 
 **Model-Agnostic**: Works with OpenAI, Anthropic, Google, local models, or Ollama via a simple adapter interface.
+
 
 ## How It Works
 
@@ -28,7 +93,46 @@ User Problem → Neo CLI → Semantic Retrieval → Reasoning → Code Generatio
                     Executable Code + Memory Update
 ```
 
-Neo retrieves similar past solutions using Jina Code embeddings (768-dimensional vectors), applies learned patterns, generates solutions, and stores feedback for continuous improvement.
+Neo retrieves similar past solutions using Jina Code embeddings (768-dimensional vectors),
+applies learned patterns, generates solutions, and stores feedback for continuous improvement.
+
+1. Jina's embeddings model (open source) is downloaded automatically when you first run Neo.
+    This model runs locally on your machine to generate vector embeddings.
+
+2. When you ask Neo for help:
+    - Your query is embedded locally using the Jina model
+    - Neo searches local memory for similar past solutions (using FAISS)
+    - Retrieved patterns are combined with your original prompt
+    - This combined context is sent to your chosen LLM API (OpenAI/Anthropic/Google)
+    - The LLM generates a solution informed by both your query and past patterns
+    - The result is stored back in local memory for future use
+
+Local storage:
+  ~/.neo/reasoning_patterns.json  ← Stores vectors + patterns
+  ~/.neo/faiss_index.bin         ← FAISS index for fast search
+
+Privacy:
+  - Your code never leaves your machine during embedding/search
+  - Only your prompt + retrieved patterns are sent to the LLM API
+  - This is the same as using the LLM directly, but with added context from something akin to memory.
+ 
+ ```
+   Your Prompt
+      ↓
+  Local Jina Embedding (768-dim vector)
+      ↓
+  Local FAISS Search (finds similar past solutions)
+      ↓
+  Retrieve Pattern Text from ~/.neo/reasoning_patterns.json
+      ↓
+  Combine: Your Prompt + Retrieved Pattern Text
+      ↓
+  →→→ NETWORK CALL →→→ LLM API (OpenAI/Anthropic/etc.)
+      ↓
+  Solution Generated
+      ↓
+  Store in Local Memory for future use
+ ```
 
 ## Quick Start
 
@@ -51,6 +155,7 @@ neo --version
 
 **See [QUICKSTART.md](QUICKSTART.md) for 5-minute setup guide**
 
+
 ## Claude Code Plugin
 
 Neo is available as a **Claude Code plugin** with specialized agents and slash commands for seamless integration:
@@ -65,6 +170,7 @@ Once installed, you get:
 - **Slash Commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
 - **Persistent Memory**: Neo learns from your codebase patterns over time
 - **Multi-Agent Reasoning**: Solver, Critic, and Verifier agents collaborate on solutions
+
 
 ### Quick Examples
 
@@ -84,6 +190,7 @@ Once installed, you get:
 
 **See [.claude-plugin/README.md](.claude-plugin/README.md) for full plugin documentation**
 
+
 ## Installation
 
 ### From PyPI (Recommended)
@@ -102,6 +209,7 @@ pip install neo-reasoner[all]        # All providers
 neo --version
 ```
 
+
 ### From Source (Development)
 
 ```bash
@@ -116,6 +224,7 @@ pip install -e ".[dev,all]"
 neo --version
 ```
 
+
 ### Dependencies
 
 Core dependencies are automatically installed via `pyproject.toml`:
@@ -124,6 +233,7 @@ Core dependencies are automatically installed via `pyproject.toml`:
 - datasketch >= 1.6.0
 - fastembed >= 0.3.0
 - faiss-cpu >= 1.7.0
+
 
 ### Optional: LM Provider
 
@@ -137,6 +247,7 @@ pip install requests                # Ollama
 ```
 
 **See [INSTALL.md](INSTALL.md) for detailed installation instructions**
+
 
 ## Usage
 
@@ -153,6 +264,7 @@ neo --cwd /path/to/project "optimize this function"
 neo --version
 ```
 
+
 ### Timeout Requirements
 
 Neo makes blocking LLM API calls that typically take 30-120 seconds. When calling Neo from scripts or automation, use appropriate timeouts:
@@ -167,6 +279,7 @@ subprocess.run(["neo", query], timeout=600)
 
 Insufficient timeouts will cause failures during LLM inference, not context gathering.
 
+
 ### Output Format
 
 Neo outputs executable code blocks with confidence scores:
@@ -177,9 +290,10 @@ def solution():
     pass
 ```
 
+
 ### Personality System
 
-Neo responds with personality (Matrix-inspired quotes) when displaying version info:
+Neo responds with personality _(Matrix-inspired quotes)_ when displaying version info:
 
 ```bash
 $ neo --version
@@ -187,6 +301,7 @@ $ neo --version
 
 120 patterns. 0.3 confidence.
 ```
+
 
 ## Architecture
 
@@ -216,17 +331,21 @@ class CodeSuggestion:
 
 This eliminates the 18% extraction failure rate from diff parsing.
 
+
 ### Storage Architecture
 
 - **Local Files**: JSON storage in ~/.neo directory
 - **FAISS Index**: Fast vector search for pattern retrieval
 - **Auto-Consolidation**: Intelligent pattern merging to prevent fragmentation
 
+
 ## Performance
 
 **Neo improves over time as it learns from experience.** Initial performance depends on available memory patterns. Performance grows as the semantic memory builds up successful and failed solution patterns.
 
+
 ## Configuration
+
 
 ### CLI Configuration Management
 
