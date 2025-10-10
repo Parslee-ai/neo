@@ -18,5 +18,5 @@
 - Test all changes before committing
 - Use 3-5 minute timeout when executing `neo` commands
 - Semantic memory: Local embeddings (Jina 768-dim) preferred over OpenAI (1536-dim)
-- Memory stays under 200 entries via auto-consolidation (triggers every 10 entries after 30+)
-- Local storage uses JSON files in ~/.neo directory (efficient for <1000 entries)
+- Memory stays under 2000 entries via auto-consolidation (triggers every 10 entries after 30+)
+- Local storage uses JSON files in ~/.neo directory (efficient for <5000 entries)
