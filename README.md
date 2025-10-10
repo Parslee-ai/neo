@@ -1,6 +1,6 @@
 # Neo
 
-[![PyPI version](https://badge.fury.io/py/neo-reasoner.svg)](https://badge.fury.io/py/neo-reasoner)
+[![PyPI version](https://img.shields.io/pypi/v/neo-reasoner.svg)](https://pypi.org/project/neo-reasoner/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/neo-reasoner.svg)](https://pypi.org/project/neo-reasoner/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
@@ -324,14 +324,6 @@ class CustomAdapter(LMAdapter):
 - **Local Storage**: Privacy-first JSON storage in ~/.neo directory
 - **Benchmarking**: LiveCodeBench integration for measurable progress
 - **Model-Agnostic**: Works with any LM provider
-
-## Architecture Decisions
-
-See [docs/architecture-decisions.md](docs/architecture-decisions.md) for design rationale:
-- Why code blocks instead of diffs
-- Semantic embeddings vs keyword matching
-- Local-first storage strategy
-- Learning loop design
 
 ## Development
 
