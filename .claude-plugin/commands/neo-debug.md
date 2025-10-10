@@ -1,4 +1,6 @@
-# Command: /neo-debug
+---
+description: "Get debugging assistance from Neo"
+---
 
 Get debugging assistance from Neo.
 
