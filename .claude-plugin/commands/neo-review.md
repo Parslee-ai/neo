@@ -1,4 +1,6 @@
-# Command: /neo-review
+---
+description: "Get Neo's code review with semantic analysis"
+---
 
 Get Neo's code review with semantic analysis.
 

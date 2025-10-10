@@ -1,4 +1,6 @@
-# Command: /neo-pattern
+---
+description: "Extract reusable patterns with Neo"
+---
 
 Extract reusable patterns with Neo.
 

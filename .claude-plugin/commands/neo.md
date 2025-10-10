@@ -1,4 +1,6 @@
-# Command: /neo
+---
+description: "Ask Neo for semantic reasoning and code suggestions"
+---
 
 Ask Neo for semantic reasoning and code suggestions.
 

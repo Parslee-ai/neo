@@ -1,4 +1,6 @@
-# Command: /neo-architect
+---
+description: "Get architectural guidance from Neo on design decisions"
+---
 
 Get architectural guidance from Neo on design decisions.
 

@@ -1,4 +1,6 @@
-# Command: /neo-optimize
+---
+description: "Get optimization suggestions from Neo"
+---
 
 Get optimization suggestions from Neo.
 
