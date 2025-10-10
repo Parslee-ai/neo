@@ -1,0 +1,91 @@
+{
+  "name": "neo",
+  "displayName": "Neo - Semantic Reasoning Helper",
+  "version": "0.7.0",
+  "description": "Multi-agent semantic reasoning system with persistent memory for code suggestions, architectural guidance, and optimization recommendations",
+  "author": {
+    "name": "Parslee AI"
+  },
+  "repository": "https://github.com/Parslee-ai/neo",
+  "homepage": "https://github.com/Parslee-ai/neo",
+  "license": "Apache-2.0",
+  "keywords": [
+    "reasoning",
+    "semantic-search",
+    "multi-agent",
+    "code-review",
+    "optimization",
+    "architecture",
+    "memory",
+    "patterns"
+  ],
+  "categories": [
+    "code-quality",
+    "productivity",
+    "architecture"
+  ],
+  "requirements": {
+    "python": ">=3.9",
+    "packages": [
+      "neo-reasoner>=0.7.0"
+    ],
+    "dependencies": [
+      "fastembed",
+      "faiss-cpu"
+    ]
+  },
+  "installation": {
+    "type": "pip",
+    "package": "neo-reasoner",
+    "steps": [
+      "1. Install Neo: pip install neo-reasoner",
+      "2. Configure API key: neo --config set --config-key provider --config-value anthropic",
+      "3. Set your API key: neo --config set --config-key api_key --config-value YOUR_KEY",
+      "4. Verify installation: neo --version"
+    ],
+    "post_install": [
+      "echo '✓ Neo installed! Configure with: neo --config set --config-key api_key --config-value YOUR_KEY'"
+    ]
+  },
+  "agents": [
+    {
+      "name": "neo",
+      "path": ".claude/agents/neo.md",
+      "description": "Semantic reasoning helper using multi-agent MapCoder approach with persistent memory"
+    }
+  ],
+  "commands": [
+    {
+      "name": "neo",
+      "path": ".claude/commands/neo.md",
+      "description": "Ask Neo for semantic reasoning and code suggestions"
+    },
+    {
+      "name": "neo-review",
+      "path": ".claude/commands/neo-review.md",
+      "description": "Get Neo's code review with semantic analysis"
+    },
+    {
+      "name": "neo-optimize",
+      "path": ".claude/commands/neo-optimize.md",
+      "description": "Get optimization suggestions from Neo"
+    },
+    {
+      "name": "neo-architect",
+      "path": ".claude/commands/neo-architect.md",
+      "description": "Get architectural guidance from Neo on design decisions"
+    },
+    {
+      "name": "neo-debug",
+      "path": ".claude/commands/neo-debug.md",
+      "description": "Get debugging assistance from Neo"
+    },
+    {
+      "name": "neo-pattern",
+      "path": ".claude/commands/neo-pattern.md",
+      "description": "Extract reusable patterns with Neo"
+    }
+  ],
+  "documentation": "https://github.com/Parslee-ai/neo/blob/main/.claude-plugin/README.md",
+  "icon": "🧠"
+}

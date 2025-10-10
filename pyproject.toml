@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neo-reasoner"
+version = "0.7.0"
+description = "A self-improving code reasoning engine with persistent semantic memory"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Parslee AI", email = "hello@parslee.ai"}
+]
+keywords = ["reasoning", "ai", "llm", "code-generation", "cli", "semantic-memory", "embeddings"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+    "datasketch>=1.6.0",
+    "fastembed>=0.3.0",
+    "faiss-cpu>=1.7.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.21.0"]
+openai = ["openai>=1.0.0"]
+google = ["google-generativeai>=0.3.0"]
+ollama = ["requests>=2.31.0"]
+all = [
+    "anthropic>=0.21.0",
+    "openai>=1.0.0",
+    "google-generativeai>=0.3.0",
+    "requests>=2.31.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+neo = "neo.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Parslee-ai/neo"
+Documentation = "https://github.com/Parslee-ai/neo/blob/main/README.md"
+Repository = "https://github.com/Parslee-ai/neo"
+Issues = "https://github.com/Parslee-ai/neo/issues"
+Changelog = "https://github.com/Parslee-ai/neo/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["--import-mode=importlib", "-v"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39']
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

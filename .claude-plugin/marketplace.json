@@ -1,0 +1,13 @@
+{
+  "name": "neo-marketplace",
+  "owner": {
+    "name": "Parslee AI"
+  },
+  "plugins": [
+    {
+      "name": "neo",
+      "source": "./",
+      "description": "Multi-agent semantic reasoning system with persistent memory for code suggestions, architectural guidance, and optimization recommendations"
+    }
+  ]
+}
