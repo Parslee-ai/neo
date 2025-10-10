@@ -323,7 +323,6 @@ class CustomAdapter(LMAdapter):
 - **Semantic Retrieval**: Vector search finds relevant patterns
 - **Code-First Generation**: No diff parsing failures
 - **Local Storage**: Privacy-first JSON storage in ~/.neo directory
-- **Benchmarking**: LiveCodeBench integration for measurable progress
 - **Model-Agnostic**: Works with any LM provider
 
 ## Development
@@ -368,8 +367,6 @@ Neo's design is informed by cutting-edge research in code reasoning and memory s
 
 - **FAISS** ([facebookresearch/faiss](https://github.com/facebookresearch/faiss))
   Facebook AI Similarity Search - efficient vector similarity search and clustering
-
-- **LiveCodeBench** - Competitive programming benchmark for measuring code generation quality
 
 - **FastEmbed** ([qdrant/fastembed](https://github.com/qdrant/fastembed))
   Local embedding generation without external API dependencies
