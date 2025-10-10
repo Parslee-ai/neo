@@ -161,8 +161,11 @@ neo --version
 Neo is available as a **Claude Code plugin** with specialized agents and slash commands for seamless integration:
 
 ```bash
-# Install Neo as a Claude Code plugin
+# Add the marketplace
 /plugin marketplace add Parslee-ai/claude-code-plugins
+
+# Install Neo plugin
+/plugin install neo
 ```
 
 Once installed, you get:
