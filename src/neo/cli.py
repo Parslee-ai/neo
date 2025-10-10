@@ -2371,6 +2371,62 @@ def regenerate_embeddings(
     )
 
 
+def handle_load_program(args):
+    """Handle --load-program flag operations (The Operator)."""
+    from neo.config import NeoConfig
+    from neo.program_loader import ProgramLoader
+    from neo.persistent_reasoning import PersistentReasoningMemory
+
+    try:
+        # Load config
+        config = NeoConfig.load()
+        codebase_root = args.cwd or os.getcwd()
+
+        # Initialize memory
+        memory = PersistentReasoningMemory(
+            codebase_root=codebase_root,
+            config=config
+        )
+
+        # Initialize loader
+        loader = ProgramLoader(memory)
+
+        # Parse column mapping if provided
+        column_mapping = None
+        if args.columns:
+            try:
+                column_mapping = json.loads(args.columns)
+            except json.JSONDecodeError as e:
+                print(f"Error: Invalid JSON in --columns: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Load program
+        result = loader.load_program(
+            dataset_id=args.load_program,
+            split=args.split,
+            column_mapping=column_mapping,
+            limit=args.limit,
+            dry_run=args.dry_run,
+            quiet=args.quiet
+        )
+
+        # Print Matrix-style output
+        print()
+        print(loader.format_result(result))
+
+    except ImportError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print("Install with: pip install datasets", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        logger.exception("Failed to load program")
+        print(f"Error: Unexpected failure: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def handle_config(args):
     """Handle --config flag operations."""
     from neo.config import NeoConfig
@@ -2475,6 +2531,11 @@ def parse_args():
     p.add_argument("--config", choices=['list', 'get', 'set', 'reset'], help="Manage configuration")
     p.add_argument("--config-key", help="Config key (for get/set)")
     p.add_argument("--config-value", help="Value (for set)")
+    p.add_argument("--load-program", metavar="DATASET_ID", help="Load training pack from HuggingFace (e.g., mbpp)")
+    p.add_argument("--split", default="train", help="Dataset split (train/test/validation)")
+    p.add_argument("--columns", metavar="JSON", help="Column mapping JSON (e.g., '{\"text\":\"pattern\"}')")
+    p.add_argument("--limit", type=int, default=1000, help="Max samples to import (default: 1000)")
+    p.add_argument("--quiet", action="store_true", help="Suppress progress output")
     return p.parse_args()
 
 
@@ -2532,6 +2593,11 @@ def main():
     # Handle --config flag
     if args.config:
         handle_config(args)
+        sys.exit(0)
+
+    # Handle --load-program flag
+    if args.load_program:
+        handle_load_program(args)
         sys.exit(0)
 
     # Handle --regenerate-embeddings flag

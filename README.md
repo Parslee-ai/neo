@@ -305,6 +305,60 @@ $ neo --version
 120 patterns. 0.3 confidence.
 ```
 
+### Load Program - Training Neo's Memory
+
+**"The Operator uploads a program into Neo's head."**
+
+Neo can bootstrap its memory by importing patterns from HuggingFace datasets. This is NOT model fine-tuning - it's retrieval learning that expands local semantic memory with reusable code patterns.
+
+```bash
+# Install datasets library
+pip install datasets
+
+# Load patterns from MBPP (recommended starter - 1000 Python problems)
+neo --load-program mbpp --split train --limit 1000
+
+# Load from OpenAI HumanEval (164 hand-written coding problems)
+neo --load-program openai_humaneval --split test
+
+# Load from BigCode HumanEvalPack (multi-language variants)
+neo --load-program bigcode/humanevalpack --split test --limit 500
+
+# Dry run to preview
+neo --load-program mbpp --dry-run
+
+# Custom column mapping
+neo --load-program my_dataset \
+    --columns '{"text":"pattern","code":"solution"}'
+```
+
+**Output (Matrix-style):**
+```
+"I know kung fu."
+
+Loaded: 847 patterns
+Deduped: 153 duplicates
+Index rebuilt: 1.2s
+Memory: 1247 total patterns
+```
+
+**How it works:**
+1. **Acquire**: Pull dataset from HuggingFace
+2. **Normalize**: Map rows to ReasoningEntry schema
+3. **Dedupe**: Hash-based deduplication against existing memory
+4. **Embed**: Generate local embeddings (Jina Code v2)
+5. **Index**: Upsert into FAISS index
+6. **Report**: Matrix quote + counts
+
+**Key points:**
+- NOT fine-tuning - just expanding retrieval memory
+- Patterns start at 0.3 confidence (trainable via real-world usage)
+- Automatic deduplication prevents memory bloat
+- Uses local embeddings (no data leaves your machine)
+- Stored in `~/.neo/` alongside learned patterns
+
+**See [docs/LOAD_PROGRAM.md](docs/LOAD_PROGRAM.md) for detailed documentation**
+
 
 ## Architecture
 
