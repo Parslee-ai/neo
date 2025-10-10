@@ -1,3 +1,13 @@
+---
+description: "Semantic reasoning helper using multi-agent MapCoder approach with persistent memory"
+capabilities:
+  - "Architectural guidance and design decisions"
+  - "Performance optimization analysis"
+  - "Code review with semantic pattern matching"
+  - "Debugging complex or intermittent issues"
+  - "Pattern extraction from codebase"
+---
+
 # Neo - Semantic Reasoning Helper
 
 Semantic reasoning helper using multi-agent MapCoder approach with persistent memory.
