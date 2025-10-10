@@ -1,5 +1,7 @@
 """Neo - A self-improving code reasoning engine with persistent semantic memory."""
 
-__version__ = "0.7.0"
+from neo.cli import CodeSuggestion, PlanStep, SimulationTrace, StaticCheckResult
 
-__all__ = ["__version__"]
+__version__ = "0.7.4"
+
+__all__ = ["__version__", "CodeSuggestion", "PlanStep", "SimulationTrace", "StaticCheckResult"]
