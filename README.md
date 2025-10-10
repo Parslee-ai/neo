@@ -162,7 +162,7 @@ Neo is available as a **Claude Code plugin** with specialized agents and slash c
 
 ```bash
 # Install Neo as a Claude Code plugin
-/plugin marketplace add Parslee-ai/neo
+/plugin marketplace add Parslee-ai/claude-code-plugins
 ```
 
 Once installed, you get:
