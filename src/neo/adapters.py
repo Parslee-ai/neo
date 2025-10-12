@@ -3,6 +3,10 @@ LM Adapter implementations for OpenAI, Anthropic, and local models.
 """
 
 import os
+import json
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 # Load environment variables from .env file
@@ -411,6 +415,162 @@ class AzureOpenAIAdapter(LMAdapter):
 
 
 # ============================================================================
+# Claude Code Adapter
+# ============================================================================
+
+class ClaudeCodeAdapter(LMAdapter):
+    """
+    Adapter that uses Claude Code CLI instead of direct Anthropic API.
+
+    This allows Neo to leverage Claude Code Max/Pro subscriptions
+    instead of incurring direct API billing costs.
+
+    Requirements:
+    - Claude Code CLI installed (`npm install -g @anthropic-ai/claude-code`)
+    - User authenticated via `claude auth login`
+    - ANTHROPIC_API_KEY should NOT be set (to force subscription auth)
+    """
+
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-5-20250929",
+        cli_path: str = "claude",
+        timeout: int = 600,
+        api_key: Optional[str] = None,  # Accepted for compatibility, but not used
+        base_url: Optional[str] = None,  # Accepted for compatibility, but not used
+    ):
+        self.model = model
+        self.cli_path = cli_path
+        self.timeout = timeout
+
+        # Verify Claude Code CLI is available
+        try:
+            result = subprocess.run(
+                [cli_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Claude Code CLI not found at: {cli_path}")
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Claude Code CLI not installed. "
+                "Install with: npm install -g @anthropic-ai/claude-code"
+            )
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        stop: Optional[list[str]] = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> str:
+        """Generate response using Claude Code CLI."""
+
+        # Extract system prompt from messages
+        system_prompt = ""
+        conversation_messages = []
+
+        for msg in messages:
+            if msg["role"] == "system":
+                system_prompt = msg["content"]
+            else:
+                conversation_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"],
+                })
+
+        # Write system prompt to temp file
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            suffix='.txt',
+            delete=False
+        ) as f:
+            f.write(system_prompt)
+            system_prompt_file = f.name
+
+        try:
+            # Build Claude Code CLI arguments
+            args = [
+                self.cli_path,
+                "--system-prompt-file", system_prompt_file,
+                "--output-format", "stream-json",
+                "--model", self.model,
+                "--max-turns", "1",
+                "--verbose",
+                "-p",
+            ]
+
+            # Prepare environment (remove API key to force subscription)
+            env = {
+                **os.environ,
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max_tokens),
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            }
+            env.pop("ANTHROPIC_API_KEY", None)
+
+            # Run Claude Code CLI
+            process = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                text=True,
+            )
+
+            # Write messages to stdin
+            process.stdin.write(json.dumps(conversation_messages))
+            process.stdin.close()
+
+            # Parse streaming JSON output
+            response_text = ""
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    chunk = json.loads(line)
+
+                    if chunk.get("type") == "assistant":
+                        message = chunk.get("message", {})
+                        for content in message.get("content", []):
+                            if content.get("type") == "text":
+                                response_text += content.get("text", "")
+
+                    if chunk.get("type") == "assistant":
+                        message = chunk.get("message", {})
+                        if message.get("stop_reason"):
+                            content = message.get("content", [{}])[0]
+                            if content.get("text", "").startswith("API Error"):
+                                stderr = process.stderr.read()
+                                raise RuntimeError(
+                                    f"Claude Code error: {content['text']}\n{stderr}"
+                                )
+
+                except json.JSONDecodeError:
+                    continue
+
+            return_code = process.wait(timeout=self.timeout)
+
+            if return_code != 0:
+                stderr = process.stderr.read()
+                raise RuntimeError(
+                    f"Claude Code exited with code {return_code}: {stderr}"
+                )
+
+            return response_text.strip()
+
+        finally:
+            Path(system_prompt_file).unlink(missing_ok=True)
+
+    def name(self) -> str:
+        return f"claude-code/{self.model}"
+
+
+# ============================================================================
 # Adapter Factory
 # ============================================================================
 
@@ -423,7 +583,7 @@ def create_adapter(
     Factory function to create appropriate adapter.
 
     Args:
-        provider: One of "openai", "anthropic", "google", "azure", "local", "ollama"
+        provider: One of "openai", "anthropic", "google", "azure", "local", "ollama", "claude-code"
         model: Model name (optional, uses provider default)
         **kwargs: Additional provider-specific arguments
 
@@ -444,8 +604,10 @@ def create_adapter(
         return LocalAdapter(model=model or "local-model", **kwargs)
     elif provider == "ollama":
         return OllamaAdapter(model=model or "llama2", **kwargs)
+    elif provider == "claude-code":
+        return ClaudeCodeAdapter(model=model or "claude-sonnet-4-5-20250929", **kwargs)
     else:
         raise ValueError(
             f"Unknown provider: {provider}. "
-            f"Supported: openai, anthropic, google, azure, local, ollama"
+            f"Supported: openai, anthropic, google, azure, local, ollama, claude-code"
         )
