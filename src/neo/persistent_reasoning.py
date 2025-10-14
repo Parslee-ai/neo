@@ -102,6 +102,7 @@ class ReasoningEntry:
     source_hash: str = ""  # Hash of the problem it came from
     codebase_context: dict = field(default_factory=dict)
     contextual_stats: dict = field(default_factory=dict)  # tuple[str, ...] -> tuple[int, int]
+    source_context: dict = field(default_factory=dict)  # Import provenance metadata
 
     # Semantic embeddings (NEW - Phase 1)
     embedding: Optional[np.ndarray] = None  # Embedding vector for semantic retrieval
@@ -362,6 +363,7 @@ class ReasoningEntry:
             "last_used": self.last_used,
             "source_hash": self.source_hash,
             "codebase_context": self.codebase_context,
+            "source_context": self.source_context,
             "contextual_stats": {
                 "|".join(k): v for k, v in self.contextual_stats.items()
             } if self.contextual_stats else {},
@@ -434,6 +436,9 @@ class ReasoningEntry:
 
         # Phase 4: Self-Contrast backward compatibility
         data.setdefault("problem_outcomes", {})
+
+        # Import provenance backward compatibility
+        data.setdefault("source_context", {})
 
         # Deserialize embedding from list back to numpy array with validation
         try:
@@ -992,6 +997,7 @@ class PersistentReasoningMemory:
             confidence=initial_confidence,  # Start skeptical
             source_hash=content_hash,
             codebase_context=self._extract_codebase_context(source_context),
+            source_context=source_context,
             # Phase 2 fields
             code_skeleton=code_skeleton,
             common_pitfalls=common_pitfalls,
@@ -999,6 +1005,10 @@ class PersistentReasoningMemory:
             algorithm_category=algo_pattern["algorithm_type"],  # Use detected algorithm type
             merge_count=0,  # New entries start with 0 merges
         )
+
+        # Debug logging for source context
+        if source_context:
+            logger.debug(f"Adding reasoning entry with source context: {source_context.get('dataset', 'unknown')}")
 
         # Generate embedding for new entry if embedding model available
         # This enables immediate semantic retrieval without waiting for consolidation
