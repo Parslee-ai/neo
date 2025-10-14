@@ -5,7 +5,7 @@ NO FALLBACKS - If parsing fails, we want to see the real error so we can fix it.
 """
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 from neo import CodeSuggestion, PlanStep, SimulationTrace
 
@@ -232,7 +232,7 @@ def parse_code_suggestions(response: str) -> list[CodeSuggestion]:
 # Helper: Extract structured data with JSON fallback
 # ============================================================================
 
-def extract_json_block(response: str) -> dict[str, Any] | None:
+def extract_json_block(response: str) -> Optional[dict[str, Any]]:
     """Extract JSON block from response if present."""
     json_pattern = r'```json\s*(.*?)```'
     match = re.search(json_pattern, response, re.DOTALL)

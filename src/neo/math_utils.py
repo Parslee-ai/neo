@@ -3,19 +3,19 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal, InvalidOperation
-from typing import Union
+from typing import Optional, Union
 
 NumberLike = Union[int, float, Decimal, str]
 
 
-def add_numbers(a: NumberLike, b: NumberLike, *, bit_limit: int | None = 64):
+def add_numbers(a: NumberLike, b: NumberLike, *, bit_limit: Optional[int] = 64):
     """Add two numeric values with validation and overflow protection.
 
     Parameters
     ----------
     a, b: Union[int, float, Decimal, str]
         Operands to add. Strings must represent finite numeric values.
-    bit_limit: int | None, optional
+    bit_limit: Optional[int], optional
         When provided, enforce the operands and result fit within a signed range
         defined by ``bit_limit`` bits. Defaults to 64. Set to ``None`` to disable
         the range check.

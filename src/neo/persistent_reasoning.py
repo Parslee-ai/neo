@@ -1309,7 +1309,7 @@ class PersistentReasoningMemory:
         return "adaptive"
 
     @staticmethod
-    def _get_success_rate(affinity_tuple: tuple[int, int] | None) -> float:
+    def _get_success_rate(affinity_tuple: Optional[tuple[int, int]]) -> float:
         """Extract success rate from (success, total) tuple."""
         if not affinity_tuple or affinity_tuple[1] == 0:
             return 0.5  # Neutral default

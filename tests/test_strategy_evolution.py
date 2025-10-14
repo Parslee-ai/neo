@@ -250,21 +250,21 @@ class TestGetSuccessRate:
 
     def test_get_success_rate_normal(self):
         """Test normal success rate calculation."""
-        from persistent_reasoning import PersistentReasoningMemory
+        from neo.persistent_reasoning import PersistentReasoningMemory
 
         rate = PersistentReasoningMemory._get_success_rate((7, 10))
         assert rate == 0.7
 
     def test_get_success_rate_none(self):
         """Test that None returns neutral 0.5."""
-        from persistent_reasoning import PersistentReasoningMemory
+        from neo.persistent_reasoning import PersistentReasoningMemory
 
         rate = PersistentReasoningMemory._get_success_rate(None)
         assert rate == 0.5
 
     def test_get_success_rate_zero_total(self):
         """Test that zero total returns neutral 0.5."""
-        from persistent_reasoning import PersistentReasoningMemory
+        from neo.persistent_reasoning import PersistentReasoningMemory
 
         rate = PersistentReasoningMemory._get_success_rate((0, 0))
         assert rate == 0.5

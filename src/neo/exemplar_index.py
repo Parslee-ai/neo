@@ -8,7 +8,7 @@ Can be upgraded to use sentence transformers for better semantic search.
 import json
 import pickle
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -355,7 +355,7 @@ class SimpleExemplarIndex:
 def create_exemplar_index(
     storage_path: Optional[str] = None,
     use_vectors: bool = True,
-) -> ExemplarIndex | SimpleExemplarIndex:
+) -> Union[ExemplarIndex, SimpleExemplarIndex]:
     """
     Create an exemplar index.
 
