@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.6] - 2025-01-14
+
+### Fixed
+- Python 3.9 compatibility: Replaced Python 3.10+ union syntax (X | Y) with Optional/Union for broader compatibility (#21)
+- Added missing `source_context` field to ReasoningEntry dataclass (#20)
+
+### Documentation
+- Updated documentation files to latest standards
+
 ## [0.7.0] - 2025-01-10
 
 ### Added - ReasoningBank Implementation (Phases 2-5)
