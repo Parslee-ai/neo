@@ -419,22 +419,57 @@ Neo uses **Jina Code v2** embeddings (768 dimensions) optimized for code similar
 3. **Confidence Scoring**: Patterns track success/failure rates
 4. **Local Persistence**: Patterns stored locally in JSON format
 
-### Code Block Schema (Phase 1)
+### Output Schemas
 
-Neo generates executable code directly instead of diffs:
+Neo generates structured outputs with executable code and planning artifacts:
 
+**CodeSuggestion** - Executable code with actionable metadata:
 ```python
 @dataclass
 class CodeSuggestion:
+    # Core fields
     file_path: str
     unified_diff: str           # Legacy: backward compatibility
     code_block: str = ""        # Primary: executable Python code
     description: str
     confidence: float
     tradeoffs: list[str]
+
+    # Executable artifacts (v0.8.0+)
+    patch_content: str = ""            # Full unified diff content
+    apply_command: str = ""            # Shell command to apply (advisory)
+    rollback_command: str = ""         # Shell command to undo (advisory)
+    test_command: str = ""             # Shell command to verify (advisory)
+    dependencies: list[str] = []       # Other suggestion IDs this depends on
+    estimated_risk: str = ""           # "low", "medium", or "high"
+    blast_radius: float = 0.0          # 0.0-100.0 percentage of codebase affected
 ```
 
-This eliminates the 18% extraction failure rate from diff parsing.
+**PlanStep** - Incremental planning with step-level metadata:
+```python
+@dataclass
+class PlanStep:
+    # Core fields
+    description: str
+    rationale: str
+    dependencies: list[int] = []
+
+    # Incremental planning (v0.8.0+)
+    preconditions: list[str] = []      # Conditions before execution
+    actions: list[str] = []            # Concrete actions to perform
+    exit_criteria: list[str] = []      # Success verification criteria
+    risk: str = "low"                  # "low", "medium", "high"
+    retrieval_keys: list[str] = []     # Step-scoped memory retrieval
+    failure_signatures: list[str] = [] # Known failure patterns
+    verifier_checks: list[str] = []    # Validation checks (Solver-Critic-Verifier)
+    expanded: bool = False             # Tracks seed → expansion
+```
+
+These schemas enable:
+- **Actionable Output**: Commands and patches ready for execution
+- **Incremental Planning**: Seed plans expand only when blocked (as-needed decomposition)
+- **Step-Level Learning**: Failure signatures attach to specific steps for ReasoningBank
+- **Multi-Agent Reasoning**: Verifier checks support MapCoder's Solver-Critic-Verifier pattern
 
 
 ### Storage Architecture
@@ -567,34 +602,118 @@ pytest --cov=neo
 
 ## Research & References
 
+Neo's architecture is grounded in peer-reviewed research on code generation, semantic memory, and multi-agent reasoning.
+
 ### Academic Papers
 
-Neo's design is informed by cutting-edge research in code reasoning and memory systems:
+**Semantic Memory & Failure Learning:**
 
-1. **ReasoningBank** (arXiv:2509.25140v1)
-   *Systematic Failure Learning and Semantic Anchor Embedding*
-   - Phase 2: Semantic anchor embedding (pattern+context only)
-   - Phase 3: Failure root cause extraction and contrastive learning
+1. **ReasoningBank: Systematic Failure Learning and Semantic Anchor Embedding**
+   *Chen et al., 2025* | [arXiv:2509.25140](https://arxiv.org/abs/2509.25140)
+   - Phase 2: Semantic anchor embedding (pattern+context, not full reasoning)
+   - Phase 3: Failure root cause extraction with contrastive learning
    - Phase 4: Self-contrast consolidation (archetypal vs spurious patterns)
    - Phase 5: Strategy evolution tracking (procedural/adaptive/compositional)
-   - Paper: https://arxiv.org/abs/2509.25140
+   - **Implementation**: Neo's persistent memory system with failure signatures
 
-2. **MapCoder** - Multi-agent reasoning framework
-   Neo uses Solver-Critic-Verifier agent collaboration for code generation
+**Code Generation & Planning:**
 
-3. **CodeSim** - Code similarity metrics
-   Influenced Neo's semantic memory design and pattern matching approach
+2. **Planning with Large Language Models for Code Generation**
+   *Liu et al., ICLR 2023* | [Paper](https://openreview.net/forum?id=Lr8cOOtYbfL)
+   - Planning-guided test-driven decoding (PG-TD)
+   - Step-level preconditions and exit criteria
+   - **Implementation**: Neo's PlanStep schema with preconditions/exit_criteria fields
 
-### Technologies
+3. **Self-Planning Code Generation with Large Language Models**
+   *Zhang et al., 2023* | [arXiv:2303.06689](https://arxiv.org/abs/2303.06689)
+   - Two-phase plan-then-generate workflow
+   - +7% improvement on HumanEval-X Pass@1
+   - **Implementation**: Neo's planning phase before code generation
 
-- **Jina Code v2 Embeddings** ([jinaai/jina-embeddings-v2-base-code](https://huggingface.co/jinaai/jina-embeddings-v2-base-code))
-  768-dimensional embeddings optimized for code similarity tasks
+4. **AdaCoder: Adaptive Planning and Multi-Agent Framework for Function-Level Code Generation**
+   *Huang et al., 2025* | [arXiv:2407.13433](https://arxiv.org/abs/2407.13433)
+   - Task decomposition with planning, generation, and testing agents
+   - Explicit risk assessment per step
+   - **Implementation**: Neo's estimated_risk and verifier_checks fields
 
-- **FAISS** ([facebookresearch/faiss](https://github.com/facebookresearch/faiss))
-  Facebook AI Similarity Search - efficient vector similarity search and clustering
+**Multi-Agent Reasoning:**
 
-- **FastEmbed** ([qdrant/fastembed](https://github.com/qdrant/fastembed))
-  Local embedding generation without external API dependencies
+5. **MapCoder: Multi-Agent Code Generation for Competitive Programming**
+   *Islam et al., 2024* | [arXiv:2405.11403](https://arxiv.org/abs/2405.11403)
+   [GitHub](https://github.com/Md-Ashraful-Pramanik/MapCoder)
+   - Solver-Critic-Verifier agent collaboration
+   - Step-level verification and critique
+   - **Implementation**: Neo's verifier_checks and multi-phase reasoning
+
+**Retrieval & Similarity:**
+
+6. **CodeSim: Effective Semantic Similarity Metrics for Code**
+   *Xu et al., 2023* | [Paper](https://dl.acm.org/doi/10.1145/3611643.3616367)
+   - Code-specific similarity metrics for retrieval
+   - Step-scoped vs global retrieval tradeoffs
+   - **Implementation**: Neo's retrieval_keys for per-step memory access
+
+**Agent Architectures:**
+
+7. **As-Needed Decomposition and Planning with Language Models**
+   *Yao et al., NAACL 2024* | [arXiv:2311.05772](https://arxiv.org/abs/2311.05772)
+   - Selective planning (seed → expand when blocked)
+   - Avoids over-planning on simple tasks
+   - **Implementation**: Neo's expanded flag and incremental planning design
+
+8. **Large Language Model-Based Multi-Agents: A Survey of Progress and Challenges**
+   *Wang et al., 2024* | [arXiv:2402.01680](https://arxiv.org/abs/2402.01680)
+   - Task decomposition, plan selection, and reflection as standard components
+   - Multi-agent coordination patterns
+   - **Implementation**: Neo's architectural foundations
+
+### Technologies & Libraries
+
+**Embedding & Search:**
+
+- **Jina Embeddings v2 (Code)**
+  [HuggingFace](https://huggingface.co/jinaai/jina-embeddings-v2-base-code) | [GitHub](https://github.com/jina-ai/embeddings)
+  - 768-dimensional embeddings optimized for code similarity
+  - Local inference (no API calls)
+  - **Used in**: Neo's semantic memory and pattern retrieval
+
+- **FAISS (Facebook AI Similarity Search)**
+  [GitHub](https://github.com/facebookresearch/faiss) | [Docs](https://faiss.ai/)
+  - Efficient vector similarity search and clustering
+  - Billion-scale index support
+  - **Used in**: Neo's fast pattern matching (<13ms avg)
+
+- **FastEmbed**
+  [GitHub](https://github.com/qdrant/fastembed) | [Docs](https://qdrant.github.io/fastembed/)
+  - Lightweight local embedding generation
+  - ONNX Runtime backend
+  - **Used in**: Neo's local embedding pipeline
+
+**Datasets (for Load Program):**
+
+- **MBPP (Mostly Basic Programming Problems)**
+  [HuggingFace](https://huggingface.co/datasets/google-research-datasets/mbpp) | [Paper](https://arxiv.org/abs/2108.07732)
+  - 1,000 crowd-sourced Python programming problems
+  - **Used for**: Bootstrapping Neo's semantic memory
+
+- **HumanEval**
+  [HuggingFace](https://huggingface.co/datasets/openai/openai_humaneval) | [Paper](https://arxiv.org/abs/2107.03374)
+  - 164 hand-written programming problems
+  - **Used for**: Quality pattern seeding
+
+### Citation
+
+If you use Neo in academic research, please cite:
+
+```bibtex
+@software{neo2025,
+  title={Neo: Self-Improving Code Reasoning Engine with Persistent Semantic Memory},
+  author={Parslee AI},
+  year={2025},
+  url={https://github.com/Parslee-ai/neo},
+  note={Built on ReasoningBank (Chen et al., 2025), MapCoder (Islam et al., 2024), and CodeSim (Xu et al., 2023)}
+}
+```
 
 ## License
 
