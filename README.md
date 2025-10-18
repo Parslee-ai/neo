@@ -99,6 +99,54 @@ applies learned patterns, generates solutions, and stores feedback for continuou
 1. Jina's embeddings model (open source) is downloaded automatically when you first run Neo.
     This model runs locally on your machine to generate vector embeddings.
 
+
+## The Construct
+
+Neo includes **The Construct** - a curated library of architecture and design patterns with semantic search capabilities. Think of it as your personal reference library for common engineering patterns, indexed and searchable using the same embedding technology that powers Neo's reasoning memory.
+
+### What is The Construct?
+
+The Construct is a collection of vendor-agnostic design patterns covering:
+- **Rate Limiting**: Token bucket, sliding window, distributed rate limiting
+- **Caching**: Cache-aside, write-through, invalidation strategies
+- **More domains**: Additional patterns contributed by the community
+
+Each pattern follows a structured format inspired by the Gang of Four:
+- **Intent**: What problem does this solve?
+- **Forces**: Key constraints and tradeoffs
+- **Solution**: Conceptual structure (no framework-specific code)
+- **Consequences**: Benefits, risks, and observability signals
+- **References**: Links to real-world implementations
+
+### Using The Construct
+
+```bash
+# List all patterns
+neo construct list
+
+# Filter by domain
+neo construct list --domain rate-limiting
+
+# Show a specific pattern
+neo construct show rate-limiting/token-bucket
+
+# Semantic search across patterns
+neo construct search "how to prevent api abuse"
+
+# Build the search index
+neo construct index
+```
+
+### Pattern Quality Standards
+
+All patterns must:
+- Include author attribution
+- Be under 300 lines
+- Remain vendor-agnostic (no AWS/GCP/Azure-specific solutions)
+- Include concrete consequences and observability guidance
+
+See `/construct/README.md` for contribution guidelines.
+
 2. When you ask Neo for help:
     - Your query is embedded locally using the Jina model
     - Neo searches local memory for similar past solutions (using FAISS)
@@ -500,6 +548,7 @@ class CustomAdapter(LMAdapter):
 - **Code-First Generation**: No diff parsing failures
 - **Local Storage**: Privacy-first JSON storage in ~/.neo directory
 - **Model-Agnostic**: Works with any LM provider
+- **The Construct**: Curated library of architecture patterns with semantic search
 
 ## Development
 

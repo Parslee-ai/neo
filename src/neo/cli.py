@@ -2427,6 +2427,101 @@ def handle_load_program(args):
         sys.exit(1)
 
 
+def handle_construct(args):
+    """Handle construct subcommand operations."""
+    from neo.construct import ConstructIndex
+    from pathlib import Path
+
+    # Determine construct root
+    cwd = Path(args.cwd) if hasattr(args, 'cwd') and args.cwd else Path.cwd()
+
+    # Try to find construct directory in repo
+    construct_root = None
+    if (cwd / 'construct').exists():
+        construct_root = cwd / 'construct'
+    elif (cwd.parent / 'construct').exists():
+        construct_root = cwd.parent / 'construct'
+    else:
+        # Check if we're in the neo repo
+        current = cwd
+        while current != current.parent:
+            if (current / 'construct').exists():
+                construct_root = current / 'construct'
+                break
+            current = current.parent
+
+    index = ConstructIndex(construct_root=construct_root)
+
+    if args.construct_action == 'list':
+        patterns = index.list_patterns(domain=args.domain)
+        if not patterns:
+            print("No patterns found.")
+            if args.domain:
+                print(f"(Domain filter: {args.domain})")
+            return
+
+        # Group by domain
+        by_domain = {}
+        for p in patterns:
+            by_domain.setdefault(p.domain, []).append(p)
+
+        for domain in sorted(by_domain.keys()):
+            print(f"\n{domain}:")
+            for p in by_domain[domain]:
+                print(f"  {p.pattern_id:<40} {p.name}")
+
+        print(f"\nTotal: {len(patterns)} patterns")
+
+    elif args.construct_action == 'show':
+        pattern = index.show_pattern(args.pattern_id)
+        if not pattern:
+            print(f"Error: Pattern '{args.pattern_id}' not found", file=sys.stderr)
+            sys.exit(1)
+
+        # Display pattern
+        print(f"# Pattern: {pattern.name}")
+        print(f"Author: {pattern.author}")
+        print(f"Domain: {pattern.domain}")
+        print(f"ID: {pattern.pattern_id}\n")
+        print(f"## Intent\n{pattern.intent}\n")
+        print(f"## Forces\n{pattern.forces}\n")
+        print(f"## Solution\n{pattern.solution}\n")
+        print(f"## Consequences\n{pattern.consequences}\n")
+        if pattern.references:
+            print(f"## References\n{pattern.references}\n")
+
+    elif args.construct_action == 'search':
+        results = index.search(args.query, top_k=args.top_k)
+        if not results:
+            print(f"No results found for: {args.query}")
+            return
+
+        print(f"Search results for: {args.query}\n")
+        for i, (pattern, score) in enumerate(results, 1):
+            print(f"{i}. {pattern.pattern_id} (score: {score:.3f})")
+            print(f"   {pattern.name}")
+            print(f"   {pattern.intent[:100]}...")
+            print()
+
+    elif args.construct_action == 'index':
+        print("Building construct pattern index...")
+        result = index.build_index(force_rebuild=args.force)
+
+        if result['status'] == 'success':
+            print(f"✓ Indexed {result['pattern_count']} patterns in {result['elapsed_seconds']:.2f}s")
+            print(f"  Index: {result['index_path']}")
+        elif result['status'] == 'skipped':
+            print(f"Index is recent, skipping rebuild (use --force to rebuild)")
+        else:
+            print(f"✗ Index build failed: {result.get('reason', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+
+    else:
+        print("Error: No construct action specified", file=sys.stderr)
+        print("Usage: neo construct {list|show|search|index}", file=sys.stderr)
+        sys.exit(1)
+
+
 def handle_config(args):
     """Handle --config flag operations."""
     from neo.config import NeoConfig
@@ -2504,11 +2599,53 @@ def handle_config(args):
 def parse_args():
     """Parse command-line arguments."""
     import argparse
+    import sys
+
+    # Detect if 'construct' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'construct':
+        # Parse construct subcommand with proper sub-subparsers
+        p = argparse.ArgumentParser(
+            prog="neo construct",
+            description="Manage design pattern library"
+        )
+        subparsers = p.add_subparsers(dest='action', help='Construct actions')
+
+        # construct list
+        list_p = subparsers.add_parser('list', help='List all patterns')
+        list_p.add_argument('--domain', help='Filter by domain')
+
+        # construct show
+        show_p = subparsers.add_parser('show', help='Show a pattern')
+        show_p.add_argument('pattern_id', help='Pattern ID (e.g., caching/cache-aside)')
+
+        # construct search
+        search_p = subparsers.add_parser('search', help='Search patterns')
+        search_p.add_argument('query', help='Search query')
+        search_p.add_argument('--top-k', type=int, default=5, help='Number of results')
+
+        # construct index
+        index_p = subparsers.add_parser('index', help='Build search index')
+        index_p.add_argument('--force', action='store_true', help='Force rebuild')
+
+        # Add global --cwd to all
+        for sp in [list_p, show_p, search_p, index_p]:
+            sp.add_argument('--cwd', metavar="PATH", help="Working directory override")
+
+        # Remove 'construct' from argv for parsing
+        sys.argv.pop(1)
+        args = p.parse_args()
+        # Restore for compatibility
+        args.command = 'construct'
+        args.construct_action = args.action
+        return args
+
+    # Default argument parser (for reasoning mode)
     p = argparse.ArgumentParser(
         prog="neo",
         description="Neo - Reasoning helper for coding tasks",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
+
     p.add_argument("prompt", nargs="?", help="Plain text prompt (or use stdin)")
     p.add_argument("--json", action="store_true", help="Print JSONL events and final JSON")
     p.add_argument("--output-schema", metavar="NAME_OR_PATH", help="Control final response shape")
@@ -2583,6 +2720,11 @@ def main():
     """Main entry point for stdin/stdout interface."""
     # Parse arguments
     args = parse_args()
+
+    # Handle construct subcommand
+    if args.command == 'construct':
+        handle_construct(args)
+        sys.exit(0)
 
     # Handle --version flag
     if args.version:
