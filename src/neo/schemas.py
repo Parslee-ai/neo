@@ -39,6 +39,53 @@ PLAN_STEP_SCHEMA = {
             "items": {"type": "integer", "minimum": 0},
             "description": "List of step indices this depends on"
         },
+        "preconditions": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 500},
+            "maxItems": 20,
+            "description": "Conditions that must be met before executing this step"
+        },
+        "actions": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 500},
+            "minItems": 1,
+            "maxItems": 20,
+            "description": "Concrete actions to perform in this step"
+        },
+        "exit_criteria": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 500},
+            "minItems": 1,
+            "maxItems": 10,
+            "description": "Success criteria - how to verify this step completed correctly"
+        },
+        "risk": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Risk level for this specific step"
+        },
+        "retrieval_keys": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 100},
+            "maxItems": 10,
+            "description": "Keywords for retrieving relevant past experiences from memory"
+        },
+        "failure_signatures": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 500},
+            "maxItems": 10,
+            "description": "Known failure patterns from previous attempts at similar steps"
+        },
+        "verifier_checks": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 500},
+            "maxItems": 10,
+            "description": "Verification checks to run after step execution (Solver-Critic-Verifier pattern)"
+        },
+        "expanded": {
+            "type": "boolean",
+            "description": "Whether this step was expanded from a minimal seed plan"
+        },
         "schema_version": {
             "type": "string",
             "const": SCHEMA_VERSION,
@@ -127,6 +174,42 @@ CODE_SUGGESTION_SCHEMA = {
             "items": {"type": "string", "maxLength": 500},
             "maxItems": 10,
             "description": "Tradeoffs to consider"
+        },
+        "patch_content": {
+            "type": "string",
+            "description": "Full unified diff patch content (executable via git apply)"
+        },
+        "apply_command": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Shell command to apply this change (ADVISORY ONLY - validate before execution, never use shell=True)"
+        },
+        "rollback_command": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Shell command to undo this change (ADVISORY ONLY - validate before execution, never use shell=True)"
+        },
+        "test_command": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Shell command to verify the change (ADVISORY ONLY - validate before execution, never use shell=True)"
+        },
+        "dependencies": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^[a-z0-9_-]+$"},
+            "maxItems": 10,
+            "description": "IDs of other code suggestions this depends on (apply in order)"
+        },
+        "estimated_risk": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Risk level: low (<10 lines), medium (<100 lines), high (>=100 lines or critical path)"
+        },
+        "blast_radius": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 100.0,
+            "description": "Percentage of codebase affected (files changed / total files * 100). Use 0.0 for changes affecting <0.01% of codebase."
         },
         "schema_version": {
             "type": "string",
