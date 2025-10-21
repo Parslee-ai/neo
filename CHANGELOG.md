@@ -1,8 +1,21 @@
 # Changelog
 
-## [0.8.0] - 2025-10-18
+## [0.8.0] - 2025-10-21
 
-### Added - Executable Artifacts & Incremental Planning
+### Added
+
+**Release Automation**
+- Added `/prepare-release` command for automated version bumping and changelog updates (#23)
+- Added `/ship-release` command for complete release workflow with PR creation and PyPI publishing (#23)
+- Automated version updates across pyproject.toml, __init__.py, and plugin.json
+
+**The Construct - Semantic Pattern Discovery**
+- Added semantic pattern discovery system for extracting reusable patterns from successful code (#24)
+- Pattern extraction with confidence scoring and similarity-based clustering
+- Integration with Neo's semantic memory for pattern recall and reuse
+- Enables learning from successful implementations across projects
+
+**Executable Artifacts & Incremental Planning**
 
 *Grounded in recent code generation research (Liu ICLR 2023, Zhang 2023, Huang 2025, Yao NAACL 2024)*
 
