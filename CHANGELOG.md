@@ -14,7 +14,7 @@
   - `test_command`: Shell command to verify change (ADVISORY)
   - `dependencies`: Array of suggestion IDs this depends on (execution order)
   - `estimated_risk`: Enum (low/medium/high) for risk assessment
-  - `blast_radius`: Float 0.0-100.0 for codebase impact percentage
+  - `blast_radius`: Float 0.0-100.0 percentage of codebase files affected (files changed / total files × 100)
 - Security warnings: All command fields documented as ADVISORY ONLY (never use shell=True)
 - Backward compatible: All new fields optional, schema version remains v3
 
