@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.8.0] - 2025-01-18
+## [0.8.0] - 2025-10-18
 
 ### Added - Executable Artifacts & Incremental Planning
 
@@ -70,7 +70,7 @@ This release implements concepts from:
 - Chen et al., 2025 - ReasoningBank failure learning (failure_signatures)
 - Wang et al., 2024 - Multi-agent survey (architectural foundations)
 
-## [0.7.6] - 2025-01-14
+## [0.7.6] - 2025-10-14
 
 ### Fixed
 - Python 3.9 compatibility: Replaced Python 3.10+ union syntax (X | Y) with Optional/Union for broader compatibility (#21)
@@ -79,7 +79,7 @@ This release implements concepts from:
 ### Documentation
 - Updated documentation files to latest standards
 
-## [0.7.0] - 2025-01-10
+## [0.7.0] - 2025-10-10
 
 ### Added - ReasoningBank Implementation (Phases 2-5)
 
