@@ -79,6 +79,39 @@ This release implements concepts from:
 ### Documentation
 - Updated documentation files to latest standards
 
+## [0.7.5] - 2025-10-10
+
+### Changed
+- Bumped version to 0.7.5 to match plugin version for consistency
+
+### Fixed
+- Plugin file paths: Ensured all file paths are correctly relative to the plugin root (#15)
+- Plugin file paths: Fixed to be relative to repository root (#14)
+
+### Added
+- Updated plugin version to 0.7.5 and removed redundant README.md file (#13)
+- Load program feature: HuggingFace dataset import (#12)
+- Required YAML front matter to command files for Claude Code compatibility (#11)
+- Plugin install step to README (#10)
+
+### Changed
+- Increased default max_entries from 200 to 2000 for larger memory capacity (#7)
+
+### Fixed
+- Claude Code plugin manifest schema validation errors (#9)
+
+## [0.7.4] - 2025-10-10
+
+### Fixed
+- ImportError: Export CodeSuggestion, PlanStep, SimulationTrace, and StaticCheckResult from neo package (Fixes #5)
+- Version sync: Updated __version__ in __init__.py from 0.7.0 to 0.7.4 to match pyproject.toml
+
+### Added
+- GitHub community files for open source management (#6):
+  - SECURITY.md with vulnerability reporting policy
+  - PR template with comprehensive checklist
+  - dependabot.yml for automated dependency updates
+
 ## [0.7.0] - 2025-10-10
 
 ### Added - ReasoningBank Implementation (Phases 2-5)
