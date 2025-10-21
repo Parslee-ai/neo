@@ -29,7 +29,7 @@ except ImportError:
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, TypedDict
+from typing import Any, Literal, Optional, TypedDict
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -78,6 +78,14 @@ class PlanStep:
     description: str
     rationale: str
     dependencies: list[int] = field(default_factory=list)
+    preconditions: list[str] = field(default_factory=list)
+    actions: list[str] = field(default_factory=list)
+    exit_criteria: list[str] = field(default_factory=list)
+    risk: Literal["low", "medium", "high"] = "low"
+    retrieval_keys: list[str] = field(default_factory=list)
+    failure_signatures: list[str] = field(default_factory=list)
+    verifier_checks: list[str] = field(default_factory=list)
+    expanded: bool = False  # Track if this step has been expanded from seed
 
 
 @dataclass
@@ -98,6 +106,13 @@ class CodeSuggestion:
     confidence: float  # 0.0 to 1.0
     tradeoffs: list[str] = field(default_factory=list)
     code_block: str = ""  # Optional: executable Python code (preferred over diff extraction)
+    patch_content: str = ""
+    apply_command: str = ""
+    rollback_command: str = ""
+    test_command: str = ""
+    dependencies: list[str] = field(default_factory=list)
+    estimated_risk: Literal["", "low", "medium", "high"] = ""
+    blast_radius: float = 0.0  # 0.0-100.0 percentage
 
 
 @dataclass
