@@ -2616,13 +2616,26 @@ def parse_args():
     import argparse
     import sys
 
+    # Create parent parser for global flags (shared across all parsers)
+    global_parser = argparse.ArgumentParser(add_help=False)
+    global_parser.add_argument('--version', '-v', action='store_true', help='Show version and learning progress')
+    global_parser.add_argument('--config', choices=['list', 'get', 'set', 'reset'], help='Manage configuration')
+    global_parser.add_argument('--config-key', help='Config key (for get/set)')
+    global_parser.add_argument('--config-value', help='Value (for set)')
+    global_parser.add_argument('--load-program', metavar='DATASET_ID', help='Load training pack from HuggingFace (e.g., mbpp)')
+    global_parser.add_argument('--regenerate-embeddings', action='store_true', help='Regenerate all embeddings with current model (safe, with automatic backup)')
+    global_parser.add_argument('--index', action='store_true', help='Build semantic index for current directory')
+    global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
+
     # Detect if 'construct' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'construct':
         # Parse construct subcommand with proper sub-subparsers
         p = argparse.ArgumentParser(
             prog="neo construct",
-            description="Manage design pattern library"
+            description="Manage design pattern library",
+            parents=[global_parser]
         )
+
         subparsers = p.add_subparsers(dest='action', help='Construct actions')
 
         # construct list
@@ -2642,10 +2655,6 @@ def parse_args():
         index_p = subparsers.add_parser('index', help='Build search index')
         index_p.add_argument('--force', action='store_true', help='Force rebuild')
 
-        # Add global --cwd to all
-        for sp in [list_p, show_p, search_p, index_p]:
-            sp.add_argument('--cwd', metavar="PATH", help="Working directory override")
-
         # Remove 'construct' from argv for parsing
         sys.argv.pop(1)
         args = p.parse_args()
@@ -2658,13 +2667,13 @@ def parse_args():
     p = argparse.ArgumentParser(
         prog="neo",
         description="Neo - Reasoning helper for coding tasks",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[global_parser]
     )
 
     p.add_argument("prompt", nargs="?", help="Plain text prompt (or use stdin)")
     p.add_argument("--json", action="store_true", help="Print JSONL events and final JSON")
     p.add_argument("--output-schema", metavar="NAME_OR_PATH", help="Control final response shape")
-    p.add_argument("--cwd", metavar="PATH", help="Working directory override")
     p.add_argument("--max-bytes", type=int, default=300_000, help="Hard cap for total context bytes")
     p.add_argument("--max-files", type=int, default=30, help="Soft cap for number of context files")
     p.add_argument("--include", action="append", default=[], help="Allowlist glob patterns (repeatable)")
@@ -2677,13 +2686,6 @@ def parse_args():
     p.add_argument("--stdin-json", action="store_true", help="Force JSON input mode")
     p.add_argument("--stdin-text", action="store_true", help="Force text input mode")
     p.add_argument("--dry-run", action="store_true", help="Show what would be sent to model and exit")
-    p.add_argument("--version", "-v", action="store_true", help="Show version and learning progress")
-    p.add_argument("--regenerate-embeddings", action="store_true", help="Regenerate all embeddings with current model (safe, with automatic backup)")
-    p.add_argument("--index", action="store_true", help="Build semantic index for current directory")
-    p.add_argument("--config", choices=['list', 'get', 'set', 'reset'], help="Manage configuration")
-    p.add_argument("--config-key", help="Config key (for get/set)")
-    p.add_argument("--config-value", help="Value (for set)")
-    p.add_argument("--load-program", metavar="DATASET_ID", help="Load training pack from HuggingFace (e.g., mbpp)")
     p.add_argument("--split", default="train", help="Dataset split (train/test/validation)")
     p.add_argument("--columns", metavar="JSON", help="Column mapping JSON (e.g., '{\"text\":\"pattern\"}')")
     p.add_argument("--limit", type=int, default=1000, help="Max samples to import (default: 1000)")
@@ -2736,10 +2738,7 @@ def main():
     # Parse arguments
     args = parse_args()
 
-    # Handle construct subcommand
-    if args.command == 'construct':
-        handle_construct(args)
-        sys.exit(0)
+    # Handle global flags first (exist on all parsers, must check before subcommand-specific attributes)
 
     # Handle --version flag
     if args.version:
@@ -2798,6 +2797,11 @@ def main():
         except Exception as e:
             print(f"[Neo] Failed to build index: {e}", file=sys.stderr)
             sys.exit(1)
+
+    # Handle construct subcommand
+    if args.command == 'construct':
+        handle_construct(args)
+        sys.exit(0)
 
     # Detect input mode
     input_mode = detect_input_mode(args)
