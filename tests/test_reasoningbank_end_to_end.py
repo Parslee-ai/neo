@@ -18,6 +18,9 @@ class TestReasoningBankImpact:
         """Create realistic memory with diverse patterns."""
         self.memory = PersistentReasoningMemory()
 
+        # Clear any loaded entries for clean test environment
+        self.memory.entries = []
+
         # Create realistic problem patterns across difficulty levels
         self.patterns = [
             # Easy patterns (procedural)
@@ -336,7 +339,10 @@ class TestReasoningBankImpact:
 
         query_embedding = np.random.rand(768).astype(np.float32)
         original_embed = self.memory._embed_text
+        original_exploration = self.memory.exploration_rate
+
         self.memory._embed_text = lambda x: query_embedding
+        self.memory.exploration_rate = 0.0  # Disable exploration for deterministic results
 
         try:
             # Run 5 retrievals and measure time
@@ -361,6 +367,7 @@ class TestReasoningBankImpact:
 
         finally:
             self.memory._embed_text = original_embed
+            self.memory.exploration_rate = original_exploration
 
 
 class TestReasoningBankMetrics:
