@@ -25,7 +25,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 import numpy as np
 
 # Import FAISS for fast similarity search
@@ -431,7 +431,7 @@ class ProjectIndex:
         for rel_path in changed_files:
             # Check budget
             if time.time() - start_time > budget_s:
-                logger.info(f"Refresh budget exceeded, stopping early")
+                logger.info("Refresh budget exceeded, stopping early")
                 break
 
             if len(updated_chunks) >= max_chunks:
@@ -641,7 +641,7 @@ class ProjectIndex:
             logger.debug(f"Failed to get git commit: {e}")
         return ""
 
-    def status(self) -> Dict[str, any]:
+    def status(self) -> Dict[str, Any]:
         """
         Get index status for display.
 

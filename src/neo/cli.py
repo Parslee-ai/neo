@@ -2775,7 +2775,7 @@ def main():
 
     # Handle --index flag
     if args.index:
-        from src.index.project_index import ProjectIndex
+        from neo.index.project_index import ProjectIndex
 
         codebase_root = args.cwd or os.getcwd()
         print(f"[Neo] Building semantic index for {codebase_root}...")
