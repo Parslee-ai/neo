@@ -2799,7 +2799,7 @@ def main():
             sys.exit(1)
 
     # Handle construct subcommand
-    if args.command == 'construct':
+    if hasattr(args, 'command') and args.command == 'construct':
         handle_construct(args)
         sys.exit(0)
 
