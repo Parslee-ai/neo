@@ -72,6 +72,41 @@ MAX_TEXT_LENGTH = 32000  # ~8K tokens for OpenAI API
 ALLOWED_DIFFICULTIES = frozenset(["easy", "medium", "hard"])
 
 
+def _serialize_context_for_json(context: dict) -> dict:
+    """Convert context dict with enums/dataclasses to JSON-serializable format.
+
+    Handles TaskType enums and ContextFile dataclasses that cannot be directly
+    serialized by json.dumps(). Only call this at JSON serialization boundaries.
+
+    Args:
+        context: Dict potentially containing enum or dataclass objects
+
+    Returns:
+        Dict with all values converted to JSON-serializable types
+    """
+    serialized = {}
+    for key, value in context.items():
+        if hasattr(value, 'value'):  # Enum type
+            serialized[key] = value.value
+        elif hasattr(value, '__dataclass_fields__'):  # Dataclass
+            # Convert single dataclass to dict
+            serialized[key] = {
+                field: getattr(value, field)
+                for field in value.__dataclass_fields__
+            }
+        elif isinstance(value, list):
+            # Handle lists of dataclasses
+            serialized[key] = [
+                {field: getattr(item, field) for field in item.__dataclass_fields__}
+                if hasattr(item, '__dataclass_fields__')
+                else item
+                for item in value
+            ]
+        else:
+            serialized[key] = value
+    return serialized
+
+
 @dataclass
 class ReasoningEntry:
     """A single piece of learned reasoning."""
@@ -363,7 +398,7 @@ class ReasoningEntry:
             "last_used": self.last_used,
             "source_hash": self.source_hash,
             "codebase_context": self.codebase_context,
-            "source_context": self.source_context,
+            "source_context": _serialize_context_for_json(self.source_context),
             "contextual_stats": {
                 "|".join(k): v for k, v in self.contextual_stats.items()
             } if self.contextual_stats else {},
