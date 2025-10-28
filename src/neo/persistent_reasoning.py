@@ -15,7 +15,6 @@ Design philosophy:
 """
 
 import copy
-import json
 import random
 import time
 from dataclasses import dataclass, field
@@ -866,7 +865,7 @@ class PersistentReasoningMemory:
         Returns True if entry appears to be a problem description rather than a solution.
         """
         text_lower = (pattern + " " + suggestion).lower()
-        suggestion_lower = suggestion.lower()
+        suggestion.lower()
 
         # Check for problem description indicators
         junk_count = sum(1 for indicator in self.JUNK_INDICATORS if indicator in text_lower)
@@ -1919,7 +1918,7 @@ class PersistentReasoningMemory:
             try:
                 minhash = self._get_or_create_minhash(entry)
                 self.lsh.insert(entry.source_hash, minhash)
-            except ValueError as e:
+            except ValueError:
                 # Duplicate hash - regenerate unique one
                 import time
                 entry.source_hash = self._hash_content(entry.pattern + entry.context + str(time.time()))
@@ -2575,7 +2574,7 @@ Focus on: edge cases, algorithm choice, complexity, logic errors."""
 
         # Validate merged entry
         if merged.embedding is None:
-            logger.error(f"Merged archetype has no embedding, using best entry")
+            logger.error("Merged archetype has no embedding, using best entry")
             return best  # Fallback to best entry
 
         if not (0 <= merged.confidence <= 1.0):
@@ -2750,7 +2749,7 @@ Focus on: edge cases, algorithm choice, complexity, logic errors."""
             return False
 
         # Check if entry's files are in current codebase
-        entry_files = entry.codebase_context.get("file_patterns", [])
+        entry.codebase_context.get("file_patterns", [])
         working_dir = entry.codebase_context.get("working_dir", "")
 
         if working_dir:

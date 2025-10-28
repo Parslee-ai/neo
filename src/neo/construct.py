@@ -7,7 +7,6 @@ Patterns are stored as markdown files with structured metadata.
 
 import json
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict

@@ -561,7 +561,7 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
     # Check if index exists
     if not index_path.exists():
         print(f"[Neo] No semantic index found at {index_path}", file=sys.stderr)
-        print(f"[Neo] Falling back to keyword search. Run 'neo index' to build semantic index.", file=sys.stderr)
+        print("[Neo] Falling back to keyword search. Run 'neo index' to build semantic index.", file=sys.stderr)
         return gather_context(config)
 
     # Load ProjectIndex
@@ -581,8 +581,8 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
         chunks = index.retrieve(config.prompt, k=100)
 
         if not chunks:
-            print(f"[Neo] No chunks found in semantic index", file=sys.stderr)
-            print(f"[Neo] Falling back to keyword search", file=sys.stderr)
+            print("[Neo] No chunks found in semantic index", file=sys.stderr)
+            print("[Neo] Falling back to keyword search", file=sys.stderr)
             return gather_context(config)
 
         # Pack chunks using MMR for diversity
@@ -624,11 +624,11 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
 
     except ImportError as e:
         print(f"[Neo] Failed to load ProjectIndex: {e}", file=sys.stderr)
-        print(f"[Neo] Falling back to keyword search", file=sys.stderr)
+        print("[Neo] Falling back to keyword search", file=sys.stderr)
         return gather_context(config)
     except Exception as e:
         print(f"[Neo] Semantic search error: {e}", file=sys.stderr)
-        print(f"[Neo] Falling back to keyword search", file=sys.stderr)
+        print("[Neo] Falling back to keyword search", file=sys.stderr)
         return gather_context(config)
 
 

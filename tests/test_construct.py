@@ -4,12 +4,11 @@ Tests for The Construct pattern library.
 Tests cover pattern parsing, validation, indexing, and CLI integration.
 """
 
-import json
 import pytest
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch, MagicMock
 
 from neo.construct import (
     PatternSchema,
@@ -361,7 +360,7 @@ class TestConstructIndex:
 
             # Measure search performance
             start = time.time()
-            results = index.search("rate limiting strategies", top_k=5)
+            index.search("rate limiting strategies", top_k=5)
             elapsed = (time.time() - start) * 1000  # Convert to ms
 
             # Note: This test may be flaky depending on system load

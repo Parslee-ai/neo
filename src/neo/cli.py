@@ -2049,7 +2049,7 @@ def show_version(codebase_root: Optional[str] = None):
     # Get package version
     try:
         version = importlib.metadata.version("neo-reasoner")
-    except:
+    except Exception:
         version = "unknown"
 
     config = NeoConfig.load()
@@ -2526,7 +2526,7 @@ def handle_construct(args):
             print(f"✓ Indexed {result['pattern_count']} patterns in {result['elapsed_seconds']:.2f}s")
             print(f"  Index: {result['index_path']}")
         elif result['status'] == 'skipped':
-            print(f"Index is recent, skipping rebuild (use --force to rebuild)")
+            print("Index is recent, skipping rebuild (use --force to rebuild)")
         else:
             print(f"✗ Index build failed: {result.get('reason', 'unknown error')}", file=sys.stderr)
             sys.exit(1)
@@ -2792,7 +2792,7 @@ def main():
             status = index.status()
             print(f"[Neo] Built index: {status['total_chunks']} chunks from {status['total_files']} files")
             print(f"[Neo] Index stored in {codebase_root}/.neo/")
-            print(f"[Neo] Use '--semantic' flag to enable semantic search")
+            print("[Neo] Use '--semantic' flag to enable semantic search")
             sys.exit(0)
         except Exception as e:
             print(f"[Neo] Failed to build index: {e}", file=sys.stderr)
@@ -2840,7 +2840,7 @@ def main():
 
         # Gather context from working directory unless --no-scan
         if not args.no_scan:
-            from neo.context_gatherer import gather_context, gather_context_semantic, GatherConfig, ContextFile as GatheredFile
+            from neo.context_gatherer import gather_context, gather_context_semantic, GatherConfig
 
             exts = args.exts.split(',') if args.exts else None
 
@@ -2875,7 +2875,7 @@ def main():
             # Print summary to stderr
             total_bytes = sum(gf.bytes for gf in gathered)
             print(f"[Neo] Gathered {len(gathered)} files ({total_bytes:,} bytes)", file=sys.stderr)
-            print(f"[Neo] Invoking LLM inference...", file=sys.stderr)
+            print("[Neo] Invoking LLM inference...", file=sys.stderr)
 
             if args.dry_run:
                 print("\n=== DRY RUN: Context that would be sent ===\n", file=sys.stderr)

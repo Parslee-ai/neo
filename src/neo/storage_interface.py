@@ -6,7 +6,7 @@ Simple interface that allows pluggable storage backends:
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 
 class StorageBackend(ABC):

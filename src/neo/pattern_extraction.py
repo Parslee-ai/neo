@@ -4,7 +4,7 @@ Neo learns prevention rules from its own mistakes.
 """
 
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 

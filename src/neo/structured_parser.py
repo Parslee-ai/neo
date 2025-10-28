@@ -162,7 +162,7 @@ def tolerant_json_load(json_str: str) -> ParseResult:
     try:
         data = json.loads(json_str)
         return ParseResult(success=True, data=data)
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError:
         pass  # Try repairs below
 
     # Common repairs

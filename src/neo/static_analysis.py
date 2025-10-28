@@ -8,7 +8,6 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
 
 from neo import CodeSuggestion, StaticCheckResult
 
@@ -313,7 +312,7 @@ def apply_diff_to_content(unified_diff: str, original_content: str) -> str:
             diff_path = f.name
 
         # Apply patch
-        result = subprocess.run(
+        subprocess.run(
             ['patch', orig_path, diff_path],
             capture_output=True,
         )
