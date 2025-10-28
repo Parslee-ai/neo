@@ -5,8 +5,7 @@ This is the 10x opportunity: cheap verification vs expensive correction.
 """
 
 import re
-import ast
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 
@@ -264,23 +263,23 @@ If no clear constraints, return "none"."""
         for constraint in constraints:
             check = constraint.to_check()
             check_code += f"# Check: {constraint.description}\n"
-            check_code += f"try:\n"
-            check_code += f"    if isinstance(result, str) and result.strip():\n"
-            check_code += f"        # Try parsing as int/float\n"
-            check_code += f"        try:\n"
-            check_code += f"            result = int(result)\n"
-            check_code += f"        except:\n"
-            check_code += f"            try:\n"
-            check_code += f"                result = float(result)\n"
-            check_code += f"            except:\n"
-            check_code += f"                try:\n"
-            check_code += f"                    result = eval(result)\n"
-            check_code += f"                except: pass\n"
+            check_code += "try:\n"
+            check_code += "    if isinstance(result, str) and result.strip():\n"
+            check_code += "        # Try parsing as int/float\n"
+            check_code += "        try:\n"
+            check_code += "            result = int(result)\n"
+            check_code += "        except:\n"
+            check_code += "            try:\n"
+            check_code += "                result = float(result)\n"
+            check_code += "            except:\n"
+            check_code += "                try:\n"
+            check_code += "                    result = eval(result)\n"
+            check_code += "                except: pass\n"
             check_code += f"    assert {check}, '{constraint.description}'\n"
             check_code += f"    print('✓ {constraint.type.value}')\n"
-            check_code += f"except AssertionError:\n"
+            check_code += "except AssertionError:\n"
             check_code += f"    print('✗ {constraint.type.value}')\n"
-            check_code += f"except Exception as e:\n"
+            check_code += "except Exception as e:\n"
             check_code += f"    print('? {constraint.type.value}')\n"
 
         # Execute verification

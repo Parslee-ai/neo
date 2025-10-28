@@ -12,11 +12,9 @@ expanding local semantic memory with patterns from datasets.
 """
 
 import hashlib
-import json
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -199,7 +197,7 @@ class ProgramLoader:
             self.memory._rebuild_faiss_index()
             index_time = time.time() - index_start
 
-        total_time = time.time() - start_time
+        time.time() - start_time
 
         return ProgramLoadResult(
             loaded_count=loaded,

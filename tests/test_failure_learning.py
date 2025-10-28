@@ -6,7 +6,7 @@ Tests the failure extraction and contrastive learning implementation.
 """
 
 import pytest
-from neo.persistent_reasoning import PersistentReasoningMemory, ReasoningEntry
+from neo.persistent_reasoning import PersistentReasoningMemory
 
 
 class TestFailureExtraction:
@@ -227,7 +227,7 @@ class TestPitfallSurfacing:
         # Just verify that if an entry has pitfalls, they're preserved
         assert len(results) > 0  # Some results returned
         # Check if any result has pitfalls (validates field preservation)
-        has_pitfalls = any(len(e.common_pitfalls) > 0 for e in results)
+        any(len(e.common_pitfalls) > 0 for e in results)
         # Note: might be True or False depending on what's in memory
         # The key test is that pitfalls field exists and is accessible
 

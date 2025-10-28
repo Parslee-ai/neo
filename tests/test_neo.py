@@ -7,7 +7,6 @@ Usage:
     python test_neo.py
 """
 
-import json
 import os
 import sys
 

@@ -4,11 +4,10 @@ Test storage adapter integration in PersistentReasoningMemory.
 Verifies all issues from iteration #1 are fixed.
 """
 
-import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))

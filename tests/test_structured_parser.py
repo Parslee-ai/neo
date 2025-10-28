@@ -5,10 +5,7 @@ Fuzzing tests for structured parser.
 Tests parser robustness against malformed inputs.
 """
 
-import pytest
 from neo.structured_parser import (
-    extract_block,
-    tolerant_json_load,
     parse_plan_steps,
     parse_simulation_traces,
     parse_code_suggestions,

@@ -33,7 +33,7 @@ def parse_plan(response: str) -> list[PlanStep]:
     matches = re.finditer(step_pattern, response, re.DOTALL | re.MULTILINE)
 
     for match in matches:
-        step_num = int(match.group(1))
+        int(match.group(1))
         step_content = match.group(2).strip()
 
         # Extract description (first line)
@@ -93,7 +93,7 @@ def parse_simulation_traces(response: str) -> list[SimulationTrace]:
     matches = re.finditer(sim_pattern, response, re.DOTALL | re.IGNORECASE)
 
     for match in matches:
-        sim_num = int(match.group(1))
+        int(match.group(1))
         sim_content = match.group(2).strip()
 
         # Extract input
