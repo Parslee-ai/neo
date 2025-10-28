@@ -241,7 +241,7 @@ def extract_json_block(response: str) -> Optional[dict[str, Any]]:
         try:
             import json
             return json.loads(match.group(1))
-        except:
+        except (ValueError, IndexError):  # JSON parsing error or regex group mismatch
             pass
 
     return None

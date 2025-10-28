@@ -36,20 +36,15 @@ try:
     # Check for GPU support
     try:
         FAISS_GPU_AVAILABLE = faiss.get_num_gpus() > 0
-    except:
+    except Exception:  # FAISS GPU check may fail on non-GPU systems
         FAISS_GPU_AVAILABLE = False
 except ImportError:
     FAISS_AVAILABLE = False
     FAISS_GPU_AVAILABLE = False
     # FAISS not installed - will fall back to O(n²) clustering
 
-# Import OpenAI exception types at module level
-try:
-    from openai import OpenAIError, RateLimitError, APIError
-except ImportError:
-    # OpenAI not installed - exceptions won't be needed
-    # because openai_client will be None
-    pass
+# OpenAI exceptions not imported - not currently used in this module
+# If needed in future, they can be imported in specific exception handlers
 
 # Import fastembed for local embeddings (alternative to OpenAI)
 try:
@@ -703,7 +698,6 @@ class PersistentReasoningMemory:
         # TF-IDF for semantic similarity
         try:
             from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
 
             # Fit on all entry patterns
             if self.entries:
@@ -2726,8 +2720,6 @@ Focus on: edge cases, algorithm choice, complexity, logic errors."""
         # Rebuild TF-IDF after loading all entries
         if self.entries:
             try:
-                from sklearn.feature_extraction.text import TfidfVectorizer
-
                 corpus = [entry.pattern + " " + entry.context for entry in self.entries]
                 if hasattr(self, 'tfidf_vectorizer') and self.tfidf_vectorizer is not None:
                     self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(corpus)

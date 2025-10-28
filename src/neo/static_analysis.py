@@ -272,8 +272,7 @@ def get_original_content(file_path: str) -> str:
     """Get original file content if it exists."""
     try:
         return Path(file_path).read_text()
-    except:
-        # File doesn't exist yet (new file)
+    except (FileNotFoundError, IsADirectoryError, OSError):  # File doesn't exist or can't be read
         return ""
 
 
@@ -325,7 +324,7 @@ def apply_diff_to_content(unified_diff: str, original_content: str) -> str:
         Path(diff_path).unlink()
 
         return patched_content
-    except:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):  # patch command failed or file issues
         # Fallback: extract lines starting with +
         lines = []
         for line in unified_diff.splitlines():

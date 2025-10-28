@@ -15,7 +15,10 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from neo.persistent_reasoning import PersistentReasoningMemory
 
 logger = logging.getLogger(__name__)
 

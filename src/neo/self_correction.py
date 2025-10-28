@@ -17,7 +17,6 @@ except ImportError:
     PATTERN_EXTRACTION_AVAILABLE = False
 
 try:
-    from constraint_verification import ConstraintVerifier
     CONSTRAINT_VERIFICATION_AVAILABLE = True
 except ImportError:
     CONSTRAINT_VERIFICATION_AVAILABLE = False
@@ -300,6 +299,7 @@ Return ONLY executable Python code, no explanations.{memory_context}{prevention_
 
     attempts = []
     current_code = code
+    autopsy = None  # Track failure analysis from previous iteration
 
     for attempt in range(max_attempts):
         # Test current solution
@@ -324,7 +324,7 @@ Return ONLY executable Python code, no explanations.{memory_context}{prevention_
                     problem,
                     first_failed_code,
                     current_code,
-                    autopsy,  # Will be set from previous iteration
+                    autopsy,  # Failure analysis from previous iteration
                     adapter
                 )
 
