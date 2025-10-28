@@ -28,7 +28,7 @@ class TestStrategyInference:
         entry.difficulty_affinity = {
             "easy": (8, 10),    # 80% easy
             "medium": (7, 10),  # 70% medium
-            "hard": (6, 10)     # 60% hard
+            "hard": (7, 10)     # 70% hard (>60% threshold for compositional)
         }
         entry.merge_count = 4  # Evolved
 
