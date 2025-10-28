@@ -74,11 +74,14 @@ class TestFailureExtraction:
 class TestFailureIntegration:
     """Test failure extraction integration into add_reasoning (Phase 3.3)."""
 
-    def test_add_reasoning_extracts_failures_on_low_confidence(self):
+    def test_add_reasoning_extracts_failures_on_low_confidence(self, tmp_path):
         """Test that low-confidence entries with errors extract pitfalls."""
-        memory = PersistentReasoningMemory()
+        # Use temporary storage for clean test
+        storage_path = tmp_path / "test_memory.json"
+        memory = PersistentReasoningMemory(storage_path=str(storage_path))
 
-        # Clear existing entries for clean test
+        # Clear existing entries for clean test environment
+        memory.entries = []
         initial_count = len(memory.entries)
 
         context = {

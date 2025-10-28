@@ -1298,7 +1298,8 @@ class PersistentReasoningMemory:
         hard_rate = self._get_success_rate(entry.difficulty_affinity.get("hard"))
 
         # Compositional: excels on hard, evolved through consolidation
-        if hard_rate >= 0.60 and entry.merge_count >= 3:
+        # Use > 0.60 to distinguish from adaptive patterns that have exactly 60% hard success
+        if hard_rate > 0.60 and entry.merge_count > 3:
             return "compositional"
 
         # Procedural: works on easy, fails on hard
