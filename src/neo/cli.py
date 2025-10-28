@@ -29,7 +29,12 @@ except ImportError:
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, Optional, TypedDict
+
+if TYPE_CHECKING:
+    from neo.config import NeoConfig
+    from neo.exemplar_index import ExemplarIndex
+    from neo.persistent_reasoning import PersistentReasoningMemory
 
 # Initialize logger
 logger = logging.getLogger(__name__)
