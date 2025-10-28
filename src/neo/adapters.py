@@ -104,7 +104,7 @@ class OpenAIAdapter(LMAdapter):
 class AnthropicAdapter(LMAdapter):
     """Adapter for Anthropic models (Claude)."""
 
-    def __init__(self, model: str = "claude-3-5-sonnet-20241022", api_key: Optional[str] = None):
+    def __init__(self, model: str = "claude-sonnet-4-5-20250929", api_key: Optional[str] = None):
         self.model = model
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
@@ -407,7 +407,7 @@ def create_adapter(
     if provider == "openai":
         return OpenAIAdapter(model=model or "gpt-4", **kwargs)
     elif provider == "anthropic":
-        return AnthropicAdapter(model=model or "claude-3-5-sonnet-20241022", **kwargs)
+        return AnthropicAdapter(model=model or "claude-sonnet-4-5-20250929", **kwargs)
     elif provider == "google":
         return GoogleAdapter(model=model or "gemini-pro", **kwargs)
     elif provider == "azure":

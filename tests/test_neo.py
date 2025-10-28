@@ -35,7 +35,7 @@ def test_simple_algorithm():
         return False
 
     # Create adapter
-    adapter = create_adapter("anthropic", model="claude-3-5-sonnet-20241022")
+    adapter = create_adapter("anthropic", model="claude-sonnet-4-5-20250929")
     print(f"Using adapter: {adapter.name()}\n")
 
     # Create engine

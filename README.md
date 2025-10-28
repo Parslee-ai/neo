@@ -500,7 +500,7 @@ neo --config get --config-key provider
 
 # Set a value
 neo --config set --config-key provider --config-value anthropic
-neo --config set --config-key model --config-value claude-3-5-sonnet-20241022
+neo --config set --config-key model --config-value claude-sonnet-4-5-20250929
 neo --config set --config-key api_key --config-value sk-ant-...
 
 # Reset to defaults
@@ -509,7 +509,7 @@ neo --config reset
 
 **Exposed Configuration Fields:**
 - `provider` - LM provider (openai, anthropic, google, azure, ollama, local)
-- `model` - Model name (e.g., gpt-4, claude-3-5-sonnet-20241022)
+- `model` - Model name (e.g., gpt-4, claude-sonnet-4-5-20250929)
 - `api_key` - API key for the chosen provider
 - `base_url` - Base URL for local/Ollama endpoints
 
