@@ -344,15 +344,28 @@ class ConstructIndex:
         """
         start_time = time.time()
 
-        # Check if index exists and is recent
-        if not force_rebuild and self.index_path.exists() and self.metadata_path.exists():
-            age_seconds = time.time() - self.index_path.stat().st_mtime
-            if age_seconds < 3600:  # Less than 1 hour old
-                logger.info(f"Index is recent ({age_seconds:.0f}s old), skipping rebuild")
-                return {'status': 'skipped', 'reason': 'index_recent'}
-
-        # Scan construct directory for patterns
+        # Get pattern files - needed for freshness check and building
         pattern_files = list(self.construct_root.rglob('*.md'))
+
+        # Check if index exists and is fresh relative to source files
+        if not force_rebuild and self.index_path.exists() and self.metadata_path.exists():
+            index_mtime = self.index_path.stat().st_mtime
+
+            # Check if any pattern file is newer than the index
+            for pattern_file in pattern_files:
+                try:
+                    if pattern_file.stat().st_mtime > index_mtime:
+                        logger.info(
+                            f"Pattern file {pattern_file.relative_to(self.construct_root)} "
+                            f"modified at {pattern_file.stat().st_mtime}, index at {index_mtime}, rebuilding"
+                        )
+                        break
+                except OSError as e:
+                    logger.warning(f"Cannot stat {pattern_file}: {e}, triggering rebuild")
+                    break
+            else:
+                logger.info("Index is up to date with pattern files, skipping rebuild")
+                return {'status': 'skipped', 'reason': 'index_fresh'}
         if not pattern_files:
             logger.warning(f"No pattern files found in {self.construct_root}")
             return {'status': 'error', 'reason': 'no_patterns'}

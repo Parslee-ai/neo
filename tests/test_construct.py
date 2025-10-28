@@ -487,3 +487,63 @@ class TestPatternQualityConstraints:
         errors = PatternValidator.validate(long_pattern)
         assert len(errors) > 0
         assert any("line" in e.lower() or "300" in e for e in errors)
+
+
+class TestIndexFreshness:
+    """Test index freshness checks against pattern file modifications."""
+
+    @patch('neo.construct.FASTEMBED_AVAILABLE', True)
+    @patch('neo.construct.FAISS_AVAILABLE', True)
+    def test_construct_index_respects_pattern_file_changes(self, temp_construct_dir):
+        """Test that index rebuilds when pattern file is modified after index creation."""
+        with patch('neo.construct.TextEmbedding') as mock_embedder_class:
+            mock_embedder = MagicMock()
+            mock_embedder.embed = MagicMock(return_value=[[0.5] * 768])
+            mock_embedder_class.return_value = mock_embedder
+
+            index = ConstructIndex(construct_root=temp_construct_dir)
+
+            # Build initial index
+            result = index.build_index(force_rebuild=True)
+            assert result['status'] == 'success'
+
+            # Wait to ensure different mtime
+            time.sleep(0.1)
+
+            # Modify a pattern file
+            pattern_path = temp_construct_dir / 'caching' / 'cache-aside.md'
+            content = pattern_path.read_text()
+            pattern_path.write_text(content + "\n# Modified")
+
+            # Build index again without force_rebuild
+            result = index.build_index(force_rebuild=False)
+
+            # Should rebuild because pattern was modified
+            assert result['status'] == 'success'
+            assert result['pattern_count'] == 2
+
+    @patch('neo.construct.FASTEMBED_AVAILABLE', True)
+    @patch('neo.construct.FAISS_AVAILABLE', True)
+    def test_construct_index_skips_when_fresh(self, temp_construct_dir):
+        """Test that index is skipped when all patterns are older than index."""
+        with patch('neo.construct.TextEmbedding') as mock_embedder_class:
+            mock_embedder = MagicMock()
+            mock_embedder.embed = MagicMock(return_value=[[0.5] * 768])
+            mock_embedder_class.return_value = mock_embedder
+
+            index = ConstructIndex(construct_root=temp_construct_dir)
+
+            # Build initial index
+            result = index.build_index(force_rebuild=True)
+            assert result['status'] == 'success'
+
+            # Wait to ensure different mtime
+            time.sleep(0.1)
+
+            # Build index again without modifying files
+            result = index.build_index(force_rebuild=False)
+
+            # Should skip because index is fresh and no files modified
+            assert result['status'] == 'skipped'
+            assert result['reason'] == 'index_fresh'
+
