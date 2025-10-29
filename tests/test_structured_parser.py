@@ -309,6 +309,65 @@ def test_escape_errors():
         assert result.error_code in [ParseErrorCode.ESCAPE_ERRORS, ParseErrorCode.BAD_JSON]
 
 
+def test_empty_string_defensive_normalization():
+    """LLM empty strings are normalized before validation to prevent failures."""
+    # Reproduces actual bug: LLM returns empty input_data
+    raw_json = """<<<NEO:SCHEMA=v3:KIND=simulation>>>
+[
+    {
+        "n": 1,
+        "input_data": "",
+        "expected_output": "result",
+        "reasoning_steps": ["step 1"],
+        "issues_found": [],
+        "schema_version": "3"
+    }
+]
+<<<END:simulation>>>"""
+
+    result = parse_simulation_traces(raw_json)
+
+    # Should succeed with normalization
+    assert result.success is True
+    assert result.data[0]["input_data"] == "Not provided"
+    assert result.data[0]["expected_output"] == "result"
+
+
+def test_multiple_empty_fields_normalization():
+    """Multiple empty fields across traces are all normalized."""
+    raw_json = """<<<NEO:SCHEMA=v3:KIND=simulation>>>
+[
+    {
+        "n": 1,
+        "input_data": "",
+        "expected_output": "",
+        "reasoning_steps": ["step"],
+        "issues_found": [],
+        "schema_version": "3"
+    },
+    {
+        "n": 2,
+        "input_data": "valid input",
+        "expected_output": "",
+        "reasoning_steps": ["step"],
+        "issues_found": [],
+        "schema_version": "3"
+    }
+]
+<<<END:simulation>>>"""
+
+    result = parse_simulation_traces(raw_json)
+
+    assert result.success is True
+    assert len(result.data) == 2
+    # First trace: both fields empty
+    assert result.data[0]["input_data"] == "Not provided"
+    assert result.data[0]["expected_output"] == "Not provided"
+    # Second trace: only expected_output empty
+    assert result.data[1]["input_data"] == "valid input"
+    assert result.data[1]["expected_output"] == "Not provided"
+
+
 if __name__ == "__main__":
     # Run tests
     import sys
