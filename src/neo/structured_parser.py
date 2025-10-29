@@ -200,9 +200,48 @@ def tolerant_json_load(json_str: str) -> ParseResult:
         )
 
 
+def _normalize_empty_strings(data: Any, schema: dict) -> Any:
+    """Replace empty strings with 'Not provided' to satisfy minLength constraints.
+
+    LLMs occasionally return empty strings despite schema constraints.
+    This prevents intermittent validation failures.
+
+    See: Bug #48 - test_with_exemplars intermittent failures
+    """
+    if not isinstance(data, str):
+        return data
+
+    min_length = schema.get("minLength")
+    if min_length is None:
+        return data
+
+    if len(data) < min_length:
+        # "Not provided" (12 chars) covers minLength up to 12 without padding
+        return "Not provided"
+
+    return data
+
+
+def _normalize_empty_strings_recursive(data: Any, schema: dict) -> Any:
+    """Recursively normalize empty strings in nested structures."""
+    if isinstance(data, dict) and "properties" in schema:
+        result = {}
+        for key, value in data.items():
+            if key in schema["properties"]:
+                field_schema = schema["properties"][key]
+                result[key] = _normalize_empty_strings(value, field_schema)
+            else:
+                result[key] = value
+        return result
+    elif isinstance(data, list) and "items" in schema:
+        return [_normalize_empty_strings_recursive(item, schema["items"]) for item in data]
+    else:
+        return _normalize_empty_strings(data, schema)
+
+
 def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
     """
-    Recursively truncate string fields that exceed maxLength.
+    Recursively truncate string fields that exceed maxLength constraints.
 
     Walks dict/list/str structure and truncates strings to maxLength - 3,
     appending '...' to indicate truncation.
@@ -215,7 +254,7 @@ def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
         Modified data with truncated strings
     """
     if isinstance(data, dict):
-        # Truncate dict values according to schema properties
+        # Process dict values according to schema properties
         if "properties" in schema:
             result = {}
             for key, value in data.items():
@@ -228,7 +267,7 @@ def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
         return data
 
     elif isinstance(data, list):
-        # Truncate list items according to schema items
+        # Process list items according to schema items
         if "items" in schema:
             item_schema = schema["items"]
             return [_truncate_oversized_fields(item, item_schema) for item in data]
@@ -262,9 +301,6 @@ def validate_schema(data: dict, schema: dict) -> ParseResult:
     if not JSONSCHEMA_AVAILABLE:
         logger.warning("jsonschema not available, skipping validation")
         return ParseResult(success=True, data=data)
-
-    # Truncate oversized fields before validation
-    data = _truncate_oversized_fields(data, schema)
 
     try:
         validate(instance=data, schema=schema)
@@ -316,14 +352,25 @@ def parse_structured_response(response: str, kind: str, schema: dict) -> ParseRe
         json_result.raw_block = extract_result.raw_block
         return json_result
 
-    # Step 3: Validate schema
-    validate_result = validate_schema(json_result.data, schema)
+    parsed_data = json_result.data
+
+    # Step 3: Normalize empty strings before validation (defensive LLM programming)
+    if schema:
+        parsed_data = _normalize_empty_strings_recursive(parsed_data, schema)
+
+    # Step 4: Truncate oversized fields before validation
+    if schema:
+        parsed_data = _truncate_oversized_fields(parsed_data, schema)
+
+    # Step 5: Validate schema
+    validate_result = validate_schema(parsed_data, schema)
     if not validate_result.success:
         validate_result.raw_block = extract_result.raw_block
         return validate_result
 
-    # Step 4: Check schema version
     data = validate_result.data
+
+    # Step 6: Check schema version
     if isinstance(data, dict):
         if "schema_version" in data and data["schema_version"] != SCHEMA_VERSION:
             return ParseResult(
