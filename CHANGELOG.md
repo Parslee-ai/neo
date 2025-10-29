@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.8.1] - 2025-10-29
+
+### Fixed
+
+**Critical Bug Fixes**
+- Prevent JSON serialization failure causing data loss in persistent reasoning (#44)
+- Normalize empty strings before schema validation to prevent parser errors (#48, #56)
+- Resolve ModuleNotFoundError for --index flag (issue #38) (#40)
+- Reorder CLI flag checks to prevent AttributeError on --version (#37)
+- Check for command attribute existence before accessing in CLI
+- Check pattern file modifications for index freshness in Construct (#41)
+
+**Model Compatibility**
+- Upgrade deprecated Anthropic model to claude-sonnet-4-5-20250929 (#55)
+
+**Test Stability**
+- Correct compositional strategy boundary condition to 70% (#54)
+- Transform flaky latency test to behavioral semantic test (#53)
+- Use set comparison for consistency test to handle score ties
+- Resolve 5 failing tests in reasoning bank and failure learning (#42)
+
+**Code Quality**
+- Resolve 17 ruff linting violations for code quality compliance (#52)
+
+### Added
+
+**Dependencies**
+- Add missing jsonschema dependency to pyproject.toml for schema validation
+
+**CI/CD**
+- Add GitHub Actions CI workflow for automated testing (#50)
+- Bump actions/upload-artifact from 4 to 5 (#36)
+- Bump actions/download-artifact from 4 to 6 (#35)
+- Bump actions/checkout from 4 to 5 (#4)
+- Bump actions/setup-python from 5 to 6 (#2)
+
+### Changed
+
+**Development**
+- Update autonomous commands for Neo codebase (#39)
+- Update .gitignore to exclude specs directory
+
 ## [0.8.0] - 2025-10-21
 
 ### Added
