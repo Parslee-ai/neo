@@ -38,6 +38,7 @@ venv.bak/
 # Claude Code
 .claude/settings.local.json
 .claude/current-session.json
+specs/
 
 # Environment variables and secrets
 .env
