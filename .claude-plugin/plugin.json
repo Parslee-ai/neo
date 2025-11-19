@@ -1,6 +1,6 @@
 {
   "name": "neo",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Multi-agent semantic reasoning system with persistent memory for code suggestions, architectural guidance, and optimization recommendations",
   "author": {
     "name": "Parslee AI"
