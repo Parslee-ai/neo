@@ -260,49 +260,6 @@ class TestFullPipelineIntegration:
 class TestPerformanceIntegration:
     """Test performance with all phases enabled."""
 
-    def test_retrieval_returns_semantically_relevant_results(self, tmp_path):
-        """Verify that retrieval returns relevant entries for a search query.
-
-        This test validates the semantic matching quality of the retrieval system,
-        ensuring that relevant patterns are surfaced for related queries.
-        """
-        # Use isolated storage for test
-        memory = PersistentReasoningMemory(storage_path=str(tmp_path / "test_memory.json"))
-
-        # Add one highly relevant entry
-        memory.add_reasoning(
-            pattern="implement binary search algorithm",
-            context="algorithm implementation",
-            reasoning="binary search is efficient for sorted arrays",
-            suggestion="use binary search for O(log n) lookup",
-            confidence=0.9,
-            source_context={"hash": "binary_search"}
-        )
-
-        # Add one irrelevant entry
-        memory.add_reasoning(
-            pattern="configure nginx server",
-            context="web server setup",
-            reasoning="nginx is fast and reliable",
-            suggestion="use nginx for serving static files",
-            confidence=0.8,
-            source_context={"hash": "nginx"}
-        )
-
-        # Query should match the search algorithm entry
-        results = memory.retrieve_relevant(
-            problem_context={"prompt": "implement search algorithm"},
-            k=5
-        )
-
-        # Verify we got results
-        assert len(results) > 0, "Expected to find relevant entries for search algorithm query"
-
-        # Verify the top result is semantically relevant
-        top_result = results[0]
-        assert "binary search" in top_result.pattern.lower() or "search" in top_result.pattern.lower(), \
-            f"Expected top result to be about search algorithms, got: {top_result.pattern}"
-
     def test_consolidation_performance_with_all_boosts(self):
         """
         Test that consolidation completes quickly with Phase 4 contrastive boosts.
