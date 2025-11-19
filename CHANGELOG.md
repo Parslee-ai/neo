@@ -72,6 +72,10 @@ python -c "from google import genai; print('Google SDK OK')"
 
 ### Added
 
+**CLI Enhancements**
+- Enhanced `neo --version` output to display current provider and model (#61)
+- Updated default OpenAI model to gpt-5.1-codex-max for improved performance (#61)
+
 **Test Coverage**
 - Added comprehensive test suite for GoogleAdapter (tests/test_google_adapter.py)
 - Tests cover initialization, API key validation, message formatting, and response extraction
