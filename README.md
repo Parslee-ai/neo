@@ -293,7 +293,7 @@ Choose your language model provider:
 ```bash
 pip install openai                  # GPT models (recommended)
 pip install anthropic               # Claude
-pip install google-generativeai     # Gemini
+pip install google-genai>=0.2.0     # Gemini (requires Python 3.10+)
 pip install requests                # Ollama
 ```
 
@@ -546,12 +546,14 @@ Latest models: `claude-sonnet-4-5-20250929`, `claude-opus-4-1-20250805`, `claude
 
 ### Google
 
+**Note: Requires Python 3.10+ and google-genai>=0.2.0**
+
 ```python
 from neo.adapters import GoogleAdapter
-adapter = GoogleAdapter(model="gemini-2.5-pro")
+adapter = GoogleAdapter(model="gemini-2.0-flash")
 ```
 
-Latest models: `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
+Latest models: `gemini-2.0-flash`, `gemini-2.0-flash-thinking-exp`, `gemini-exp-1206`
 
 ### Ollama
 

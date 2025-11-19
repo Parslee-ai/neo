@@ -33,7 +33,7 @@ pip install -e .[dev]        # Development tools
 
 ## Requirements
 
-- **Python**: 3.9 or higher
+- **Python**: 3.10 or higher (3.9 supported for most providers, 3.10+ required for Google Gemini)
 - **pip**: Latest version recommended
 
 ### Core Dependencies (Auto-Installed)
@@ -54,7 +54,7 @@ Choose your language model provider:
 ```bash
 pip install openai                  # GPT models (recommended)
 pip install anthropic               # Claude
-pip install google-generativeai     # Gemini
+pip install google-genai            # Gemini (requires Python 3.10+)
 pip install requests                # Ollama (usually already installed)
 ```
 

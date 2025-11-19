@@ -7,7 +7,7 @@ name = "neo-reasoner"
 version = "0.8.1"
 description = "A self-improving code reasoning engine with persistent semantic memory"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Parslee AI", email = "hello@parslee.ai"}
@@ -19,7 +19,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -40,12 +39,12 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.21.0"]
 openai = ["openai>=1.0.0"]
-google = ["google-generativeai>=0.3.0"]
+google = ["google-genai>=0.2.0"]
 ollama = ["requests>=2.31.0"]
 all = [
     "anthropic>=0.21.0",
     "openai>=1.0.0",
-    "google-generativeai>=0.3.0",
+    "google-genai>=0.2.0",
     "requests>=2.31.0",
 ]
 dev = [
@@ -75,14 +74,14 @@ addopts = ["--import-mode=importlib", "-v"]
 
 [tool.black]
 line-length = 100
-target-version = ['py39']
+target-version = ['py310']
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
