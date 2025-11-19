@@ -15,7 +15,7 @@ class NeoConfig:
 
     # LM Provider settings
     provider: str = "openai"  # openai, anthropic, google, azure, local, ollama
-    model: Optional[str] = "gpt-5-codex"
+    model: Optional[str] = "gpt-5.1-codex-max"
     api_key: Optional[str] = None
     base_url: Optional[str] = None  # For local/ollama
 
