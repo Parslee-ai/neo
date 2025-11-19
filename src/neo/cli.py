@@ -2110,6 +2110,7 @@ def show_version(codebase_root: Optional[str] = None):
     bar = '█' * bar_filled + '░' * (40 - bar_filled)
 
     print(f"neo {version}")
+    print(f"Provider: {config.provider} | Model: {config.model}")
     print(f"Storage: {storage_info}")
     print(f"Stage: {stage} | Memory: {level:.1%}")
     print(f"{bar}")
