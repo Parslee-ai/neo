@@ -15,46 +15,30 @@
 
 ### Upgrading from 0.8.x
 
-If you use Google Gemini models, follow these steps to upgrade:
+**For Python 3.9 users:**
+- This release requires Python 3.10+
+- Upgrade Python before installing v0.9.0
 
-**Step 1: Check Python Version**
+**For Google Gemini users:**
 ```bash
-python --version  # Must be 3.10 or higher
+# Upgrade Neo (pip automatically handles the SDK migration)
+pip install --upgrade neo-reasoner[google]
+
+# Verify installation
+neo --version
 ```
 
-If needed, upgrade Python:
-```bash
-# macOS (Homebrew)
-brew install python@3.10
-
-# Ubuntu/Debian
-sudo apt-get install python3.10
-
-# Windows
-# Download from python.org
-```
-
-**Step 2: Uninstall Old Google SDK**
-```bash
-pip uninstall google-generativeai
-```
-
-**Step 3: Install New Google SDK**
-```bash
-pip install google-genai>=0.2.0
-```
-
-**Step 4: Update Model Names (if needed)**
-- Old: `gemini-pro` → New: `gemini-2.0-flash` (recommended)
+**Model name changes (if you explicitly specify models):**
+- Old: `gemini-pro` → New: `gemini-2.0-flash` (recommended default)
 - Old: `gemini-pro-vision` → New: `gemini-2.0-flash`
 
-**Step 5: Verify Installation**
+**For OpenAI/Anthropic/Ollama users:**
 ```bash
-neo --version
-python -c "from google import genai; print('Google SDK OK')"
+# Just upgrade normally
+pip install --upgrade neo-reasoner
 ```
 
-**Note**: If you don't use Google Gemini models, no action is required. Python 3.9 remains supported for OpenAI, Anthropic, and Ollama providers.
+No additional action required - pip handles all package dependencies automatically.
 
 ### Changed
 
