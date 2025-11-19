@@ -1,5 +1,87 @@
 # Changelog
 
+## [0.9.0] - 2025-11-19
+
+### BREAKING CHANGES
+
+**Python Version Requirement**
+- Minimum Python version increased from 3.9 to 3.10
+- Required for google-genai SDK compatibility
+
+**Google Gemini SDK Migration**
+- Migrated from deprecated google-generativeai to official google-genai SDK
+- google-generativeai reaches EOL on November 30, 2025
+- Hard cutover approach - no backward compatibility with old SDK
+
+### Upgrading from 0.8.x
+
+If you use Google Gemini models, follow these steps to upgrade:
+
+**Step 1: Check Python Version**
+```bash
+python --version  # Must be 3.10 or higher
+```
+
+If needed, upgrade Python:
+```bash
+# macOS (Homebrew)
+brew install python@3.10
+
+# Ubuntu/Debian
+sudo apt-get install python3.10
+
+# Windows
+# Download from python.org
+```
+
+**Step 2: Uninstall Old Google SDK**
+```bash
+pip uninstall google-generativeai
+```
+
+**Step 3: Install New Google SDK**
+```bash
+pip install google-genai>=0.2.0
+```
+
+**Step 4: Update Model Names (if needed)**
+- Old: `gemini-pro` → New: `gemini-2.0-flash` (recommended)
+- Old: `gemini-pro-vision` → New: `gemini-2.0-flash`
+
+**Step 5: Verify Installation**
+```bash
+neo --version
+python -c "from google import genai; print('Google SDK OK')"
+```
+
+**Note**: If you don't use Google Gemini models, no action is required. Python 3.9 remains supported for OpenAI, Anthropic, and Ollama providers.
+
+### Changed
+
+**GoogleAdapter Updates**
+- Replaced google-generativeai with google-genai>=0.2.0
+- Updated client initialization to use `genai.Client(api_key=...)`
+- Migrated to new `client.models.generate_content()` API
+- Updated message format to use `types.GenerateContentConfig`
+- Changed default model from "gemini-pro" to "gemini-2.0-flash"
+
+**Dependencies**
+- Updated pyproject.toml to require Python 3.10+
+- Removed Python 3.9 classifier
+- Updated tool configurations (black, ruff, mypy) to target Python 3.10
+
+### Added
+
+**Test Coverage**
+- Added comprehensive test suite for GoogleAdapter (tests/test_google_adapter.py)
+- Tests cover initialization, API key validation, message formatting, and response extraction
+- All tests use mocks to avoid real API calls
+
+**Documentation**
+- Updated README.md with Python 3.10+ requirement for Google provider
+- Updated model names to latest Gemini 2.0 models
+- Added migration notes for google-genai SDK
+
 ## [0.8.1] - 2025-10-29
 
 ### Fixed

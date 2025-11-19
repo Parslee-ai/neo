@@ -162,21 +162,21 @@ class AnthropicAdapter(LMAdapter):
 # ============================================================================
 
 class GoogleAdapter(LMAdapter):
-    """Adapter for Google models (Gemini)."""
+    """Adapter for Google models (Gemini) using google-genai SDK."""
 
-    def __init__(self, model: str = "gemini-pro", api_key: Optional[str] = None):
+    def __init__(self, model: str = "gemini-2.0-flash", api_key: Optional[str] = None):
         self.model = model
         self.api_key = api_key or os.environ.get("GOOGLE_API_KEY")
         if not self.api_key:
             raise ValueError("Google API key required")
 
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self.client = genai.GenerativeModel(model)
+            from google import genai
+            # Create client with API key
+            self.client = genai.Client(api_key=self.api_key)
         except ImportError:
             raise ImportError(
-                "google-generativeai package required: pip install google-generativeai"
+                "google-genai package required: pip install google-genai"
             )
 
     def generate(
@@ -186,8 +186,13 @@ class GoogleAdapter(LMAdapter):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> str:
-        """Generate response using Google API."""
-        # Convert messages to Gemini format
+        """Generate response using Google Generative AI SDK."""
+        from google.genai import types
+
+        # Convert messages to new SDK format
+        # Messages use "user" or "model" roles, with content in "parts" array
+        # Note: Google SDK requires "system" messages be mapped to "user" role
+        # This is a known SDK limitation - system prompts are merged with user context
         formatted_messages = []
         for msg in messages:
             role = "user" if msg["role"] in ["user", "system"] else "model"
@@ -196,19 +201,42 @@ class GoogleAdapter(LMAdapter):
                 "parts": [msg["content"]],
             })
 
-        generation_config = {
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-
-        if stop:
-            generation_config["stop_sequences"] = stop
-
-        response = self.client.generate_content(
-            formatted_messages,
-            generation_config=generation_config,
+        # Create generation config using types
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            stop_sequences=stop,
         )
-        return response.text
+
+        try:
+            # Generate content using new SDK interface
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=formatted_messages,
+                config=config,
+            )
+
+            # Handle missing or None response text
+            if not hasattr(response, 'text') or response.text is None:
+                raise ValueError("API returned empty response")
+
+            return response.text
+
+        except Exception as e:
+            error_msg = str(e).lower()
+
+            # Handle common API errors with clear messages
+            if "401" in error_msg or "403" in error_msg or "unauthorized" in error_msg:
+                raise ValueError(f"Invalid API key: {e}")
+            elif "429" in error_msg or "rate limit" in error_msg:
+                raise ValueError(f"Rate limit exceeded: {e}")
+            elif "404" in error_msg or "not found" in error_msg:
+                raise ValueError(f"Invalid model '{self.model}': {e}")
+            elif "network" in error_msg or "connection" in error_msg:
+                raise ValueError(f"Network error: {e}")
+            else:
+                # Re-raise with original error for unexpected cases
+                raise
 
     def name(self) -> str:
         return f"google/{self.model}"
@@ -409,7 +437,7 @@ def create_adapter(
     elif provider == "anthropic":
         return AnthropicAdapter(model=model or "claude-sonnet-4-5-20250929", **kwargs)
     elif provider == "google":
-        return GoogleAdapter(model=model or "gemini-pro", **kwargs)
+        return GoogleAdapter(model=model or "gemini-2.0-flash", **kwargs)
     elif provider == "azure":
         return AzureOpenAIAdapter(model=model or "gpt-4", **kwargs)
     elif provider == "local":
