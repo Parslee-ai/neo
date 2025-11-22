@@ -2547,7 +2547,7 @@ def handle_config(args):
     """Handle --config flag operations."""
     from neo.config import NeoConfig
 
-    VALID_PROVIDERS = ['openai', 'anthropic', 'google', 'azure', 'ollama', 'local']
+    VALID_PROVIDERS = ['openai', 'anthropic', 'google', 'azure', 'ollama', 'local', 'claude-code']
     EXPOSED_FIELDS = ['provider', 'model', 'api_key', 'base_url']
 
     def mask_secret(value: str) -> str:
