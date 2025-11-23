@@ -136,15 +136,7 @@ class ProjectIndex:
         self.snapshot: Optional[IndexSnapshot] = None
         self.faiss_index: Optional[Any] = None
         self.embedding_model: Optional[TextEmbedding] = None
-
-        # Initialize tree-sitter parser
-        try:
-            self.parser = TreeSitterParser()
-        except ImportError as e:
-            raise RuntimeError(
-                "Tree-sitter is required for indexing. "
-                "Install with: pip install neo[tree-sitter]"
-            ) from e
+        self.parser: Optional[TreeSitterParser] = None  # Lazy-initialized
 
         # Load existing index if available
         if self.snapshot_path.exists():
@@ -260,8 +252,15 @@ class ProjectIndex:
             languages: Languages to index (e.g., ['python', 'csharp', 'typescript'])
             max_files: Maximum files to index (prevent runaway on large repos)
         """
-        if not self.parser:
-            raise RuntimeError("Tree-sitter parser not available")
+        # Lazy-initialize parser
+        if self.parser is None:
+            try:
+                self.parser = TreeSitterParser()
+            except ImportError as e:
+                raise RuntimeError(
+                    "Tree-sitter is required for indexing. "
+                    "Install with: pip install neo[tree-sitter]"
+                ) from e
 
         # Auto-generate file patterns from languages if specified
         if languages and not file_patterns:
@@ -273,8 +272,11 @@ class ProjectIndex:
                     f"Supported languages: {', '.join(sorted(valid_languages))}"
                 )
         elif not file_patterns:
-            # Default to common languages
-            file_patterns = ["**/*.py", "**/*.cs", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.java", "**/*.go"]
+            # Default to all supported languages
+            file_patterns = [
+                "**/*.py", "**/*.cs", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx",
+                "**/*.java", "**/*.go", "**/*.rs", "**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"
+            ]
 
         logger.info(f"Building project index for {self.repo_root}")
         logger.info(f"File patterns: {file_patterns}")
