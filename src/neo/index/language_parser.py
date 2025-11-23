@@ -10,7 +10,7 @@ Supported languages:
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import hashlib
 import time
 
@@ -233,9 +233,9 @@ class TreeSitterParser:
                 "Install with: pip install tree-sitter-languages"
             )
 
-        self.parsers: Dict[str, any] = {}  # Lazy-loaded parsers per language
-        self.languages: Dict[str, any] = {}  # Language objects
-        self.compiled_queries: Dict[str, Dict[str, any]] = {}  # Compiled queries
+        self.parsers: Dict[str, Any] = {}  # Lazy-loaded parsers per language
+        self.languages: Dict[str, Any] = {}  # Language objects
+        self.compiled_queries: Dict[str, Dict[str, Any]] = {}  # Compiled queries
 
     def supports_extension(self, ext: str) -> bool:
         """Check if file extension is supported."""
@@ -353,9 +353,7 @@ class TreeSitterParser:
         content_bytes = content.encode('utf8')
 
         # Group captures by their parent construct
-        # Captures are ordered, so we can track the current construct
         constructs = {}  # node_id -> {name, body, start, end}
-        current_construct = None
 
         for node, capture_name in captures:
             # Find the parent construct (the one with full definition)
@@ -368,23 +366,34 @@ class TreeSitterParser:
                         'name': None,
                         'symbols': []
                     }
-                    current_construct = constructs[node_id]
-            elif capture_name == 'name' and current_construct is not None:
-                # Assign name to current construct if it's a descendant
+            elif capture_name == 'name':
+                # Find which construct this name belongs to
                 name_text = content_bytes[node.start_byte:node.end_byte].decode('utf8')
-                construct_node = current_construct['node']
 
-                # Check if this name belongs to the current construct
-                if (node.start_byte >= construct_node.start_byte and
-                    node.end_byte <= construct_node.end_byte):
-                    # This is likely the name of the current construct
-                    if current_construct['name'] is None:
-                        current_construct['name'] = name_text
-                        current_construct['symbols'].append(name_text)
+                # Find the smallest construct that contains this name
+                # (handles nested constructs correctly)
+                containing_construct = None
+                smallest_size = float('inf')
+
+                for construct_id, construct in constructs.items():
+                    construct_node = construct['node']
+                    # Check if name is within this construct
+                    if (node.start_byte >= construct_node.start_byte and
+                        node.end_byte <= construct_node.end_byte):
+                        # Track the smallest containing construct
+                        construct_size = construct_node.end_byte - construct_node.start_byte
+                        if construct_size < smallest_size:
+                            smallest_size = construct_size
+                            containing_construct = construct
+
+                if containing_construct is not None:
+                    if containing_construct['name'] is None:
+                        containing_construct['name'] = name_text
+                        containing_construct['symbols'].append(name_text)
                     else:
                         # Additional symbol (e.g., method in a class)
-                        if name_text not in current_construct['symbols']:
-                            current_construct['symbols'].append(name_text)
+                        if name_text not in containing_construct['symbols']:
+                            containing_construct['symbols'].append(name_text)
 
         # Create chunks from constructs
         for construct_id, construct in constructs.items():

@@ -141,8 +141,10 @@ class ProjectIndex:
         try:
             self.parser = TreeSitterParser()
         except ImportError as e:
-            logger.error(f"Failed to initialize tree-sitter parser: {e}")
-            self.parser = None
+            raise RuntimeError(
+                "Tree-sitter is required for indexing. "
+                "Install with: pip install neo[tree-sitter]"
+            ) from e
 
         # Load existing index if available
         if self.snapshot_path.exists():
@@ -264,6 +266,12 @@ class ProjectIndex:
         # Auto-generate file patterns from languages if specified
         if languages and not file_patterns:
             file_patterns = self._patterns_from_languages(languages)
+            if not file_patterns:
+                valid_languages = self.parser.get_supported_languages() if self.parser else []
+                raise ValueError(
+                    f"No valid languages found in {languages}. "
+                    f"Supported languages: {', '.join(sorted(valid_languages))}"
+                )
         elif not file_patterns:
             # Default to common languages
             file_patterns = ["**/*.py", "**/*.cs", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.java", "**/*.go"]
