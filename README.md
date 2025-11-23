@@ -262,7 +262,9 @@ neo --version
 
 ### Updating Neo
 
-Neo automatically checks for updates and notifies you when a new version is available. You have several options for updating:
+Neo supports both manual and fully automatic updates:
+
+#### Manual Updates
 
 ```bash
 # Option 1: Use neo's built-in update command (simplest)
@@ -277,9 +279,42 @@ pipx upgrade neo-reasoner           # Update to latest version
 pipx upgrade-all                    # Update all pipx packages
 ```
 
-**Auto-Update Notifications**: Neo checks for updates once every 24 hours and displays a notification when a new version is available. This check happens in the background and will not interrupt your workflow.
+#### Fully Automatic Updates
 
-To disable update checks, you can set the `NEO_SKIP_UPDATE_CHECK` environment variable:
+Enable automatic installation of updates in the background:
+
+```bash
+# Enable auto-install (persisted in ~/.neo/config.json)
+neo --config set --config-key auto_install_updates --config-value true
+
+# Or use environment variable
+export NEO_AUTO_INSTALL_UPDATES=1
+```
+
+When enabled, Neo will:
+- Check for updates once every 24 hours
+- Automatically download and install new versions in the background
+- Notify you when updates complete
+- Log all auto-update activity to `~/.neo/auto_update.log`
+
+**Example output when auto-install is enabled:**
+```bash
+$ neo "your query"
+
+⚡ Auto-installing neo update: 0.9.0 → 0.10.0
+   This happens in the background. Please wait...
+
+✓ Auto-update completed: 0.10.0
+   Restart neo to use the new version.
+
+[Neo] Processing your query...
+```
+
+#### Update Notifications (Default)
+
+By default, Neo checks for updates once every 24 hours and displays a notification when a new version is available. This check happens in the background and will not interrupt your workflow.
+
+To disable update checks entirely:
 ```bash
 export NEO_SKIP_UPDATE_CHECK=1
 ```
@@ -536,6 +571,7 @@ neo --config reset
 - `model` - Model name (e.g., gpt-4, claude-sonnet-4-5-20250929)
 - `api_key` - API key for the chosen provider
 - `base_url` - Base URL for local/Ollama endpoints
+- `auto_install_updates` - Automatically install updates in background (true/false)
 
 Configuration is stored in `~/.neo/config.json` and takes precedence over environment variables.
 

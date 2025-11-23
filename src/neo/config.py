@@ -41,6 +41,9 @@ class NeoConfig:
     enable_mypy: bool = False
     enable_eslint: bool = True
 
+    # Auto-update settings
+    auto_install_updates: bool = False  # Automatically install updates in background
+
     @classmethod
     def from_file(cls, config_path: str) -> "NeoConfig":
         """Load configuration from JSON file."""
@@ -89,6 +92,10 @@ class NeoConfig:
         if exemplar_dir := os.environ.get("NEO_EXEMPLAR_DIR"):
             config.exemplar_dir = exemplar_dir
 
+        # Auto-update settings
+        if auto_install := os.environ.get("NEO_AUTO_INSTALL_UPDATES"):
+            config.auto_install_updates = auto_install.lower() in ("1", "true", "yes")
+
         return config
 
     @classmethod
@@ -134,6 +141,7 @@ class NeoConfig:
             'model': self.model,
             'api_key': self.api_key,
             'base_url': self.base_url,
+            'auto_install_updates': self.auto_install_updates,
         }
 
         with open(path, "w") as f:

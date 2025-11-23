@@ -116,12 +116,13 @@ def _compare_versions(current: str, latest: str) -> bool:
         return latest != current
 
 
-def check_for_updates(suppress_output: bool = False) -> Optional[str]:
+def check_for_updates(suppress_output: bool = False, auto_install: bool = False) -> Optional[str]:
     """
     Check PyPI for a newer version of neo-reasoner.
 
     Args:
         suppress_output: If True, don't print update notifications
+        auto_install: If True, automatically install updates when found
 
     Returns:
         The new version string if an update is available, None otherwise
@@ -142,8 +143,12 @@ def check_for_updates(suppress_output: bool = False) -> Optional[str]:
             cache = _read_cache()
             if cache:
                 new_version = cache.get("new_version")
-                if new_version and not suppress_output:
-                    _print_update_notification(current_version, new_version)
+                if new_version:
+                    # Auto-install if enabled (even from cache)
+                    if auto_install:
+                        perform_auto_install(new_version)
+                    elif not suppress_output:
+                        _print_update_notification(current_version, new_version)
                 return new_version
 
         # Fetch latest version from PyPI
@@ -158,7 +163,10 @@ def check_for_updates(suppress_output: bool = False) -> Optional[str]:
 
         # Check if update is available
         if _compare_versions(current_version, latest_version):
-            if not suppress_output:
+            # Auto-install if enabled
+            if auto_install:
+                perform_auto_install(latest_version)
+            elif not suppress_output:
                 _print_update_notification(current_version, latest_version)
             return latest_version
 
@@ -175,6 +183,73 @@ def _print_update_notification(current: str, latest: str) -> None:
     print(f"\n⚡ Neo update available: {current} → {latest}", file=sys.stderr)
     print(f"   Run: pip install --upgrade {PYPI_PACKAGE_NAME}", file=sys.stderr)
     print(f"   Or:  neo update\n", file=sys.stderr)
+
+
+def perform_auto_install(new_version: str) -> bool:
+    """
+    Perform automatic background update installation.
+
+    This is more aggressive than perform_update() - it installs without prompting.
+    Should only be called when auto_install_updates is enabled in config.
+
+    Args:
+        new_version: The version to install
+
+    Returns:
+        True if update was successful, False otherwise
+    """
+    import subprocess
+
+    current_version = _get_current_version()
+
+    try:
+        # Write update log
+        log_file = _get_cache_file().parent / "auto_update.log"
+        with open(log_file, 'a') as f:
+            import datetime
+            timestamp = datetime.datetime.now().isoformat()
+            f.write(f"\n[{timestamp}] Auto-updating from {current_version} to {new_version}\n")
+
+        # Notify user that auto-update is happening
+        print(f"\n⚡ Auto-installing neo update: {current_version} → {new_version}", file=sys.stderr)
+        print(f"   This happens in the background. Please wait...\n", file=sys.stderr)
+
+        # Use pip to upgrade
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", PYPI_PACKAGE_NAME, "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=120  # 2 minute timeout
+        )
+
+        if result.returncode == 0:
+            # Log success
+            with open(log_file, 'a') as f:
+                f.write(f"   ✓ Success! Updated to {new_version}\n")
+
+            print(f"✓ Auto-update completed: {new_version}", file=sys.stderr)
+            print(f"   Restart neo to use the new version.\n", file=sys.stderr)
+
+            # Clear cache so next check will re-verify
+            cache_file = _get_cache_file()
+            if cache_file.exists():
+                cache_file.unlink()
+
+            return True
+        else:
+            # Log failure
+            with open(log_file, 'a') as f:
+                f.write(f"   ✗ Failed: {result.stderr}\n")
+
+            logger.debug(f"Auto-update failed: {result.stderr}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.debug("Auto-update timed out after 120 seconds")
+        return False
+    except Exception as e:
+        logger.debug(f"Auto-update failed: {e}")
+        return False
 
 
 def perform_update() -> bool:

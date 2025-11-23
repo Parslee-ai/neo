@@ -2556,7 +2556,7 @@ def handle_config(args):
     from neo.config import NeoConfig
 
     VALID_PROVIDERS = ['openai', 'anthropic', 'google', 'azure', 'ollama', 'local']
-    EXPOSED_FIELDS = ['provider', 'model', 'api_key', 'base_url']
+    EXPOSED_FIELDS = ['provider', 'model', 'api_key', 'base_url', 'auto_install_updates']
 
     def mask_secret(value: str) -> str:
         """Mask API keys and secrets for display."""
@@ -2613,10 +2613,22 @@ def handle_config(args):
             print(f"Error: Invalid provider. Valid providers: {', '.join(VALID_PROVIDERS)}", file=sys.stderr)
             sys.exit(1)
 
+        # Convert boolean values
+        if args.config_key == 'auto_install_updates':
+            if args.config_value.lower() in ('true', '1', 'yes', 'on'):
+                value = True
+            elif args.config_value.lower() in ('false', '0', 'no', 'off'):
+                value = False
+            else:
+                print(f"Error: Invalid boolean value. Use: true/false, 1/0, yes/no, on/off", file=sys.stderr)
+                sys.exit(1)
+        else:
+            value = args.config_value
+
         # Set the value
-        setattr(config, args.config_key, args.config_value)
+        setattr(config, args.config_key, value)
         config.save()
-        print(f"✓ Set {args.config_key} = {args.config_value if args.config_key != 'api_key' else mask_secret(args.config_value)}")
+        print(f"✓ Set {args.config_key} = {value if args.config_key != 'api_key' else mask_secret(value)}")
 
     elif args.config == 'reset':
         # Reset to defaults
@@ -2773,7 +2785,11 @@ def main():
     if not skip_update_check:
         try:
             from neo.update_checker import check_for_updates
-            check_for_updates()
+            from neo.config import NeoConfig
+
+            # Load config to check if auto-install is enabled
+            config = NeoConfig.load()
+            check_for_updates(auto_install=config.auto_install_updates)
         except Exception:
             pass  # Silent failure - don't disrupt workflow
 
