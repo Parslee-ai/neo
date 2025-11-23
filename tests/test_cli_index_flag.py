@@ -11,6 +11,12 @@ import sys
 
 import pytest
 
+# Check if tree-sitter is available
+try:
+    from neo.index.language_parser import TREE_SITTER_AVAILABLE
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+
 
 def test_index_flag_imports_successfully():
     """Validates that the --index flag can import ProjectIndex without errors.
@@ -25,6 +31,10 @@ def test_index_flag_imports_successfully():
         pytest.fail(f"Failed to import ProjectIndex: {e}")
 
 
+@pytest.mark.skipif(
+    not TREE_SITTER_AVAILABLE,
+    reason="tree-sitter-languages not installed (requires Python 3.8-3.12)"
+)
 def test_index_flag_basic_functionality(tmp_path):
     """Validates that --index flag can build an index.
 
