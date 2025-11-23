@@ -2651,6 +2651,7 @@ def parse_args():
     global_parser.add_argument('--load-program', metavar='DATASET_ID', help='Load training pack from HuggingFace (e.g., mbpp)')
     global_parser.add_argument('--regenerate-embeddings', action='store_true', help='Regenerate all embeddings with current model (safe, with automatic backup)')
     global_parser.add_argument('--index', action='store_true', help='Build semantic index for current directory')
+    global_parser.add_argument('--languages', metavar='CSV', help='Languages to index (e.g., python,csharp,typescript)')
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
 
     # Detect if 'update' subcommand is being used
@@ -2837,20 +2838,26 @@ def main():
 
         index = ProjectIndex(codebase_root)
 
-        # Determine file patterns based on detected languages
-        patterns = ['**/*.py']  # Default to Python
+        # Parse languages if provided
+        languages = None
+        if hasattr(args, 'languages') and args.languages:
+            languages = [lang.strip() for lang in args.languages.split(',')]
+            print(f"[Neo] Indexing languages: {', '.join(languages)}")
 
         max_files = 100  # Configurable later
 
         try:
-            index.build_index(patterns, max_files=max_files)
+            index.build_index(languages=languages, max_files=max_files)
             status = index.status()
             print(f"[Neo] Built index: {status['total_chunks']} chunks from {status['total_files']} files")
             print(f"[Neo] Index stored in {codebase_root}/.neo/")
+            print("[Neo] Supported languages: Python, C#, TypeScript, JavaScript, Java, Go, Rust, C/C++")
             print("[Neo] Use '--semantic' flag to enable semantic search")
             sys.exit(0)
         except Exception as e:
             print(f"[Neo] Failed to build index: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
 
     # Handle update subcommand
