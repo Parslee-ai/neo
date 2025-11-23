@@ -18,7 +18,6 @@ Design philosophy:
 - Zero hidden CPU work (all indexing is explicit or budgeted)
 """
 
-import ast
 import hashlib
 import json
 import logging
@@ -27,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 import numpy as np
+
+from neo.index.language_parser import TreeSitterParser
 
 # Import FAISS for fast similarity search
 try:
@@ -135,6 +136,7 @@ class ProjectIndex:
         self.snapshot: Optional[IndexSnapshot] = None
         self.faiss_index: Optional[Any] = None
         self.embedding_model: Optional[TextEmbedding] = None
+        self.parser: Optional[TreeSitterParser] = None  # Lazy-initialized
 
         # Load existing index if available
         if self.snapshot_path.exists():
@@ -241,18 +243,43 @@ class ProjectIndex:
             logger.error(f"Failed to save project index: {e}")
             raise
 
-    def build_index(self, file_patterns: List[str] = None, max_files: int = 100):
+    def build_index(self, file_patterns: List[str] = None, languages: List[str] = None, max_files: int = 100):
         """
         Build initial index for repository.
 
         Args:
-            file_patterns: Glob patterns for files to index (default: ["**/*.py"])
+            file_patterns: Glob patterns for files to index
+            languages: Languages to index (e.g., ['python', 'csharp', 'typescript'])
             max_files: Maximum files to index (prevent runaway on large repos)
         """
-        if not file_patterns:
-            file_patterns = ["**/*.py"]  # Default to Python files
+        # Lazy-initialize parser
+        if self.parser is None:
+            try:
+                self.parser = TreeSitterParser()
+            except ImportError as e:
+                raise RuntimeError(
+                    "Tree-sitter is required for indexing. "
+                    "Install with: pip install neo[tree-sitter]"
+                ) from e
+
+        # Auto-generate file patterns from languages if specified
+        if languages and not file_patterns:
+            file_patterns = self._patterns_from_languages(languages)
+            if not file_patterns:
+                valid_languages = self.parser.get_supported_languages() if self.parser else []
+                raise ValueError(
+                    f"No valid languages found in {languages}. "
+                    f"Supported languages: {', '.join(sorted(valid_languages))}"
+                )
+        elif not file_patterns:
+            # Default to all supported languages
+            file_patterns = [
+                "**/*.py", "**/*.cs", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx",
+                "**/*.java", "**/*.go", "**/*.rs", "**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp"
+            ]
 
         logger.info(f"Building project index for {self.repo_root}")
+        logger.info(f"File patterns: {file_patterns}")
         start_time = time.time()
 
         # Initialize snapshot
@@ -477,74 +504,52 @@ class ProjectIndex:
 
     def _extract_chunks_from_file(self, file_path: Path, rel_path: str) -> List[CodeChunk]:
         """
-        Extract semantic chunks from a file using AST analysis.
+        Extract semantic chunks from a file using tree-sitter.
 
-        Chunks are:
-        - Top-level functions
-        - Top-level classes
-        - Module docstring
+        Chunks include:
+        - Functions/methods
+        - Classes/structs
+        - Interfaces (for languages that support them)
         """
-        chunks = []
+        if not self.parser:
+            logger.error("Tree-sitter parser not available")
+            return []
 
         try:
+            # Check if parser supports this file extension
+            if not self.parser.supports_extension(file_path.suffix):
+                logger.debug(f"Unsupported file extension: {file_path.suffix}")
+                return []
+
+            # Read file content
             content = file_path.read_text(encoding='utf-8')
-            file_hash = self._compute_file_hash(file_path)
 
-            # Parse AST
-            tree = ast.parse(content, filename=str(file_path))
+            # Parse using tree-sitter
+            parser_chunks = self.parser.parse_file(file_path, content)
 
-            # Extract module docstring
-            module_doc = ast.get_docstring(tree)
-            if module_doc:
-                chunks.append(CodeChunk(
+            # Convert ParserCodeChunk to ProjectIndex CodeChunk
+            chunks = []
+            for pc in parser_chunks:
+                # Update file_path to be relative
+                chunk = CodeChunk(
                     file_path=rel_path,
-                    chunk_id="module_doc",
-                    content=module_doc,
-                    chunk_type="module_doc",
-                    start_line=1,
-                    end_line=len(module_doc.split('\n')),
-                    file_hash=file_hash
-                ))
+                    chunk_id=pc.chunk_id,
+                    content=pc.content,
+                    chunk_type=pc.chunk_type,
+                    start_line=pc.start_line,
+                    end_line=pc.end_line,
+                    symbols=pc.symbols,
+                    imports=pc.imports,
+                    file_hash=pc.file_hash,
+                    indexed_at=pc.indexed_at
+                )
+                chunks.append(chunk)
 
-            # Extract top-level functions and classes
-            for node in ast.iter_child_nodes(tree):
-                if isinstance(node, ast.FunctionDef):
-                    func_content = ast.get_source_segment(content, node)
-                    if func_content:
-                        chunks.append(CodeChunk(
-                            file_path=rel_path,
-                            chunk_id=f"func:{node.name}",
-                            content=func_content[:MAX_CHUNK_LENGTH],
-                            chunk_type="function",
-                            start_line=node.lineno,
-                            end_line=node.end_lineno or node.lineno,
-                            symbols=[node.name],
-                            file_hash=file_hash
-                        ))
+            return chunks
 
-                elif isinstance(node, ast.ClassDef):
-                    class_content = ast.get_source_segment(content, node)
-                    if class_content:
-                        # Extract method names
-                        methods = [n.name for n in ast.walk(node) if isinstance(n, ast.FunctionDef)]
-
-                        chunks.append(CodeChunk(
-                            file_path=rel_path,
-                            chunk_id=f"class:{node.name}",
-                            content=class_content[:MAX_CHUNK_LENGTH],
-                            chunk_type="class",
-                            start_line=node.lineno,
-                            end_line=node.end_lineno or node.lineno,
-                            symbols=[node.name] + methods,
-                            file_hash=file_hash
-                        ))
-
-        except SyntaxError as e:
-            logger.warning(f"Syntax error in {file_path}: {e}")
         except Exception as e:
             logger.error(f"Failed to extract chunks from {file_path}: {e}")
-
-        return chunks
+            return []
 
     def _embed_chunks(self, chunks: List[CodeChunk]):
         """Generate embeddings for chunks."""
@@ -623,6 +628,41 @@ class ProjectIndex:
         except Exception as e:
             logger.error(f"Failed to hash {file_path}: {e}")
             return ""
+
+    def _patterns_from_languages(self, languages: List[str]) -> List[str]:
+        """Convert language names to file patterns."""
+        from neo.index.language_parser import LANGUAGE_MAP
+
+        # Language aliases for common names
+        LANGUAGE_ALIASES = {
+            'csharp': 'c_sharp',
+            'c#': 'c_sharp',
+            'js': 'javascript',
+            'ts': 'typescript',
+            'py': 'python',
+            'golang': 'go',
+            'c++': 'cpp',
+        }
+
+        # Invert the language map to get extensions for each language
+        lang_to_exts = {}
+        for ext, lang in LANGUAGE_MAP.items():
+            if lang not in lang_to_exts:
+                lang_to_exts[lang] = []
+            lang_to_exts[lang].append(ext)
+
+        patterns = []
+        for lang in languages:
+            # Normalize language name
+            lang_normalized = LANGUAGE_ALIASES.get(lang.lower(), lang.lower())
+
+            if lang_normalized in lang_to_exts:
+                for ext in lang_to_exts[lang_normalized]:
+                    patterns.append(f"**/*{ext}")
+            else:
+                logger.warning(f"Unknown language: {lang}")
+
+        return patterns
 
     def _get_git_commit(self) -> str:
         """Get current git commit hash."""
