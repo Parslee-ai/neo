@@ -260,6 +260,30 @@ pip install neo-reasoner[all]        # All providers
 neo --version
 ```
 
+### Updating Neo
+
+Neo automatically checks for updates and notifies you when a new version is available. You have several options for updating:
+
+```bash
+# Option 1: Use neo's built-in update command (simplest)
+neo update
+
+# Option 2: Update with pip
+pip install --upgrade neo-reasoner
+
+# Option 3: Use pipx for isolated installation (recommended for end users)
+pipx install neo-reasoner          # First-time install
+pipx upgrade neo-reasoner           # Update to latest version
+pipx upgrade-all                    # Update all pipx packages
+```
+
+**Auto-Update Notifications**: Neo checks for updates once every 24 hours and displays a notification when a new version is available. This check happens in the background and will not interrupt your workflow.
+
+To disable update checks, you can set the `NEO_SKIP_UPDATE_CHECK` environment variable:
+```bash
+export NEO_SKIP_UPDATE_CHECK=1
+```
+
 
 ### From Source (Development)
 

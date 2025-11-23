@@ -2448,6 +2448,14 @@ def handle_load_program(args):
         sys.exit(1)
 
 
+def handle_update(args):
+    """Handle the 'neo update' command to perform self-update."""
+    from neo.update_checker import perform_update
+
+    success = perform_update()
+    sys.exit(0 if success else 1)
+
+
 def handle_construct(args):
     """Handle construct subcommand operations."""
     from neo.construct import ConstructIndex
@@ -2633,6 +2641,17 @@ def parse_args():
     global_parser.add_argument('--index', action='store_true', help='Build semantic index for current directory')
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
 
+    # Detect if 'update' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'update':
+        p = argparse.ArgumentParser(
+            prog="neo update",
+            description="Update neo to the latest version",
+            parents=[global_parser]
+        )
+        args = p.parse_args(sys.argv[2:])  # Parse remaining args after 'update'
+        args.command = 'update'
+        return args
+
     # Detect if 'construct' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'construct':
         # Parse construct subcommand with proper sub-subparsers
@@ -2744,6 +2763,20 @@ def main():
     # Parse arguments
     args = parse_args()
 
+    # Check for updates (non-blocking, silent on failure)
+    # Skip if running certain commands to avoid noise
+    skip_update_check = (
+        hasattr(args, 'version') and args.version or
+        hasattr(args, 'config') and args.config or
+        hasattr(args, 'command') and args.command == 'update'
+    )
+    if not skip_update_check:
+        try:
+            from neo.update_checker import check_for_updates
+            check_for_updates()
+        except Exception:
+            pass  # Silent failure - don't disrupt workflow
+
     # Handle global flags first (exist on all parsers, must check before subcommand-specific attributes)
 
     # Handle --version flag
@@ -2803,6 +2836,11 @@ def main():
         except Exception as e:
             print(f"[Neo] Failed to build index: {e}", file=sys.stderr)
             sys.exit(1)
+
+    # Handle update subcommand
+    if hasattr(args, 'command') and args.command == 'update':
+        handle_update(args)
+        sys.exit(0)
 
     # Handle construct subcommand
     if hasattr(args, 'command') and args.command == 'construct':
