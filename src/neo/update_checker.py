@@ -182,7 +182,7 @@ def _print_update_notification(current: str, latest: str) -> None:
     """Print a user-friendly update notification."""
     print(f"\n⚡ Neo update available: {current} → {latest}", file=sys.stderr)
     print(f"   Run: pip install --upgrade {PYPI_PACKAGE_NAME}", file=sys.stderr)
-    print(f"   Or:  neo update\n", file=sys.stderr)
+    print("   Or:  neo update\n", file=sys.stderr)
 
 
 def perform_auto_install(new_version: str) -> bool:
@@ -212,7 +212,7 @@ def perform_auto_install(new_version: str) -> bool:
 
         # Notify user that auto-update is happening
         print(f"\n⚡ Auto-installing neo update: {current_version} → {new_version}", file=sys.stderr)
-        print(f"   This happens in the background. Please wait...\n", file=sys.stderr)
+        print("   This happens in the background. Please wait...\n", file=sys.stderr)
 
         # Use pip to upgrade
         result = subprocess.run(
@@ -228,7 +228,7 @@ def perform_auto_install(new_version: str) -> bool:
                 f.write(f"   ✓ Success! Updated to {new_version}\n")
 
             print(f"✓ Auto-update completed: {new_version}", file=sys.stderr)
-            print(f"   Restart neo to use the new version.\n", file=sys.stderr)
+            print("   Restart neo to use the new version.\n", file=sys.stderr)
 
             # Clear cache so next check will re-verify
             cache_file = _get_cache_file()
@@ -275,7 +275,7 @@ def perform_update() -> bool:
 
     try:
         # Use pip to upgrade
-        result = subprocess.run(
+        subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade", PYPI_PACKAGE_NAME],
             capture_output=True,
             text=True,

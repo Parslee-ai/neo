@@ -2620,7 +2620,7 @@ def handle_config(args):
             elif args.config_value.lower() in ('false', '0', 'no', 'off'):
                 value = False
             else:
-                print(f"Error: Invalid boolean value. Use: true/false, 1/0, yes/no, on/off", file=sys.stderr)
+                print("Error: Invalid boolean value. Use: true/false, 1/0, yes/no, on/off", file=sys.stderr)
                 sys.exit(1)
         else:
             value = args.config_value
