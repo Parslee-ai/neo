@@ -7,6 +7,17 @@ import shutil
 
 from neo.index.project_index import ProjectIndex
 
+# Check if tree-sitter is available
+try:
+    from neo.index.language_parser import TREE_SITTER_AVAILABLE
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not TREE_SITTER_AVAILABLE,
+    reason="tree-sitter-languages not installed (requires Python 3.8-3.12)"
+)
+
 
 # Sample files for different languages
 SAMPLE_FILES = {
