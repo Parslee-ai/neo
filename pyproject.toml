@@ -37,6 +37,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tree-sitter = [
+    "tree-sitter>=0.21.0,<0.22",  # 0.22+ has API changes incompatible with tree-sitter-languages
+    "tree-sitter-languages>=1.10.0; python_version<'3.13'",
+]
 anthropic = ["anthropic>=0.21.0"]
 openai = ["openai>=1.0.0"]
 google = ["google-genai>=0.2.0"]
