@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 import numpy as np
 
-from neo.index.language_parser import TreeSitterParser, CodeChunk as ParserCodeChunk
+from neo.index.language_parser import TreeSitterParser
 
 # Import FAISS for fast similarity search
 try:

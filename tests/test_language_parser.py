@@ -2,7 +2,7 @@
 
 import pytest
 from pathlib import Path
-from neo.index.language_parser import TreeSitterParser, LANGUAGE_MAP
+from neo.index.language_parser import TreeSitterParser
 
 
 # Sample code for each language

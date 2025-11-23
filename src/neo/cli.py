@@ -2802,7 +2802,7 @@ def main():
             status = index.status()
             print(f"[Neo] Built index: {status['total_chunks']} chunks from {status['total_files']} files")
             print(f"[Neo] Index stored in {codebase_root}/.neo/")
-            print(f"[Neo] Supported languages: Python, C#, TypeScript, JavaScript, Java, Go, Rust, C/C++")
+            print("[Neo] Supported languages: Python, C#, TypeScript, JavaScript, Java, Go, Rust, C/C++")
             print("[Neo] Use '--semantic' flag to enable semantic search")
             sys.exit(0)
         except Exception as e:
