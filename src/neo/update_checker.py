@@ -112,8 +112,13 @@ def _compare_versions(current: str, latest: str) -> bool:
         from packaging import version
         return version.parse(latest) > version.parse(current)
     except ImportError:
-        # Fallback to simple string comparison if packaging not available
-        return latest != current
+        # Fallback: parse as tuples for proper comparison
+        def parse_version(v):
+            return tuple(int(x) for x in v.split('.') if x.isdigit())
+        try:
+            return parse_version(latest) > parse_version(current)
+        except (ValueError, TypeError):
+            return False  # Can't compare, assume no update
 
 
 def check_for_updates(suppress_output: bool = False, auto_install: bool = False) -> Optional[str]:
@@ -201,6 +206,8 @@ def perform_auto_install(new_version: str) -> bool:
     import subprocess
 
     current_version = _get_current_version()
+    if current_version == new_version:
+        return True  # Already installed
 
     try:
         # Write update log
