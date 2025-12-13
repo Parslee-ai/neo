@@ -2448,6 +2448,14 @@ def handle_load_program(args):
         sys.exit(1)
 
 
+def handle_update(args):
+    """Handle the 'neo update' command to perform self-update."""
+    from neo.update_checker import perform_update
+
+    success = perform_update()
+    sys.exit(0 if success else 1)
+
+
 def handle_construct(args):
     """Handle construct subcommand operations."""
     from neo.construct import ConstructIndex
@@ -2548,7 +2556,7 @@ def handle_config(args):
     from neo.config import NeoConfig
 
     VALID_PROVIDERS = ['openai', 'anthropic', 'google', 'azure', 'ollama', 'local']
-    EXPOSED_FIELDS = ['provider', 'model', 'api_key', 'base_url']
+    EXPOSED_FIELDS = ['provider', 'model', 'api_key', 'base_url', 'auto_install_updates']
 
     def mask_secret(value: str) -> str:
         """Mask API keys and secrets for display."""
@@ -2605,10 +2613,22 @@ def handle_config(args):
             print(f"Error: Invalid provider. Valid providers: {', '.join(VALID_PROVIDERS)}", file=sys.stderr)
             sys.exit(1)
 
+        # Convert boolean values
+        if args.config_key == 'auto_install_updates':
+            if args.config_value.lower() in ('true', '1', 'yes', 'on'):
+                value = True
+            elif args.config_value.lower() in ('false', '0', 'no', 'off'):
+                value = False
+            else:
+                print("Error: Invalid boolean value. Use: true/false, 1/0, yes/no, on/off", file=sys.stderr)
+                sys.exit(1)
+        else:
+            value = args.config_value
+
         # Set the value
-        setattr(config, args.config_key, args.config_value)
+        setattr(config, args.config_key, value)
         config.save()
-        print(f"✓ Set {args.config_key} = {args.config_value if args.config_key != 'api_key' else mask_secret(args.config_value)}")
+        print(f"✓ Set {args.config_key} = {value if args.config_key != 'api_key' else mask_secret(value)}")
 
     elif args.config == 'reset':
         # Reset to defaults
@@ -2633,6 +2653,17 @@ def parse_args():
     global_parser.add_argument('--index', action='store_true', help='Build semantic index for current directory')
     global_parser.add_argument('--languages', metavar='CSV', help='Languages to index (e.g., python,csharp,typescript)')
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
+
+    # Detect if 'update' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'update':
+        p = argparse.ArgumentParser(
+            prog="neo update",
+            description="Update neo to the latest version",
+            parents=[global_parser]
+        )
+        args = p.parse_args(sys.argv[2:])  # Parse remaining args after 'update'
+        args.command = 'update'
+        return args
 
     # Detect if 'construct' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'construct':
@@ -2745,6 +2776,24 @@ def main():
     # Parse arguments
     args = parse_args()
 
+    # Check for updates (non-blocking, silent on failure)
+    # Skip if running certain commands to avoid noise
+    skip_update_check = (
+        hasattr(args, 'version') and args.version or
+        hasattr(args, 'config') and args.config or
+        hasattr(args, 'command') and args.command == 'update'
+    )
+    if not skip_update_check:
+        try:
+            from neo.update_checker import check_for_updates
+            from neo.config import NeoConfig
+
+            # Load config to check if auto-install is enabled
+            config = NeoConfig.load()
+            check_for_updates(auto_install=config.auto_install_updates)
+        except Exception as e:
+            logger.debug(f"Update check failed: {e}")
+
     # Handle global flags first (exist on all parsers, must check before subcommand-specific attributes)
 
     # Handle --version flag
@@ -2810,6 +2859,11 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(1)
+
+    # Handle update subcommand
+    if hasattr(args, 'command') and args.command == 'update':
+        handle_update(args)
+        sys.exit(0)
 
     # Handle construct subcommand
     if hasattr(args, 'command') and args.command == 'construct':
