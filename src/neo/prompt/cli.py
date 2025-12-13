@@ -12,7 +12,6 @@ Provides the `neo prompt` subcommand with subcommands:
 
 import argparse
 import sys
-from typing import Optional
 
 
 def register_prompt_commands(subparsers: argparse._SubParsersAction) -> None:

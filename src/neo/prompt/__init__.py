@@ -18,9 +18,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
-
 # Re-export components for backwards compatibility
 from neo.prompt.scanner import (
     Scanner,
@@ -43,6 +40,8 @@ from neo.prompt.evolution import (
     EvolutionTracker,
 )
 from neo.prompt.enhancer import PromptEnhancer, PromptEnhancement
+
+logger = logging.getLogger(__name__)
 
 
 class PromptSystem:
