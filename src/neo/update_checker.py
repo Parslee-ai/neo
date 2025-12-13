@@ -111,7 +111,7 @@ def _compare_versions(current: str, latest: str) -> bool:
     try:
         from packaging import version
         return version.parse(latest) > version.parse(current)
-    except ImportError:
+    except (ImportError, version.InvalidVersion):
         # Fallback: parse as tuples for proper comparison
         def parse_version(v):
             return tuple(int(x) for x in v.split('.') if x.isdigit())
@@ -148,13 +148,16 @@ def check_for_updates(suppress_output: bool = False, auto_install: bool = False)
             cache = _read_cache()
             if cache:
                 new_version = cache.get("new_version")
-                if new_version:
+                # Validate cached version is actually newer than current
+                # (handles case where user manually updated via pip)
+                if new_version and _compare_versions(current_version, new_version):
                     # Auto-install if enabled (even from cache)
                     if auto_install:
                         perform_auto_install(new_version)
                     elif not suppress_output:
                         _print_update_notification(current_version, new_version)
-                return new_version
+                    return new_version
+            return None  # No update needed if versions match or cache invalid
 
         # Fetch latest version from PyPI
         latest_version = _fetch_latest_version_from_pypi()
@@ -286,7 +289,8 @@ def perform_update() -> bool:
             [sys.executable, "-m", "pip", "install", "--upgrade", PYPI_PACKAGE_NAME],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            timeout=120
         )
 
         print(f"✓ Successfully updated to version {new_version}")
@@ -299,6 +303,9 @@ def perform_update() -> bool:
 
         return True
 
+    except subprocess.TimeoutExpired:
+        print("✗ Update timed out after 120 seconds", file=sys.stderr)
+        return False
     except subprocess.CalledProcessError as e:
         print(f"✗ Update failed: {e.stderr}", file=sys.stderr)
         return False

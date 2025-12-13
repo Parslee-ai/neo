@@ -2791,8 +2791,8 @@ def main():
             # Load config to check if auto-install is enabled
             config = NeoConfig.load()
             check_for_updates(auto_install=config.auto_install_updates)
-        except Exception:
-            pass  # Silent failure - don't disrupt workflow
+        except Exception as e:
+            logger.debug(f"Update check failed: {e}")
 
     # Handle global flags first (exist on all parsers, must check before subcommand-specific attributes)
 
