@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from neo.prompt.scanner import Scanner, ScannedPrompt, ScannedSession, ScannedClaudeMd
+    from neo.prompt.scanner import (
+        Scanner,
+        ScannedPrompt,
+        ScannedSession,
+        ScannedClaudeMd,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +173,10 @@ class ChangeDetector:
         """
         Get prompts from history that have been added since the last watermark.
 
+        Uses line-based position tracking for accurate incremental scanning.
+        The watermark stores the actual line number in history.jsonl, allowing
+        efficient resumption from the exact position in subsequent scans.
+
         Args:
             scanner: The Scanner instance to use for reading history.
 
@@ -175,15 +184,21 @@ class ChangeDetector:
             List of ScannedPrompt objects added since the last scan.
         """
         watermark = self.get_watermark("history")
-        since = watermark.timestamp if watermark else None
+        since_line = watermark.position if watermark else None
 
-        prompts = scanner.scan_history(since=since)
+        result = scanner.scan_history(since_line=since_line)
+        prompts = result.prompts
 
-        # Update watermark if we found any prompts
-        if prompts:
-            latest_timestamp = max(p.timestamp for p in prompts)
-            latest_position = len(prompts) + (watermark.position or 0) if watermark else len(prompts)
-            self.update_watermark("history", latest_timestamp, position=latest_position)
+        # Update watermark with the actual line number from the file
+        if result.last_line_number > 0:
+            latest_timestamp = (
+                max(p.timestamp for p in prompts)
+                if prompts
+                else (watermark.timestamp if watermark else datetime.now())
+            )
+            self.update_watermark(
+                "history", latest_timestamp, position=result.last_line_number
+            )
 
         return prompts
 

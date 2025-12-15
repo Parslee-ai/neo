@@ -181,15 +181,19 @@ class PromptSystem:
                         # Convert entries to PromptEffectivenessScore objects
                         effective_scores = []
                         for entry in effective_entries:
+                            # Build signals list with logging for invalid values
+                            signals_list = []
+                            valid_signal_values = [e.value for e in EffectivenessSignal]
+                            for s in entry.data.get("signals", []):
+                                if s in valid_signal_values:
+                                    signals_list.append(EffectivenessSignal(s))
+                                else:
+                                    logger.debug(f"Skipping invalid signal value: {s}")
                             score = PromptEffectivenessScore(
                                 prompt_hash=entry.data.get("prompt_hash", ""),
                                 prompt_text=entry.data.get("prompt_text", ""),
                                 score=entry.data.get("score", 0.0),
-                                signals=[
-                                    EffectivenessSignal(s)
-                                    for s in entry.data.get("signals", [])
-                                    if s in [e.value for e in EffectivenessSignal]
-                                ],
+                                signals=signals_list,
                                 iterations_to_complete=entry.data.get("iterations_to_complete", 0),
                                 tool_calls=entry.data.get("tool_calls", 0),
                                 sample_count=entry.data.get("sample_count", 1),

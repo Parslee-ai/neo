@@ -440,12 +440,14 @@ class EffectivenessAnalyzer:
                 return True
 
         # Short messages that are likely positive feedback, NOT clarifications
+        # Note: strings are normalized with .rstrip("!.,") before comparison,
+        # so only base forms are needed (no punctuated versions)
         positive_feedback = {
-            "thanks", "thank you", "thanks!", "thank you!",
-            "perfect", "perfect!", "great", "great!",
-            "good", "good!", "ok", "okay", "ok!",
-            "awesome", "awesome!", "nice", "nice!",
-            "yes", "yes!", "yep", "yep!", "done", "done!",
+            "thanks", "thank you",
+            "perfect", "great",
+            "good", "ok", "okay",
+            "awesome", "nice",
+            "yes", "yep", "done",
             "lgtm", "ship it", "looks good", "sounds good",
         }
 
@@ -456,7 +458,11 @@ class EffectivenessAnalyzer:
             if next_lower.rstrip("!.,") in positive_feedback:
                 return False
             # Check if it starts with positive feedback
-            if words and words[0].lower().rstrip("!.,") in {"thanks", "thank", "perfect", "great", "good", "ok", "okay", "awesome", "nice", "yes", "yep", "done", "lgtm"}:
+            feedback_starters = {
+                "thanks", "thank", "perfect", "great", "good", "ok", "okay",
+                "awesome", "nice", "yes", "yep", "done", "lgtm",
+            }
+            if words and words[0].lower().rstrip("!.,") in feedback_starters:
                 return False
             # Short correction-like messages (starts with "no" or similar)
             if words and words[0].lower().rstrip(",") in {"no", "nope", "wait", "actually"}:

@@ -113,6 +113,14 @@ class ScannedPrompt:
 
 
 @dataclass
+class HistoryScanResult:
+    """Result of scanning history.jsonl with position metadata."""
+
+    prompts: list[ScannedPrompt]
+    last_line_number: int  # Actual line number in the file (1-indexed)
+
+
+@dataclass
 class ScannedSession:
     """A complete conversation session."""
 
@@ -182,7 +190,9 @@ class Scanner:
         """
         self.sources = sources or ClaudeCodeSources()
 
-    def scan_history(self, since: Optional[datetime] = None) -> list[ScannedPrompt]:
+    def scan_history(
+        self, since: Optional[datetime] = None, since_line: Optional[int] = None
+    ) -> HistoryScanResult:
         """
         Scan history.jsonl for prompts.
 
@@ -191,20 +201,30 @@ class Scanner:
 
         Args:
             since: Only return prompts after this datetime (None for all)
+            since_line: Only return prompts after this line number (1-indexed).
+                       If provided, starts reading from this line. More efficient
+                       than timestamp filtering for incremental scans.
 
         Returns:
-            List of ScannedPrompt objects sorted by timestamp
+            HistoryScanResult containing prompts and the last line number processed
         """
-        prompts = []
+        prompts: list[ScannedPrompt] = []
         history_file = self.sources.history_file
+        last_line_number = 0
 
         if not history_file.exists():
             logger.debug(f"History file not found: {history_file}")
-            return prompts
+            return HistoryScanResult(prompts=prompts, last_line_number=0)
 
         try:
             with open(history_file, encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
+                    last_line_number = line_num
+
+                    # Skip lines before since_line if provided
+                    if since_line is not None and line_num <= since_line:
+                        continue
+
                     line = line.strip()
                     if not line:
                         continue
@@ -223,10 +243,22 @@ class Scanner:
                     if not display or not timestamp_ms:
                         continue
 
+                    # Validate timestamp range before conversion
+                    # Reasonable range: year 2000 to 1 year from now
+                    min_timestamp_ms = 946684800000  # 2000-01-01 00:00:00 UTC
+                    max_timestamp_ms = (datetime.now().timestamp() + 365 * 24 * 60 * 60) * 1000
+
+                    if timestamp_ms < min_timestamp_ms or timestamp_ms > max_timestamp_ms:
+                        logger.warning(
+                            f"Invalid timestamp {timestamp_ms} on line {line_num}: "
+                            f"outside valid range (2000-01-01 to 1 year from now)"
+                        )
+                        continue
+
                     # Convert millisecond epoch to datetime
                     timestamp = datetime.fromtimestamp(timestamp_ms / 1000)
 
-                    # Filter by since datetime
+                    # Filter by since datetime (secondary filter if since_line not provided)
                     if since and timestamp < since:
                         continue
 
@@ -245,7 +277,7 @@ class Scanner:
 
         # Sort by timestamp ascending
         prompts.sort(key=lambda p: p.timestamp)
-        return prompts
+        return HistoryScanResult(prompts=prompts, last_line_number=last_line_number)
 
     def scan_sessions(
         self, project: Optional[str] = None, since: Optional[datetime] = None

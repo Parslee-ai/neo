@@ -2558,7 +2558,14 @@ def handle_prompt(args):
         prompt = getattr(args, 'prompt_text', None)
         if not prompt:
             if not sys.stdin.isatty():
-                prompt = sys.stdin.read().strip()
+                try:
+                    prompt = sys.stdin.read().strip()
+                except EOFError:
+                    print("Error: No input received (Ctrl+D pressed)", file=sys.stderr)
+                    sys.exit(1)
+                except KeyboardInterrupt:
+                    print("\nOperation cancelled", file=sys.stderr)
+                    sys.exit(130)
             else:
                 print("Error: No prompt provided. Use: neo prompt enhance \"your prompt\" or pipe via stdin", file=sys.stderr)
                 sys.exit(1)
