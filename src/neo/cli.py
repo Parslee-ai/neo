@@ -2551,6 +2551,215 @@ def handle_construct(args):
         sys.exit(1)
 
 
+def handle_prompt(args):
+    """Handle prompt subcommand operations."""
+    from neo.prompt import PromptSystem
+
+    system = PromptSystem()
+
+    if args.prompt_action == 'analyze':
+        results = system.analyze(project=args.project, since=args.since)
+        _print_prompt_analysis(results)
+
+    elif args.prompt_action == 'enhance':
+        # Read prompt from argument or stdin
+        prompt = getattr(args, 'prompt_text', None)
+        if not prompt:
+            if not sys.stdin.isatty():
+                try:
+                    prompt = sys.stdin.read().strip()
+                except EOFError:
+                    print("Error: No input received (Ctrl+D pressed)", file=sys.stderr)
+                    sys.exit(1)
+                except KeyboardInterrupt:
+                    print("\nOperation cancelled", file=sys.stderr)
+                    sys.exit(130)
+            else:
+                print("Error: No prompt provided. Use: neo prompt enhance \"your prompt\" or pipe via stdin", file=sys.stderr)
+                sys.exit(1)
+
+        enhancement = system.enhance(prompt)
+
+        if getattr(args, 'auto', False):
+            print(enhancement.enhanced)
+        else:
+            _print_prompt_enhancement(enhancement)
+
+    elif args.prompt_action == 'patterns':
+        patterns = system.get_patterns(
+            search=getattr(args, 'search', None),
+            limit=getattr(args, 'limit', 10)
+        )
+        _print_prompt_patterns(patterns)
+
+    elif args.prompt_action == 'suggest':
+        suggestions = system.suggest_improvements(project=args.project)
+        _print_prompt_suggestions(suggestions)
+
+    elif args.prompt_action == 'history':
+        evolutions = system.get_evolution_history(path=getattr(args, 'path', None))
+        _print_prompt_evolutions(evolutions)
+
+    elif args.prompt_action == 'stats':
+        stats = system.get_stats()
+        _print_prompt_stats(stats)
+
+    else:
+        print("Error: No prompt action specified", file=sys.stderr)
+        print("Usage: neo prompt {analyze|enhance|patterns|suggest|history|stats}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _print_prompt_analysis(results: dict) -> None:
+    """Format and print prompt analysis results."""
+    print("\n" + "=" * 60)
+    print("PROMPT EFFECTIVENESS ANALYSIS")
+    print("=" * 60)
+    print(f"\nSessions analyzed: {results['total_sessions']}")
+    print(f"Prompts scored: {results['total_prompts']}")
+    print(f"Average effectiveness: {results['avg_effectiveness']:.2f}")
+
+    avg = results["avg_effectiveness"]
+    if avg >= 0.7:
+        rating = "Excellent - prompts are highly effective"
+    elif avg >= 0.4:
+        rating = "Good - most prompts work well"
+    elif avg >= 0.0:
+        rating = "Fair - room for improvement"
+    else:
+        rating = "Needs work - many prompts cause issues"
+    print(f"Rating: {rating}")
+
+    if results.get("common_issues"):
+        print("\nCommon Issues:")
+        for issue in results["common_issues"]:
+            signal = issue.get("signal", "").replace("_", " ").title()
+            count = issue.get("count", 0)
+            print(f"  - {signal}: {count} occurrences")
+
+    if results.get("recommendations"):
+        print("\nRecommendations:")
+        for i, rec in enumerate(results["recommendations"], 1):
+            print(f"  {i}. {rec}")
+    print()
+
+
+def _print_prompt_enhancement(enhancement) -> None:
+    """Format and print prompt enhancement results."""
+    print("\n" + "=" * 60)
+    print("PROMPT ENHANCEMENT")
+    print("=" * 60)
+    print(f"\nOriginal:\n  {enhancement.original}")
+    print(f"\nEnhanced:\n  {enhancement.enhanced}")
+
+    if enhancement.improvements:
+        print("\nImprovements made:")
+        for imp in enhancement.improvements:
+            print(f"  - {imp.replace('_', ' ').title()}")
+
+    print(f"\nExpected benefit: {enhancement.expected_benefit}")
+    print(f"Confidence: {enhancement.confidence:.0%}")
+    print()
+
+
+def _print_prompt_patterns(patterns: list) -> None:
+    """Format and print effective patterns."""
+    if not patterns:
+        print("No patterns found. Patterns are extracted from effective prompts over time.")
+        return
+
+    print("\n" + "=" * 60)
+    print("EFFECTIVE PROMPT PATTERNS")
+    print("=" * 60)
+
+    for i, pattern in enumerate(patterns, 1):
+        name = pattern.name if hasattr(pattern, 'name') else pattern.get('name', 'Unknown')
+        score = pattern.effectiveness_score if hasattr(pattern, 'effectiveness_score') else pattern.get('effectiveness_score', 0.0)
+        template = pattern.template if hasattr(pattern, 'template') else pattern.get('template', '')
+
+        print(f"\n{i}. {name} (score: {score:.2f})")
+        if template:
+            print(f"   Template: {template}")
+
+    print(f"\nTotal: {len(patterns)} patterns")
+    print()
+
+
+def _print_prompt_suggestions(suggestions: list) -> None:
+    """Format and print improvement suggestions."""
+    if not suggestions:
+        print("No improvement suggestions at this time.")
+        return
+
+    print("\n" + "=" * 60)
+    print("CLAUDE.MD IMPROVEMENT SUGGESTIONS")
+    print("=" * 60)
+
+    for i, sugg in enumerate(suggestions, 1):
+        stype = sugg.get("type", "unknown").replace("_", " ").title()
+        suggestion = sugg.get("suggestion", "")
+        reason = sugg.get("reason", "")
+        confidence = sugg.get("confidence", 0.0)
+
+        conf_label = "HIGH" if confidence >= 0.8 else "MEDIUM" if confidence >= 0.5 else "LOW"
+        print(f"\n{i}. [{conf_label}] {stype}")
+        print(f"   Suggestion: {suggestion}")
+        if reason:
+            print(f"   Reason: {reason}")
+
+    print(f"\nTotal: {len(suggestions)} suggestions")
+    print()
+
+
+def _print_prompt_evolutions(evolutions: list) -> None:
+    """Format and print CLAUDE.md evolution history."""
+    if not evolutions:
+        print("No evolution history found.")
+        return
+
+    print("\n" + "=" * 60)
+    print("CLAUDE.MD EVOLUTION HISTORY")
+    print("=" * 60)
+
+    for i, evo in enumerate(evolutions, 1):
+        path = str(evo.path) if hasattr(evo, 'path') else evo.get('path', '')
+        timestamp = evo.timestamp if hasattr(evo, 'timestamp') else evo.get('timestamp', '')
+        change_type = evo.change_type if hasattr(evo, 'change_type') else evo.get('change_type', '')
+        reason = evo.inferred_reason if hasattr(evo, 'inferred_reason') else evo.get('inferred_reason', '')
+
+        ts_str = timestamp.strftime("%Y-%m-%d %H:%M") if hasattr(timestamp, 'strftime') else str(timestamp)[:16]
+
+        print(f"\n{i}. {path}")
+        print(f"   Time: {ts_str}")
+        print(f"   Type: {change_type}")
+        if reason:
+            print(f"   Reason: {reason}")
+
+    print(f"\nTotal: {len(evolutions)} changes recorded")
+    print()
+
+
+def _print_prompt_stats(stats: dict) -> None:
+    """Format and print knowledge base statistics."""
+    print("\n" + "=" * 60)
+    print("PROMPT KNOWLEDGE BASE STATISTICS")
+    print("=" * 60)
+    print(f"\nTotal entries: {stats.get('total_entries', 0):,}")
+    print(f"Patterns: {stats.get('patterns', 0):,}")
+    print(f"Effectiveness scores: {stats.get('scores', 0):,}")
+    print(f"Evolution records: {stats.get('evolutions', 0):,}")
+    print(f"Pending suggestions: {stats.get('pending_suggestions', 0):,}")
+    print(f"Projects tracked: {stats.get('projects_tracked', 0):,}")
+
+    components = stats.get("components_available", {})
+    if components:
+        print("\nComponent Status:")
+        for name, available in components.items():
+            status = "OK" if available else "NOT AVAILABLE"
+            print(f"  - {name.replace('_', ' ').title()}: {status}")
+    print()
+
+
 def handle_config(args):
     """Handle --config flag operations."""
     from neo.config import NeoConfig
@@ -2699,6 +2908,52 @@ def parse_args():
         # Restore for compatibility
         args.command = 'construct'
         args.construct_action = args.action
+        return args
+
+    # Detect if 'prompt' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'prompt':
+        # Parse prompt subcommand with proper sub-subparsers
+        p = argparse.ArgumentParser(
+            prog="neo prompt",
+            description="Prompt enhancement and analysis tools",
+            parents=[global_parser]
+        )
+
+        subparsers = p.add_subparsers(dest='action', help='Prompt actions')
+
+        # prompt analyze
+        analyze_p = subparsers.add_parser('analyze', help='Analyze prompt effectiveness')
+        analyze_p.add_argument('--project', metavar='PATH', help='Project path to analyze')
+        analyze_p.add_argument('--since', metavar='DATE', help='Analyze since date (ISO format)')
+
+        # prompt enhance
+        enhance_p = subparsers.add_parser('enhance', help='Enhance a prompt')
+        enhance_p.add_argument('prompt_text', nargs='?', help='Prompt to enhance (or stdin)')
+        enhance_p.add_argument('--auto', action='store_true', help='Output only enhanced prompt')
+
+        # prompt patterns
+        patterns_p = subparsers.add_parser('patterns', help='Show effective patterns')
+        patterns_p.add_argument('--search', metavar='QUERY', help='Search query')
+        patterns_p.add_argument('--limit', type=int, default=10, help='Max patterns to show')
+
+        # prompt suggest
+        suggest_p = subparsers.add_parser('suggest', help='Suggest CLAUDE.md improvements')
+        suggest_p.add_argument('--project', metavar='PATH', help='Project to analyze')
+        suggest_p.add_argument('--apply', action='store_true', help='Apply interactively')
+
+        # prompt history
+        history_p = subparsers.add_parser('history', help='Show CLAUDE.md evolution history')
+        history_p.add_argument('--path', metavar='FILE', help='Specific file path')
+
+        # prompt stats
+        subparsers.add_parser('stats', help='Show knowledge base stats')
+
+        # Remove 'prompt' from argv for parsing
+        sys.argv.pop(1)
+        args = p.parse_args()
+        # Restore for compatibility
+        args.command = 'prompt'
+        args.prompt_action = args.action
         return args
 
     # Default argument parser (for reasoning mode)
@@ -2868,6 +3123,11 @@ def main():
     # Handle construct subcommand
     if hasattr(args, 'command') and args.command == 'construct':
         handle_construct(args)
+        sys.exit(0)
+
+    # Handle prompt subcommand
+    if hasattr(args, 'command') and args.command == 'prompt':
+        handle_prompt(args)
         sys.exit(0)
 
     # Detect input mode
