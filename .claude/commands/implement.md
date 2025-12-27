@@ -12,10 +12,10 @@ parameters:
 
 ```bash
 # Paste plan, run command
-/implement
+/quick-implement
 
 # Or inline (for single-line summaries)
-/implement "Add memory consolidation threshold check: update consolidate_memory() to respect min_entries, add tests, commit to feature/memory-fix"
+/implement "Add user profile dropdown to sidebar: create ProfileMenu component, integrate with auth context, add tests, commit to feature/profile-menu"
 ```
 
 ## Purpose
@@ -90,7 +90,7 @@ Flow: 3.1 Implementation → 3.2 Code Review → 3.3 Outcome → 3.4a Test Verif
 * INVOKE Task tool:
   - subagent_type: "code-implementer"
   - description: "Implement iteration #{iteration}"
-  - prompt: "Implement the plan with mandatory test creation. Plan: {full_plan}. Iteration #{iteration}. Constraints: (1) Only files/symbols from plan, (2) Changes <100 lines per file if possible, (3) **CRITICAL: If plan has 'Test Specification' or 'Write Tests' section, you MUST create test code. Do NOT just document test approach - write actual test functions with the exact names from the plan.**, (4) Incorporate NeoDeltas only if constraints allow, (5) Comment non-obvious logic. Test Creation Requirements (if applicable): Create/modify test files listed in plan's Test Specification, write test functions with exact names from plan, implement setup, mocks, and assertions as specified, test code must be executable (not pseudocode). Report: (1) Files modified (implementation + tests) with line counts, (2) Test files created/modified (if applicable), (3) Test functions added (list exact names from plan), (4) Approach summary, (5) Quick test method (≤30s), (6) Estimated diff. {If iteration > 1: Address @Linus feedback: {previous_feedback}}"
+  - prompt: "Implement the plan with mandatory test creation. Plan: {full_plan}. Iteration #{iteration}. Constraints: (1) Only files/symbols from plan, (2) Changes <100 lines per file if possible, (3) **CRITICAL: If plan has 'Test Specification' or 'Write Tests' section, you MUST create test code. Do NOT just document test approach - write actual test functions with the exact names from the plan.**, (4) Incorporate NeoDeltas only if constraints allow, (5) Comment non-obvious logic, (6) Follow project conventions and best practices for the detected language/framework. Test Creation Requirements (if applicable): Create/modify test files listed in plan's Test Specification, write test functions with exact names from plan, implement setup, mocks, and assertions as specified, test code must be executable (not pseudocode). Report: (1) Files modified (implementation + tests) with line counts, (2) Test files created/modified (if applicable), (3) Test functions added (list exact names from plan), (4) Approach summary, (5) Quick test method (≤30s), (6) Estimated diff. {If iteration > 1: Address @Linus feedback: {previous_feedback}}"
 
 **Step 3.2: Code Review**
 * INVOKE Task tool:
@@ -123,12 +123,44 @@ Flow: 3.1 Implementation → 3.2 Code Review → 3.3 Outcome → 3.4a Test Verif
 * INVOKE Task tool:
   - subagent_type: "test-validator"
   - description: "Run quick tests"
-  - prompt: "Test the implementation (≤30s each). Plan: {full_plan}. Run:
-    - Unit tests for modified files: pytest tests/test_[modified_module].py -v
-    - Integration tests for affected features (if applicable)
-    - Runtime smoke test: neo --help (validates CLI, imports, basic functionality)
+  - prompt: "Test the implementation (≤30s each). Plan: {full_plan}.
 
-    Report: (1) Results (pass/fail), (2) Execution times, (3) Failures if any."
+  IMPORTANT: Detect project type and run appropriate validation commands.
+
+  Detection Strategy:
+  1. Check for language-specific files (package.json, Cargo.toml, go.mod, requirements.txt, Gemfile, etc.)
+  2. Look for framework indicators (next.config.js, vite.config.js, django settings, etc.)
+  3. Examine plan's 'Validation Commands' section for quick test hints
+
+  Common Quick Tests by Project Type (≤30s each):
+
+  JavaScript/TypeScript:
+    - Type checking: npx tsc --noEmit (if tsconfig.json exists)
+    - Syntax validation: node --check <main-file> (fallback)
+    - Import validation: Quick build test if build command exists
+
+  Python:
+    - Syntax check: python -m py_compile <changed-files>
+    - Import check: python -c 'import <module>' for key modules
+    - Type checking: mypy <files> (if mypy configured)
+
+  Go:
+    - Syntax/type check: go build -o /dev/null ./...
+    - Format check: gofmt -l <changed-files>
+
+  Rust:
+    - Type check: cargo check
+    - Format check: cargo fmt --check
+
+  Ruby:
+    - Syntax check: ruby -c <changed-files>
+    - Load check: ruby -e 'require \"<file>\"'
+
+  Generic Fallback:
+    - File existence check for modified files
+    - Basic syntax validation using language-specific linter if available
+
+  Report: (1) Detected project type, (2) Commands executed, (3) Results (pass/fail), (4) Execution times, (5) Failures if any."
 
 * **If FAIL:** → Step 3.1 (NEEDS WORK)
 * **If PASS:** → Step 3.5
@@ -137,7 +169,50 @@ Flow: 3.1 Implementation → 3.2 Code Review → 3.3 Outcome → 3.4a Test Verif
 * INVOKE Task tool:
   - subagent_type: "test-validator"
   - description: "Run full regression suite"
-  - prompt: "Execute comprehensive validation per plan's Validation Commands. Plan: {full_plan}. IMPORTANT: Run ALL commands from plan's 'Validation Commands' section. No time limits - this is comprehensive validation. Commands to execute: (1) Parse 'Validation Commands' section from plan, (2) Execute each command in order, (3) Record output and exit codes, (4) Detect any failures. Common validation commands: pytest -v (full test suite), make lint (code quality checks), any type checking commands. Report: (1) Commands executed (in order), (2) Results per command (exit code, duration), (3) Full output if any failures, (4) Verdict: PASS (all commands exit 0) or FAIL (any non-zero exit)"
+  - prompt: "Execute comprehensive validation per plan's Validation Commands. Plan: {full_plan}.
+
+  IMPORTANT: Run ALL commands from plan's 'Validation Commands' section. No time limits - this is comprehensive validation.
+
+  Validation Strategy:
+  1. FIRST: Look for 'Validation Commands' section in plan - if present, execute those commands exactly
+  2. SECOND: If no validation commands in plan, detect project type and run standard validation suite
+
+  Detection & Standard Validation by Project Type:
+
+  JavaScript/TypeScript (package.json):
+    - Full type check: npx tsc --noEmit (if TypeScript)
+    - Linting: npm run lint (if configured)
+    - Build: npm run build (if configured)
+    - Tests: npm test -- --watchAll=false (if test script exists)
+
+  Python (requirements.txt, setup.py, pyproject.toml):
+    - Type check: mypy . (if mypy configured)
+    - Linting: flake8 . or pylint <module> (if configured)
+    - Tests: pytest or python -m unittest discover (if tests exist)
+    - Format: black --check . (if black configured)
+
+  Go (go.mod):
+    - Build: go build ./...
+    - Test: go test ./...
+    - Vet: go vet ./...
+    - Format: gofmt -l .
+
+  Rust (Cargo.toml):
+    - Check: cargo check
+    - Test: cargo test
+    - Clippy: cargo clippy
+    - Format: cargo fmt --check
+
+  Ruby (Gemfile):
+    - Tests: bundle exec rspec or bundle exec rake test
+    - Linting: bundle exec rubocop (if configured)
+
+  Generic Fallback:
+    - Run test command if detectable (make test, ./test.sh, etc.)
+    - Run build command if detectable (make, make build, ./build.sh, etc.)
+    - Basic linting if linter config found (.eslintrc, .rubocop.yml, etc.)
+
+  Report: (1) Detected project type, (2) Commands executed (in order), (3) Results per command (exit code, duration), (4) Full output if any failures, (5) Verdict: PASS (all commands exit 0) or FAIL (any non-zero exit)"
 
 * **If FAIL:** → Step 3.1 (NEEDS WORK - regression detected)
 * **If PASS:** → Step 3.6
