@@ -299,8 +299,8 @@ class TestConstructIndex:
 
     @patch('neo.construct.FASTEMBED_AVAILABLE', True)
     @patch('neo.construct.FAISS_AVAILABLE', True)
-    def test_construct_search_relevance_ordering(self, temp_construct_dir):
-        """Test that search results are ordered by relevance."""
+    def test_construct_embedder_initialization_with_mocked_deps(self, temp_construct_dir):
+        """Test that embedder is properly initialized when dependencies are available."""
         # Mock the embedder
         with patch('neo.construct.TextEmbedding') as mock_embedder_class:
             mock_embedder = MagicMock()
