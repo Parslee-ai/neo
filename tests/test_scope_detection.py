@@ -1,7 +1,5 @@
 """Tests for neo.memory.scope - org/project detection."""
 
-import pytest
-
 from neo.memory.scope import (
     _compute_project_id,
     _parse_org_from_url,

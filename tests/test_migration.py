@@ -1,7 +1,6 @@
 """Tests for neo.memory.migration - legacy format migration."""
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest

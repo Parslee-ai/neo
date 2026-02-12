@@ -1,9 +1,6 @@
 """Tests for neo.memory.models - data model serialization and enums."""
 
-import time
-
 import numpy as np
-import pytest
 
 from neo.memory.models import (
     ContextResult,

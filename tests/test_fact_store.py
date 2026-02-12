@@ -1,8 +1,5 @@
 """Tests for neo.memory.store - FactStore integration tests."""
 
-import json
-import time
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -131,7 +128,7 @@ class TestSupersession:
         store._facts.append(old)
 
         with patch.object(store, '_embed_text', return_value=emb):
-            new = store.add_fact(
+            store.add_fact(
                 subject="New",
                 body="Body",
                 kind=FactKind.FAILURE,  # Different kind
