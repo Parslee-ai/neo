@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, TypedDict
 if TYPE_CHECKING:
     from neo.config import NeoConfig
     from neo.exemplar_index import ExemplarIndex
+    from neo.memory.store import FactStore
     from neo.persistent_reasoning import PersistentReasoningMemory
 
 # Initialize logger
@@ -235,18 +236,37 @@ class NeoEngine:
         else:
             self.refiner = None
 
-        # Initialize persistent reasoning memory (per-codebase)
+        # Initialize persistent memory (per-codebase)
+        # Supports two backends: "fact_store" (new) and "legacy" (PersistentReasoningMemory)
+        self.persistent_memory = None
+        self.fact_store: Optional["FactStore"] = None
         if enable_persistent_memory:
-            try:
-                from neo.persistent_reasoning import PersistentReasoningMemory
-                self.persistent_memory = PersistentReasoningMemory(
-                    codebase_root=codebase_root,
-                    config=config
-                )
-            except ImportError:
-                self.persistent_memory = None
-        else:
-            self.persistent_memory = None
+            memory_backend = "fact_store"
+            if config and hasattr(config, "memory_backend"):
+                memory_backend = config.memory_backend
+
+            if memory_backend == "fact_store":
+                try:
+                    from neo.memory.store import FactStore
+                    self.fact_store = FactStore(
+                        codebase_root=codebase_root,
+                        config=config
+                    )
+                    # Set persistent_memory for backward compat in methods that check it
+                    self.persistent_memory = self.fact_store
+                except ImportError:
+                    logger.warning("FactStore not available, falling back to legacy memory")
+                    memory_backend = "legacy"
+
+            if memory_backend == "legacy":
+                try:
+                    from neo.persistent_reasoning import PersistentReasoningMemory
+                    self.persistent_memory = PersistentReasoningMemory(
+                        codebase_root=codebase_root,
+                        config=config
+                    )
+                except ImportError:
+                    self.persistent_memory = None
 
 
         # Track request history for implicit feedback (bounded to last 100 entries)
@@ -367,7 +387,8 @@ class NeoEngine:
         )
 
         # Phase 7: Store reasoning in persistent memory
-        if self.persistent_memory and code_suggestions:
+        # No code_suggestions gate - store all reasoning (fact store accepts everything)
+        if self.persistent_memory:
             self._store_reasoning(
                 neo_input, plan, code_suggestions, confidence, enriched_context
             )
@@ -453,8 +474,21 @@ class NeoEngine:
 
         # Retrieve past learnings from persistent memory
         past_learnings = []
-        if self.persistent_memory:
-            # Use adaptive k-selection (heuristic-based, not ML)
+        if self.fact_store is not None:
+            # Use FactStore: build_context + format_context_for_prompt
+            prompt_text = context.get("prompt", "")
+            k = self._adaptive_k_selection(prompt_text, context)
+            fact_context = self.fact_store.build_context(prompt_text, environment=context, k=k)
+            formatted = self.fact_store.format_context_for_prompt(fact_context)
+            if formatted:
+                past_learnings = [formatted]
+
+            # Log retrieval for measurement
+            relevant_entries = fact_context.valid_facts
+            self._log_pattern_retrieval(relevant_entries, context, k)
+
+        elif self.persistent_memory:
+            # Legacy path: use PersistentReasoningMemory
             k = self._adaptive_k_selection(context.get("prompt", ""), context)
             relevant_entries = self.persistent_memory.retrieve_relevant(context, k=k)
 
@@ -990,8 +1024,8 @@ RULES:
             return
 
         # Extract pattern from task type and prompt
-        task_type = neo_input.task_type.value if neo_input.task_type else "unknown"
-        pattern = f"{task_type}: {neo_input.prompt[:50]}"
+        task_type_str = neo_input.task_type.value if neo_input.task_type else "unknown"
+        pattern = f"{task_type_str}: {neo_input.prompt[:50]}"
 
         # Build context description
         context_desc = []
@@ -1011,57 +1045,75 @@ RULES:
         if len(suggestions) > 1:
             suggestion += f" (+{len(suggestions)-1} more)"
 
-        # NEW: Extract code skeleton from first suggestion (Kite-inspired AST approach)
+        # Extract code skeleton from first suggestion (Kite-inspired AST approach)
         code_skeleton = ""
         if suggestions:
-            # Prefer code_block over unified_diff
             code_source = suggestions[0].code_block or suggestions[0].unified_diff
             if code_source:
                 code_skeleton = self._extract_code_skeleton(code_source)
 
-        # NEW: Extract pitfalls from simulation traces (Phase 2)
+        # Extract pitfalls from simulation traces
         pitfalls = []
         if hasattr(self, 'last_simulation_traces') and self.last_simulation_traces:
             for trace in self.last_simulation_traces:
-                # Extract issues from trace if available
                 if hasattr(trace, 'issues_found') and isinstance(trace.issues_found, list):
                     pitfalls.extend(trace.issues_found)
-                # Also check for errors or warnings in trace
                 if hasattr(trace, 'errors') and isinstance(trace.errors, list):
                     pitfalls.extend(trace.errors)
 
-        # NEW: Extract test patterns from simulation (Phase 2)
-        test_patterns = []
-        if hasattr(self, 'last_simulation_traces') and self.last_simulation_traces:
-            for trace in self.last_simulation_traces:
-                # Extract input patterns from trace
-                if hasattr(trace, 'input_data') and trace.input_data is not None:
-                    if isinstance(trace.input_data, str):
-                        input_str = trace.input_data[:100]
-                    else:
-                        input_str = str(trace.input_data)[:100]
-                    test_patterns.append(f"Input: {input_str}")
-                # Extract test case descriptions
-                if hasattr(trace, 'test_case') and trace.test_case:
-                    if isinstance(trace.test_case, str):
-                        tc_str = trace.test_case[:100]
-                    else:
-                        tc_str = str(trace.test_case)[:100]
-                    test_patterns.append(tc_str)
+        # Route to FactStore or legacy memory
+        if self.fact_store is not None:
+            # Map task_type to FactKind
+            from neo.memory.models import FactKind
+            kind_map = {
+                "algorithm": FactKind.PATTERN,
+                "refactor": FactKind.ARCHITECTURE,
+                "bugfix": FactKind.FAILURE,
+                "feature": FactKind.DECISION,
+                "explanation": FactKind.PATTERN,
+            }
+            fact_kind = kind_map.get(task_type_str, FactKind.PATTERN)
 
-        # Store in memory with Phase 2 fields
-        self.persistent_memory.add_reasoning(
-            pattern=pattern,
-            context=context_str,
-            reasoning=reasoning,
-            suggestion=suggestion,
-            confidence=confidence,
-            source_context=context,
-            # NEW: Phase 2 fields
-            code_skeleton=code_skeleton,
-            common_pitfalls=pitfalls[:5],  # Top 5 issues
-            test_patterns=test_patterns[:3],  # Top 3 test cases
-        )
+            # Combine reasoning + suggestion + pitfalls into body
+            body_parts = [f"Reasoning: {reasoning}"]
+            if suggestion:
+                body_parts.append(f"Suggestion: {suggestion}")
+            if code_skeleton:
+                body_parts.append(f"Code skeleton: {code_skeleton}")
+            if pitfalls:
+                body_parts.append("Pitfalls: " + "; ".join(pitfalls[:5]))
+
+            self.fact_store.add_fact(
+                subject=pattern,
+                body="\n".join(body_parts),
+                kind=fact_kind,
+                confidence=confidence,
+                source_prompt=neo_input.prompt[:200],
+                tags=[task_type_str],
+            )
+        else:
+            # Legacy path
+            test_patterns = []
+            if hasattr(self, 'last_simulation_traces') and self.last_simulation_traces:
+                for trace in self.last_simulation_traces:
+                    if hasattr(trace, 'input_data') and trace.input_data is not None:
+                        input_str = str(trace.input_data)[:100]
+                        test_patterns.append(f"Input: {input_str}")
+                    if hasattr(trace, 'test_case') and trace.test_case:
+                        tc_str = str(trace.test_case)[:100]
+                        test_patterns.append(tc_str)
+
+            self.persistent_memory.add_reasoning(
+                pattern=pattern,
+                context=context_str,
+                reasoning=reasoning,
+                suggestion=suggestion,
+                confidence=confidence,
+                source_context=context,
+                code_skeleton=code_skeleton,
+                common_pitfalls=pitfalls[:5],
+                test_patterns=test_patterns[:3],
+            )
 
         # Clean up temporary simulation traces to prevent memory leak
         if hasattr(self, 'last_simulation_traces'):
@@ -1935,7 +1987,17 @@ Generate unified diff patches. Keep changes minimal and isolated."""
             )
 
             # Store as learning in persistent memory
-            if self.persistent_memory:
+            if self.fact_store is not None:
+                from neo.memory.models import FactKind
+                self.fact_store.add_fact(
+                    subject=f"parse_failure:{result.error_code}",
+                    body=f"Parse failed: {result.error_message}\n"
+                         f"Raw: {result.raw_block[:200] if result.raw_block else 'N/A'}",
+                    kind=FactKind.FAILURE,
+                    confidence=0.9,
+                    tags=["parse_failure", result.error_code or "unknown"],
+                )
+            elif self.persistent_memory:
                 self.persistent_memory.add_reasoning(
                     pattern=f"parse_failure:{result.error_code}",
                     context="planning phase parse failure",
