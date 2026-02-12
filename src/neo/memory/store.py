@@ -69,10 +69,10 @@ class FactStore:
         # All facts in memory
         self._facts: list[Fact] = []
 
-        # Embedding model (reuse existing Jina Code v2)
+        # Embedding model (lazy-initialized on first use to avoid slow startup)
         self._embedder = None
+        self._embedder_initialized = False
         self._embedding_cache: OrderedDict = OrderedDict()
-        self._init_embedder()
 
         # Context assembler
         self._assembler = ContextAssembler()
@@ -86,8 +86,11 @@ class FactStore:
         # Ingest constraints
         self._ingest_constraints()
 
-    def _init_embedder(self) -> None:
-        """Initialize the embedding model."""
+    def _ensure_embedder(self) -> None:
+        """Lazy-initialize the embedding model on first use."""
+        if self._embedder_initialized:
+            return
+        self._embedder_initialized = True
         if FASTEMBED_AVAILABLE:
             try:
                 self._embedder = TextEmbedding(model_name="jinaai/jina-embeddings-v2-base-code")
@@ -357,6 +360,8 @@ class FactStore:
         """Generate embedding for text using local Jina model."""
         if not text or not text.strip():
             return None
+
+        self._ensure_embedder()
 
         cache_key = hashlib.md5(text.encode()).hexdigest()
         if cache_key in self._embedding_cache:
