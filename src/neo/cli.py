@@ -485,9 +485,21 @@ class NeoEngine:
             if formatted:
                 past_learnings = [formatted]
 
-            # Log retrieval for measurement
-            relevant_entries = fact_context.valid_facts
-            self._log_pattern_retrieval(relevant_entries, context, k)
+            # Log retrieval for measurement (Fact-compatible attributes)
+            self._log_pattern_retrieval(
+                [
+                    type("_Entry", (), {
+                        "source_hash": f.id,
+                        "algorithm_type": f.kind.value if f.kind else "unknown",
+                        "confidence": f.metadata.confidence if f.metadata else 0.0,
+                        "_score": 0.0,
+                        "use_count": f.metadata.access_count if f.metadata else 0,
+                    })()
+                    for f in fact_context.valid_facts
+                ],
+                context,
+                k,
+            )
 
         elif self.persistent_memory:
             # Legacy path: use PersistentReasoningMemory

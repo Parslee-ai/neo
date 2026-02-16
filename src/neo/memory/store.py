@@ -342,8 +342,9 @@ class FactStore:
         old.superseded_by = new.id
         new.supersedes = old.id
 
-        # Carry forward confidence with a small boost
-        new.metadata.confidence = min(1.0, old.metadata.confidence + 0.05)
+        # Carry forward confidence with a small boost, but never downgrade
+        carry_forward = min(1.0, old.metadata.confidence + 0.05)
+        new.metadata.confidence = max(new.metadata.confidence, carry_forward)
 
         # Cascade: mark dependents as needing review
         self._cascade_needs_review(old.id)
