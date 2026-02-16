@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.10.0] - 2026-02-16
+
+### Added
+- Replace memory system with fact-based store — scoped facts (global/org/project), supersession-based deduplication, four-layer context assembly inspired by StateBench (#71)
+- Prompt enhancement system for analyzing Claude Code effectiveness (#67)
+- Fully automatic update system with opt-in auto-install (#64)
+- Tree-sitter multi-language code indexing with FAISS-backed semantic search (#63)
+
+### Changed
+- Add autonomous agent slash commands for bug, feature, and chore workflows
+- Add fix-ci slash command for CI failure repair
+
+### Documentation
+- Update all documentation (README, INSTALL, QUICKSTART, CONTRIBUTING, LOAD_PROGRAM, SECURITY) to reflect fact-based memory system
+
+### CI
+- Bump actions/upload-artifact from 5 to 6 (#68)
+- Bump actions/download-artifact from 6 to 7 (#69)
+- Bump actions/checkout from 4 to 6 (#66)
+
 ## [0.9.0] - 2025-11-19
 
 ### BREAKING CHANGES
