@@ -387,7 +387,9 @@ class NeoEngine:
         )
 
         # Phase 7: Store reasoning in persistent memory
-        # No code_suggestions gate - store all reasoning (fact store accepts everything)
+        # No code_suggestions gate - intentionally store all reasoning regardless of
+        # whether code suggestions were generated. Both fact_store and legacy backends
+        # benefit from recording the full reasoning chain for future retrieval.
         if self.persistent_memory:
             self._store_reasoning(
                 neo_input, plan, code_suggestions, confidence, enriched_context
@@ -741,8 +743,15 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             exemplars = [f"{ex.prompt} -> {ex.solution[:100]}..." for ex in similar]
 
         past_learnings = []
-        if self.persistent_memory:
-            # Use adaptive k-selection (heuristic-based, not ML)
+        if self.fact_store is not None:
+            prompt_text = context.get("prompt", "")
+            k = self._adaptive_k_selection(prompt_text, context)
+            fact_context = self.fact_store.build_context(prompt_text, environment=context, k=k)
+            formatted = self.fact_store.format_context_for_prompt(fact_context)
+            if formatted:
+                past_learnings = [formatted]
+        elif self.persistent_memory:
+            # Legacy path: PersistentReasoningMemory
             k = self._adaptive_k_selection(context.get("prompt", ""), context)
             relevant = self.persistent_memory.retrieve_relevant(context, k=k)
 

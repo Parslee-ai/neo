@@ -55,6 +55,7 @@ class FactStore:
         config: Optional[Any] = None,
     ):
         self.codebase_root = codebase_root
+        self._config = config
 
         # Detect org and project
         self.org_id, self.project_id = detect_org_and_project(codebase_root)
@@ -244,6 +245,10 @@ class FactStore:
         # Sigmoid with reference point at 50 facts
         return 1.0 - 1.0 / (1.0 + valid_count / 50.0)
 
+    def detect_implicit_feedback(self, current_request: dict, request_history: list) -> None:
+        """No-op: implicit feedback not yet implemented for FactStore."""
+        pass
+
     @property
     def entries(self) -> list[Fact]:
         """Backward-compatible access to all facts."""
@@ -257,7 +262,7 @@ class FactStore:
         """Save facts to scoped JSON files."""
         global_facts = [f for f in self._facts if f.scope == FactScope.GLOBAL]
         org_facts = [f for f in self._facts if f.scope == FactScope.ORG]
-        project_facts = [f for f in self._facts if f.scope in (FactScope.PROJECT, FactScope.SESSION)]
+        project_facts = [f for f in self._facts if f.scope == FactScope.PROJECT]
 
         self._save_file(self._global_path, global_facts)
         if self._org_path:
@@ -403,7 +408,7 @@ class FactStore:
 
     def _ingest_constraints(self) -> None:
         """Scan constraint files and ingest/update constraint facts."""
-        config_auto_scan = True
+        config_auto_scan = getattr(self._config, "constraint_auto_scan", True)
         if not config_auto_scan:
             return
 
