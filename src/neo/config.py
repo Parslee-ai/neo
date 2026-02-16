@@ -15,7 +15,7 @@ class NeoConfig:
 
     # LM Provider settings
     provider: str = "openai"  # openai, anthropic, google, azure, local, ollama
-    model: Optional[str] = "gpt-5.1-codex-max"
+    model: Optional[str] = "gpt-5.3-codex"
     api_key: Optional[str] = None
     base_url: Optional[str] = None  # For local/ollama
 
@@ -43,6 +43,10 @@ class NeoConfig:
 
     # Auto-update settings
     auto_install_updates: bool = False  # Automatically install updates in background
+
+    # Memory backend settings
+    memory_backend: str = "fact_store"  # "fact_store" (new) or "legacy" (PersistentReasoningMemory)
+    constraint_auto_scan: bool = True  # Auto-scan CLAUDE.md etc. for constraints
 
     @classmethod
     def from_file(cls, config_path: str) -> "NeoConfig":
@@ -142,6 +146,8 @@ class NeoConfig:
             'api_key': self.api_key,
             'base_url': self.base_url,
             'auto_install_updates': self.auto_install_updates,
+            'memory_backend': self.memory_backend,
+            'constraint_auto_scan': self.constraint_auto_scan,
         }
 
         with open(path, "w") as f:
