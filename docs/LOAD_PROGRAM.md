@@ -6,16 +6,16 @@
 Operator → Trainer process that "loads" programs
 Training pack → Dataset slice from HuggingFace
 Neural jack → Embedding pipeline
-The Construct → Local ~/.neo memory store + FAISS index
+The Construct → Local ~/.neo/facts/ fact store
 Dojo session → Evaluation pass that updates confidence
-"I know kung fu" → New patterns become retrievable
+"I know kung fu" → New facts become retrievable
 ```
 
 ## Concept
 
-**Goal**: Expand Neo's memory with reusable reasoning patterns from datasets
+**Goal**: Expand Neo's memory with reusable facts from datasets
 **NOT**: Model fine-tuning, gradient updates, or weight training
-**IS**: Retrieval learning - append patterns to local semantic memory
+**IS**: Retrieval learning - append facts to local semantic memory
 
 ## CLI Interface
 
@@ -61,10 +61,10 @@ neo --load-program my_dataset --columns '{"text":"pattern","code":"solution"}'
 
 ```
 1. ACQUIRE   → Pull dataset slice from HuggingFace
-2. NORMALIZE → Map rows to ReasoningEntry schema
+2. NORMALIZE → Map rows to fact schema
 3. DEDUPE    → Hash-based deduplication
 4. EMBED     → Generate local embeddings (Jina Code v2)
-5. INDEX     → Upsert into FAISS
+5. STORE     → Add as facts to the fact store
 6. DOJO      → (Optional) Evaluate on synthetic probes
 7. REPORT    → Matrix quote + counts
 ```
@@ -90,17 +90,17 @@ neo --load-program bigcode/humanevalpack --split test
 
 ## Schema Mapping
 
-### HuggingFace Row → ReasoningEntry
+### HuggingFace Row → Fact
 
 ```python
 {
   # Required mappings
-  "text": entry.pattern,        # Problem/pattern description
-  "code": entry.suggestion,     # Solution/code
+  "text": fact.subject,         # Problem/pattern description
+  "code": fact.body,            # Solution/code
 
   # Optional mappings
-  "tags": entry.algorithm_type, # Algorithm category
-  "difficulty": difficulty_affinity metadata
+  "tags": fact.tags,            # Algorithm category
+  "difficulty": metadata
 }
 ```
 
@@ -239,7 +239,7 @@ docs/
 | Column drift across datasets | Version mappings per dataset |
 | Garbage patterns pollute retrieval | Quality gates + dedupe |
 | Over-indexing generic Q&A | Focus on code-specific datasets |
-| Index bloat | Auto-consolidation at 2000 entries |
+| Index bloat | Supersession deduplicates similar facts |
 | License violations | Block by default, explicit override |
 
 ## Success Metrics
@@ -252,7 +252,8 @@ docs/
 
 ## References
 
-- ReasoningEntry schema: `src/neo/persistent_reasoning.py:76`
-- Embedding pipeline: `src/neo/persistent_reasoning.py:604`
-- FAISS indexing: `src/neo/persistent_reasoning.py:2078`
-- CLI parsing: `src/neo/cli.py:2448`
+- Fact model: `src/neo/memory/models.py`
+- FactStore: `src/neo/memory/store.py`
+- Embedding pipeline: `src/neo/memory/store.py` (via fastembed/Jina Code v2)
+- Program loader: `src/neo/program_loader.py`
+- CLI parsing: `src/neo/cli.py`

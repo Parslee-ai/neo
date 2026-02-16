@@ -76,20 +76,30 @@ mypy src/
 ```
 neo/
 ├── src/
-│   └── neo/            # Main package
-│       ├── cli.py              # CLI entry point
-│       ├── persistent_reasoning.py  # Memory system
-│       ├── adapters.py         # LM provider adapters
-│       ├── config.py           # Configuration management
-│       ├── context_gatherer.py # Context collection
-│       ├── storage.py          # Local file storage
-│       └── ...                 # Other modules
+│   └── neo/              # Main package
+│       ├── cli.py                # CLI entry point
+│       ├── config.py             # Configuration management
+│       ├── adapters.py           # LM provider adapters
+│       ├── memory/               # Fact-based memory system
+│       │   ├── models.py         #   Fact, FactKind, FactScope models
+│       │   ├── store.py          #   FactStore implementation
+│       │   ├── scope.py          #   Scoping (global/org/project)
+│       │   ├── context.py        #   Four-layer context assembly
+│       │   ├── constraints.py    #   CLAUDE.md constraint ingestion
+│       │   └── migration.py      #   Legacy → fact store migration
+│       ├── index/                # Tree-sitter code indexing
+│       ├── prompt/               # Prompt enhancement system
+│       ├── context_gatherer.py   # Context collection
+│       ├── construct.py          # The Construct pattern library
+│       ├── persistent_reasoning.py  # Legacy memory (deprecated)
+│       └── ...                   # Other modules
 ├── tests/
-│   ├── test_neo.py             # Core tests
-│   ├── test_integration.py     # Integration tests
-│   └── ...                     # Other test files
-├── .claude-plugin/             # Claude Code plugin
-└── pyproject.toml              # Package configuration
+│   ├── test_neo.py               # Core tests
+│   ├── test_integration.py       # Integration tests
+│   └── ...                       # Other test files
+├── construct/                    # Curated design pattern library
+├── .claude-plugin/               # Claude Code plugin
+└── pyproject.toml                # Package configuration
 ```
 
 ## Contributing Guidelines

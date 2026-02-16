@@ -17,7 +17,7 @@ neo --version
 ```
 
 This automatically installs:
-- Core dependencies (numpy, scikit-learn, datasketch, faiss-cpu)
+- Core dependencies (numpy, scikit-learn, datasketch, fastembed, faiss-cpu, jsonschema)
 - Neo CLI command (`neo`)
 
 ### Alternative: Using pyproject.toml
@@ -33,7 +33,7 @@ pip install -e .[dev]        # Development tools
 
 ## Requirements
 
-- **Python**: 3.10 or higher (3.9 supported for most providers, 3.10+ required for Google Gemini)
+- **Python**: 3.10 or higher
 - **pip**: Latest version recommended
 
 ### Core Dependencies (Auto-Installed)
@@ -44,7 +44,9 @@ When you run `pip install -e .`, these are automatically installed:
 numpy >= 1.24.0
 scikit-learn >= 1.3.0
 datasketch >= 1.6.0
+fastembed >= 0.3.0
 faiss-cpu >= 1.7.0
+jsonschema >= 4.0.0
 ```
 
 ### Optional: LM Provider SDKs
@@ -88,7 +90,10 @@ neo --version
 # Should output something like:
 # "What is real? How do you define 'real'?"
 #
-# 120 patterns. 0.3 confidence.
+# neo 0.9.0
+# Provider: openai | Model: gpt-5.3-codex
+# Stage: Sleeper | Memory: 0.0%
+# 0 facts | 0.00 avg confidence
 ```
 
 ### Test Core Functionality
@@ -297,7 +302,7 @@ pip uninstall neo-reasoner
 # - ANTHROPIC_API_KEY
 # - etc.
 
-# Optional: Remove local memory cache
+# Optional: Remove local data (facts, config, indexes)
 rm -rf ~/.neo
 ```
 
@@ -347,15 +352,25 @@ After installation, you'll have:
 ```
 neo/
 ├── src/
-│   └── neo/            # Main package
-│       ├── cli.py              # CLI entry point
-│       ├── persistent_reasoning.py  # Memory system
-│       ├── storage.py          # Local file storage
-│       ├── adapters.py         # LM provider adapters
-│       └── config/             # Configuration (including personality)
-├── tests/              # Test suite
-├── pyproject.toml      # Package configuration
-└── README.md           # Documentation
+│   └── neo/              # Main package
+│       ├── cli.py                # CLI entry point
+│       ├── config.py             # Configuration management
+│       ├── adapters.py           # LM provider adapters
+│       ├── memory/               # Fact-based memory system
+│       │   ├── models.py         #   Fact, FactKind, FactScope models
+│       │   ├── store.py          #   FactStore implementation
+│       │   ├── scope.py          #   Scoping (global/org/project)
+│       │   ├── context.py        #   Four-layer context assembly
+│       │   ├── constraints.py    #   CLAUDE.md constraint ingestion
+│       │   └── migration.py      #   Legacy → fact store migration
+│       ├── index/                # Tree-sitter code indexing
+│       ├── prompt/               # Prompt enhancement system
+│       ├── construct.py          # The Construct pattern library
+│       ├── persistent_reasoning.py  # Legacy memory (deprecated)
+│       └── config/               # Configuration (including personality)
+├── tests/                # Test suite
+├── pyproject.toml        # Package configuration
+└── README.md             # Documentation
 ```
 
 ## Verifying Installation

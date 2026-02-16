@@ -6,10 +6,10 @@
 
 > A self-improving code reasoning engine that learns from experience using persistent semantic memory. Neo uses multi-agent reasoning to analyze code, generate solutions, and continuously improve through feedback loops.
 
-- **Persistent Memory**: Learns from every solution attempt
-- **Semantic Retrieval**: Vector search finds relevant patterns
+- **Fact-Based Memory**: Learns from every solution attempt using a scoped, supersession-based fact store
+- **Semantic Retrieval**: Vector search finds relevant facts via Jina Code embeddings
 - **Code-First Generation**: No diff parsing failures
-- **Local Storage**: Privacy-first JSON storage in ~/.neo directory
+- **Local Storage**: Privacy-first JSON storage in ~/.neo/facts/ directory
 - **Model-Agnostic**: Works with any LM provider
 - **Available as a [Claude Code Plugin](#claude-code-plugin)**: Integrates seamlessly with Anthropic's Claude models and CLI.
 
@@ -45,15 +45,15 @@ Neo is **_the missing context layer_** for AI Code Assistants.  It learns from e
   - [Output Format](#output-format)
   - [Personality System](#personality-system)
 - [Architecture](#architecture)
-  - [Semantic Memory](#semantic-memory)
-  - [Code Block Schema (Phase 1)](#code-block-schema-phase-1)
+  - [Fact-Based Memory](#fact-based-memory)
+  - [Output Schemas](#output-schemas)
   - [Storage Architecture](#storage-architecture)
 - [Performance](#performance)
 - [Configuration](#configuration)
   - [CLI Configuration Management](#cli-configuration-management)
   - [Environment Variables](#environment-variables)
 - [LM Adapters](#lm-adapters)
-  - [OpenAI (Recommended)](#openai-recommended)
+  - [OpenAI (Default)](#openai-default)
   - [Anthropic](#anthropic)
   - [Google](#google)
   - [Ollama](#ollama)
@@ -72,11 +72,11 @@ Neo is **_the missing context layer_** for AI Code Assistants.  It learns from e
 
 ## Design Philosophy
 
-**Persistent Learning**: Neo builds a semantic memory of successful and failed solutions, using vector embeddings to retrieve relevant patterns for new problems.
+**Fact-Based Learning**: Neo builds a semantic memory of facts — constraints, architectural decisions, patterns, review learnings, decisions, known unknowns, and failures — using vector embeddings for retrieval.
 
 **Code-First Output**: Instead of generating diffs that need parsing, Neo outputs executable code blocks directly, eliminating extraction failures.
 
-**Local File Storage**: Semantic memory stored in ~/.neo directory for privacy and offline access.
+**Scoped Storage**: Facts are scoped to global, organization, or project level, stored locally in ~/.neo/facts/ for privacy and offline access.
 
 **Model-Agnostic**: Works with OpenAI, Anthropic, Google, local models, or Ollama via a simple adapter interface.
 
@@ -93,8 +93,8 @@ User Problem → Neo CLI → Semantic Retrieval → Reasoning → Code Generatio
                     Executable Code + Memory Update
 ```
 
-Neo retrieves similar past solutions using Jina Code embeddings (768-dimensional vectors),
-applies learned patterns, generates solutions, and stores feedback for continuous improvement.
+Neo retrieves relevant facts using Jina Code embeddings (768-dimensional vectors),
+applies learned patterns, generates solutions, and stores new facts for continuous improvement.
 
 1. Jina's embeddings model (open source) is downloaded automatically when you first run Neo.
     This model runs locally on your machine to generate vector embeddings.
@@ -149,37 +149,38 @@ See `/construct/README.md` for contribution guidelines.
 
 2. When you ask Neo for help:
     - Your query is embedded locally using the Jina model
-    - Neo searches local memory for similar past solutions (using FAISS)
-    - Retrieved patterns are combined with your original prompt
+    - Neo searches the fact store for relevant knowledge (using cosine similarity)
+    - Retrieved facts are organized into layers: constraints, relevant knowledge, recent changes, known unknowns
     - This combined context is sent to your chosen LLM API (OpenAI/Anthropic/Google)
-    - The LLM generates a solution informed by both your query and past patterns
-    - The result is stored back in local memory for future use
+    - The LLM generates a solution informed by both your query and past facts
+    - The result is stored back as a new fact in local memory for future use
 
 Local storage:
-  ~/.neo/reasoning_patterns.json  ← Stores vectors + patterns
-  ~/.neo/faiss_index.bin         ← FAISS index for fast search
+  ~/.neo/facts/facts_global.json       ← Global-scoped facts
+  ~/.neo/facts/facts_org_{id}.json     ← Organization-scoped facts
+  ~/.neo/facts/facts_project_{id}.json ← Project-scoped facts
 
 Privacy:
   - Your code never leaves your machine during embedding/search
-  - Only your prompt + retrieved patterns are sent to the LLM API
+  - Only your prompt + retrieved facts are sent to the LLM API
   - This is the same as using the LLM directly, but with added context from something akin to memory.
- 
+
  ```
    Your Prompt
       ↓
   Local Jina Embedding (768-dim vector)
       ↓
-  Local FAISS Search (finds similar past solutions)
+  Cosine Similarity Search (finds relevant facts)
       ↓
-  Retrieve Pattern Text from ~/.neo/reasoning_patterns.json
+  Retrieve Facts from ~/.neo/facts/
       ↓
-  Combine: Your Prompt + Retrieved Pattern Text
+  Assemble Context: Constraints → Knowledge → Recent Changes → Known Unknowns
       ↓
   →→→ NETWORK CALL →→→ LLM API (OpenAI/Anthropic/etc.)
       ↓
   Solution Generated
       ↓
-  Store in Local Memory for future use
+  Store as New Fact in Local Memory
  ```
 
 ## Quick Start
@@ -343,6 +344,7 @@ Core dependencies are automatically installed via `pyproject.toml`:
 - datasketch >= 1.6.0
 - fastembed >= 0.3.0
 - faiss-cpu >= 1.7.0
+- jsonschema >= 4.0.0
 
 
 ### Optional: LM Provider
@@ -409,14 +411,18 @@ Neo responds with personality _(Matrix-inspired quotes)_ when displaying version
 $ neo --version
 "What is real? How do you define 'real'?"
 
-120 patterns. 0.3 confidence.
+neo 0.9.0
+Provider: openai | Model: gpt-5.3-codex
+Stage: Sleeper | Memory: 0.0%
+░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+0 facts | 0.00 avg confidence
 ```
 
 ### Load Program - Training Neo's Memory
 
 **"The Operator uploads a program into Neo's head."**
 
-Neo can bootstrap its memory by importing patterns from HuggingFace datasets. This is NOT model fine-tuning - it's retrieval learning that expands local semantic memory with reusable code patterns.
+Neo can bootstrap its memory by importing facts from HuggingFace datasets. This is NOT model fine-tuning - it's retrieval learning that expands local semantic memory with reusable code knowledge.
 
 ```bash
 # Install datasets library
@@ -443,40 +449,42 @@ neo --load-program my_dataset \
 ```
 "I know kung fu."
 
-Loaded: 847 patterns
+Loaded: 847 facts
 Deduped: 153 duplicates
 Index rebuilt: 1.2s
-Memory: 1247 total patterns
+Memory: 1247 total facts
 ```
 
 **How it works:**
 1. **Acquire**: Pull dataset from HuggingFace
-2. **Normalize**: Map rows to ReasoningEntry schema
+2. **Normalize**: Map rows to fact schema
 3. **Dedupe**: Hash-based deduplication against existing memory
 4. **Embed**: Generate local embeddings (Jina Code v2)
-5. **Index**: Upsert into FAISS index
+5. **Store**: Add as facts to the fact store
 6. **Report**: Matrix quote + counts
 
 **Key points:**
 - NOT fine-tuning - just expanding retrieval memory
-- Patterns start at 0.3 confidence (trainable via real-world usage)
+- Facts start at 0.3 confidence (trainable via real-world usage)
 - Automatic deduplication prevents memory bloat
 - Uses local embeddings (no data leaves your machine)
-- Stored in `~/.neo/` alongside learned patterns
+- Stored in `~/.neo/facts/` alongside learned facts
 
 **See [docs/LOAD_PROGRAM.md](docs/LOAD_PROGRAM.md) for detailed documentation**
 
 
 ## Architecture
 
-### Semantic Memory
+### Fact-Based Memory
 
-Neo uses **Jina Code v2** embeddings (768 dimensions) optimized for code similarity:
+Neo uses a **scoped, supersession-based fact store** with **Jina Code v2** embeddings (768 dimensions) for semantic retrieval:
 
-1. **Pattern Storage**: Every solution attempt creates a reasoning pattern
-2. **Vector Search**: Similar problems retrieve relevant patterns via FAISS
-3. **Confidence Scoring**: Patterns track success/failure rates
-4. **Local Persistence**: Patterns stored locally in JSON format
+1. **Fact Storage**: Knowledge is stored as typed facts (constraints, architecture, patterns, review learnings, decisions, known unknowns, failures)
+2. **Scoped Organization**: Facts are scoped to global, organization, or project level — automatically detected from git remotes
+3. **Supersession**: When a new fact closely matches an existing one (cosine similarity > 0.85), the old fact is superseded rather than duplicated
+4. **Confidence Scoring**: Facts carry confidence scores with automatic boosting on supersession
+5. **Four-Layer Context**: Retrieved facts are organized into constraints, relevant knowledge, recent changes, and known unknowns (inspired by StateBench)
+6. **Local Persistence**: Facts stored locally in JSON format in `~/.neo/facts/`
 
 ### Output Schemas
 
@@ -533,14 +541,16 @@ These schemas enable:
 
 ### Storage Architecture
 
-- **Local Files**: JSON storage in ~/.neo directory
-- **FAISS Index**: Fast vector search for pattern retrieval
-- **Auto-Consolidation**: Intelligent pattern merging to prevent fragmentation
+- **Scoped JSON Files**: Facts stored in `~/.neo/facts/` — separate files per scope (global, org, project)
+- **Inline Embeddings**: Vector embeddings stored alongside facts in JSON (no separate FAISS index for memory)
+- **Supersession**: Similar facts are superseded rather than merged — old facts remain but are marked invalid
+- **Constraint Auto-Ingestion**: CLAUDE.md and similar files are automatically scanned and ingested as CONSTRAINT facts
+- **Project Index** (separate system): Tree-sitter code indexing uses FAISS for per-repository semantic search in `.neo/`
 
 
 ## Performance
 
-**Neo improves over time as it learns from experience.** Initial performance depends on available memory patterns. Performance grows as the semantic memory builds up successful and failed solution patterns.
+**Neo improves over time as it learns from experience.** Initial performance depends on available facts. Performance grows as the semantic memory builds up successful solutions, failure learnings, and architectural decisions.
 
 
 ## Configuration
@@ -568,10 +578,12 @@ neo --config reset
 
 **Exposed Configuration Fields:**
 - `provider` - LM provider (openai, anthropic, google, azure, ollama, local)
-- `model` - Model name (e.g., gpt-4, claude-sonnet-4-5-20250929)
+- `model` - Model name (e.g., gpt-5.3-codex, claude-sonnet-4-5-20250929)
 - `api_key` - API key for the chosen provider
 - `base_url` - Base URL for local/Ollama endpoints
+- `memory_backend` - Memory backend: "fact_store" (default) or "legacy"
 - `auto_install_updates` - Automatically install updates in background (true/false)
+- `constraint_auto_scan` - Auto-scan CLAUDE.md for constraints (true/false, default: true)
 
 Configuration is stored in `~/.neo/config.json` and takes precedence over environment variables.
 
@@ -586,14 +598,14 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 ## LM Adapters
 
-### OpenAI (Recommended)
+### OpenAI (Default)
 
 ```python
 from neo.adapters import OpenAIAdapter
-adapter = OpenAIAdapter(model="gpt-5-codex", api_key="sk-...")
+adapter = OpenAIAdapter(model="gpt-5.3-codex", api_key="sk-...")
 ```
 
-Latest models: `gpt-5-codex` (recommended for coding), `gpt-5`, `gpt-5-mini`, `gpt-5-nano`
+Default model: `gpt-5.3-codex`. GPT-5/Codex models use the `/v1/responses` endpoint automatically.
 
 ### Anthropic
 
@@ -602,7 +614,7 @@ from neo.adapters import AnthropicAdapter
 adapter = AnthropicAdapter(model="claude-sonnet-4-5-20250929")
 ```
 
-Latest models: `claude-sonnet-4-5-20250929`, `claude-opus-4-1-20250805`, `claude-3-5-haiku-20241022`
+Default model: `claude-sonnet-4-5-20250929`
 
 ### Google
 
@@ -613,13 +625,13 @@ from neo.adapters import GoogleAdapter
 adapter = GoogleAdapter(model="gemini-2.0-flash")
 ```
 
-Latest models: `gemini-2.0-flash`, `gemini-2.0-flash-thinking-exp`, `gemini-exp-1206`
+Default model: `gemini-2.0-flash`. Uses the `google-genai` SDK.
 
 ### Ollama
 
 ```python
 from neo.adapters import OllamaAdapter
-adapter = OllamaAdapter(model="llama3.1")
+adapter = OllamaAdapter(model="llama2")
 ```
 
 ## Extending Neo
@@ -640,12 +652,14 @@ class CustomAdapter(LMAdapter):
 
 ## Key Features
 
-- **Persistent Memory**: Learns from every solution attempt
-- **Semantic Retrieval**: Vector search finds relevant patterns
+- **Fact-Based Memory**: Learns from every solution attempt using a scoped, supersession-based fact store
+- **Semantic Retrieval**: Vector search finds relevant facts via Jina Code embeddings
 - **Code-First Generation**: No diff parsing failures
-- **Local Storage**: Privacy-first JSON storage in ~/.neo directory
+- **Scoped Storage**: Privacy-first JSON storage in ~/.neo/facts/ with global, org, and project scopes
 - **Model-Agnostic**: Works with any LM provider
 - **The Construct**: Curated library of architecture patterns with semantic search
+- **Project Indexing**: Tree-sitter based multi-language code indexing with FAISS
+- **Prompt Enhancement**: Analyze and improve prompt effectiveness
 
 ## Development
 

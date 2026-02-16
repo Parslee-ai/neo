@@ -6,8 +6,8 @@ We release patches for security vulnerabilities in the following versions:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.7.x   | :white_check_mark: |
-| < 0.7   | :x:                |
+| 0.9.x   | :white_check_mark: |
+| < 0.9   | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -68,10 +68,10 @@ When using Neo:
 
 ### Persistent Memory Storage
 
-Neo stores reasoning patterns locally in `~/.neo/`:
-- **Privacy**: Memory files may contain code snippets from your projects
-- **Recommendation**: Review memory files before sharing your system
-- **Location**: `~/.neo/reasoning_patterns.json`
+Neo stores facts locally in `~/.neo/facts/`:
+- **Privacy**: Fact files may contain code snippets and patterns from your projects
+- **Recommendation**: Review fact files before sharing your system
+- **Location**: `~/.neo/facts/facts_global.json`, `~/.neo/facts/facts_org_{id}.json`, `~/.neo/facts/facts_project_{id}.json`
 
 ### LLM Provider API Keys
 

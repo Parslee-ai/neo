@@ -29,11 +29,13 @@ neo --version
 
 Expected output:
 ```
-neo 0.7.0
-Storage: FileStorage (path: /Users/you/.neo)
+"What is real? How do you define 'real'?"
+
+neo 0.9.0
+Provider: openai | Model: gpt-5.3-codex
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-0 patterns | 0.00 avg confidence
+0 facts | 0.00 avg confidence
 ```
 
 ## 4. Try a Simple Query
@@ -132,7 +134,7 @@ neo --config set --config-key model --config-value claude-sonnet-4-5-20250929
 pip install neo-reasoner[google]
 export GOOGLE_API_KEY=...
 neo --config set --config-key provider --config-value google
-neo --config set --config-key model --config-value gemini-2.5-pro
+neo --config set --config-key model --config-value gemini-2.0-flash
 ```
 
 ### Local (Ollama)
