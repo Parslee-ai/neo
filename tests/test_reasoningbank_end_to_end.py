@@ -130,8 +130,13 @@ class TestReasoningBankImpact:
             entry.problem_outcomes = pattern_data.get("problem_outcomes", {})
             entry.common_pitfalls = pattern_data.get("common_pitfalls", [])
 
-            # Generate semantic embedding (Phase 2: pattern + context)
-            entry.embedding = np.random.rand(768).astype(np.float32)
+            # Generate deterministic embedding with meaningful separation.
+            # Each entry gets a unique 96-dim block set to 1.0 so cosine
+            # similarity between different entries is low (~0.1) while a
+            # query near entry[i] stays genuinely closest to entry[i].
+            emb = np.full(768, 0.1, dtype=np.float32)
+            emb[i * 96 : (i + 1) * 96] = 1.0
+            entry.embedding = emb
 
             self.memory.entries.append(entry)
 
