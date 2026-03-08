@@ -76,13 +76,13 @@ class TestContextAssemblerLayering:
         result = assembler.assemble([old], "query")
         assert old in result.invalidated_facts
 
-    def test_invalidated_capped_at_3(self, assembler):
+    def test_invalidated_all_available_for_annotations(self, assembler):
         invalids = [
             _make_fact(is_valid=False, superseded_by=f"new_{i}")
             for i in range(10)
         ]
         result = assembler.assemble(invalids, "query")
-        assert len(result.invalidated_facts) == 3
+        assert len(result.invalidated_facts) == 10
 
 
 class TestContextAssemblerScoring:
@@ -225,6 +225,31 @@ class TestTokenBudgetEnforcement:
         assert len(result.valid_facts) >= 1
         assert len(result.valid_facts) <= 3  # budget should cap around 2
         assert len(result.working_set) == 0  # no budget left for session
+
+    def test_constraints_capped_to_reserve_budget(self, assembler):
+        # Many large constraints should not consume entire budget.
+        # With max_tokens=300, constraint cap = 200 (2/3).
+        # Each constraint ~52 tokens. So ~3-4 fit under the cap.
+        big_constraints = [
+            _make_fact(kind=FactKind.CONSTRAINT, subject=f"rule_{i}", body="x" * 200)
+            for i in range(20)
+        ]
+        fact = _make_fact(subject="useful", body="important info")
+        result = assembler.assemble(big_constraints + [fact], "query", max_tokens=300)
+        assert len(result.constraints) < 20  # constraints were capped
+        assert len(result.valid_facts) >= 1  # facts still get budget
+
+    def test_annotation_finds_old_fact_beyond_cap(self, assembler):
+        # Old fact is the 5th invalidated (would have been missed with cap of 3).
+        # The new fact should still get an annotation.
+        invalids = [
+            _make_fact(is_valid=False, superseded_by=f"n{i}", fact_id=f"old{i}", body=f"old_body_{i}")
+            for i in range(5)
+        ]
+        new = _make_fact(subject="updated", body="new value", supersedes="old4", fact_id="n4")
+        result = assembler.assemble(invalids + [new], "query")
+        formatted = assembler.format_context_for_prompt(result)
+        assert "changed from: old_body_4" in formatted
 
     def test_negative_budget_does_not_cascade(self, assembler):
         # A single oversized valid fact exceeds budget via at_least_one guarantee.

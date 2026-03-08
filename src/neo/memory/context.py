@@ -78,13 +78,24 @@ class ContextAssembler:
         scope_order = {FactScope.GLOBAL: 0, FactScope.ORG: 1, FactScope.PROJECT: 2, FactScope.SESSION: 3}
         constraints.sort(key=lambda f: scope_order.get(f.scope, 99))
 
+        # Cap constraints so they don't starve other layers.
+        # Reserve at least 1/3 of budget for non-constraint content.
+        constraint_cap = max_tokens * 2 // 3
+        constraints = self._accumulate_within_budget(constraints, constraint_cap, at_least_one=True)
+        constraint_tokens = sum(f.size_hint() for f in constraints)
+        if constraint_tokens > constraint_cap:
+            logger.warning(
+                "Constraints consume %d tokens (cap %d) — consider reducing CLAUDE.md size",
+                constraint_tokens, constraint_cap,
+            )
+
         # Rank valid facts by similarity + confidence + recency
         scored_valid = self._score_facts(valid_candidates, query_embedding)
 
-        # Budget-aware accumulation (constraints exempt).
+        # Budget-aware accumulation.
         # Valid facts get "at least one" guarantee; subsequent layers
         # only get what's left (no guarantee if budget is exhausted).
-        budget_remaining = max_tokens
+        budget_remaining = max(0, max_tokens - constraint_tokens)
         top_valid = self._accumulate_within_budget(
             [f for f, _ in scored_valid[:k]], budget_remaining, at_least_one=True,
         )
@@ -95,15 +106,14 @@ class ContextAssembler:
 
         unknowns_capped = self._accumulate_within_budget(known_unknowns, budget_remaining)
 
-        # Take most recently superseded (used for inline change annotations).
+        # Keep full invalidated list for annotation lookup; cap display to 3.
         # Sorted by last_accessed as proxy for supersession time (no superseded_at field).
         invalidated.sort(key=lambda f: f.metadata.last_accessed, reverse=True)
-        top_invalidated = invalidated[:MAX_INVALIDATED_FACTS]
 
         return ContextResult(
             constraints=constraints,
             valid_facts=top_valid,
-            invalidated_facts=top_invalidated,
+            invalidated_facts=invalidated,
             working_set=session_capped,
             environment=environment or {},
             known_unknowns=unknowns_capped,
