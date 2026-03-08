@@ -90,6 +90,10 @@ class Fact:
     embedding: Optional[np.ndarray] = None
     tags: list[str] = field(default_factory=list)
 
+    def size_hint(self) -> int:
+        """Approximate token count. Uses len//4 heuristic — not precise, just monotonic."""
+        return len(self.subject + self.body) // 4
+
     def to_dict(self) -> dict:
         data = {
             "id": self.id,
