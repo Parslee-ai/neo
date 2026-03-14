@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.0] - 2026-03-14
+
+### Added
+- Outcome-based learning from git history and code changes — neo now learns from what actually happens in the codebase, not just its own reasoning output
+- Git history ingestion: on each invocation, ingests new commits since a watermark (commit messages, changed files, diffs) to learn from all code evolution
+- Session-based outcome detection: tracks neo's suggestions between invocations and compares git diff against previous suggestions to detect accepted vs independent changes with actual diff content
+- Replaces no-op `detect_implicit_feedback` stub in FactStore with real implementation
+
 ## [0.10.0] - 2026-02-16
 
 ### Added
