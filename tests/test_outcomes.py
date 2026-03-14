@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from neo.memory.outcomes import Outcome, OutcomeTracker, SessionRecord
+from neo.memory.outcomes import OutcomeTracker, SessionRecord
 
 
 @dataclass
