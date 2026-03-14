@@ -19,6 +19,7 @@ import numpy as np
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope
+from neo.memory.outcomes import OutcomeTracker
 from neo.memory.scope import detect_org_and_project
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,12 @@ class FactStore:
         # Context assembler
         self._assembler = ContextAssembler()
 
+        # Outcome tracker for learning from actual code changes
+        self._outcome_tracker = OutcomeTracker(
+            codebase_root=codebase_root,
+            project_id=self.project_id,
+        )
+
         # Load existing facts
         self.load()
 
@@ -86,6 +93,9 @@ class FactStore:
 
         # Ingest constraints
         self._ingest_constraints()
+
+        # Ingest git history (catch up on code evolution)
+        self._ingest_git_history()
 
     def _ensure_embedder(self) -> None:
         """Lazy-initialize the embedding model on first use."""
@@ -230,6 +240,18 @@ class FactStore:
         """Render ContextResult as a formatted string."""
         return self._assembler.format_context_for_prompt(ctx)
 
+    def save_session(self, suggestions: list, prompt: str) -> None:
+        """Persist current session for outcome detection on next invocation.
+
+        Args:
+            suggestions: List of CodeSuggestion objects.
+            prompt: The user's prompt.
+        """
+        try:
+            self._outcome_tracker.save_session(suggestions, prompt)
+        except Exception as e:
+            logger.debug(f"Session save failed (non-fatal): {e}")
+
     # ------------------------------------------------------------------ #
     # Backward compatibility
     # ------------------------------------------------------------------ #
@@ -246,8 +268,55 @@ class FactStore:
         return 1.0 - 1.0 / (1.0 + valid_count / 50.0)
 
     def detect_implicit_feedback(self, current_request: dict, request_history: list) -> None:
-        """No-op: implicit feedback not yet implemented for FactStore."""
-        pass
+        """Detect outcomes from previous session and create REVIEW facts.
+
+        Compares git changes since last invocation against previous suggestions
+        to learn what the user actually did.
+        """
+        try:
+            outcomes = self._outcome_tracker.detect_outcomes()
+        except Exception as e:
+            logger.debug(f"Outcome detection failed (non-fatal): {e}")
+            return
+
+        for outcome in outcomes:
+            if outcome.outcome_type == "accepted":
+                subject = f"outcome:accepted {outcome.file_path}"
+                body_parts = [
+                    f"User applied suggestion to {outcome.file_path}.",
+                    f"Original suggestion: {outcome.suggestion_description}",
+                    f"Original confidence: {outcome.suggestion_confidence:.2f}",
+                ]
+                if outcome.diff_summary:
+                    body_parts.append(f"Actual changes:\n{outcome.diff_summary}")
+                body = "\n".join(body_parts)
+                tags = ["outcome", "accepted"]
+                confidence = min(1.0, outcome.suggestion_confidence + 0.1)
+            elif outcome.outcome_type == "independent":
+                subject = f"outcome:independent {outcome.file_path}"
+                body_parts = [f"User changed {outcome.file_path} (not suggested by neo)."]
+                if outcome.diff_summary:
+                    body_parts.append(f"Changes:\n{outcome.diff_summary}")
+                else:
+                    body_parts.append("No diff content available.")
+                body = "\n".join(body_parts)
+                tags = ["outcome", "independent"]
+                confidence = 0.3
+            else:
+                continue
+
+            self.add_fact(
+                subject=subject,
+                body=body,
+                kind=FactKind.REVIEW,
+                scope=FactScope.PROJECT,
+                confidence=confidence,
+                source_prompt=current_request.get("prompt", "")[:200],
+                tags=tags,
+            )
+
+        if outcomes:
+            logger.info(f"Recorded {len(outcomes)} outcome(s) from previous session")
 
     @property
     def entries(self) -> list[Fact]:
@@ -426,6 +495,37 @@ class FactStore:
             logger.info(
                 f"Constraints: {len(new_facts)} new, {len(superseded_facts)} superseded"
             )
+
+    # ------------------------------------------------------------------ #
+    # Git history ingestion
+    # ------------------------------------------------------------------ #
+
+    def _ingest_git_history(self) -> None:
+        """Learn from git commit history that hasn't been ingested yet.
+
+        Runs on each initialization to catch up on commits made since
+        the last neo invocation. Uses a watermark to avoid re-ingesting.
+        """
+        try:
+            records = self._outcome_tracker.ingest_git_history(max_commits=50)
+        except Exception as e:
+            logger.debug(f"Git history ingestion failed (non-fatal): {e}")
+            return
+
+        if not records:
+            return
+
+        for record in records:
+            self.add_fact(
+                subject=record["subject"],
+                body=record["body"],
+                kind=FactKind.REVIEW,
+                scope=FactScope.PROJECT,
+                confidence=0.5,
+                tags=["history", "git-commit"],
+            )
+
+        logger.info(f"Ingested {len(records)} facts from git history")
 
     # ------------------------------------------------------------------ #
     # Migration

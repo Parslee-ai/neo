@@ -12,6 +12,7 @@ from neo.memory.models import (
     FactMetadata,
     FactScope,
 )
+from neo.memory.outcomes import OutcomeTracker
 from neo.memory.store import FactStore
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "FactMetadata",
     "FactScope",
     "FactStore",
+    "OutcomeTracker",
 ]

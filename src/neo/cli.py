@@ -344,6 +344,10 @@ class NeoEngine:
                         neo_input, plan, code_suggestions, max_confidence, enriched_context
                     )
 
+                # Save session for outcome detection on next invocation
+                if self.fact_store is not None:
+                    self.fact_store.save_session(code_suggestions, neo_input.prompt)
+
                 # Log metrics
                 self._log_metrics(difficulty, time_budget, elapsed, early_exit=True)
 
@@ -394,6 +398,10 @@ class NeoEngine:
             self._store_reasoning(
                 neo_input, plan, code_suggestions, confidence, enriched_context
             )
+
+        # Save session for outcome detection on next invocation
+        if self.fact_store is not None:
+            self.fact_store.save_session(code_suggestions, neo_input.prompt)
 
         # Log final metrics
         elapsed = time.time() - start_time
