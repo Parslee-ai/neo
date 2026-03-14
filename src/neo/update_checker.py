@@ -20,6 +20,25 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 UPDATE_CHECK_INTERVAL = 86400  # 24 hours in seconds
+
+
+def _pip_install_cmd(package: str, quiet: bool = False) -> list[str]:
+    """Build a pip install command that works in PEP 668 environments.
+
+    Detects externally-managed Python installs (Homebrew, system packages)
+    and adds --break-system-packages when needed.
+    """
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", package]
+    if quiet:
+        cmd.append("--quiet")
+
+    # Check for PEP 668 marker file
+    stdlib_path = Path(sys.prefix) / "lib"
+    externally_managed = list(stdlib_path.glob("python*/EXTERNALLY-MANAGED"))
+    if externally_managed:
+        cmd.append("--break-system-packages")
+
+    return cmd
 PYPI_PACKAGE_NAME = "neo-reasoner"
 PYPI_API_URL = f"https://pypi.org/pypi/{PYPI_PACKAGE_NAME}/json"
 REQUEST_TIMEOUT = 3  # seconds
@@ -224,9 +243,9 @@ def perform_auto_install(new_version: str) -> bool:
         print(f"\n⚡ Auto-installing neo update: {current_version} → {new_version}", file=sys.stderr)
         print("   This happens in the background. Please wait...\n", file=sys.stderr)
 
-        # Use pip to upgrade
+        # Use pip to upgrade (handles PEP 668 externally-managed environments)
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", PYPI_PACKAGE_NAME, "--quiet"],
+            _pip_install_cmd(PYPI_PACKAGE_NAME, quiet=True),
             capture_output=True,
             text=True,
             timeout=120  # 2 minute timeout
@@ -284,9 +303,9 @@ def perform_update() -> bool:
     print(f"Updating {PYPI_PACKAGE_NAME} from {current_version} to {new_version}...")
 
     try:
-        # Use pip to upgrade
+        # Use pip to upgrade (handles PEP 668 externally-managed environments)
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", PYPI_PACKAGE_NAME],
+            _pip_install_cmd(PYPI_PACKAGE_NAME),
             capture_output=True,
             text=True,
             check=True,
