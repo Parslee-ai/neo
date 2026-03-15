@@ -15,3 +15,4 @@ def isolate_neo_home(tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+    monkeypatch.setenv("HOME", str(fake_home))  # Also patch $HOME for expanduser()
