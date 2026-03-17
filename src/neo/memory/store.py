@@ -228,13 +228,21 @@ class FactStore:
         Delegates to ContextAssembler to organize facts into layers.
         """
         query_embedding = self._embed_text(query)
-        return self._assembler.assemble(
+        result = self._assembler.assemble(
             facts=self._facts,
             query=query,
             query_embedding=query_embedding,
             environment=environment,
             k=k,
         )
+
+        # Update access metadata on retrieved facts (mirrors retrieve_relevant)
+        now = time.time()
+        for fact in result.valid_facts:
+            fact.metadata.last_accessed = now
+            fact.metadata.access_count += 1
+
+        return result
 
     def format_context_for_prompt(self, ctx: ContextResult) -> str:
         """Render ContextResult as a formatted string."""
