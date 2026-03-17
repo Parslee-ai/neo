@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.1] - 2026-03-17
+
+### Fixed
+- Fix memory facts decaying to zero: `build_context()` now updates `last_accessed` and `access_count` on retrieved facts, matching the behavior of `retrieve_relevant()`
+- Isolate tests from live `~/.neo/` memory files (#76)
+- Handle PEP 668 externally-managed environments in auto-update
+- Remove unused `Outcome` import in test_outcomes
+
 ## [0.11.0] - 2026-03-14
 
 ### Added
