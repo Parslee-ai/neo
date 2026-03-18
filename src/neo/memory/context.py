@@ -15,10 +15,6 @@ from neo.memory.models import ContextResult, Fact, FactKind, FactScope
 
 logger = logging.getLogger(__name__)
 
-# Maximum invalidated facts to include for contrast
-MAX_INVALIDATED_FACTS = 3
-
-
 class ContextAssembler:
     """Assembles a ContextResult from facts and query context.
 
@@ -37,8 +33,13 @@ class ContextAssembler:
         query_embedding: Optional[np.ndarray] = None,
         environment: Optional[dict] = None,
         k: int = 5,
+        max_tokens: int = 12000,
     ) -> ContextResult:
-        """Filter and rank facts into layers.
+        """Filter and rank facts into layers with token budget enforcement.
+
+        Constraints are capped to 2/3 of the budget to reserve room for other
+        layers. The remaining budget is shared across valid_facts, working_set,
+        and known_unknowns in priority order.
 
         Args:
             facts: All facts from the store.
@@ -46,6 +47,7 @@ class ContextAssembler:
             query_embedding: Embedding vector for the query (optional).
             environment: Git state and other environment info.
             k: Maximum number of valid facts to include.
+            max_tokens: Token budget for non-constraint layers.
 
         Returns:
             ContextResult with facts organized into layers.
@@ -72,22 +74,69 @@ class ContextAssembler:
         scope_order = {FactScope.GLOBAL: 0, FactScope.ORG: 1, FactScope.PROJECT: 2, FactScope.SESSION: 3}
         constraints.sort(key=lambda f: scope_order.get(f.scope, 99))
 
+        # Cap constraints so they don't starve other layers.
+        # Reserve at least 1/3 of budget for non-constraint content.
+        constraint_cap = max_tokens * 2 // 3
+        uncapped_total = sum(f.size_hint() for f in constraints)
+        constraints = self._accumulate_within_budget(constraints, constraint_cap, at_least_one=True)
+        constraint_tokens = sum(f.size_hint() for f in constraints)
+        if uncapped_total > constraint_cap:
+            logger.warning(
+                "Constraints would consume %d tokens (cap %d); truncated to %d tokens",
+                uncapped_total, constraint_cap, constraint_tokens,
+            )
+
         # Rank valid facts by similarity + confidence + recency
         scored_valid = self._score_facts(valid_candidates, query_embedding)
-        top_valid = [f for f, _ in scored_valid[:k]]
 
-        # Take most recently superseded for contrast
+        # Budget-aware accumulation.
+        # Valid facts get "at least one" guarantee; subsequent layers
+        # only get what's left (no guarantee if budget is exhausted).
+        budget_remaining = max(0, max_tokens - constraint_tokens)
+        top_valid = self._accumulate_within_budget(
+            [f for f, _ in scored_valid[:k]], budget_remaining, at_least_one=True,
+        )
+        budget_remaining = max(0, budget_remaining - sum(f.size_hint() for f in top_valid))
+
+        session_capped = self._accumulate_within_budget(session_facts, budget_remaining)
+        budget_remaining = max(0, budget_remaining - sum(f.size_hint() for f in session_capped))
+
+        unknowns_capped = self._accumulate_within_budget(known_unknowns, budget_remaining)
+
+        # Keep full invalidated list for annotation lookup.
+        # Sorted by last_accessed as proxy for supersession time (no superseded_at field).
         invalidated.sort(key=lambda f: f.metadata.last_accessed, reverse=True)
-        top_invalidated = invalidated[:MAX_INVALIDATED_FACTS]
 
         return ContextResult(
             constraints=constraints,
             valid_facts=top_valid,
-            invalidated_facts=top_invalidated,
-            working_set=session_facts,
+            invalidated_facts=invalidated,
+            working_set=session_capped,
             environment=environment or {},
-            known_unknowns=known_unknowns,
+            known_unknowns=unknowns_capped,
         )
+
+    @staticmethod
+    def _accumulate_within_budget(
+        facts: list[Fact], budget: int, *, at_least_one: bool = False,
+    ) -> list[Fact]:
+        """Accumulate facts until budget is exhausted.
+
+        Args:
+            at_least_one: If True, always include the first fact even if it
+                exceeds the budget. Only used for valid_facts (primary layer).
+        """
+        result: list[Fact] = []
+        used = 0
+        for fact in facts:
+            cost = fact.size_hint()
+            if used + cost > budget:
+                if not result and at_least_one:
+                    result.append(fact)
+                break
+            result.append(fact)
+            used += cost
+        return result
 
     def _score_facts(
         self,
@@ -132,10 +181,13 @@ class ContextAssembler:
     def format_context_for_prompt(self, ctx: ContextResult) -> str:
         """Render ContextResult as a formatted string for LLM injection.
 
-        Produces a structured block that can be inserted into system
-        or user prompts.
+        Superseded facts are shown as inline change annotations on the
+        facts that replaced them, rather than in a separate section.
         """
         sections: list[str] = []
+
+        # Build lookup: old_fact.id → old_fact for inline annotations
+        old_lookup: dict[str, Fact] = {f.id: f for f in ctx.invalidated_facts}
 
         if ctx.constraints:
             lines = ["## Project Constraints"]
@@ -148,18 +200,15 @@ class ContextAssembler:
             lines = ["## Relevant Knowledge"]
             for fact in ctx.valid_facts:
                 conf = fact.metadata.confidence
-                lines.append(
+                line = (
                     f"- **{fact.subject}** ({fact.kind.value}, confidence={conf:.2f}): "
                     f"{fact.body[:200]}"
                 )
-            sections.append("\n".join(lines))
-
-        if ctx.invalidated_facts:
-            lines = ["## Recently Changed (for context)"]
-            for fact in ctx.invalidated_facts:
-                lines.append(
-                    f"- ~~{fact.subject}~~ (superseded): {fact.body[:150]}"
-                )
+                # Inline change annotation
+                if fact.supersedes and fact.supersedes in old_lookup:
+                    old = old_lookup[fact.supersedes]
+                    line += f" (changed from: {old.body[:80]})"
+                lines.append(line)
             sections.append("\n".join(lines))
 
         if ctx.known_unknowns:

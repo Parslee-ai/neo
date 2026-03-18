@@ -458,7 +458,7 @@ class TestSynthesizeReviews:
             slight_variation = emb + np.random.randn(768).astype(np.float32) * 0.01
             slight_variation = slight_variation / np.linalg.norm(slight_variation)
             self._make_review_fact(
-                store, f"outcome:accepted store.py", f"wrap I/O in try/except variant {i}",
+                store, "outcome:accepted store.py", f"wrap I/O in try/except variant {i}",
                 ["outcome", "accepted"], embedding=slight_variation,
             )
 
@@ -489,7 +489,7 @@ class TestSynthesizeReviews:
             slight = emb + np.random.randn(768).astype(np.float32) * 0.005
             slight = slight / np.linalg.norm(slight)
             f = self._make_review_fact(
-                store, f"outcome:accepted store.py", f"same pattern {i}",
+                store, "outcome:accepted store.py", f"same pattern {i}",
                 ["outcome", "accepted"], embedding=slight,
             )
             cluster_facts.append(f)
@@ -894,7 +894,7 @@ class TestConstraintEmbeddings:
         with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
              patch.object(FactStore, "_maybe_migrate"), \
-             patch.object(FactStore, "_embed_text", return_value=fake_emb) as mock_embed:
+             patch.object(FactStore, "_embed_text", return_value=fake_emb):
             s = FactStore(codebase_root=str(tmp_path))
 
         constraints = [f for f in s._facts if f.kind == FactKind.CONSTRAINT]
