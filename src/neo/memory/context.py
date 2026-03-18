@@ -15,10 +15,6 @@ from neo.memory.models import ContextResult, Fact, FactKind, FactScope
 
 logger = logging.getLogger(__name__)
 
-# Maximum invalidated facts to include for contrast
-MAX_INVALIDATED_FACTS = 3
-
-
 class ContextAssembler:
     """Assembles a ContextResult from facts and query context.
 
@@ -81,12 +77,13 @@ class ContextAssembler:
         # Cap constraints so they don't starve other layers.
         # Reserve at least 1/3 of budget for non-constraint content.
         constraint_cap = max_tokens * 2 // 3
+        uncapped_total = sum(f.size_hint() for f in constraints)
         constraints = self._accumulate_within_budget(constraints, constraint_cap, at_least_one=True)
         constraint_tokens = sum(f.size_hint() for f in constraints)
-        if constraint_tokens > constraint_cap:
+        if uncapped_total > constraint_cap:
             logger.warning(
-                "Constraints consume %d tokens (cap %d) — consider reducing CLAUDE.md size",
-                constraint_tokens, constraint_cap,
+                "Constraints would consume %d tokens (cap %d); truncated to %d tokens",
+                uncapped_total, constraint_cap, constraint_tokens,
             )
 
         # Rank valid facts by similarity + confidence + recency
@@ -106,7 +103,7 @@ class ContextAssembler:
 
         unknowns_capped = self._accumulate_within_budget(known_unknowns, budget_remaining)
 
-        # Keep full invalidated list for annotation lookup; cap display to 3.
+        # Keep full invalidated list for annotation lookup.
         # Sorted by last_accessed as proxy for supersession time (no superseded_at field).
         invalidated.sort(key=lambda f: f.metadata.last_accessed, reverse=True)
 
