@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.2] - 2026-03-18
+
+### Added
+- Outcome linkage: accepted suggestions now boost the original fact's confidence and success_count instead of creating orphan REVIEW facts
+- Review synthesis: clusters of similar REVIEW facts are distilled into single PATTERN facts via embedding-based complete-linkage clustering
+- LLM-based synthesis: clusters of 5+ facts optionally use an LLM for richer distillation (falls back to mechanical synthesis)
+- Quality pruning: stale facts (low confidence, zero successes, >14 days old) are automatically removed
+- Success/failure-based demotion: facts retrieved 5+ times without validation lose confidence; 10+ times get invalidated; consistently helpful facts get protected
+- Full maintenance chain in `detect_implicit_feedback`: synthesize → prune stale → demote unhelpful → purge dead
+
+### Changed
+- `detect_outcomes()` now returns suggestion_fact_ids for outcome-to-fact linkage
+- `SessionRecord` carries `suggestion_fact_ids` mapping for cross-invocation tracking
+- `FactMetadata` gains `success_count` field for tracking validated suggestions
+- `FactStore` accepts optional `lm_adapter` for LLM-based synthesis
+
 ## [0.11.1] - 2026-03-17
 
 ### Fixed

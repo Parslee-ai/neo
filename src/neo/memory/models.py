@@ -42,6 +42,7 @@ class FactMetadata:
     source_file: str = ""      # File that generated this fact
     source_prompt: str = ""    # Prompt that triggered this fact
     confidence: float = 0.5    # 0.0 to 1.0
+    success_count: int = 0     # Times this suggestion was validated
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +52,7 @@ class FactMetadata:
             "source_file": self.source_file,
             "source_prompt": self.source_prompt,
             "confidence": self.confidence,
+            "success_count": self.success_count,
         }
 
     @classmethod
@@ -62,6 +64,7 @@ class FactMetadata:
             source_file=data.get("source_file", ""),
             source_prompt=data.get("source_prompt", ""),
             confidence=data.get("confidence", 0.5),
+            success_count=data.get("success_count", 0),
         )
 
 
