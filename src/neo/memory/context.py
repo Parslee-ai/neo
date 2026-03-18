@@ -37,9 +37,9 @@ class ContextAssembler:
     ) -> ContextResult:
         """Filter and rank facts into layers with token budget enforcement.
 
-        Constraints are always included (exempt from budget). The remaining
-        budget is shared across valid_facts, working_set, and known_unknowns
-        in priority order.
+        Constraints are capped to 2/3 of the budget to reserve room for other
+        layers. The remaining budget is shared across valid_facts, working_set,
+        and known_unknowns in priority order.
 
         Args:
             facts: All facts from the store.
