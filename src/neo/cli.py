@@ -250,7 +250,8 @@ class NeoEngine:
                     from neo.memory.store import FactStore
                     self.fact_store = FactStore(
                         codebase_root=codebase_root,
-                        config=config
+                        config=config,
+                        lm_adapter=lm_adapter,
                     )
                     # Set persistent_memory for backward compat in methods that check it
                     self.persistent_memory = self.fact_store
@@ -339,14 +340,16 @@ class NeoEngine:
                 logger.info(f"High confidence solution ({max_confidence:.2f}), early exit")
 
                 # Store reasoning before returning
+                fact = None
                 if self.persistent_memory:
-                    self._store_reasoning(
+                    fact = self._store_reasoning(
                         neo_input, plan, code_suggestions, max_confidence, enriched_context
                     )
 
                 # Save session for outcome detection on next invocation
                 if self.fact_store is not None:
-                    self.fact_store.save_session(code_suggestions, neo_input.prompt)
+                    ids = self._build_suggestion_fact_ids(fact, code_suggestions)
+                    self.fact_store.save_session(code_suggestions, neo_input.prompt, ids)
 
                 # Log metrics
                 self._log_metrics(difficulty, time_budget, elapsed, early_exit=True)
@@ -394,14 +397,16 @@ class NeoEngine:
         # No code_suggestions gate - intentionally store all reasoning regardless of
         # whether code suggestions were generated. Both fact_store and legacy backends
         # benefit from recording the full reasoning chain for future retrieval.
+        fact = None
         if self.persistent_memory:
-            self._store_reasoning(
+            fact = self._store_reasoning(
                 neo_input, plan, code_suggestions, confidence, enriched_context
             )
 
         # Save session for outcome detection on next invocation
         if self.fact_store is not None:
-            self.fact_store.save_session(code_suggestions, neo_input.prompt)
+            ids = self._build_suggestion_fact_ids(fact, code_suggestions)
+            self.fact_store.save_session(code_suggestions, neo_input.prompt, ids)
 
         # Log final metrics
         elapsed = time.time() - start_time
@@ -1040,6 +1045,20 @@ RULES:
         # Combine template with facts
         return f"{template}\n\n({facts})"
 
+    @staticmethod
+    def _build_suggestion_fact_ids(
+        fact, code_suggestions: list[CodeSuggestion]
+    ) -> dict[str, str]:
+        """Build file_path -> fact_id mapping for outcome linkage."""
+        if fact is None:
+            return {}
+        ids: dict[str, str] = {}
+        for s in code_suggestions:
+            fp = getattr(s, "file_path", "")
+            if fp and fp not in ("/", "N/A"):
+                ids[fp] = fact.id
+        return ids
+
     def _store_reasoning(
         self,
         neo_input: NeoInput,
@@ -1112,7 +1131,7 @@ RULES:
             if pitfalls:
                 body_parts.append("Pitfalls: " + "; ".join(pitfalls[:5]))
 
-            self.fact_store.add_fact(
+            fact = self.fact_store.add_fact(
                 subject=pattern,
                 body="\n".join(body_parts),
                 kind=fact_kind,
@@ -1120,6 +1139,7 @@ RULES:
                 source_prompt=neo_input.prompt[:200],
                 tags=[task_type_str],
             )
+            return fact
         else:
             # Legacy path
             test_patterns = []
@@ -1143,6 +1163,7 @@ RULES:
                 common_pitfalls=pitfalls[:5],
                 test_patterns=test_patterns[:3],
             )
+            return None
 
         # Clean up temporary simulation traces to prevent memory leak
         if hasattr(self, 'last_simulation_traces'):

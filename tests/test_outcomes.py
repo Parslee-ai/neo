@@ -78,6 +78,46 @@ class TestSaveAndLoadSession:
         assert tracker._load_previous_session() is None
 
 
+class TestSessionRecordWithFactIds:
+    def test_save_and_load_with_fact_ids(self, tracker):
+        suggestions = [
+            FakeSuggestion(file_path="src/foo.py", description="Add validation", confidence=0.9),
+        ]
+        fact_ids = {"src/foo.py": "abc123def456"}
+        tracker.save_session(suggestions, "fix bug", suggestion_fact_ids=fact_ids)
+
+        session = tracker._load_previous_session()
+        assert session is not None
+        assert session.suggestion_fact_ids == {"src/foo.py": "abc123def456"}
+
+    def test_backward_compat_no_fact_ids(self, tracker):
+        """Old sessions without suggestion_fact_ids should load with empty dict."""
+        suggestions = [
+            FakeSuggestion(file_path="src/foo.py", description="Fix", confidence=0.8),
+        ]
+        # Save without fact_ids (old behavior)
+        tracker.save_session(suggestions, "fix")
+
+        session = tracker._load_previous_session()
+        assert session is not None
+        assert session.suggestion_fact_ids == {}
+
+    def test_detect_outcomes_returns_fact_ids(self, tracker):
+        """detect_outcomes should return suggestion_fact_ids from previous session."""
+        suggestions = [
+            FakeSuggestion(file_path="src/foo.py", description="Add validation", confidence=0.9),
+        ]
+        fact_ids = {"src/foo.py": "fact123"}
+        tracker.save_session(suggestions, "fix", suggestion_fact_ids=fact_ids)
+
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value="+code"):
+            outcomes, returned_ids = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert returned_ids == {"src/foo.py": "fact123"}
+
+
 class TestDetectOutcomesAccepted:
     def test_accepted_when_suggested_file_changed(self, tracker):
         # Save a session with suggestions
@@ -89,7 +129,7 @@ class TestDetectOutcomesAccepted:
         # Mock git to return the same file as changed, with diff content
         with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
              patch.object(tracker, "_get_file_diff_since", return_value="+    validate_input(data)\n-    process(data)"):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
         assert outcomes[0].outcome_type == "accepted"
@@ -106,7 +146,7 @@ class TestDetectOutcomesAccepted:
         diff_text = "+def new_helper():\n+    return 42"
         with patch.object(tracker, "_get_changed_files_since", return_value={"src/bar.py"}), \
              patch.object(tracker, "_get_file_diff_since", return_value=diff_text):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
         assert outcomes[0].outcome_type == "independent"
@@ -121,13 +161,14 @@ class TestDetectOutcomesNoChanges:
         tracker.save_session(suggestions, "fix bug")
 
         with patch.object(tracker, "_get_changed_files_since", return_value=set()):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         assert outcomes == []
 
     def test_no_outcomes_when_no_previous_session(self, tracker):
-        outcomes = tracker.detect_outcomes()
+        outcomes, fact_ids = tracker.detect_outcomes()
         assert outcomes == []
+        assert fact_ids == {}
 
 
 class TestDetectOutcomesIndependent:
@@ -140,7 +181,7 @@ class TestDetectOutcomesIndependent:
         # User changed a different file
         with patch.object(tracker, "_get_changed_files_since", return_value={"src/bar.py"}), \
              patch.object(tracker, "_get_file_diff_since", return_value="+new code"):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
         assert outcomes[0].outcome_type == "independent"
@@ -155,7 +196,7 @@ class TestDetectOutcomesIndependent:
             "_get_changed_files_since",
             return_value={"README.md", "config.yaml", ".gitignore"},
         ):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         assert outcomes == []
 
@@ -170,7 +211,7 @@ class TestDetectOutcomesIndependent:
             "_get_changed_files_since",
             return_value={"src/foo.py", "src/bar.py"},
         ), patch.object(tracker, "_get_file_diff_since", return_value="+change"):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         types = {o.outcome_type for o in outcomes}
         assert "accepted" in types
@@ -183,7 +224,7 @@ class TestGitNotAvailable:
         tracker.save_session(suggestions, "fix")
 
         with patch("neo.memory.outcomes.subprocess.run", side_effect=FileNotFoundError):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         assert outcomes == []
 
@@ -196,7 +237,7 @@ class TestGitNotAvailable:
             "neo.memory.outcomes.subprocess.run",
             side_effect=subprocess.CalledProcessError(128, "git"),
         ):
-            outcomes = tracker.detect_outcomes()
+            outcomes, _ = tracker.detect_outcomes()
 
         assert outcomes == []
 
@@ -220,7 +261,7 @@ class TestDifferentProject:
                 "suggestions": session.suggestions,
             }, f)
 
-        outcomes = tracker.detect_outcomes()
+        outcomes, _ = tracker.detect_outcomes()
         assert outcomes == []
 
 

@@ -38,6 +38,7 @@ class SessionRecord:
     project_id: str = ""
     prompt: str = ""
     suggestions: list[dict] = field(default_factory=list)
+    suggestion_fact_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -76,12 +77,14 @@ class OutcomeTracker:
         self,
         suggestions: list,
         prompt: str,
+        suggestion_fact_ids: Optional[dict[str, str]] = None,
     ) -> None:
         """Persist current session for outcome detection on next run.
 
         Args:
             suggestions: List of CodeSuggestion objects from current invocation.
             prompt: The user's prompt.
+            suggestion_fact_ids: Mapping of file_path -> fact_id for linking outcomes.
         """
         if not self._session_path:
             return
@@ -103,6 +106,7 @@ class OutcomeTracker:
             project_id=self.project_id,
             prompt=prompt[:200],
             suggestions=records,
+            suggestion_fact_ids=suggestion_fact_ids or {},
         )
 
         try:
@@ -112,26 +116,26 @@ class OutcomeTracker:
         except OSError as e:
             logger.warning(f"Failed to save session: {e}")
 
-    def detect_outcomes(self) -> list[Outcome]:
+    def detect_outcomes(self) -> tuple[list[Outcome], dict[str, str]]:
         """Detect outcomes by comparing previous suggestions to actual git changes.
 
         Returns:
-            List of Outcome objects describing what happened.
+            Tuple of (outcomes list, suggestion_fact_ids mapping from previous session).
         """
         prev = self._load_previous_session()
         if not prev or not prev.timestamp:
-            return []
+            return [], {}
 
         # Only detect outcomes for the same project
         if prev.project_id != self.project_id:
-            return []
+            return [], {}
 
         # Get files changed since last session
         changed_files = self._get_changed_files_since(prev.timestamp)
         if not changed_files:
-            return []
+            return [], {}
 
-        return self._match_to_suggestions(changed_files, prev)
+        return self._match_to_suggestions(changed_files, prev), prev.suggestion_fact_ids
 
     def _load_previous_session(self) -> Optional[SessionRecord]:
         """Load the previous session record from disk."""
