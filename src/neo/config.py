@@ -48,6 +48,9 @@ class NeoConfig:
     memory_backend: str = "fact_store"  # "fact_store" (new) or "legacy" (PersistentReasoningMemory)
     constraint_auto_scan: bool = True  # Auto-scan CLAUDE.md etc. for constraints
 
+    # Logging settings
+    log_level: str = "WARNING"  # DEBUG, INFO, WARNING, ERROR
+
     @classmethod
     def from_file(cls, config_path: str) -> "NeoConfig":
         """Load configuration from JSON file."""
@@ -100,6 +103,10 @@ class NeoConfig:
         if auto_install := os.environ.get("NEO_AUTO_INSTALL_UPDATES"):
             config.auto_install_updates = auto_install.lower() in ("1", "true", "yes")
 
+        # Logging settings
+        if log_level := os.environ.get("NEO_LOG_LEVEL"):
+            config.log_level = log_level.upper()
+
         return config
 
     @classmethod
@@ -148,6 +155,7 @@ class NeoConfig:
             'auto_install_updates': self.auto_install_updates,
             'memory_backend': self.memory_backend,
             'constraint_auto_scan': self.constraint_auto_scan,
+            'log_level': self.log_level,
         }
 
         with open(path, "w") as f:

@@ -112,7 +112,10 @@ class OutcomeTracker:
         try:
             with open(self._session_path, "w") as f:
                 json.dump(asdict(session), f, indent=2)
-            logger.debug(f"Saved session with {len(records)} suggestions")
+            logger.info(
+                f"Saved session: {len(records)} suggestion(s), "
+                f"{len(suggestion_fact_ids or {})} linked fact(s)"
+            )
         except OSError as e:
             logger.warning(f"Failed to save session: {e}")
 
@@ -124,18 +127,32 @@ class OutcomeTracker:
         """
         prev = self._load_previous_session()
         if not prev or not prev.timestamp:
+            logger.debug("No previous session found for outcome detection")
             return [], {}
 
         # Only detect outcomes for the same project
         if prev.project_id != self.project_id:
+            logger.debug(f"Previous session project mismatch: {prev.project_id} != {self.project_id}")
             return [], {}
 
         # Get files changed since last session
         changed_files = self._get_changed_files_since(prev.timestamp)
         if not changed_files:
+            logger.debug("No files changed since last session")
             return [], {}
 
-        return self._match_to_suggestions(changed_files, prev), prev.suggestion_fact_ids
+        suggested = [s.get("file_path", "") for s in prev.suggestions]
+        logger.info(
+            f"Outcome detection: {len(changed_files)} changed files, "
+            f"{len(suggested)} suggestions, "
+            f"{len(prev.suggestion_fact_ids)} linked fact(s)"
+        )
+
+        outcomes = self._match_to_suggestions(changed_files, prev)
+        accepted = sum(1 for o in outcomes if o.outcome_type == "accepted")
+        independent = sum(1 for o in outcomes if o.outcome_type == "independent")
+        logger.info(f"Outcomes: {accepted} accepted, {independent} independent")
+        return outcomes, prev.suggestion_fact_ids
 
     def _load_previous_session(self) -> Optional[SessionRecord]:
         """Load the previous session record from disk."""

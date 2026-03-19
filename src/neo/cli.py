@@ -345,7 +345,6 @@ class NeoEngine:
                     fact = self._store_reasoning(
                         neo_input, plan, code_suggestions, max_confidence, enriched_context
                     )
-
                 # Save session for outcome detection on next invocation
                 if self.fact_store is not None:
                     ids = self._build_suggestion_fact_ids(fact, code_suggestions)
@@ -1051,12 +1050,14 @@ RULES:
     ) -> dict[str, str]:
         """Build file_path -> fact_id mapping for outcome linkage."""
         if fact is None:
+            logger.warning("_build_suggestion_fact_ids: fact is None, no linkage possible")
             return {}
         ids: dict[str, str] = {}
         for s in code_suggestions:
             fp = getattr(s, "file_path", "")
             if fp and fp not in ("/", "N/A"):
                 ids[fp] = fact.id
+        logger.debug(f"_build_suggestion_fact_ids: linked {len(ids)} suggestions to fact {fact.id}")
         return ids
 
     def _store_reasoning(
@@ -1069,6 +1070,7 @@ RULES:
     ):
         """Store reasoning in persistent memory for future use."""
         if not self.persistent_memory:
+            logger.warning("_store_reasoning: no persistent_memory, returning None")
             return
 
         # Extract pattern from task type and prompt
@@ -1139,6 +1141,7 @@ RULES:
                 source_prompt=neo_input.prompt[:200],
                 tags=[task_type_str],
             )
+            logger.info(f"_store_reasoning: created fact id={fact.id} subject={pattern[:50]}")
             return fact
         else:
             # Legacy path
@@ -2974,6 +2977,8 @@ def parse_args():
     global_parser.add_argument('--index', action='store_true', help='Build semantic index for current directory')
     global_parser.add_argument('--languages', metavar='CSV', help='Languages to index (e.g., python,csharp,typescript)')
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
+    global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
+    global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
 
     # Detect if 'update' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'update':
@@ -3138,10 +3143,44 @@ def read_prompt_from_argv_or_stdin(args):
     sys.exit(2)
 
 
+def _configure_logging(args) -> None:
+    """Configure logging based on CLI flags, env var, or config.
+
+    Priority: --debug > --verbose > NEO_LOG_LEVEL env > config.log_level > WARNING
+    Output goes to stderr so it doesn't interfere with JSON on stdout.
+    """
+    # Determine level from flags
+    if getattr(args, "debug", False):
+        level = logging.DEBUG
+    elif getattr(args, "verbose", False):
+        level = logging.INFO
+    else:
+        # Check env, then fall back to default (config loaded later)
+        env_level = os.environ.get("NEO_LOG_LEVEL", "").upper()
+        level = getattr(logging, env_level, None) if env_level else None
+
+    if level is None:
+        # Will be reconfigured after config is loaded if needed
+        level = logging.WARNING
+
+    logging.basicConfig(
+        level=level,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+    # Quiet noisy third-party loggers
+    for name in ("httpx", "httpcore", "openai", "anthropic", "urllib3", "fastembed", "onnxruntime"):
+        logging.getLogger(name).setLevel(max(level, logging.WARNING))
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # Parse arguments
     args = parse_args()
+
+    # Configure logging early so all subsequent code can log
+    _configure_logging(args)
 
     # Check for updates (non-blocking, silent on failure)
     # Skip if running certain commands to avoid noise
@@ -3332,6 +3371,14 @@ def main():
     try:
         # Load config to get API key
         config = NeoConfig.load()
+
+        # Upgrade log level from config if no CLI flag was set
+        if not getattr(args, "debug", False) and not getattr(args, "verbose", False):
+            if not os.environ.get("NEO_LOG_LEVEL"):
+                cfg_level = getattr(logging, config.log_level.upper(), None)
+                if cfg_level is not None:
+                    logging.getLogger().setLevel(cfg_level)
+
         adapter = create_adapter(
             provider=config.provider,
             model=config.model,
