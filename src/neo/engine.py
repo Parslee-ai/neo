@@ -29,10 +29,10 @@ from neo.models import (
 )
 
 if TYPE_CHECKING:
-    from neo.config import NeoConfig
-    from neo.exemplar_index import ExemplarIndex
-    from neo.memory.store import FactStore
-    from neo.persistent_reasoning import PersistentReasoningMemory
+    from neo.config import NeoConfig  # noqa: F401
+    from neo.exemplar_index import ExemplarIndex  # noqa: F401
+    from neo.memory.store import FactStore  # noqa: F401
+    from neo.persistent_reasoning import PersistentReasoningMemory  # noqa: F401
 
 # Initialize logger
 logger = logging.getLogger(__name__)

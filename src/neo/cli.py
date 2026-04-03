@@ -30,12 +30,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Backward-compat re-exports (moved to neo.models, neo.engine, neo.subcommands)
-from neo.models import (  # noqa: F401
+from neo.models import (  # noqa: E402, F401
     TaskType, ContextFile, NeoInput, PlanStep, SimulationTrace,
     CodeSuggestion, StaticCheckResult, NeoOutput, RegenerateStats, LMAdapter,
 )
-from neo.engine import NeoEngine  # noqa: F401
-from neo.subcommands import (  # noqa: F401
+from neo.engine import NeoEngine  # noqa: E402, F401
+from neo.subcommands import (  # noqa: E402, F401
     show_version, show_help, _interpret_confidence, _restore_from_backup,
     _regenerate_entry_embeddings, regenerate_embeddings, handle_load_program,
     handle_update, handle_construct, handle_prompt, handle_config,
@@ -44,7 +44,7 @@ from neo.subcommands import (  # noqa: F401
 )
 
 # Re-export constants that were at module level
-from neo.subcommands import MIN_EMBEDDING_SUCCESS_RATE, VALID_EMBEDDING_DIMENSIONS  # noqa: F401
+from neo.subcommands import MIN_EMBEDDING_SUCCESS_RATE, VALID_EMBEDDING_DIMENSIONS  # noqa: E402, F401
 
 
 def parse_args():
