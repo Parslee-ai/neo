@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.12.0] - 2026-04-02
+
+### Fixed
+- Fix dead code / memory leak: `_store_reasoning` cleanup was unreachable after two early returns
+- Fix path traversal in `_read_safe_files`: resolve `base_dir` before containment check
+- Fix `show_version` displaying stale stats from legacy memory backend instead of configured FactStore
+- Remove telemetry exfiltration risk: `NEO_TELEMETRY_ENDPOINT` env var allowed sending data to arbitrary URLs
+- Fix `sys.argv` mutation in `parse_args` — now uses `sys.argv[2:]` slicing instead of `pop(1)`
+- Fix `iter_paths` return type annotation (was 2-tuple, actually 3-tuple)
+- Fix broken `sys.path` hack for `ProjectIndex` import in `context_gatherer.py`
+- Replace MD5 with SHA256 for embedding cache keys
+
+### Changed
+- **Breaking**: Split `cli.py` (3609 lines) into `models.py`, `engine.py`, `subcommands.py` with backward-compat re-exports
+- Consolidate 4 copy-paste `_simulate_*` methods into single `_run_simulation` with dispatch table
+- Extract `cosine_similarity` into `math_utils.py`, replacing 3 duplicate implementations
+- Extract `FactStore.initialize()` from `__init__` with `eager_init` parameter for lightweight construction
+- Atomic writes for fact persistence via `tempfile.mkstemp` + `os.replace` with cleanup on failure
+- Upgrade memory pipeline exception handlers from debug to warning level
+
 ## [0.11.3] - 2026-04-02
 
 ### Fixed
