@@ -87,6 +87,10 @@ class OutcomeTracker:
             suggestion_fact_ids: Mapping of file_path -> fact_id for linking outcomes.
         """
         if not self._session_path:
+            logger.warning(
+                "save_session: skipped — no project_id (codebase_root not set). "
+                "Memory will NOT persist. Pass --cwd or working_directory in JSON input."
+            )
             return
 
         records = []

@@ -3288,6 +3288,7 @@ def main():
     if input_mode == "json":
         try:
             input_data = json.loads(sys.stdin.read())
+            working_dir = input_data.get("working_directory") or args.cwd or os.getcwd()
             neo_input = NeoInput(
                 prompt=input_data["prompt"],
                 task_type=TaskType(input_data.get("task_type", "feature")),
@@ -3297,7 +3298,7 @@ def main():
                 error_trace=input_data.get("error_trace"),
                 recent_commands=input_data.get("recent_commands", []),
                 safe_read_paths=input_data.get("safe_read_paths", []),
-                working_directory=input_data.get("working_directory"),
+                working_directory=working_dir,
             )
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             error_output = {"error": f"Invalid JSON input: {e}"}

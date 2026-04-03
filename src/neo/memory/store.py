@@ -278,7 +278,7 @@ class FactStore:
         try:
             self._outcome_tracker.save_session(suggestions, prompt, suggestion_fact_ids)
         except Exception as e:
-            logger.debug(f"Session save failed (non-fatal): {e}")
+            logger.warning(f"Session save failed: {e}")
 
     # ------------------------------------------------------------------ #
     # Backward compatibility
@@ -305,7 +305,7 @@ class FactStore:
         try:
             outcomes, suggestion_fact_ids = self._outcome_tracker.detect_outcomes()
         except Exception as e:
-            logger.debug(f"Outcome detection failed (non-fatal): {e}")
+            logger.warning(f"Outcome detection failed: {e}")
             return
 
         facts_by_id = {f.id: f for f in self._facts}

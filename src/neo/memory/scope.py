@@ -106,6 +106,10 @@ def _compute_project_id(codebase_root: Optional[str] = None) -> str:
     the existing PersistentReasoningMemory approach.
     """
     if not codebase_root:
+        logger.warning(
+            "No codebase_root provided — project_id will be empty. "
+            "Session saves and outcome detection will be disabled."
+        )
         return ""
     resolved = str(Path(codebase_root).resolve())
     return hashlib.sha256(resolved.encode()).hexdigest()[:16]
