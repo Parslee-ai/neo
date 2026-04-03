@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.11.3] - 2026-04-02
+
+### Fixed
+- Fix silent memory pipeline failure: JSON input mode left `working_directory` as None when not provided, causing empty `project_id` and all memory operations (session saves, outcome detection, fact persistence) to silently no-op. Now falls back to `--cwd` or `os.getcwd()`
+- Elevate silent `debug`-level exception handlers in `FactStore.save_session()` and `detect_implicit_feedback()` to `warning` level so memory failures are visible
+- Add warning logs when `project_id` is empty in `OutcomeTracker.save_session()` and `_compute_project_id()` instead of returning silently
+
+### Added
+- Configurable logging infrastructure: `--verbose` (INFO), `--debug` (DEBUG), `NEO_LOG_LEVEL` env var, and `config.log_level` setting for diagnosing memory pipeline issues
+- Token budget enforcement and inline change annotations (#75)
+
 ## [0.11.2] - 2026-03-18
 
 ### Added
