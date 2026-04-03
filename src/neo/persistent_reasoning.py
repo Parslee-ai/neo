@@ -26,6 +26,7 @@ import os
 import numpy as np
 from datasketch import MinHash, MinHashLSH
 from collections import OrderedDict
+from neo.math_utils import cosine_similarity
 from neo.storage import FileStorage
 from neo.storage_interface import StorageBackend
 
@@ -1489,30 +1490,8 @@ class PersistentReasoningMemory:
 
     @staticmethod
     def _cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-        """
-        Calculate cosine similarity between two vectors.
-
-        Args:
-            vec1: First vector
-            vec2: Second vector
-
-        Returns:
-            Cosine similarity in [0, 1], or 0.0 for invalid vectors
-        """
-        # Check for NaN or Inf values
-        if not np.isfinite(vec1).all() or not np.isfinite(vec2).all():
-            logger.warning("Cannot compute cosine similarity: NaN or Inf values")
-            return 0.0
-
-        dot_product = np.dot(vec1, vec2)
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-
-        if norm1 == 0 or norm2 == 0:
-            logger.debug("Zero vector in cosine similarity")
-            return 0.0
-
-        return float(dot_product / (norm1 * norm2))
+        """Compute cosine similarity between two vectors."""
+        return cosine_similarity(vec1, vec2)
 
     def consolidate_memory(self, similarity_threshold: float = 0.85, max_entries: int = 2000) -> int:
         """

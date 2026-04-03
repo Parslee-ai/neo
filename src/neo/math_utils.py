@@ -5,6 +5,28 @@ import math
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Union
 
+import logging
+
+import numpy as np
+
+_logger = logging.getLogger(__name__)
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine similarity between two vectors.
+
+    Returns 0.0 for zero-norm or non-finite vectors.
+    """
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        _logger.debug("cosine_similarity: NaN or Inf values in input vectors")
+        return 0.0
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        _logger.debug("cosine_similarity: zero-norm vector")
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
 NumberLike = Union[int, float, Decimal, str]
 
 

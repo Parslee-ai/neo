@@ -11,6 +11,7 @@ from typing import Optional
 
 import numpy as np
 
+from neo.math_utils import cosine_similarity
 from neo.memory.models import ContextResult, Fact, FactKind, FactScope
 
 logger = logging.getLogger(__name__)
@@ -172,11 +173,7 @@ class ContextAssembler:
     @staticmethod
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
+        return cosine_similarity(a, b)
 
     def format_context_for_prompt(self, ctx: ContextResult) -> str:
         """Render ContextResult as a formatted string for LLM injection.

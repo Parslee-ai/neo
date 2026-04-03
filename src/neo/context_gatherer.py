@@ -98,7 +98,7 @@ def should_ignore(rel_path: str, patterns: list[str], is_dir: bool = False) -> b
     return False
 
 
-def iter_paths(root: str, includes: list[str], excludes: list[str], exts: Optional[list[str]]) -> list[tuple[str, str]]:
+def iter_paths(root: str, includes: list[str], excludes: list[str], exts: Optional[list[str]]) -> list[tuple[str, str, int]]:
     """Walk directory respecting .gitignore patterns."""
     patterns = load_gitignore_patterns(root)
     patterns.extend(excludes)
@@ -566,13 +566,7 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
 
     # Load ProjectIndex
     try:
-        # Import here to avoid circular dependency
-        # Add src/index to path if needed
-        src_index_path = Path(__file__).parent / "src" / "index"
-        if src_index_path.exists():
-            sys.path.insert(0, str(src_index_path.parent))
-
-        from index.project_index import ProjectIndex
+        from neo.index.project_index import ProjectIndex
 
         start_time = time.time()
         index = ProjectIndex(root)

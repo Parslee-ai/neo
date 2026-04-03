@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from neo.math_utils import cosine_similarity
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope
@@ -67,6 +68,7 @@ class FactStore:
         codebase_root: Optional[str] = None,
         config: Optional[Any] = None,
         lm_adapter: Optional[Any] = None,
+        eager_init: bool = True,
     ):
         self.codebase_root = codebase_root
         self._config = config
@@ -99,16 +101,26 @@ class FactStore:
             project_id=self.project_id,
         )
 
-        # Load existing facts
+        # Load existing facts (required for basic operation)
         self.load()
 
-        # Migrate from old format if needed
+        # Heavy I/O (migration, constraint/history ingestion) deferred to initialize()
+        self._initialized = False
+        if eager_init:
+            self.initialize()
+
+    def initialize(self) -> None:
+        """Run post-construction I/O: migration, constraint ingestion, git history.
+
+        Called explicitly after construction. Separating this from __init__
+        ensures a partially-failed ingestion doesn't leave a broken object.
+        """
+        if self._initialized:
+            return
+        self._initialized = True
+
         self._maybe_migrate()
-
-        # Ingest constraints
         self._ingest_constraints()
-
-        # Ingest git history (catch up on code evolution)
         self._ingest_git_history()
 
     def _ensure_embedder(self) -> None:
@@ -531,15 +543,28 @@ class FactStore:
         logger.info(f"FactStore: Loaded {len(self._facts)} facts")
 
     def _save_file(self, path: Path, facts: list[Fact]) -> None:
-        """Save a list of facts to a JSON file."""
+        """Save a list of facts to a JSON file atomically.
+
+        Writes to a temp file in the same directory, then renames.
+        Uses mkstemp to avoid collisions with concurrent processes.
+        """
+        import os
+        import tempfile
+
         try:
             data = {
                 "version": "2.0",
                 "facts": [f.to_dict() for f in facts],
             }
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w") as fh:
-                json.dump(data, fh, indent=2)
+            fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(data, fh, indent=2)
+                os.replace(tmp_name, str(path))
+            except BaseException:
+                os.unlink(tmp_name)
+                raise
             logger.debug(f"Saved {len(facts)} facts to {path}")
         except Exception as e:
             logger.error(f"Failed to save facts to {path}: {e}")
@@ -619,7 +644,7 @@ class FactStore:
 
         self._ensure_embedder()
 
-        cache_key = hashlib.md5(text.encode()).hexdigest()
+        cache_key = hashlib.sha256(text.encode()).hexdigest()
         if cache_key in self._embedding_cache:
             self._embedding_cache.move_to_end(cache_key)
             return self._embedding_cache[cache_key]
@@ -647,11 +672,7 @@ class FactStore:
     @staticmethod
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
+        return cosine_similarity(a, b)
 
     # ------------------------------------------------------------------ #
     # Constraint ingestion
@@ -696,7 +717,7 @@ class FactStore:
         try:
             records = self._outcome_tracker.ingest_git_history(max_commits=50)
         except Exception as e:
-            logger.debug(f"Git history ingestion failed (non-fatal): {e}")
+            logger.warning(f"Git history ingestion failed: {e}")
             return
 
         if not records:
