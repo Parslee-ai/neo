@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.13.2] - 2026-04-05
+
+### Fixed
+- Run full initialization in `neo --version` so seed and community facts load on first run
+- Always show community contribution status in version output (not just when ready)
+- Migrate existing users to auto-update on upgrade (old default was false, now true)
+- Seed RNG in reasoning bank tests to eliminate flaky CI rankings
+- Add pre-commit hook (ruff + pytest) and CI gate on publish workflow
+
 ## [0.13.1] - 2026-04-05
 
 ### Added
