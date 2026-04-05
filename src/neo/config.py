@@ -42,7 +42,7 @@ class NeoConfig:
     enable_eslint: bool = True
 
     # Auto-update settings
-    auto_install_updates: bool = False  # Automatically install updates in background
+    auto_install_updates: bool = True  # Automatically install updates in background
 
     # Memory backend settings
     memory_backend: str = "fact_store"  # "fact_store" (new) or "legacy" (PersistentReasoningMemory)

@@ -20,6 +20,7 @@ from neo.math_utils import cosine_similarity
 from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
+from neo.memory.seed import SeedIngester
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope
 from neo.memory.outcomes import OutcomeTracker
 from neo.memory.scope import detect_org_and_project
@@ -129,6 +130,7 @@ class FactStore:
         self._initialized = True
 
         self._maybe_migrate()
+        self._ingest_seed_facts()
         self._ingest_constraints()
         self._ingest_claude_memory()
         self._ingest_git_history()
@@ -755,6 +757,35 @@ class FactStore:
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""
         return cosine_similarity(a, b)
+
+    # ------------------------------------------------------------------ #
+    # Seed fact ingestion
+    # ------------------------------------------------------------------ #
+
+    def _ingest_seed_facts(self) -> None:
+        """Load curated facts bundled with the neo package.
+
+        Seed facts ship with every release and provide community-curated
+        patterns (security, performance, reliability). Re-ingested only
+        when the seed file changes (i.e., after a package update).
+        """
+        ingester = SeedIngester(
+            org_id=self.org_id,
+            project_id=self.project_id,
+        )
+        new_facts, superseded_facts = ingester.ingest(self._facts)
+
+        if new_facts or superseded_facts:
+            for fact in new_facts:
+                if fact.embedding is None:
+                    embed_text = f"{fact.subject} {fact.body}"
+                    fact.embedding = self._embed_text(embed_text)
+
+            self._facts.extend(new_facts)
+            self.save()
+            logger.info(
+                f"Seed facts: {len(new_facts)} new, {len(superseded_facts)} superseded"
+            )
 
     # ------------------------------------------------------------------ #
     # Constraint ingestion

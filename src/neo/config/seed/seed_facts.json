@@ -1,0 +1,126 @@
+{
+  "version": "0.13.0",
+  "description": "Curated patterns shipped with neo. Updated each release.",
+  "facts": [
+    {
+      "subject": "N+1 query detection",
+      "body": "When code iterates over a collection and makes a database query per item, replace with a batch query or JOIN. Common in ORMs: `for user in users: user.posts` triggers N+1. Fix with eager loading (e.g., `select_related`/`include`/`preload`) or batch fetch by IDs.",
+      "kind": "pattern",
+      "tags": ["performance", "database", "orm"]
+    },
+    {
+      "subject": "Connection pool exhaustion",
+      "body": "Database and HTTP connection pools exhaust when connections are acquired but not released. Always use context managers (`with`) or try/finally for connection lifecycle. Common cause: exception paths that skip `.close()`. Symptoms: hanging requests, timeout errors under load.",
+      "kind": "pattern",
+      "tags": ["performance", "database", "reliability"]
+    },
+    {
+      "subject": "SQL injection via string interpolation",
+      "body": "Never build SQL with f-strings or string concatenation from user input. Use parameterized queries (`?` or `$1` placeholders) or ORM query builders. Applies to all SQL databases. Even internal-only APIs should use parameterized queries as defense in depth.",
+      "kind": "pattern",
+      "tags": ["security", "database", "owasp"]
+    },
+    {
+      "subject": "XSS via unescaped user content",
+      "body": "User-provided strings rendered in HTML without escaping allow script injection. Use framework auto-escaping (React JSX, Jinja2 `|e`, Django templates). Dangerous patterns: `innerHTML`, `dangerouslySetInnerHTML`, `v-html`, `|safe`. Sanitize with allowlists, not denylists.",
+      "kind": "pattern",
+      "tags": ["security", "frontend", "owasp"]
+    },
+    {
+      "subject": "Secret exposure in version control",
+      "body": "API keys, database credentials, and tokens must never be committed. Use environment variables or secret managers. Check for: `.env` files without `.gitignore` entries, hardcoded strings matching key patterns (AWS `AKIA*`, GitHub `ghp_*`), config files with `password=` fields.",
+      "kind": "pattern",
+      "tags": ["security", "devops"]
+    },
+    {
+      "subject": "Race condition in check-then-act",
+      "body": "Code that checks a condition then acts on it without atomicity is vulnerable to TOCTOU races. Examples: `if not exists(file): create(file)`, `if balance >= amount: withdraw(amount)`. Fix with atomic operations, locks, or compare-and-swap. Database: use `INSERT ... ON CONFLICT` or `SELECT ... FOR UPDATE`.",
+      "kind": "pattern",
+      "tags": ["concurrency", "reliability"]
+    },
+    {
+      "subject": "Error swallowing hides bugs",
+      "body": "Bare `except: pass` or `catch (Exception e) {}` silently drops errors, making bugs invisible. At minimum log the exception. Better: catch specific exceptions and handle them. Worst offenders: background tasks and event handlers where failures go unnoticed until data is corrupted.",
+      "kind": "pattern",
+      "tags": ["reliability", "debugging"]
+    },
+    {
+      "subject": "Unbounded collection growth",
+      "body": "In-memory caches, event listeners, log buffers, and message queues that grow without bounds cause OOM. Always set a max size with eviction (LRU, TTL, ring buffer). Common culprits: memoization without size limits, event emitter listeners that are added but never removed, append-only lists in long-running processes.",
+      "kind": "pattern",
+      "tags": ["performance", "reliability"]
+    },
+    {
+      "subject": "Floating point equality comparison",
+      "body": "Never compare floats with `==`. Use epsilon-based comparison (`abs(a - b) < epsilon`) or language-specific tools (`math.isclose` in Python, `Number.EPSILON` in JS). Particularly critical in financial calculations, coordinate systems, and physics simulations. For money, use integer cents or decimal types.",
+      "kind": "pattern",
+      "tags": ["correctness", "math"]
+    },
+    {
+      "subject": "Off-by-one in pagination",
+      "body": "Pagination with offset/limit is error-prone: `offset = page * size` skips the first page (should be `(page - 1) * size` for 1-based pages). Also: total page count needs `ceil(total / size)`, not `total / size`. For large datasets, prefer cursor-based pagination (keyset) over offset — offset scans grow linearly.",
+      "kind": "pattern",
+      "tags": ["correctness", "database", "api"]
+    },
+    {
+      "subject": "Timezone-naive datetime bugs",
+      "body": "Storing or comparing datetimes without timezone info causes bugs across regions and during DST transitions. Always store as UTC in databases. Convert to local only for display. In Python: use `datetime.now(timezone.utc)` not `datetime.now()`. In JS: use `Date.toISOString()` for storage. Dangerous: comparing naive and aware datetimes silently gives wrong results in some languages.",
+      "kind": "pattern",
+      "tags": ["correctness", "internationalization"]
+    },
+    {
+      "subject": "Retry without backoff causes thundering herd",
+      "body": "Retrying failed requests immediately and uniformly causes all clients to retry simultaneously, amplifying the outage. Use exponential backoff with jitter: `delay = base * 2^attempt + random(0, base)`. Set a max retry count (3-5). Add circuit breakers for sustained failures. Never retry non-idempotent operations without deduplication.",
+      "kind": "pattern",
+      "tags": ["reliability", "distributed-systems", "api"]
+    },
+    {
+      "subject": "Mutable default arguments in Python",
+      "body": "Python evaluates default arguments once at function definition, not per call. `def f(items=[])` shares the same list across all calls. Fix: use `None` sentinel and create inside the function: `def f(items=None): items = items or []`. Same applies to dicts, sets, and any mutable object. Also affects dataclass field defaults — use `field(default_factory=list)`.",
+      "kind": "pattern",
+      "tags": ["python", "correctness"]
+    },
+    {
+      "subject": "JavaScript async/await error handling",
+      "body": "Unhandled promise rejections crash Node.js processes. Every `await` in a code path that can throw needs try/catch or a `.catch()` handler. Common miss: `Promise.all()` rejects on first failure — use `Promise.allSettled()` when partial results are acceptable. Fire-and-forget async calls need explicit `.catch(log)` to avoid silent failures.",
+      "kind": "pattern",
+      "tags": ["javascript", "typescript", "reliability"]
+    },
+    {
+      "subject": "React useEffect cleanup prevents memory leaks",
+      "body": "Effects that subscribe to events, set timers, or start async operations must return a cleanup function. Without cleanup: subscriptions stack on re-render, timers fire after unmount, setState on unmounted components. Pattern: `useEffect(() => { const id = setInterval(...); return () => clearInterval(id); }, [deps])`.",
+      "kind": "pattern",
+      "tags": ["react", "javascript", "frontend"]
+    },
+    {
+      "subject": "Git rebase vs merge strategy",
+      "body": "Rebase produces linear history (cleaner log, easier bisect) but rewrites commits (dangerous on shared branches). Merge preserves branch topology (shows when work happened) but clutters history. Rule of thumb: rebase local feature branches onto main before merging. Never rebase commits that others have pulled. Force-push to feature branches only.",
+      "kind": "pattern",
+      "tags": ["git", "workflow"]
+    },
+    {
+      "subject": "Environment variable validation at startup",
+      "body": "Validate all required environment variables at application startup, not at first use. Fail fast with a clear error listing all missing vars. Pattern: check on import/init, not inside request handlers where the failure is harder to diagnose. Common miss: optional vars with fallbacks that silently use wrong defaults in production.",
+      "kind": "pattern",
+      "tags": ["reliability", "devops", "configuration"]
+    },
+    {
+      "subject": "Database migration safety",
+      "body": "Migrations that lock tables (ALTER TABLE ADD COLUMN with default, CREATE INDEX) cause downtime on large tables. Safe patterns: add nullable column first then backfill, CREATE INDEX CONCURRENTLY (Postgres), split into deploy-then-migrate steps. Never drop columns referenced by running code — remove code first, then migrate. Always test migrations against production-size data.",
+      "kind": "pattern",
+      "tags": ["database", "devops", "reliability"]
+    },
+    {
+      "subject": "API versioning prevents breaking clients",
+      "body": "Breaking changes to API responses or request schemas break existing clients. Version APIs via URL prefix (`/v2/`) or header (`Accept: application/vnd.api+json;version=2`). Additive changes (new fields) are safe. Removing or renaming fields, changing types, or altering semantics are breaking. Deprecate with a timeline, don't surprise.",
+      "kind": "pattern",
+      "tags": ["api", "architecture"]
+    },
+    {
+      "subject": "Log structured data not strings",
+      "body": "String-interpolated logs (`log(f'User {id} failed')`) are hard to search and aggregate. Use structured logging with key-value pairs: `logger.error('auth_failed', user_id=id, reason=reason)`. Emit JSON in production. Include correlation IDs for request tracing. Never log secrets, tokens, or PII.",
+      "kind": "pattern",
+      "tags": ["observability", "reliability"]
+    }
+  ]
+}

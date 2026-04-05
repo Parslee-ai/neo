@@ -14,6 +14,7 @@ from neo.memory.models import (
     FactScope,
 )
 from neo.memory.outcomes import OutcomeTracker
+from neo.memory.seed import SeedIngester
 from neo.memory.store import FactStore
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "FactScope",
     "FactStore",
     "OutcomeTracker",
+    "SeedIngester",
 ]
