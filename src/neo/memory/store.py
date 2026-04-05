@@ -31,6 +31,14 @@ MAX_TEXT_LENGTH = 32000
 SUPERSESSION_THRESHOLD = 0.85  # Cosine similarity threshold for supersession
 SYNTHESIS_SIMILARITY = 0.80    # Cosine similarity threshold for review clustering
 
+# Per-scope capacity limits
+SCOPE_LIMITS: dict[str, int] = {
+    FactScope.GLOBAL.value: 200,    # Cross-project patterns, grows slowly
+    FactScope.ORG.value: 100,       # Team conventions, medium churn
+    FactScope.PROJECT.value: 500,   # Codebase-specific, most active
+    FactScope.SESSION.value: 50,    # Ephemeral, dies with session
+}
+
 # Pruning constants
 STALE_MAX_CONFIDENCE = 0.4     # Facts below this confidence are stale candidates
 STALE_MIN_AGE_DAYS = 14        # Must be this old before stale-pruning
@@ -197,6 +205,7 @@ class FactStore:
             self._supersede(candidate, fact)
 
         self._facts.append(fact)
+        self._enforce_scope_limit(fact.scope)
         self.save()
         return fact
 
@@ -208,7 +217,7 @@ class FactStore:
             k: Maximum number of facts to return.
 
         Returns:
-            List of relevant Fact objects, scored by similarity * confidence * recency.
+            List of relevant Fact objects, scored by similarity * confidence.
         """
         query_embedding = self._embed_text(query)
 
@@ -226,10 +235,7 @@ class FactStore:
                 sim = self._cosine_similarity(query_embedding, fact.embedding)
 
             confidence = fact.metadata.confidence
-            age_days = (now - fact.metadata.last_accessed) / 86400
-            recency = 0.5 ** (age_days / 30)
-
-            score = sim * confidence * (0.5 + 0.5 * recency)
+            score = sim * confidence
             scored.append((fact, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -297,15 +303,39 @@ class FactStore:
     # ------------------------------------------------------------------ #
 
     def memory_level(self) -> float:
-        """Calculate memory level (backward compatible with PersistentReasoningMemory).
+        """Calculate memory level based on quality-weighted facts.
 
-        Returns 0.0-1.0 based on fact count using sigmoid scaling.
+        Each valid fact contributes its confidence (boosted by success rate
+        for well-tested facts). Sigmoid scaling maps total to 0.0-1.0.
+
+        The reference quality scales with the total capacity of loaded scopes,
+        so a project-only view and a multi-project view both reach "The One"
+        at ~80% of their potential quality.
         """
-        valid_count = sum(1 for f in self._facts if f.is_valid)
-        if valid_count == 0:
+        valid = [f for f in self._facts if f.is_valid]
+        if not valid:
             return 0.0
-        # Sigmoid with reference point at 50 facts
-        return 1.0 - 1.0 / (1.0 + valid_count / 50.0)
+
+        total_quality = 0.0
+        for f in valid:
+            score = f.metadata.confidence
+            access = f.metadata.access_count
+            if access > 0 and f.metadata.success_count > 0:
+                success_rate = f.metadata.success_count / access
+                score = score * 0.5 + success_rate * 0.5
+            # Usage bonus: reward facts that have been applied
+            usage_factor = min(1.0, access / 10)
+            score *= (0.9 + 0.1 * usage_factor)
+            total_quality += score
+
+        # Reference quality = 20% of aggregate capacity across loaded scopes.
+        # "The One" (0.80) requires ~80% of capacity filled with well-validated
+        # facts (avg confidence ~0.7 + some success history).
+        loaded_scopes = {f.scope for f in self._facts}
+        capacity = sum(SCOPE_LIMITS.get(s.value, 200) for s in loaded_scopes)
+        reference_quality = max(50.0, capacity * 0.2)
+
+        return 1.0 - 1.0 / (1.0 + total_quality / reference_quality)
 
     def detect_implicit_feedback(self, current_request: dict, request_history: list) -> None:
         """Detect outcomes from previous session and update/create facts.
@@ -389,6 +419,56 @@ class FactStore:
     def entries(self) -> list[Fact]:
         """Backward-compatible access to all facts."""
         return self._facts
+
+    # ------------------------------------------------------------------ #
+    # Scope capacity enforcement
+    # ------------------------------------------------------------------ #
+
+    def _enforce_scope_limit(self, scope: FactScope) -> int:
+        """Evict lowest-quality valid facts when a scope exceeds its limit.
+
+        Eviction score: confidence weighted by success rate. Constraints and
+        synthesized facts are protected from eviction. The newest fact (just
+        appended) is never evicted.
+
+        Returns the number of evicted facts.
+        """
+        limit = SCOPE_LIMITS.get(scope.value)
+        if limit is None:
+            return 0
+
+        scoped = [f for f in self._facts if f.scope == scope and f.is_valid]
+        excess = len(scoped) - limit
+        if excess <= 0:
+            return 0
+
+        def _eviction_score(fact: Fact) -> float:
+            """Lower score = evict first."""
+            base = fact.metadata.confidence
+            total = fact.metadata.access_count
+            if total > 0 and fact.metadata.success_count > 0:
+                base = base * 0.5 + (fact.metadata.success_count / total) * 0.5
+            return base
+
+        # Never evict constraints or synthesized archetypes
+        evictable = [
+            f for f in scoped
+            if f.kind != FactKind.CONSTRAINT and "synthesized" not in f.tags
+        ]
+        evictable.sort(key=_eviction_score)
+
+        evicted = 0
+        for fact in evictable[:excess]:
+            fact.is_valid = False
+            self._cascade_needs_review(fact.id)
+            evicted += 1
+
+        if evicted:
+            logger.info(
+                f"Evicted {evicted} fact(s) from {scope.value} scope "
+                f"(limit={limit}, was={len(scoped)})"
+            )
+        return evicted
 
     # ------------------------------------------------------------------ #
     # Persistence

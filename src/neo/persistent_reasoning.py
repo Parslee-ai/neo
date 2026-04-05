@@ -360,13 +360,7 @@ class ReasoningEntry:
         else:
             score = base_score * base_weight + contextual_conf * (1 - base_weight)
 
-        # Stronger recency decay - penalize old entries more aggressively
-        age_days = (time.time() - self.last_used) / 86400
-        # Half-life of 14 days instead of 30, stronger penalty (0.5 base instead of 0.7)
-        recency_factor = 0.5 ** (age_days / 14)
-        score *= (0.5 + 0.5 * recency_factor)
-
-        # Usage bonus (unchanged)
+        # Usage bonus: reward entries that have been applied successfully
         usage_factor = min(1.0, self.use_count / 10)
         score *= (0.9 + 0.1 * usage_factor)
 

@@ -144,12 +144,11 @@ class ContextAssembler:
         facts: list[Fact],
         query_embedding: Optional[np.ndarray],
     ) -> list[tuple[Fact, float]]:
-        """Score facts by cosine similarity * confidence * recency.
+        """Score facts by cosine similarity * confidence.
 
         Returns sorted list of (fact, score) tuples, highest first.
         """
         scored: list[tuple[Fact, float]] = []
-        now = time.time()
 
         for fact in facts:
             # Cosine similarity component
@@ -160,11 +159,7 @@ class ContextAssembler:
             # Confidence component
             confidence = fact.metadata.confidence
 
-            # Recency factor: half-life of 30 days
-            age_days = (now - fact.metadata.last_accessed) / 86400
-            recency = 0.5 ** (age_days / 30)
-
-            score = sim * confidence * (0.5 + 0.5 * recency)
+            score = sim * confidence
             scored.append((fact, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)

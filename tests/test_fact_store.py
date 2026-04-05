@@ -246,6 +246,240 @@ class TestMemoryLevel:
 
         assert level55 > level5
 
+    def test_higher_confidence_higher_level(self, store):
+        """Quality-based: higher confidence facts should yield higher level."""
+        for i in range(20):
+            store._facts.append(Fact(
+                subject=f"low {i}", body="b",
+                scope=FactScope.PROJECT,
+                metadata=FactMetadata(confidence=0.3),
+            ))
+        level_low = store.memory_level()
+
+        store._facts.clear()
+        for i in range(20):
+            store._facts.append(Fact(
+                subject=f"high {i}", body="b",
+                scope=FactScope.PROJECT,
+                metadata=FactMetadata(confidence=0.9),
+            ))
+        level_high = store.memory_level()
+
+        assert level_high > level_low
+
+    def test_validated_facts_higher_level(self, store):
+        """Facts with success history should contribute more to level."""
+        for i in range(20):
+            store._facts.append(Fact(
+                subject=f"unused {i}", body="b",
+                scope=FactScope.PROJECT,
+                metadata=FactMetadata(confidence=0.5, access_count=0, success_count=0),
+            ))
+        level_unused = store.memory_level()
+
+        store._facts.clear()
+        for i in range(20):
+            store._facts.append(Fact(
+                subject=f"validated {i}", body="b",
+                scope=FactScope.PROJECT,
+                metadata=FactMetadata(confidence=0.5, access_count=10, success_count=8),
+            ))
+        level_validated = store.memory_level()
+
+        assert level_validated > level_unused
+
+    def test_no_time_decay(self, store):
+        """Memory level should NOT decay based on time since last access."""
+        old_time = time.time() - 90 * 86400  # 90 days ago
+        for i in range(20):
+            store._facts.append(Fact(
+                subject=f"old {i}", body="b",
+                scope=FactScope.PROJECT,
+                metadata=FactMetadata(confidence=0.7, last_accessed=old_time),
+            ))
+        level_old = store.memory_level()
+
+        store._facts.clear()
+        for i in range(20):
+            store._facts.append(Fact(
+                subject=f"new {i}", body="b",
+                scope=FactScope.PROJECT,
+                metadata=FactMetadata(confidence=0.7, last_accessed=time.time()),
+            ))
+        level_new = store.memory_level()
+
+        assert level_old == level_new
+
+
+class TestScopeLimits:
+    def test_evicts_when_over_limit(self, store):
+        """Adding facts beyond scope limit should evict lowest-quality entries."""
+        from neo.memory.store import SCOPE_LIMITS
+        limit = SCOPE_LIMITS[FactScope.SESSION.value]  # 50
+
+        # Fill to limit with medium confidence
+        for i in range(limit):
+            store._facts.append(Fact(
+                subject=f"session {i}", body="b",
+                scope=FactScope.SESSION,
+                metadata=FactMetadata(confidence=0.5),
+            ))
+
+        # Add one more — should trigger eviction
+        store.add_fact(
+            subject="new session fact", body="important",
+            scope=FactScope.SESSION, confidence=0.9,
+        )
+
+        valid_session = [f for f in store._facts if f.scope == FactScope.SESSION and f.is_valid]
+        assert len(valid_session) <= limit
+
+    def test_evicts_lowest_quality_first(self, store):
+        """Eviction should remove the lowest confidence facts first."""
+        # Add a low-confidence fact
+        low = Fact(
+            subject="weak pattern", body="b",
+            scope=FactScope.SESSION,
+            metadata=FactMetadata(confidence=0.1),
+        )
+        store._facts.append(low)
+
+        # Add a high-confidence fact
+        high = Fact(
+            subject="strong pattern", body="b",
+            scope=FactScope.SESSION,
+            metadata=FactMetadata(confidence=0.9),
+        )
+        store._facts.append(high)
+
+        # Fill remaining capacity
+        from neo.memory.store import SCOPE_LIMITS
+        limit = SCOPE_LIMITS[FactScope.SESSION.value]
+        for i in range(limit - 1):  # -1 because we already have 2, want to go 1 over
+            store._facts.append(Fact(
+                subject=f"filler {i}", body="b",
+                scope=FactScope.SESSION,
+                metadata=FactMetadata(confidence=0.5),
+            ))
+
+        store._enforce_scope_limit(FactScope.SESSION)
+
+        # Low-confidence fact should be evicted
+        assert low.is_valid is False
+        # High-confidence fact should survive
+        assert high.is_valid is True
+
+    def test_constraints_protected_from_eviction(self, store):
+        """Constraint facts should never be evicted even when over limit."""
+        from neo.memory.store import SCOPE_LIMITS
+        limit = SCOPE_LIMITS[FactScope.PROJECT.value]
+
+        constraint = Fact(
+            subject="project rule", body="must do X",
+            kind=FactKind.CONSTRAINT,
+            scope=FactScope.PROJECT,
+            metadata=FactMetadata(confidence=0.1),  # lowest possible
+        )
+        store._facts.append(constraint)
+
+        # Fill past capacity
+        for i in range(limit + 5):
+            store._facts.append(Fact(
+                subject=f"pattern {i}", body="b",
+                scope=FactScope.PROJECT,
+                metadata=FactMetadata(confidence=0.5),
+            ))
+
+        store._enforce_scope_limit(FactScope.PROJECT)
+
+        # Constraint must survive
+        assert constraint.is_valid is True
+
+    def test_synthesized_protected_from_eviction(self, store):
+        """Synthesized archetype facts should be protected from eviction."""
+        from neo.memory.store import SCOPE_LIMITS
+        limit = SCOPE_LIMITS[FactScope.SESSION.value]
+
+        synth = Fact(
+            subject="synthesized archetype", body="b",
+            scope=FactScope.SESSION,
+            metadata=FactMetadata(confidence=0.1),
+            tags=["synthesized"],
+        )
+        store._facts.append(synth)
+
+        for i in range(limit + 5):
+            store._facts.append(Fact(
+                subject=f"filler {i}", body="b",
+                scope=FactScope.SESSION,
+                metadata=FactMetadata(confidence=0.5),
+            ))
+
+        store._enforce_scope_limit(FactScope.SESSION)
+        assert synth.is_valid is True
+
+    def test_no_eviction_under_limit(self, store):
+        """No eviction should happen when under the scope limit."""
+        for i in range(5):
+            store._facts.append(Fact(
+                subject=f"fact {i}", body="b",
+                scope=FactScope.GLOBAL,
+                metadata=FactMetadata(confidence=0.5),
+            ))
+
+        evicted = store._enforce_scope_limit(FactScope.GLOBAL)
+        assert evicted == 0
+        assert all(f.is_valid for f in store._facts)
+
+    def test_different_scopes_independent(self, store):
+        """Filling one scope should not affect another scope's capacity."""
+        from neo.memory.store import SCOPE_LIMITS
+        session_limit = SCOPE_LIMITS[FactScope.SESSION.value]
+
+        # Fill SESSION to capacity
+        for i in range(session_limit):
+            store._facts.append(Fact(
+                subject=f"session {i}", body="b",
+                scope=FactScope.SESSION,
+                metadata=FactMetadata(confidence=0.5),
+            ))
+
+        # Add GLOBAL facts — should not be affected
+        for i in range(10):
+            store._facts.append(Fact(
+                subject=f"global {i}", body="b",
+                scope=FactScope.GLOBAL,
+                metadata=FactMetadata(confidence=0.5),
+            ))
+
+        store._enforce_scope_limit(FactScope.GLOBAL)
+        global_valid = [f for f in store._facts if f.scope == FactScope.GLOBAL and f.is_valid]
+        assert len(global_valid) == 10
+
+
+class TestRetrievalNoDecay:
+    def test_old_facts_not_penalized(self, store):
+        """Retrieval scoring should not penalize old facts."""
+        old_time = time.time() - 180 * 86400  # 6 months ago
+        old_fact = Fact(
+            subject="old but good", body="important pattern",
+            kind=FactKind.PATTERN,
+            scope=FactScope.PROJECT,
+            metadata=FactMetadata(confidence=0.9, last_accessed=old_time),
+        )
+        new_fact = Fact(
+            subject="new but weak", body="tentative pattern",
+            kind=FactKind.PATTERN,
+            scope=FactScope.PROJECT,
+            metadata=FactMetadata(confidence=0.4, last_accessed=time.time()),
+        )
+        store._facts.extend([old_fact, new_fact])
+
+        results = store.retrieve_relevant("pattern", k=2)
+
+        # Old high-confidence fact should rank above new low-confidence fact
+        assert results[0].subject == "old but good"
+
 
 class TestBuildContext:
     def test_returns_context_result(self, store):
