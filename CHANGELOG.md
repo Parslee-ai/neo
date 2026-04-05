@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.13.0] - 2026-04-05
+
+### Fixed
+- Remove time-based memory decay that punished inactivity instead of poor quality — vacations and project switches no longer crush memory level
+- Remove 14-day half-life from `persistent_reasoning.score()`, 30-day half-life from `store.retrieve_relevant()` and `context._score_facts()`
+- Replace count-based `memory_level()` with quality-weighted sigmoid that reflects actual fact validation
+
+### Added
+- Per-scope capacity limits: GLOBAL (200), ORG (100), PROJECT (500), SESSION (50) with quality-based eviction when full
+- Claude Code auto-memory ingestion: reads curated knowledge from `~/.claude/projects/{id}/memory/*.md` as neo facts
+- AI tool instruction file ingestion: `.cursorrules`, `.windsurfrules`, `.clinerules`, `.github/copilot-instructions.md` now ingested as constraints alongside CLAUDE.md
+- New `ClaudeMemoryIngester` class with YAML frontmatter parsing and type mapping (project→DECISION, feedback→PATTERN, reference→ARCHITECTURE)
+
+### Changed
+- Retrieval scoring simplified to `similarity * confidence` — old facts rank by quality, not recency
+- Memory level now scales reference quality to loaded scope capacity so per-project views are meaningful
+
 ## [0.12.0] - 2026-04-02
 
 ### Fixed
