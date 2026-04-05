@@ -10,6 +10,9 @@ import pytest
 import numpy as np
 from neo.persistent_reasoning import PersistentReasoningMemory, ReasoningEntry
 
+# Fixed seed for reproducible rankings in retrieval tests
+_RNG = np.random.RandomState(42)
+
 
 class TestReasoningBankImpact:
     """Measure the impact of ReasoningBank improvements on retrieval quality."""
@@ -149,7 +152,7 @@ class TestReasoningBankImpact:
         - Linear search (procedural, 10% hard)
         """
         # Query for hard problem
-        query_embedding = self.memory.entries[5].embedding + np.random.rand(768).astype(np.float32) * 0.05
+        query_embedding = self.memory.entries[5].embedding + _RNG.rand(768).astype(np.float32) * 0.05
 
         original_embed = self.memory._embed_text
         self.memory._embed_text = lambda x: query_embedding
@@ -185,7 +188,7 @@ class TestReasoningBankImpact:
         - Linear search is acceptable for easy problems
         - No penalty applied to procedural patterns
         """
-        query_embedding = self.memory.entries[0].embedding + np.random.rand(768).astype(np.float32) * 0.05
+        query_embedding = self.memory.entries[0].embedding + _RNG.rand(768).astype(np.float32) * 0.05
 
         original_embed = self.memory._embed_text
         self.memory._embed_text = lambda x: query_embedding
@@ -222,7 +225,7 @@ class TestReasoningBankImpact:
 
         # Make query embedding close to both
         avg_embedding = (dp_entry.embedding + recursive_entry.embedding) / 2
-        query_embedding = avg_embedding + np.random.rand(768).astype(np.float32) * 0.05
+        query_embedding = avg_embedding + _RNG.rand(768).astype(np.float32) * 0.05
 
         original_embed = self.memory._embed_text
         self.memory._embed_text = lambda x: query_embedding
@@ -304,7 +307,7 @@ class TestReasoningBankImpact:
         - Hash table (adaptive, 80% medium) gets +0.10 boost
         - Two-pointer (adaptive, 70% medium) gets +0.10 boost
         """
-        query_embedding = self.memory.entries[2].embedding + np.random.rand(768).astype(np.float32) * 0.05
+        query_embedding = self.memory.entries[2].embedding + _RNG.rand(768).astype(np.float32) * 0.05
 
         original_embed = self.memory._embed_text
         self.memory._embed_text = lambda x: query_embedding
@@ -342,7 +345,7 @@ class TestReasoningBankImpact:
             "difficulty": "hard"
         }
 
-        query_embedding = np.random.rand(768).astype(np.float32)
+        query_embedding = _RNG.rand(768).astype(np.float32)
         original_embed = self.memory._embed_text
         original_exploration = self.memory.exploration_rate
 
