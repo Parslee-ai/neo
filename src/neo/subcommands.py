@@ -49,7 +49,7 @@ def show_version(codebase_root: Optional[str] = None):
 
     if memory_backend == "fact_store":
         from neo.memory.store import FactStore
-        memory = FactStore(codebase_root=codebase_root, config=config, eager_init=False)
+        memory = FactStore(codebase_root=codebase_root, config=config, eager_init=True)
     else:
         from neo.persistent_reasoning import PersistentReasoningMemory
         memory = PersistentReasoningMemory(codebase_root=codebase_root, config=config)
