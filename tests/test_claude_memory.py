@@ -1,18 +1,15 @@
 """Tests for neo.memory.claude_memory - Claude Code auto-memory ingestion."""
 
-import json
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from neo.memory.claude_memory import (
-    CHECKSUM_FILE,
     CLAUDE_MEMORY_CONFIDENCE,
-    CLAUDE_PROJECTS_DIR,
     ClaudeMemoryIngester,
 )
-from neo.memory.models import Fact, FactKind, FactMetadata, FactScope
+from neo.memory.models import Fact, FactKind, FactMetadata
 
 
 @pytest.fixture
