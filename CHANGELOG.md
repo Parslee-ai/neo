@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.13.3] - 2026-04-05
+
+### Changed
+- `neo --version` contribution status now shows pattern count and progress toward contribution threshold instead of a generic message
+
 ## [0.13.2] - 2026-04-05
 
 ### Fixed

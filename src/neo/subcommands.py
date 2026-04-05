@@ -131,9 +131,13 @@ def show_version(codebase_root: Optional[str] = None):
                     and f.metadata.confidence >= 0.6
                     and f.metadata.success_count >= 1]
             if near:
-                print(f"\n\u26a1 {len(near)} pattern(s) growing toward community contribution")
+                print(f"\n\u26a1 {len(near)} pattern(s) approaching contribution (need 0.8 confidence + 3 successes)")
+            elif valid:
+                best_conf = max((f.metadata.confidence for f in valid if hasattr(f, 'metadata')), default=0)
+                best_succ = max((f.metadata.success_count for f in valid if hasattr(f, 'metadata')), default=0)
+                print(f"\n\u26a1 {len(valid)} pattern(s), none yet contributable (best: {best_conf:.0%} confidence, {best_succ} successes — need 0.8 + 3)")
             else:
-                print("\n\u26a1 Use neo to build patterns — validated ones can be shared via: neo contribute")
+                print("\n\u26a1 No patterns yet. Use neo to build patterns — validated ones can be shared via: neo contribute")
     print()
 
 
