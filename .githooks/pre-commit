@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit hook: lint and test before every commit
+# Install: git config core.hooksPath .githooks
+
+set -e
+
+echo "Running ruff lint..."
+python3 -m ruff check src/ tests/
+
+echo "Running tests..."
+python3 -m pytest tests/ -q --tb=line -x
+
+echo "All checks passed."
