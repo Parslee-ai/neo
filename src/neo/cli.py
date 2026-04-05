@@ -380,6 +380,83 @@ def main():
         handle_prompt(args)
         sys.exit(0)
 
+    def _print_neo_greeting(prompt: str, working_dir: str) -> None:
+        """Print a Neo-character greeting based on prompt context and memory level."""
+        from pathlib import Path
+        try:
+            import yaml
+            from neo.config import NeoConfig
+
+            # Load beat deck
+            beat_deck_path = Path(__file__).parent / "config" / "beats" / "neo_matrix.yaml"
+            if not beat_deck_path.exists():
+                return
+            with open(beat_deck_path, "r") as f:
+                beat_deck = yaml.safe_load(f)
+            if not beat_deck:
+                return
+
+            # Get memory level
+            config = NeoConfig.load()
+            memory_backend = getattr(config, "memory_backend", "fact_store")
+            memory_level = 0.0
+
+            if memory_backend == "fact_store":
+                from neo.memory.store import FactStore
+                fs = FactStore(codebase_root=working_dir, config=config)
+                memory_level = fs.memory_level()
+            else:
+                from neo.persistent_reasoning import PersistentReasoningMemory
+                mem = PersistentReasoningMemory(codebase_root=working_dir, config=config)
+                memory_level = mem.memory_level()
+
+            # Map to stage 1-5
+            if memory_level < 0.2:
+                stage = 1
+            elif memory_level < 0.4:
+                stage = 2
+            elif memory_level < 0.6:
+                stage = 3
+            elif memory_level < 0.8:
+                stage = 4
+            else:
+                stage = 5
+
+            # Select contextual beat based on prompt
+            prompt_lower = prompt.lower()
+            triggers = set()
+            if any(kw in prompt_lower for kw in ("bug", "fix", "error", "broken", "crash")):
+                triggers.add("bugfix")
+            if any(kw in prompt_lower for kw in ("refactor", "redesign", "clean up")):
+                triggers.add("refactor")
+            if any(kw in prompt_lower for kw in ("optimize", "performance", "algorithm", "slow")):
+                triggers.add("algorithm")
+                triggers.add("optimization")
+
+            # Find best matching beat
+            best_beat = None
+            best_score = 0
+            for beat in beat_deck.get("beats", []):
+                beat_triggers = set(beat.get("trigger_contexts", []))
+                score = len(triggers & beat_triggers)
+                if score > best_score:
+                    best_score = score
+                    best_beat = beat
+
+            # Get the greeting from beat or base expressions
+            greeting = ""
+            if best_beat and "expressions" in best_beat and stage in best_beat["expressions"]:
+                greeting = best_beat["expressions"][stage].get("notes_tone", "")
+            if not greeting:
+                base = beat_deck.get("base_expressions", {}).get(stage, {})
+                greeting = base.get("internal", "")
+
+            if greeting:
+                print(f"[Neo] {greeting}", file=sys.stderr)
+
+        except Exception:
+            pass  # Greeting is cosmetic — never block the pipeline
+
     # Detect input mode
     input_mode = detect_input_mode(args)
 
@@ -399,6 +476,8 @@ def main():
                 safe_read_paths=input_data.get("safe_read_paths", []),
                 working_directory=working_dir,
             )
+            if not args.json:
+                _print_neo_greeting(neo_input.prompt, working_dir)
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             error_output = {"error": f"Invalid JSON input: {e}"}
             print(json.dumps(error_output, indent=2))
@@ -415,6 +494,7 @@ def main():
             working_directory=working_dir,
             safe_read_paths=[working_dir],
         )
+        _print_neo_greeting(prompt, working_dir)
 
         # Gather context from working directory unless --no-scan
         if not args.no_scan:
