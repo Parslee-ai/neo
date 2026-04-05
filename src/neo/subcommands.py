@@ -117,12 +117,23 @@ def show_version(codebase_root: Optional[str] = None):
     print(f"{bar}")
     print(f"{total_entries} patterns | {avg_confidence:.2f} avg confidence")
 
-    # Check for contributable facts
+    # Community contribution status
     if memory_backend == "fact_store" and hasattr(memory, 'find_contributable'):
         contributable = memory.find_contributable()
         if contributable:
             print(f"\n\u2728 {len(contributable)} pattern(s) ready to share with the community")
             print("   Run: neo contribute")
+        else:
+            # Show progress toward contribution
+            valid = [f for f in entries if getattr(f, 'is_valid', True)]
+            near = [f for f in valid
+                    if hasattr(f, 'metadata')
+                    and f.metadata.confidence >= 0.6
+                    and f.metadata.success_count >= 1]
+            if near:
+                print(f"\n\u26a1 {len(near)} pattern(s) growing toward community contribution")
+            else:
+                print("\n\u26a1 Use neo to build patterns — validated ones can be shared via: neo contribute")
     print()
 
 
