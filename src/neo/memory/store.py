@@ -426,6 +426,29 @@ class FactStore:
         """Backward-compatible access to all facts."""
         return self._facts
 
+    def find_contributable(self, min_confidence: float = 0.8,
+                           min_successes: int = 3) -> list[Fact]:
+        """Find high-quality facts worth contributing to the community feed.
+
+        Criteria: high confidence, real success validation, not already
+        from seed/community feeds, not constraints (project-specific).
+        """
+        auto_tags = {"seed", "community", "constraint", "history", "git-commit"}
+        results = []
+        for f in self._facts:
+            if not f.is_valid:
+                continue
+            if f.kind == FactKind.CONSTRAINT:
+                continue
+            if f.metadata.confidence < min_confidence:
+                continue
+            if f.metadata.success_count < min_successes:
+                continue
+            if auto_tags & set(f.tags):
+                continue
+            results.append(f)
+        return results
+
     # ------------------------------------------------------------------ #
     # Scope capacity enforcement
     # ------------------------------------------------------------------ #

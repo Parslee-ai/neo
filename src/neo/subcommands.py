@@ -115,7 +115,61 @@ def show_version(codebase_root: Optional[str] = None):
     print(f"Storage: {storage_info}")
     print(f"Stage: {stage} | Memory: {level:.1%}")
     print(f"{bar}")
-    print(f"{total_entries} patterns | {avg_confidence:.2f} avg confidence\n")
+    print(f"{total_entries} patterns | {avg_confidence:.2f} avg confidence")
+
+    # Check for contributable facts
+    if memory_backend == "fact_store" and hasattr(memory, 'find_contributable'):
+        contributable = memory.find_contributable()
+        if contributable:
+            print(f"\n\u2728 {len(contributable)} pattern(s) ready to share with the community")
+            print("   Run: neo contribute")
+    print()
+
+
+def handle_contribute(args):
+    """Export high-quality patterns and open a GitHub PR draft."""
+    from neo.config import NeoConfig
+    from neo.memory.store import FactStore
+
+    codebase_root = getattr(args, 'cwd', None) or os.getcwd()
+    config = NeoConfig.load()
+    memory = FactStore(codebase_root=codebase_root, config=config, eager_init=False)
+
+    contributable = memory.find_contributable()
+    if not contributable:
+        print("No patterns ready to contribute yet.")
+        print("Patterns qualify when they reach high confidence (>0.8) with 3+ successes.")
+        return
+
+    print(f"Found {len(contributable)} pattern(s) ready to contribute:\n")
+
+    # Anonymize and format for community_facts.json
+    exported = []
+    for fact in contributable:
+        # Strip identifying info
+        entry = {
+            "subject": fact.subject,
+            "body": fact.body,
+            "kind": fact.kind.value,
+            "tags": [t for t in fact.tags
+                     if t not in ("auto-ingested", "claude-memory", "synthesized")],
+        }
+        exported.append(entry)
+        conf = fact.metadata.confidence
+        successes = fact.metadata.success_count
+        print(f"  [{conf:.0%} confidence, {successes} successes] {fact.subject}")
+        print(f"    {fact.body[:100]}{'...' if len(fact.body) > 100 else ''}")
+        print()
+
+    # Write to temp file
+    import json
+    import tempfile
+    export_data = {"contributed_by": "neo-user", "facts": exported}
+    export_file = Path(tempfile.gettempdir()) / "neo_contribution.json"
+    export_file.write_text(json.dumps(export_data, indent=2))
+    print(f"Exported to: {export_file}")
+    print("\nTo contribute, open a PR adding these to community_facts.json:")
+    print("  https://github.com/Parslee-ai/neo/edit/main/community_facts.json")
 
 
 def show_help():

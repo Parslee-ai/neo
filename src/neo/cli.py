@@ -66,6 +66,17 @@ def parse_args():
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
 
+    # Detect if 'contribute' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'contribute':
+        p = argparse.ArgumentParser(
+            prog="neo contribute",
+            description="Export high-quality patterns for community contribution",
+            parents=[global_parser]
+        )
+        args = p.parse_args(sys.argv[2:])
+        args.command = 'contribute'
+        return args
+
     # Detect if 'update' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'update':
         p = argparse.ArgumentParser(
@@ -347,6 +358,12 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(1)
+
+    # Handle contribute subcommand
+    if hasattr(args, 'command') and args.command == 'contribute':
+        from neo.subcommands import handle_contribute
+        handle_contribute(args)
+        sys.exit(0)
 
     # Handle update subcommand
     if hasattr(args, 'command') and args.command == 'update':
