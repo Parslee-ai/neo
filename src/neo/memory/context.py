@@ -6,7 +6,6 @@ then renders them as a formatted string for prompt injection.
 """
 
 import logging
-import time
 from typing import Optional
 
 import numpy as np
