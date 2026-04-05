@@ -24,6 +24,9 @@ def store(tmp_facts_dir, tmp_path):
     with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
          patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
          patch.object(FactStore, "_ingest_constraints"), \
+         patch.object(FactStore, "_ingest_seed_facts"), \
+         patch.object(FactStore, "_ingest_community_feed"), \
+         patch.object(FactStore, "_ingest_claude_memory"), \
          patch.object(FactStore, "_maybe_migrate"), \
          patch("neo.memory.store.FASTEMBED_AVAILABLE", False):
         s = FactStore(codebase_root=str(tmp_path))
@@ -206,6 +209,9 @@ class TestPersistence:
         with patch("neo.memory.store.FACTS_DIR", store._global_path.parent), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
              patch("neo.memory.store.ConstraintIngester") as mock_ingester, \
+             patch.object(FactStore, "_ingest_seed_facts"), \
+             patch.object(FactStore, "_ingest_community_feed"), \
+             patch.object(FactStore, "_ingest_claude_memory"), \
              patch("neo.memory.store.FASTEMBED_AVAILABLE", False):
             mock_ingester.return_value.ingest.return_value = ([], [])
             store2 = FactStore(codebase_root=store.codebase_root)
@@ -1128,6 +1134,9 @@ class TestConstraintEmbeddings:
         with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
              patch.object(FactStore, "_maybe_migrate"), \
+             patch.object(FactStore, "_ingest_seed_facts"), \
+             patch.object(FactStore, "_ingest_community_feed"), \
+             patch.object(FactStore, "_ingest_claude_memory"), \
              patch.object(FactStore, "_embed_text", return_value=fake_emb):
             s = FactStore(codebase_root=str(tmp_path))
 

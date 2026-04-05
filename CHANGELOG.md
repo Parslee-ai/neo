@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.1] - 2026-04-05
+
+### Added
+- Ship 20 curated seed facts (security, performance, reliability, correctness) with every release — `pip install` is now a knowledge upgrade
+- Community fact feed: neo fetches crowd-curated patterns from GitHub daily, updated between releases via PR
+- `neo contribute` command: exports anonymized high-quality patterns for community contribution
+- `neo --version` shows contribution hint when local patterns qualify (confidence >0.8, 3+ successes)
+- Auto-update enabled by default (`auto_install_updates: true`)
+
+### Fixed
+- Fix CI: patch all ingesters in test fixtures to prevent seed/community facts from leaking into unit tests
+
 ## [0.13.0] - 2026-04-05
 
 ### Fixed
