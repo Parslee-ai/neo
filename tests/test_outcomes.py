@@ -16,6 +16,7 @@ class FakeSuggestion:
     file_path: str = ""
     description: str = ""
     confidence: float = 0.8
+    unified_diff: str = ""
 
 
 @pytest.fixture
@@ -418,3 +419,122 @@ class TestIsCodeFile:
 
     def test_no_extension_is_not_code(self):
         assert OutcomeTracker._is_code_file("Makefile") is False
+
+
+class TestComputeDiffOverlap:
+    def test_identical_diffs(self):
+        diff = "+line1\n+line2\n-line3"
+        assert OutcomeTracker._compute_diff_overlap(diff, diff) == 1.0
+
+    def test_completely_different_diffs(self):
+        suggested = "+add_validation(x)\n-old_code()"
+        actual = "+completely_different()\n-other_thing()"
+        assert OutcomeTracker._compute_diff_overlap(suggested, actual) == 0.0
+
+    def test_partial_overlap(self):
+        suggested = "+line1\n+line2\n-line3"
+        actual = "+line1\n+different\n-line3"
+        overlap = OutcomeTracker._compute_diff_overlap(suggested, actual)
+        # 2 of 4 unique lines match ("+line1" and "-line3")
+        assert 0.4 <= overlap <= 0.6
+
+    def test_both_empty(self):
+        assert OutcomeTracker._compute_diff_overlap("", "") == 1.0
+
+    def test_one_empty(self):
+        assert OutcomeTracker._compute_diff_overlap("+line", "") == 0.0
+        assert OutcomeTracker._compute_diff_overlap("", "+line") == 0.0
+
+    def test_ignores_diff_headers(self):
+        suggested = "--- a/foo.py\n+++ b/foo.py\n@@ -1,3 +1,3 @@\n+real_line"
+        actual = "--- a/foo.py\n+++ b/foo.py\n@@ -5,3 +5,3 @@\n+real_line"
+        # Only "+real_line" counts as a change line
+        assert OutcomeTracker._compute_diff_overlap(suggested, actual) == 1.0
+
+    def test_no_change_lines_in_either(self):
+        suggested = "--- a/foo.py\n+++ b/foo.py"
+        actual = "--- a/bar.py\n+++ b/bar.py"
+        # No change lines extracted from either -> both empty -> 1.0
+        assert OutcomeTracker._compute_diff_overlap(suggested, actual) == 1.0
+
+
+class TestModifiedOutcome:
+    def test_modified_when_diff_diverges(self, tracker):
+        """When suggested diff and actual diff have low overlap, outcome is 'modified'."""
+        suggested_diff = "+validate_input(data)\n-process(data)"
+        suggestions = [
+            FakeSuggestion(
+                file_path="src/foo.py",
+                description="Add validation",
+                confidence=0.9,
+                unified_diff=suggested_diff,
+            ),
+        ]
+        tracker.save_session(suggestions, "fix bug")
+
+        actual_diff = "+completely_rewritten()\n-something_else()"
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value=actual_diff):
+            outcomes, _ = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome_type == "modified"
+        assert outcomes[0].file_path == "src/foo.py"
+        assert outcomes[0].suggestion_description == "Add validation"
+
+    def test_accepted_when_diff_matches(self, tracker):
+        """When suggested diff and actual diff overlap well, outcome is 'accepted'."""
+        suggested_diff = "+validate_input(data)\n-process(data)"
+        suggestions = [
+            FakeSuggestion(
+                file_path="src/foo.py",
+                description="Add validation",
+                confidence=0.9,
+                unified_diff=suggested_diff,
+            ),
+        ]
+        tracker.save_session(suggestions, "fix bug")
+
+        # Actual diff matches the suggestion
+        actual_diff = "+validate_input(data)\n-process(data)\n+extra_line()"
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value=actual_diff):
+            outcomes, _ = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome_type == "accepted"
+
+    def test_accepted_when_no_suggested_diff(self, tracker):
+        """When no suggested_diff was stored (old session), default to 'accepted'."""
+        suggestions = [
+            FakeSuggestion(
+                file_path="src/foo.py",
+                description="Add validation",
+                confidence=0.9,
+                # No unified_diff
+            ),
+        ]
+        tracker.save_session(suggestions, "fix bug")
+
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value="+any_change"):
+            outcomes, _ = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome_type == "accepted"
+
+    def test_suggested_diff_persisted_in_session(self, tracker):
+        """Verify suggested_diff is saved and loaded in session records."""
+        suggestions = [
+            FakeSuggestion(
+                file_path="src/foo.py",
+                description="Fix",
+                confidence=0.8,
+                unified_diff="+new_code\n-old_code",
+            ),
+        ]
+        tracker.save_session(suggestions, "fix")
+
+        session = tracker._load_previous_session()
+        assert session is not None
+        assert session.suggestions[0]["suggested_diff"] == "+new_code\n-old_code"

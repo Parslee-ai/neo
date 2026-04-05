@@ -16,7 +16,7 @@ try:
 except ImportError:
     pass
 
-from neo.cli import LMAdapter
+from neo.models import LMAdapter
 
 
 # ============================================================================

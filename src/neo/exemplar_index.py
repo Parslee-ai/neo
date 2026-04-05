@@ -10,12 +10,8 @@ import pickle
 from pathlib import Path
 from typing import Any, Optional, Union
 
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 # ============================================================================
@@ -76,12 +72,6 @@ class ExemplarIndex:
         Args:
             storage_path: Path to store the index (default: ~/.neo/exemplars.pkl)
         """
-        if not SKLEARN_AVAILABLE:
-            raise ImportError(
-                "sklearn required for exemplar indexing. "
-                "Install with: pip install scikit-learn numpy"
-            )
-
         self.exemplars: list[Exemplar] = []
         self.vectorizer = TfidfVectorizer(
             max_features=1000,
@@ -365,7 +355,7 @@ def create_exemplar_index(
     Returns:
         ExemplarIndex or SimpleExemplarIndex
     """
-    if use_vectors and SKLEARN_AVAILABLE:
+    if use_vectors:
         return ExemplarIndex(storage_path)
     else:
         return SimpleExemplarIndex(storage_path)

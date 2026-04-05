@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from neo import CodeSuggestion, StaticCheckResult
+from neo.models import CodeSuggestion, StaticCheckResult
 
 
 # ============================================================================

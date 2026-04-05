@@ -13,7 +13,7 @@ from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from neo.prompt.knowledge_base import PromptKnowledgeBase
-    from neo.cli import LMAdapter
+    from neo.models import LMAdapter
 
 logger = logging.getLogger(__name__)
 

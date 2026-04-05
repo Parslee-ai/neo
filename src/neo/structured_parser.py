@@ -10,12 +10,7 @@ import logging
 from typing import Any, Optional
 from dataclasses import dataclass
 
-try:
-    from jsonschema import validate, ValidationError
-    JSONSCHEMA_AVAILABLE = True
-except ImportError:
-    JSONSCHEMA_AVAILABLE = False
-    logging.warning("jsonschema not available, schema validation disabled")
+from jsonschema import validate, ValidationError
 
 from neo.schemas import (
     SCHEMA_VERSION,
@@ -298,10 +293,6 @@ def validate_schema(data: dict, schema: dict) -> ParseResult:
     Returns:
         ParseResult with validation result
     """
-    if not JSONSCHEMA_AVAILABLE:
-        logger.warning("jsonschema not available, skipping validation")
-        return ParseResult(success=True, data=data)
-
     try:
         validate(instance=data, schema=schema)
 

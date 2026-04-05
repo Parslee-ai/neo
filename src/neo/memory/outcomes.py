@@ -44,7 +44,7 @@ class SessionRecord:
 @dataclass
 class Outcome:
     """A detected outcome from comparing suggestions to actual changes."""
-    outcome_type: str  # "accepted", "independent"
+    outcome_type: str  # "accepted", "modified", "independent"
     file_path: str
     diff_summary: str = ""  # actual git diff content (truncated)
     suggestion_description: str = ""  # empty for independent changes
@@ -102,6 +102,7 @@ class OutcomeTracker:
                 "file_path": file_path,
                 "description": getattr(s, "description", "")[:500],
                 "confidence": getattr(s, "confidence", 0.0),
+                "suggested_diff": getattr(s, "unified_diff", "")[:2000],
             })
 
         session = SessionRecord(
@@ -154,8 +155,9 @@ class OutcomeTracker:
 
         outcomes = self._match_to_suggestions(changed_files, prev)
         accepted = sum(1 for o in outcomes if o.outcome_type == "accepted")
+        modified = sum(1 for o in outcomes if o.outcome_type == "modified")
         independent = sum(1 for o in outcomes if o.outcome_type == "independent")
-        logger.info(f"Outcomes: {accepted} accepted, {independent} independent")
+        logger.info(f"Outcomes: {accepted} accepted, {modified} modified, {independent} independent")
         return outcomes, prev.suggestion_fact_ids
 
     def _load_previous_session(self) -> Optional[SessionRecord]:
@@ -241,8 +243,17 @@ class OutcomeTracker:
 
             if normalized in changed_files or file_path in changed_files:
                 diff = self._get_file_diff_since(normalized, session.timestamp)
+                suggested_diff = sugg.get("suggested_diff", "")
+
+                # Determine if user applied our suggestion or did something different
+                if suggested_diff and diff:
+                    overlap = self._compute_diff_overlap(suggested_diff, diff)
+                    outcome_type = "accepted" if overlap > 0.3 else "modified"
+                else:
+                    outcome_type = "accepted"
+
                 outcomes.append(Outcome(
-                    outcome_type="accepted",
+                    outcome_type=outcome_type,
                     file_path=normalized,
                     diff_summary=diff,
                     suggestion_description=sugg.get("description", ""),
@@ -343,6 +354,32 @@ class OutcomeTracker:
         except (ValueError, TypeError):
             pass
         return path
+
+    @staticmethod
+    def _compute_diff_overlap(suggested: str, actual: str) -> float:
+        """Compute line-level overlap between suggested and actual diffs.
+
+        Returns 0.0-1.0 where 1.0 means identical changes.
+        """
+        def extract_change_lines(diff_text: str) -> set[str]:
+            lines = set()
+            for line in diff_text.split("\n"):
+                stripped = line.strip()
+                if stripped.startswith(("+", "-")) and not stripped.startswith(("+++", "---", "@@")):
+                    lines.add(stripped)
+            return lines
+
+        suggested_lines = extract_change_lines(suggested)
+        actual_lines = extract_change_lines(actual)
+
+        if not suggested_lines and not actual_lines:
+            return 1.0
+        if not suggested_lines or not actual_lines:
+            return 0.0
+
+        intersection = suggested_lines & actual_lines
+        union = suggested_lines | actual_lines
+        return len(intersection) / len(union) if union else 0.0
 
     # ------------------------------------------------------------------ #
     # Git history ingestion

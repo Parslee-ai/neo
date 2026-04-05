@@ -4,9 +4,12 @@ Neo learns prevention rules from its own mistakes.
 """
 
 import json
+import logging
 from typing import Optional, Dict
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,7 +47,24 @@ class PatternLibrary:
             json.dump(data, f, indent=2)
 
     def add_pattern(self, pattern: PreventionPattern):
-        """Add or update a pattern."""
+        """Add or update a pattern. Rejects junk entries with empty or placeholder fields."""
+        # Validate: reject patterns with empty keywords
+        if not pattern.signature_keywords:
+            logger.warning("Rejecting pattern with empty signature_keywords (bug_category=%s)", pattern.bug_category)
+            return
+
+        # Validate: reject patterns with empty/placeholder prevention_rule
+        rule = (pattern.prevention_rule or "").strip().strip("*")
+        if not rule:
+            logger.warning("Rejecting pattern with empty prevention_rule (bug_category=%s)", pattern.bug_category)
+            return
+
+        # Validate: reject patterns with empty/placeholder common_mistake
+        mistake = (pattern.common_mistake or "").strip().strip("*")
+        if not mistake:
+            logger.warning("Rejecting pattern with empty common_mistake (bug_category=%s)", pattern.bug_category)
+            return
+
         key = f"{pattern.bug_category}_{len(pattern.signature_keywords)}"
 
         if key in self.patterns:

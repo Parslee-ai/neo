@@ -25,6 +25,7 @@ from neo.memory.seed import SeedIngester
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope
 from neo.memory.outcomes import OutcomeTracker
 from neo.memory.scope import detect_org_and_project
+from neo.pattern_extraction import extract_pattern_from_correction, get_library
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +388,29 @@ class FactStore:
                 body = "\n".join(body_parts)
                 tags = ["outcome", "accepted"]
                 confidence = min(1.0, outcome.suggestion_confidence + 0.1)
+            elif outcome.outcome_type == "modified":
+                # User corrected neo's suggestion - learn from the correction
+                subject = f"outcome:modified {outcome.file_path}"
+                body_parts = [
+                    f"User modified neo's suggestion for {outcome.file_path}.",
+                    f"Original suggestion: {outcome.suggestion_description}",
+                    f"Original confidence: {outcome.suggestion_confidence:.2f}",
+                ]
+                if outcome.diff_summary:
+                    body_parts.append(f"What user actually did:\n{outcome.diff_summary}")
+                body = "\n".join(body_parts)
+                tags = ["outcome", "modified"]
+                confidence = 0.4
+
+                # Demote the original suggestion fact since it was corrected
+                fact_id = suggestion_fact_ids.get(outcome.file_path)
+                original_fact = facts_by_id.get(fact_id) if fact_id else None
+                if original_fact and original_fact.is_valid:
+                    original_fact.metadata.confidence = max(
+                        0.1, original_fact.metadata.confidence - 0.2
+                    )
+                    original_fact.metadata.last_accessed = time.time()
+                    linked_count += 1
             elif outcome.outcome_type == "independent":
                 subject = f"outcome:independent {outcome.file_path}"
                 body_parts = [f"User changed {outcome.file_path} (not suggested by neo)."]
@@ -412,14 +436,34 @@ class FactStore:
 
         if linked_count:
             self.save()
-            logger.info(f"Boosted {linked_count} original fact(s) from accepted outcomes")
+            logger.info(f"Boosted/demoted {linked_count} original fact(s) from outcomes")
         if outcomes:
-            logger.info(f"Processed {len(outcomes)} outcome(s) from previous session")
+            modified = sum(1 for o in outcomes if o.outcome_type == "modified")
+            logger.info(f"Processed {len(outcomes)} outcome(s): modified={modified}")
             # Chain maintenance: synthesize -> prune stale -> demote unhelpful -> purge dead
             self.synthesize_reviews()
             self.prune_stale_facts()
             self.demote_unhelpful_facts()
             self.purge_dead_facts()
+
+        # Extract prevention patterns from corrections
+        modified_outcomes = [o for o in outcomes if o.outcome_type == "modified"]
+        if modified_outcomes and self._lm_adapter:
+            for outcome in modified_outcomes[:3]:  # Limit to 3 per session
+                try:
+                    pattern = extract_pattern_from_correction(
+                        problem_description=outcome.suggestion_description,
+                        failed_code=outcome.suggestion_description,  # Best we have
+                        corrected_code=outcome.diff_summary,
+                        bug_category="suggestion-mismatch",
+                        root_cause=f"Neo's suggestion for {outcome.file_path} was modified by user",
+                        adapter=self._lm_adapter,
+                    )
+                    library = get_library()
+                    library.add_pattern(pattern)
+                    logger.info(f"Learned prevention pattern from correction on {outcome.file_path}")
+                except Exception as e:
+                    logger.warning(f"Pattern extraction from correction failed: {e}")
 
     @property
     def entries(self) -> list[Fact]:

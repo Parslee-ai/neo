@@ -10,28 +10,9 @@ import os
 from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 
-try:
-    from pattern_extraction import extract_pattern_from_correction, get_library, generate_prevention_warnings
-    PATTERN_EXTRACTION_AVAILABLE = True
-except ImportError:
-    PATTERN_EXTRACTION_AVAILABLE = False
-
-try:
-    CONSTRAINT_VERIFICATION_AVAILABLE = True
-except ImportError:
-    CONSTRAINT_VERIFICATION_AVAILABLE = False
-
-try:
-    from algorithm_design import design_algorithm, generate_code_from_design
-    ALGORITHM_DESIGN_AVAILABLE = True
-except ImportError:
-    ALGORITHM_DESIGN_AVAILABLE = False
-
-try:
-    from input_templates import extract_input_template, generate_solution_with_template, should_use_template
-    INPUT_TEMPLATE_AVAILABLE = True
-except ImportError:
-    INPUT_TEMPLATE_AVAILABLE = False
+from neo.pattern_extraction import extract_pattern_from_correction, get_library, generate_prevention_warnings
+from neo.algorithm_design import design_algorithm, generate_code_from_design
+from neo.input_templates import extract_input_template, generate_solution_with_template, should_use_template
 
 
 @dataclass
@@ -258,7 +239,7 @@ def iterative_solve_with_correction(
 
     # Get prevention warnings from learned patterns
     prevention_warnings = ""
-    if PATTERN_EXTRACTION_AVAILABLE and learn_patterns:
+    if learn_patterns:
         library = get_library()
         prevention_warnings = generate_prevention_warnings(
             problem['question_content'],
@@ -268,7 +249,7 @@ def iterative_solve_with_correction(
 
     # Try input template generation first (Liotta's 10x recommendation)
     input_template = None
-    if INPUT_TEMPLATE_AVAILABLE and should_use_template(problem['question_content']):
+    if should_use_template(problem['question_content']):
         input_template = extract_input_template(problem['question_content'], adapter)
 
     if input_template:
@@ -318,7 +299,7 @@ Return ONLY executable Python code, no explanations.{memory_context}{prevention_
         if test_result.passed:
             # If we corrected on attempt >1, learn from the correction
             pattern_learned = False
-            if attempt > 0 and learn_patterns and PATTERN_EXTRACTION_AVAILABLE:
+            if attempt > 0 and learn_patterns:
                 first_failed_code = attempts[0]['code']
                 pattern_learned = learn_from_correction(
                     problem,
@@ -347,7 +328,7 @@ Return ONLY executable Python code, no explanations.{memory_context}{prevention_
 
         if attempt < max_attempts - 1:
             # Use algorithm design for correction (70% success rate)
-            if attempt == 0 and ALGORITHM_DESIGN_AVAILABLE:
+            if attempt == 0:
                 # First failure: Design algorithm properly
                 algorithm_design = design_algorithm(problem['question_content'], adapter)
                 current_code = generate_code_from_design(
@@ -389,9 +370,6 @@ def learn_from_correction(
 
     Returns True if pattern was learned.
     """
-    if not PATTERN_EXTRACTION_AVAILABLE:
-        return False
-
     try:
         pattern = extract_pattern_from_correction(
             problem['question_content'],

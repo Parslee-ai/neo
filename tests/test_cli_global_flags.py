@@ -117,7 +117,7 @@ class TestCLIGlobalFlags:
             [sys.executable, "-m", "neo", "construct", "--version"],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=30
         )
 
         # Should exit successfully

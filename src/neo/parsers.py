@@ -7,7 +7,7 @@ NO FALLBACKS - If parsing fails, we want to see the real error so we can fix it.
 import re
 from typing import Any, Optional
 
-from neo import CodeSuggestion, PlanStep, SimulationTrace
+from neo.models import CodeSuggestion, PlanStep, SimulationTrace
 
 
 # ============================================================================

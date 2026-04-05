@@ -28,6 +28,8 @@ from neo.models import (
     TaskType,
 )
 
+from neo.pattern_extraction import generate_prevention_warnings, get_library
+
 if TYPE_CHECKING:
     from neo.config import NeoConfig  # noqa: F401
     from neo.exemplar_index import ExemplarIndex  # noqa: F401
@@ -60,8 +62,6 @@ class NeoEngine:
         self,
         lm_adapter: LMAdapter,
         exemplar_index: Optional["ExemplarIndex"] = None,
-        enable_enhanced_simulation: bool = True,
-        enable_iterative_refinement: bool = False,  # Off by default for speed
         enable_persistent_memory: bool = True,  # Persistent learning enabled by default
         codebase_root: Optional[str] = None,  # Root directory of the codebase being analyzed
         config: Optional[Any] = None,  # NeoConfig instance
@@ -69,30 +69,11 @@ class NeoEngine:
         self.lm = lm_adapter
         self.exemplar_index = exemplar_index
         self.context: Optional[NeoInput] = None
-        self.enable_enhanced_simulation = enable_enhanced_simulation
-        self.enable_iterative_refinement = enable_iterative_refinement
         self.enable_persistent_memory = enable_persistent_memory
         self.codebase_root = codebase_root
 
         # Load beat deck for personality templates (no LLM call)
         self.beat_deck = self._load_beat_deck()
-
-        # Initialize enhanced modules if enabled
-        if enable_enhanced_simulation:
-            try:
-                from enhanced_simulation import EnhancedSimulator
-                self.enhanced_simulator = EnhancedSimulator(lm_adapter)
-            except ImportError:
-                self.enhanced_simulator = None
-
-        if enable_iterative_refinement:
-            try:
-                from iterative_refinement import IterativeRefiner
-                self.refiner = IterativeRefiner(lm_adapter, max_iterations=3)
-            except ImportError:
-                self.refiner = None
-        else:
-            self.refiner = None
 
         # Initialize persistent memory (per-codebase)
         # Supports two backends: "fact_store" (new) and "legacy" (PersistentReasoningMemory)
@@ -609,6 +590,15 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         if past_learnings:
             past_learnings_str = "\n\nRELEVANT PATTERNS (use these insights):\n" + "\n".join(f"{i+1}. {pl}" for i, pl in enumerate(past_learnings[:3]))
 
+        # Prevention warnings from learned patterns
+        prevention_str = ""
+        library = get_library()
+        prevention_str = generate_prevention_warnings(
+            context.get("prompt", ""),
+            None,
+            library
+        )
+
         return f"""Output 3 JSON blocks using this EXACT format:
 
 <<<NEO:SCHEMA=v3:KIND=plan>>>
@@ -621,7 +611,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
 [{{"file_path":"/path","unified_diff":"diff","code_block":"code","description":"desc","confidence":0.9,"tradeoffs":[],"schema_version":"3"}}]
 <<<END:code>>>
 
-TASK: {context_str}{past_learnings_str}
+TASK: {context_str}{past_learnings_str}{prevention_str}
 
 RULES:
 - Start with <<<NEO:SCHEMA=v3:KIND=plan>>> immediately
