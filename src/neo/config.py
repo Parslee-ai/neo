@@ -66,7 +66,16 @@ class NeoConfig:
         valid_fields = set(inspect.signature(cls).parameters.keys())
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
 
-        return cls(**filtered_data)
+        config = cls(**filtered_data)
+
+        # One-time migration: auto_install_updates default changed to True
+        # in 0.13.1. Old configs saved False as the default. Flip it unless
+        # the user explicitly opted out (marked by _auto_update_explicit).
+        if (data.get("auto_install_updates") is False
+                and "_auto_update_explicit" not in data):
+            config.auto_install_updates = True
+
+        return config
 
     @classmethod
     def from_env(cls) -> "NeoConfig":
@@ -157,6 +166,10 @@ class NeoConfig:
             'constraint_auto_scan': self.constraint_auto_scan,
             'log_level': self.log_level,
         }
+
+        # Mark explicit opt-out so migration doesn't override it
+        if self.auto_install_updates is False:
+            exposed_fields['_auto_update_explicit'] = True
 
         with open(path, "w") as f:
             json.dump(exposed_fields, f, indent=2)
