@@ -1,0 +1,67 @@
+{
+  "version": "1",
+  "updated": "2026-04-05",
+  "description": "Community-curated patterns. Updated between releases via PR.",
+  "facts": [
+    {
+      "subject": "Docker layer caching order",
+      "body": "In Dockerfiles, copy dependency manifests (package.json, requirements.txt, Cargo.toml) and install dependencies BEFORE copying source code. This lets Docker cache the expensive install layer. Pattern: COPY package.json → RUN npm install → COPY . → RUN npm build. Changing source code won't re-download dependencies.",
+      "kind": "pattern",
+      "tags": ["docker", "devops", "performance"]
+    },
+    {
+      "subject": "GraphQL N+1 requires dataloader",
+      "body": "GraphQL resolvers that fetch related data per-field cause N+1 queries just like ORMs. Use DataLoader (or equivalent batching layer) to coalesce individual loads into batch queries within a single request. Without it, a query fetching 50 users with their posts fires 51 queries. DataLoader batches all 50 post-fetches into one.",
+      "kind": "pattern",
+      "tags": ["graphql", "performance", "api"]
+    },
+    {
+      "subject": "Kubernetes liveness vs readiness probes",
+      "body": "Liveness probes restart containers that are stuck (deadlocked, infinite loop). Readiness probes remove pods from service load balancing when they can't handle traffic (warming up, overloaded). Common mistake: making liveness probe hit a dependency — if the DB is down, restarting your app won't fix it. Liveness should check the process itself, readiness should check dependencies.",
+      "kind": "pattern",
+      "tags": ["kubernetes", "devops", "reliability"]
+    },
+    {
+      "subject": "CORS preflight caching saves latency",
+      "body": "Browsers send an OPTIONS preflight request before cross-origin requests with custom headers. Without `Access-Control-Max-Age`, this happens on every request — doubling latency. Set `Access-Control-Max-Age: 86400` (24h) to cache preflight results. Also: simple GET/POST requests with standard headers skip preflight entirely.",
+      "kind": "pattern",
+      "tags": ["frontend", "api", "performance"]
+    },
+    {
+      "subject": "Postgres VACUUM and bloat prevention",
+      "body": "Postgres MVCC leaves dead tuples after UPDATE/DELETE. Without VACUUM, table bloat grows unbounded, slowing queries and wasting disk. Autovacuum handles most cases but can fall behind on write-heavy tables. Monitor `n_dead_tup` in `pg_stat_user_tables`. For bulk operations: `VACUUM (VERBOSE) tablename` after large deletes. Set `autovacuum_vacuum_scale_factor` lower (0.01) for large tables.",
+      "kind": "pattern",
+      "tags": ["postgres", "database", "performance"]
+    },
+    {
+      "subject": "Type narrowing eliminates runtime checks",
+      "body": "In TypeScript, use discriminated unions (`type Result = { ok: true, data: T } | { ok: false, error: E }`) instead of optional fields. The compiler narrows types after checking the discriminant — no runtime type guards needed. Same principle in Rust (enums), Python (Literal types), and Go (interface type assertions). Eliminates entire classes of null-check bugs.",
+      "kind": "pattern",
+      "tags": ["typescript", "rust", "correctness"]
+    },
+    {
+      "subject": "Index-only scans for read-heavy queries",
+      "body": "If a query only needs columns that are in the index, the database can answer from the index alone without touching the heap. In Postgres: use INCLUDE columns in indexes (`CREATE INDEX idx ON t(a) INCLUDE (b,c)`). Verify with EXPLAIN — look for 'Index Only Scan'. Can be 10-100x faster for analytics queries on large tables.",
+      "kind": "pattern",
+      "tags": ["database", "postgres", "performance"]
+    },
+    {
+      "subject": "WebSocket heartbeat prevents silent disconnects",
+      "body": "TCP connections can die silently (NAT timeout, mobile network switch, load balancer idle timeout). Without heartbeats, both sides think the connection is alive. Implement ping/pong at the application level every 30s. Server-side: if no pong received within 10s, close and reconnect. Client-side: if no ping received within 60s, reconnect. Don't rely on TCP keepalive alone — its default interval (2h) is too long.",
+      "kind": "pattern",
+      "tags": ["websocket", "reliability", "networking"]
+    },
+    {
+      "subject": "Idempotency keys for payment operations",
+      "body": "Network failures during payment API calls leave you uncertain whether the charge went through. Use idempotency keys: client generates a unique key per operation, server deduplicates. If the request is retried, the server returns the original result instead of charging twice. Store idempotency keys with TTL (24-48h). Applies to any operation where duplicate execution causes harm.",
+      "kind": "pattern",
+      "tags": ["api", "reliability", "payments"]
+    },
+    {
+      "subject": "CSS containment for rendering performance",
+      "body": "CSS `contain: layout style paint` tells the browser that an element's internals won't affect the rest of the page. This lets the browser skip re-layout/re-paint of contained subtrees when other parts change. Use on: list items in virtual scrollers, off-screen content, independently updating widgets. `content-visibility: auto` is the high-level shorthand — elements outside the viewport are skipped entirely.",
+      "kind": "pattern",
+      "tags": ["css", "frontend", "performance"]
+    }
+  ]
+}

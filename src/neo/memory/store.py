@@ -18,6 +18,7 @@ import numpy as np
 
 from neo.math_utils import cosine_similarity
 from neo.memory.claude_memory import ClaudeMemoryIngester
+from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.seed import SeedIngester
@@ -131,6 +132,7 @@ class FactStore:
 
         self._maybe_migrate()
         self._ingest_seed_facts()
+        self._ingest_community_feed()
         self._ingest_constraints()
         self._ingest_claude_memory()
         self._ingest_git_history()
@@ -786,6 +788,36 @@ class FactStore:
             logger.info(
                 f"Seed facts: {len(new_facts)} new, {len(superseded_facts)} superseded"
             )
+
+    def _ingest_community_feed(self) -> None:
+        """Fetch and ingest community-curated patterns from remote feed.
+
+        Checks once per day, caches locally, falls back to cache on
+        network failure. Patterns are contributed via PR and ship
+        between releases.
+        """
+        try:
+            ingester = CommunityFeedIngester(
+                org_id=self.org_id,
+                project_id=self.project_id,
+            )
+            new_facts, superseded_facts = ingester.ingest(self._facts)
+
+            if new_facts or superseded_facts:
+                for fact in new_facts:
+                    if fact.embedding is None:
+                        embed_text = f"{fact.subject} {fact.body}"
+                        fact.embedding = self._embed_text(embed_text)
+
+                self._facts.extend(new_facts)
+                self.save()
+                logger.info(
+                    f"Community feed: {len(new_facts)} new, "
+                    f"{len(superseded_facts)} superseded"
+                )
+        except Exception as e:
+            # Network failures should never block neo startup
+            logger.debug(f"Community feed ingestion failed: {e}")
 
     # ------------------------------------------------------------------ #
     # Constraint ingestion
