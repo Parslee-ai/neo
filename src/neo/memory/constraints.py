@@ -23,6 +23,10 @@ CONSTRAINT_FILES = [
     ("{project}/CLAUDE.md", FactScope.PROJECT),
     ("{project}/agents.md", FactScope.PROJECT),
     ("{project}/.cursor/rules", FactScope.PROJECT),
+    ("{project}/.cursorrules", FactScope.PROJECT),
+    ("{project}/.windsurfrules", FactScope.PROJECT),
+    ("{project}/.clinerules", FactScope.PROJECT),
+    ("{project}/.github/copilot-instructions.md", FactScope.PROJECT),
 ]
 
 CHECKSUM_DIR = Path.home() / ".neo" / "constraints"

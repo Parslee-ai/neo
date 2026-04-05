@@ -17,6 +17,7 @@ from typing import Any, Optional
 import numpy as np
 
 from neo.math_utils import cosine_similarity
+from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope
@@ -129,6 +130,7 @@ class FactStore:
 
         self._maybe_migrate()
         self._ingest_constraints()
+        self._ingest_claude_memory()
         self._ingest_git_history()
 
     def _ensure_embedder(self) -> None:
@@ -782,6 +784,32 @@ class FactStore:
             self.save()
             logger.info(
                 f"Constraints: {len(new_facts)} new, {len(superseded_facts)} superseded"
+            )
+
+    def _ingest_claude_memory(self) -> None:
+        """Ingest curated knowledge from Claude Code's auto-memory system.
+
+        Reads ~/.claude/projects/{project-id}/memory/*.md files that Claude
+        Code has distilled from past conversations. These are pre-curated,
+        high-quality facts about the project.
+        """
+        ingester = ClaudeMemoryIngester(
+            codebase_root=self.codebase_root or "",
+            org_id=self.org_id,
+            project_id=self.project_id,
+        )
+        new_facts, superseded_facts = ingester.ingest(self._facts)
+
+        if new_facts or superseded_facts:
+            for fact in new_facts:
+                if fact.embedding is None:
+                    embed_text = f"{fact.subject} {fact.body}"
+                    fact.embedding = self._embed_text(embed_text)
+
+            self._facts.extend(new_facts)
+            self.save()
+            logger.info(
+                f"Claude memory: {len(new_facts)} new, {len(superseded_facts)} superseded"
             )
 
     # ------------------------------------------------------------------ #
