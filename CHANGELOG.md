@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.14.0] - 2026-04-05
+
+### Fixed
+- Wire pattern learning pipeline that has been dead code since v0.7.0 — bare module imports silently caught by try/except ImportError disabled the entire self-correction and prevention pattern system
+- Fix all internal module imports (pattern_extraction, algorithm_design, input_templates) to use package-qualified `neo.X` paths
+- Remove phantom module imports (enhanced_simulation, iterative_refinement) that never existed
+- Delete ghost CONSTRAINT_VERIFICATION try/except block containing no actual import
+- Add validation to PatternLibrary.add_pattern rejecting junk entries with empty keywords or placeholder rules
+- Fix wrong import paths across 4 files (neo.cli/neo → neo.models for LMAdapter, CodeSuggestion, etc.)
+- Remove misleading ImportError guards on required dependencies (sklearn, jsonschema)
+- Fix flaky CLI subprocess test timeout (10s → 30s for construct subcommand with heavy imports)
+
+### Added
+- Prevention warnings from learned patterns now injected into every engine prompt
+- "Modified" outcome type detects when users correct neo's suggestions (compares suggested diff vs actual diff using Jaccard overlap at 30% threshold)
+- Prevention pattern extraction from user corrections via LLM analysis — neo learns from its mistakes
+- Original fact confidence demoted when suggestions are modified by users
+- Import health test suite (49 tests) verifying all modules import and no phantom modules exist — catches silent import failures in CI
+- Diff overlap and modified outcome tests (11 tests)
+- Neo-character greeting printed before context gathering, contextual to prompt and memory level (Matrix-themed beat deck, no LLM call)
+
+### Changed
+- Internal neo module imports converted from try/except fallback to direct imports — broken features now fail loudly at import time instead of silently disabling
+- Session records now persist suggested_diff for outcome comparison
+
 ## [0.13.3] - 2026-04-05
 
 ### Changed
