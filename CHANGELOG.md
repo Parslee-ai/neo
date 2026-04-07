@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.1] - 2026-04-07
+
+### Fixed
+- Auto-updater failing on Homebrew Python due to broken dependency RECORD files (e.g., pillow installed by Homebrew lacks RECORD metadata, causing "Cannot uninstall" errors). Added `--ignore-installed` flag for externally-managed environments.
+
 ## [0.15.0] - 2026-04-07
 
 ### Fixed
