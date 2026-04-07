@@ -9,6 +9,8 @@ Session data is persisted to ~/.neo/sessions/ so outcomes can be detected
 across invocations. History watermarks are persisted to avoid re-ingesting.
 """
 
+import datetime
+import enum
 import json
 import logging
 import subprocess
@@ -20,6 +22,20 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 SESSIONS_DIR = Path.home() / ".neo" / "sessions"
+
+# Cap independent outcomes per session to avoid flooding facts with noise.
+# This is the first layer of defense; store.py's MAX_INDEPENDENT_FACTS (50)
+# caps the total across sessions. Together: 5/session * ~10 sessions before
+# cap kicks in, then oldest are invalidated.
+MAX_INDEPENDENT_OUTCOMES = 5
+
+
+class OutcomeType(enum.Enum):
+    """Classification of what the user did after a neo suggestion."""
+    ACCEPTED = "accepted"       # User applied the suggestion (diff overlap > 0.3)
+    MODIFIED = "modified"       # User changed the file differently (overlap <= 0.3)
+    UNVERIFIED = "unverified"   # File changed but no diff to compare
+    INDEPENDENT = "independent" # User changed a file neo didn't suggest
 
 
 @dataclass
@@ -44,7 +60,7 @@ class SessionRecord:
 @dataclass
 class Outcome:
     """A detected outcome from comparing suggestions to actual changes."""
-    outcome_type: str  # "accepted", "modified", "independent"
+    outcome_type: OutcomeType
     file_path: str
     diff_summary: str = ""  # actual git diff content (truncated)
     suggestion_description: str = ""  # empty for independent changes
@@ -154,9 +170,9 @@ class OutcomeTracker:
         )
 
         outcomes = self._match_to_suggestions(changed_files, prev)
-        accepted = sum(1 for o in outcomes if o.outcome_type == "accepted")
-        modified = sum(1 for o in outcomes if o.outcome_type == "modified")
-        independent = sum(1 for o in outcomes if o.outcome_type == "independent")
+        accepted = sum(1 for o in outcomes if o.outcome_type == OutcomeType.ACCEPTED)
+        modified = sum(1 for o in outcomes if o.outcome_type == OutcomeType.MODIFIED)
+        independent = sum(1 for o in outcomes if o.outcome_type == OutcomeType.INDEPENDENT)
         logger.info(f"Outcomes: {accepted} accepted, {modified} modified, {independent} independent")
         return outcomes, prev.suggestion_fact_ids
 
@@ -182,7 +198,6 @@ class OutcomeTracker:
 
         try:
             # Convert timestamp to ISO format for git
-            import datetime
             since_iso = datetime.datetime.fromtimestamp(
                 since_timestamp, tz=datetime.timezone.utc
             ).isoformat()
@@ -248,9 +263,10 @@ class OutcomeTracker:
                 # Determine if user applied our suggestion or did something different
                 if suggested_diff and diff:
                     overlap = self._compute_diff_overlap(suggested_diff, diff)
-                    outcome_type = "accepted" if overlap > 0.3 else "modified"
+                    outcome_type = OutcomeType.ACCEPTED if overlap > 0.3 else OutcomeType.MODIFIED
                 else:
-                    outcome_type = "accepted"
+                    # Missing suggested_diff or actual diff — can't verify
+                    outcome_type = OutcomeType.UNVERIFIED
 
                 outcomes.append(Outcome(
                     outcome_type=outcome_type,
@@ -260,17 +276,26 @@ class OutcomeTracker:
                     suggestion_confidence=sugg.get("confidence", 0.0),
                 ))
 
-        # Detect independent changes (user changed files neo didn't suggest)
+        # Detect independent changes (user changed files neo didn't suggest).
+        # Rate-limited: keep only the top MAX_INDEPENDENT_OUTCOMES by diff size
+        # to avoid flooding facts with low-value noise in active repos.
+        independent_candidates: list[Outcome] = []
         for changed in changed_files:
             normalized = self._normalize_path(changed)
             if normalized not in suggested_files and changed not in suggested_files:
                 if self._is_code_file(changed):
                     diff = self._get_file_diff_since(changed, session.timestamp)
-                    outcomes.append(Outcome(
-                        outcome_type="independent",
+                    if not diff:
+                        continue  # No diff content = no learning signal
+                    independent_candidates.append(Outcome(
+                        outcome_type=OutcomeType.INDEPENDENT,
                         file_path=changed,
                         diff_summary=diff,
                     ))
+
+        # Keep only the most informative independent changes (deterministic: size desc, path asc)
+        independent_candidates.sort(key=lambda o: (-len(o.diff_summary), o.file_path))
+        outcomes.extend(independent_candidates[:MAX_INDEPENDENT_OUTCOMES])
 
         return outcomes
 
@@ -286,7 +311,6 @@ class OutcomeTracker:
         MAX_DIFF_CHARS = 2000
 
         try:
-            import datetime
             since_iso = datetime.datetime.fromtimestamp(
                 since_timestamp, tz=datetime.timezone.utc
             ).isoformat()
@@ -320,18 +344,12 @@ class OutcomeTracker:
             if not diff:
                 return ""
 
-            # Extract just the meaningful parts: keep only +/- lines and headers
-            summary_lines = []
-            for line in diff.split("\n"):
-                if line.startswith(("+++", "---", "@@", "+", "-")):
-                    # Skip binary/empty markers
-                    if line.startswith(("+++", "---")):
-                        summary_lines.append(line)
-                    elif line.startswith("@@"):
-                        summary_lines.append(line)
-                    elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-                        summary_lines.append(line)
-
+            # Extract meaningful parts: headers, hunks, and change lines
+            summary_lines = [
+                line for line in diff.split("\n")
+                if line.startswith(("+++", "---", "@@"))
+                or (line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
+            ]
             summary = "\n".join(summary_lines)
             if len(summary) > MAX_DIFF_CHARS:
                 summary = summary[:MAX_DIFF_CHARS] + "\n... (truncated)"
@@ -360,14 +378,17 @@ class OutcomeTracker:
         """Compute line-level overlap between suggested and actual diffs.
 
         Returns 0.0-1.0 where 1.0 means identical changes.
+        Preserves the +/- prefix so additions and removals of the same
+        content are not conflated.
         """
         def extract_change_lines(diff_text: str) -> set[str]:
-            lines = set()
-            for line in diff_text.split("\n"):
-                stripped = line.strip()
-                if stripped.startswith(("+", "-")) and not stripped.startswith(("+++", "---", "@@")):
-                    lines.add(stripped)
-            return lines
+            return {
+                line.strip()
+                for line in diff_text.split("\n")
+                if line.strip()
+                and line.strip()[0] in ("+", "-")
+                and not line.strip().startswith(("+++", "---", "@@"))
+            }
 
         suggested_lines = extract_change_lines(suggested)
         actual_lines = extract_change_lines(actual)
@@ -517,16 +538,12 @@ class OutcomeTracker:
             if result.returncode != 0 or not result.stdout.strip():
                 return ""
 
-            # Extract +/- lines and headers (same logic as _get_file_diff_since)
-            summary_lines = []
-            for line in result.stdout.split("\n"):
-                if line.startswith(("+++", "---")):
-                    summary_lines.append(line)
-                elif line.startswith("@@"):
-                    summary_lines.append(line)
-                elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-                    summary_lines.append(line)
-
+            # Extract meaningful parts: headers, hunks, and change lines
+            summary_lines = [
+                line for line in result.stdout.split("\n")
+                if line.startswith(("+++", "---", "@@"))
+                or (line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
+            ]
             summary = "\n".join(summary_lines)
             if len(summary) > MAX_DIFF_CHARS:
                 summary = summary[:MAX_DIFF_CHARS] + "\n... (truncated)"

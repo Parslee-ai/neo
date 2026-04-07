@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from neo.memory.outcomes import OutcomeTracker, SessionRecord
+from neo.memory.outcomes import OutcomeTracker, OutcomeType, SessionRecord
 
 
 @dataclass
@@ -121,19 +121,23 @@ class TestSessionRecordWithFactIds:
 
 class TestDetectOutcomesAccepted:
     def test_accepted_when_suggested_file_changed(self, tracker):
-        # Save a session with suggestions
+        # Save a session with suggestions (including a unified_diff for comparison)
+        suggested_diff = "+    validate_input(data)\n-    process(data)"
         suggestions = [
-            FakeSuggestion(file_path="src/foo.py", description="Add validation", confidence=0.9),
+            FakeSuggestion(
+                file_path="src/foo.py", description="Add validation",
+                confidence=0.9, unified_diff=suggested_diff,
+            ),
         ]
         tracker.save_session(suggestions, "fix bug")
 
-        # Mock git to return the same file as changed, with diff content
+        # Mock git to return the same file as changed, with matching diff content
         with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
-             patch.object(tracker, "_get_file_diff_since", return_value="+    validate_input(data)\n-    process(data)"):
+             patch.object(tracker, "_get_file_diff_since", return_value=suggested_diff):
             outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
-        assert outcomes[0].outcome_type == "accepted"
+        assert outcomes[0].outcome_type == OutcomeType.ACCEPTED
         assert outcomes[0].file_path == "src/foo.py"
         assert outcomes[0].suggestion_description == "Add validation"
         assert outcomes[0].suggestion_confidence == 0.9
@@ -150,7 +154,7 @@ class TestDetectOutcomesAccepted:
             outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
-        assert outcomes[0].outcome_type == "independent"
+        assert outcomes[0].outcome_type == OutcomeType.INDEPENDENT
         assert "new_helper" in outcomes[0].diff_summary
 
 
@@ -185,7 +189,7 @@ class TestDetectOutcomesIndependent:
             outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
-        assert outcomes[0].outcome_type == "independent"
+        assert outcomes[0].outcome_type == OutcomeType.INDEPENDENT
         assert outcomes[0].file_path == "src/bar.py"
 
     def test_non_code_files_ignored(self, tracker):
@@ -202,8 +206,12 @@ class TestDetectOutcomesIndependent:
         assert outcomes == []
 
     def test_mixed_accepted_and_independent(self, tracker):
+        diff_text = "+change"
         suggestions = [
-            FakeSuggestion(file_path="src/foo.py", description="Fix foo"),
+            FakeSuggestion(
+                file_path="src/foo.py", description="Fix foo",
+                unified_diff=diff_text,
+            ),
         ]
         tracker.save_session(suggestions, "fix")
 
@@ -211,12 +219,12 @@ class TestDetectOutcomesIndependent:
             tracker,
             "_get_changed_files_since",
             return_value={"src/foo.py", "src/bar.py"},
-        ), patch.object(tracker, "_get_file_diff_since", return_value="+change"):
+        ), patch.object(tracker, "_get_file_diff_since", return_value=diff_text):
             outcomes, _ = tracker.detect_outcomes()
 
         types = {o.outcome_type for o in outcomes}
-        assert "accepted" in types
-        assert "independent" in types
+        assert OutcomeType.ACCEPTED in types
+        assert OutcomeType.INDEPENDENT in types
 
 
 class TestGitNotAvailable:
@@ -478,7 +486,7 @@ class TestModifiedOutcome:
             outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
-        assert outcomes[0].outcome_type == "modified"
+        assert outcomes[0].outcome_type == OutcomeType.MODIFIED
         assert outcomes[0].file_path == "src/foo.py"
         assert outcomes[0].suggestion_description == "Add validation"
 
@@ -502,10 +510,10 @@ class TestModifiedOutcome:
             outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
-        assert outcomes[0].outcome_type == "accepted"
+        assert outcomes[0].outcome_type == OutcomeType.ACCEPTED
 
-    def test_accepted_when_no_suggested_diff(self, tracker):
-        """When no suggested_diff was stored (old session), default to 'accepted'."""
+    def test_unverified_when_no_suggested_diff(self, tracker):
+        """When no suggested_diff was stored, classify as 'unverified' not 'accepted'."""
         suggestions = [
             FakeSuggestion(
                 file_path="src/foo.py",
@@ -521,7 +529,7 @@ class TestModifiedOutcome:
             outcomes, _ = tracker.detect_outcomes()
 
         assert len(outcomes) == 1
-        assert outcomes[0].outcome_type == "accepted"
+        assert outcomes[0].outcome_type == OutcomeType.UNVERIFIED
 
     def test_suggested_diff_persisted_in_session(self, tracker):
         """Verify suggested_diff is saved and loaded in session records."""
@@ -538,3 +546,43 @@ class TestModifiedOutcome:
         session = tracker._load_previous_session()
         assert session is not None
         assert session.suggestions[0]["suggested_diff"] == "+new_code\n-old_code"
+
+    def test_independent_outcomes_rate_limited(self, tracker):
+        """Independent outcomes are capped at MAX_INDEPENDENT_OUTCOMES."""
+        from neo.memory.outcomes import MAX_INDEPENDENT_OUTCOMES
+
+        suggestions = [
+            FakeSuggestion(file_path="src/foo.py", description="Fix", confidence=0.8),
+        ]
+        tracker.save_session(suggestions, "fix")
+
+        # Simulate 20 independent files changing
+        changed = {f"src/file{i}.py" for i in range(20)} | {"src/foo.py"}
+
+        with patch.object(tracker, "_get_changed_files_since", return_value=changed), \
+             patch.object(tracker, "_get_file_diff_since", return_value="+changes"):
+            outcomes, _ = tracker.detect_outcomes()
+
+        independent = [o for o in outcomes if o.outcome_type == OutcomeType.INDEPENDENT]
+        assert len(independent) <= MAX_INDEPENDENT_OUTCOMES
+
+    def test_independent_skipped_when_no_diff(self, tracker):
+        """Independent changes with empty diffs are not recorded."""
+        suggestions = [
+            FakeSuggestion(file_path="src/foo.py", description="Fix", confidence=0.8),
+        ]
+        tracker.save_session(suggestions, "fix")
+
+        changed = {"src/bar.py", "src/foo.py"}
+
+        def fake_diff(path, ts):
+            if path == "src/bar.py":
+                return ""  # No diff content
+            return "+change"
+
+        with patch.object(tracker, "_get_changed_files_since", return_value=changed), \
+             patch.object(tracker, "_get_file_diff_since", side_effect=fake_diff):
+            outcomes, _ = tracker.detect_outcomes()
+
+        independent = [o for o in outcomes if o.outcome_type == OutcomeType.INDEPENDENT]
+        assert len(independent) == 0  # bar.py skipped due to empty diff

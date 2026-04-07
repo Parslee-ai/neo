@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from neo.memory.models import Fact, FactKind, FactMetadata, FactScope
+from neo.memory.outcomes import Outcome, OutcomeType
 from neo.memory.store import FactStore
 
 
@@ -19,18 +20,37 @@ def tmp_facts_dir(tmp_path):
 
 
 @pytest.fixture
-def store(tmp_facts_dir, tmp_path):
-    """Create a FactStore with temp directories and no real embedder."""
-    with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
-         patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
-         patch.object(FactStore, "_ingest_constraints"), \
-         patch.object(FactStore, "_ingest_seed_facts"), \
-         patch.object(FactStore, "_ingest_community_feed"), \
-         patch.object(FactStore, "_ingest_claude_memory"), \
-         patch.object(FactStore, "_maybe_migrate"), \
-         patch("neo.memory.store.FASTEMBED_AVAILABLE", False):
+def tmp_checksum_dir(tmp_path):
+    """Temp checksum dir to prevent test pollution of real ~/.neo/constraints/."""
+    d = tmp_path / "checksums"
+    d.mkdir()
+    return d
+
+
+@pytest.fixture
+def store(tmp_facts_dir, tmp_path, tmp_checksum_dir):
+    """Create a FactStore with temp directories and no real embedder.
+
+    Patches remain active for the lifetime of the test (generator fixture),
+    so any method calls during the test (save, load, re-ingestion) hit
+    mocked paths, not real ~/.neo state.
+    """
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        stack.enter_context(patch("neo.memory.store.FACTS_DIR", tmp_facts_dir))
+        stack.enter_context(patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")))
+        stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
+        stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
+        stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
+        stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
+        stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
+        stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
+        # Prevent test pollution of real checksums.json
+        for mod in ("constraints", "seed", "community", "claude_memory"):
+            stack.enter_context(patch(f"neo.memory.{mod}.CHECKSUM_DIR", tmp_checksum_dir))
+            stack.enter_context(patch(f"neo.memory.{mod}.CHECKSUM_FILE", tmp_checksum_dir / "checksums.json"))
         s = FactStore(codebase_root=str(tmp_path))
-    return s
+        yield s
 
 
 class TestAddFact:
@@ -208,12 +228,12 @@ class TestPersistence:
         # Load into new store (same config)
         with patch("neo.memory.store.FACTS_DIR", store._global_path.parent), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
-             patch("neo.memory.store.ConstraintIngester") as mock_ingester, \
+             patch.object(FactStore, "_ingest_constraints"), \
              patch.object(FactStore, "_ingest_seed_facts"), \
              patch.object(FactStore, "_ingest_community_feed"), \
              patch.object(FactStore, "_ingest_claude_memory"), \
+             patch.object(FactStore, "_maybe_migrate"), \
              patch("neo.memory.store.FASTEMBED_AVAILABLE", False):
-            mock_ingester.return_value.ingest.return_value = ([], [])
             store2 = FactStore(codebase_root=store.codebase_root)
 
         found = [f for f in store2.entries if f.subject == "Persist me"]
@@ -560,7 +580,6 @@ class TestOutcomeLinkage:
 
     def test_accepted_outcome_boosts_original_fact(self, store):
         """When an accepted outcome has a linked fact, boost that fact's confidence."""
-        from neo.memory.outcomes import Outcome
 
         # Create an original suggestion fact
         original = store.add_fact(
@@ -574,7 +593,7 @@ class TestOutcomeLinkage:
 
         # Simulate detect_outcomes returning a linked outcome
         outcomes = [Outcome(
-            outcome_type="accepted",
+            outcome_type=OutcomeType.ACCEPTED,
             file_path="src/foo.py",
             suggestion_description="add input validation",
             suggestion_confidence=0.7,
@@ -594,10 +613,9 @@ class TestOutcomeLinkage:
 
     def test_accepted_outcome_without_linkage_creates_review(self, store):
         """When no fact ID is linked, fall back to creating a REVIEW fact."""
-        from neo.memory.outcomes import Outcome
 
         outcomes = [Outcome(
-            outcome_type="accepted",
+            outcome_type=OutcomeType.ACCEPTED,
             file_path="src/bar.py",
             suggestion_description="refactor method",
             suggestion_confidence=0.6,
@@ -613,10 +631,9 @@ class TestOutcomeLinkage:
 
     def test_independent_outcome_creates_review(self, store):
         """Independent changes always create REVIEW facts."""
-        from neo.memory.outcomes import Outcome
 
         outcomes = [Outcome(
-            outcome_type="independent",
+            outcome_type=OutcomeType.INDEPENDENT,
             file_path="src/baz.py",
             diff_summary="+new code",
         )]
@@ -630,7 +647,6 @@ class TestOutcomeLinkage:
 
     def test_multiple_boosts_accumulate(self, store):
         """Multiple accepted outcomes should stack confidence boosts."""
-        from neo.memory.outcomes import Outcome
 
         original = store.add_fact(
             subject="pattern: error handling",
@@ -641,7 +657,7 @@ class TestOutcomeLinkage:
 
         for _ in range(3):
             outcomes = [Outcome(
-                outcome_type="accepted",
+                outcome_type=OutcomeType.ACCEPTED,
                 file_path="src/store.py",
                 suggestion_description="wrap in try/except",
                 suggestion_confidence=0.5,
@@ -652,6 +668,78 @@ class TestOutcomeLinkage:
 
         assert original.metadata.success_count == 3
         assert original.metadata.confidence == pytest.approx(0.8)
+
+
+    def test_unverified_outcome_modest_boost_no_review(self, store):
+        """Unverified outcomes give modest boost to linked fact, never create REVIEW."""
+
+        original = store.add_fact(
+            subject="bugfix: add retry",
+            body="Suggestion: add retry logic",
+            kind=FactKind.PATTERN,
+            confidence=0.7,
+        )
+
+        outcomes = [Outcome(
+            outcome_type=OutcomeType.UNVERIFIED,
+            file_path="src/foo.py",
+            suggestion_description="add retry logic",
+            suggestion_confidence=0.7,
+        )]
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=(outcomes, {"src/foo.py": original.id})):
+            store.detect_implicit_feedback({"prompt": "test"}, [])
+
+        # Modest boost (+0.05), NOT the full +0.1 of accepted
+        assert original.metadata.confidence == pytest.approx(0.75)
+        # success_count should NOT be incremented for unverified
+        assert original.metadata.success_count == 0
+        # No REVIEW facts created
+        review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
+        assert len(review_facts) == 0
+
+    def test_unverified_outcome_no_linkage_skipped(self, store):
+        """Unverified outcomes with no linked fact are silently skipped."""
+
+        initial_count = len(store._facts)
+        outcomes = [Outcome(
+            outcome_type=OutcomeType.UNVERIFIED,
+            file_path="src/bar.py",
+            suggestion_description="some change",
+            suggestion_confidence=0.5,
+        )]
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=(outcomes, {})):
+            store.detect_implicit_feedback({"prompt": "test"}, [])
+
+        # No new facts created
+        assert len(store._facts) == initial_count
+
+    def test_cap_independent_facts(self, store):
+        """_cap_independent_facts invalidates excess independent facts."""
+        from neo.memory.store import MAX_INDEPENDENT_FACTS
+
+        # Create more than MAX_INDEPENDENT_FACTS independent facts
+        for i in range(MAX_INDEPENDENT_FACTS + 20):
+            fact = Fact(
+                subject=f"outcome:independent src/file{i}.py",
+                body=f"User changed src/file{i}.py",
+                kind=FactKind.REVIEW,
+                scope=FactScope.PROJECT,
+                org_id="testorg",
+                project_id="testproj1234",
+                metadata=FactMetadata(
+                    confidence=0.2,
+                    created_at=time.time() - (MAX_INDEPENDENT_FACTS + 20 - i),
+                ),
+                tags=["outcome", "independent"],
+            )
+            store._facts.append(fact)
+
+        store._cap_independent_facts()
+
+        valid_indep = [f for f in store._facts if f.is_valid and "independent" in f.tags]
+        assert len(valid_indep) == MAX_INDEPENDENT_FACTS
 
 
 class TestSynthesizeReviews:
@@ -1124,7 +1212,7 @@ class TestLLMSynthesis:
 
 
 class TestConstraintEmbeddings:
-    def test_ingest_generates_embeddings(self, tmp_facts_dir, tmp_path):
+    def test_ingest_generates_embeddings(self, tmp_facts_dir, tmp_path, tmp_checksum_dir):
         """Constraint ingestion should generate embeddings for new facts."""
         # Create a CLAUDE.md in the temp project
         claude_md = tmp_path / "CLAUDE.md"
@@ -1137,7 +1225,9 @@ class TestConstraintEmbeddings:
              patch.object(FactStore, "_ingest_seed_facts"), \
              patch.object(FactStore, "_ingest_community_feed"), \
              patch.object(FactStore, "_ingest_claude_memory"), \
-             patch.object(FactStore, "_embed_text", return_value=fake_emb):
+             patch.object(FactStore, "_embed_text", return_value=fake_emb), \
+             patch("neo.memory.constraints.CHECKSUM_DIR", tmp_checksum_dir), \
+             patch("neo.memory.constraints.CHECKSUM_FILE", tmp_checksum_dir / "checksums.json"):
             s = FactStore(codebase_root=str(tmp_path))
 
         constraints = [f for f in s._facts if f.kind == FactKind.CONSTRAINT]

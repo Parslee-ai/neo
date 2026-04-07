@@ -23,7 +23,7 @@ from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.seed import SeedIngester
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope
-from neo.memory.outcomes import OutcomeTracker
+from neo.memory.outcomes import OutcomeTracker, OutcomeType
 from neo.memory.scope import detect_org_and_project
 from neo.pattern_extraction import extract_pattern_from_correction, get_library
 
@@ -53,6 +53,12 @@ DEMOTION_CONFIDENCE_PENALTY = 0.1  # Confidence reduction per demotion
 DEMOTION_CONFIDENCE_FLOOR = 0.1    # Never demote below this
 PROTECTION_HIT_RATE = 0.3      # Success/access ratio for protection boost
 PROTECTION_BOOST = 0.05        # Confidence boost for consistently helpful facts
+
+# Independent outcome limits (second layer — outcomes.py caps at 5/session)
+MAX_INDEPENDENT_FACTS = 50     # Cap per project to prevent bloat from active repos
+
+# Tags that protect facts from pruning/demotion (curated knowledge)
+PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 
 # Try importing fastembed
 try:
@@ -98,6 +104,7 @@ class FactStore:
 
         # All facts in memory
         self._facts: list[Fact] = []
+        self._cap_pending = False  # Set by _cap_independent_facts(save=False)
 
         # Embedding model (lazy-initialized on first use to avoid slow startup)
         self._embedder = None
@@ -137,6 +144,11 @@ class FactStore:
         self._ingest_constraints()
         self._ingest_claude_memory()
         self._ingest_git_history()
+
+        # Persist capping that load() deferred (save=False)
+        if self._cap_pending:
+            self.save()
+            self._cap_pending = False
 
     def _ensure_embedder(self) -> None:
         """Lazy-initialize the embedding model on first use."""
@@ -361,7 +373,7 @@ class FactStore:
         linked_count = 0
 
         for outcome in outcomes:
-            if outcome.outcome_type == "accepted":
+            if outcome.outcome_type == OutcomeType.ACCEPTED:
                 # Try to link back to the original suggestion fact
                 fact_id = suggestion_fact_ids.get(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
@@ -388,7 +400,7 @@ class FactStore:
                 body = "\n".join(body_parts)
                 tags = ["outcome", "accepted"]
                 confidence = min(1.0, outcome.suggestion_confidence + 0.1)
-            elif outcome.outcome_type == "modified":
+            elif outcome.outcome_type == OutcomeType.MODIFIED:
                 # User corrected neo's suggestion - learn from the correction
                 subject = f"outcome:modified {outcome.file_path}"
                 body_parts = [
@@ -411,7 +423,19 @@ class FactStore:
                     )
                     original_fact.metadata.last_accessed = time.time()
                     linked_count += 1
-            elif outcome.outcome_type == "independent":
+            elif outcome.outcome_type == OutcomeType.UNVERIFIED:
+                # Suggested file changed, but no diff to compare — weak signal.
+                # Only update linked fact modestly; never create standalone REVIEW.
+                fact_id = suggestion_fact_ids.get(outcome.file_path)
+                original_fact = facts_by_id.get(fact_id) if fact_id else None
+                if original_fact and original_fact.is_valid:
+                    original_fact.metadata.confidence = min(
+                        1.0, original_fact.metadata.confidence + 0.05
+                    )
+                    original_fact.metadata.last_accessed = time.time()
+                    linked_count += 1
+                continue  # Never create a REVIEW fact for unverified outcomes
+            elif outcome.outcome_type == OutcomeType.INDEPENDENT:
                 subject = f"outcome:independent {outcome.file_path}"
                 body_parts = [f"User changed {outcome.file_path} (not suggested by neo)."]
                 if outcome.diff_summary:
@@ -420,7 +444,7 @@ class FactStore:
                     body_parts.append("No diff content available.")
                 body = "\n".join(body_parts)
                 tags = ["outcome", "independent"]
-                confidence = 0.3
+                confidence = 0.2  # Low confidence so stale pruning cleans up faster
             else:
                 continue
 
@@ -438,7 +462,7 @@ class FactStore:
             self.save()
             logger.info(f"Boosted/demoted {linked_count} original fact(s) from outcomes")
         if outcomes:
-            modified = sum(1 for o in outcomes if o.outcome_type == "modified")
+            modified = sum(1 for o in outcomes if o.outcome_type == OutcomeType.MODIFIED)
             logger.info(f"Processed {len(outcomes)} outcome(s): modified={modified}")
             # Chain maintenance: synthesize -> prune stale -> demote unhelpful -> purge dead
             self.synthesize_reviews()
@@ -447,7 +471,7 @@ class FactStore:
             self.purge_dead_facts()
 
         # Extract prevention patterns from corrections
-        modified_outcomes = [o for o in outcomes if o.outcome_type == "modified"]
+        modified_outcomes = [o for o in outcomes if o.outcome_type == OutcomeType.MODIFIED]
         if modified_outcomes and self._lm_adapter:
             for outcome in modified_outcomes[:3]:  # Limit to 3 per session
                 try:
@@ -526,7 +550,7 @@ class FactStore:
         # Never evict constraints or synthesized archetypes
         evictable = [
             f for f in scoped
-            if f.kind != FactKind.CONSTRAINT and "synthesized" not in f.tags
+            if f.kind != FactKind.CONSTRAINT and not (PROTECTED_TAGS & set(f.tags))
         ]
         evictable.sort(key=_eviction_score)
 
@@ -548,16 +572,41 @@ class FactStore:
     # ------------------------------------------------------------------ #
 
     def save(self) -> None:
-        """Save facts to scoped JSON files."""
+        """Save facts to scoped JSON files.
+
+        Global facts use best-effort merge: re-reads the global file before
+        writing to preserve facts added by other FactStore instances since
+        load(). This is NOT concurrency-safe (no file locking). Neo is a
+        single-user CLI tool — concurrent writes are rare but possible if
+        multiple terminals invoke neo simultaneously. In that case, last
+        writer wins for same-ID facts, but cross-project additions survive.
+        """
         global_facts = [f for f in self._facts if f.scope == FactScope.GLOBAL]
         org_facts = [f for f in self._facts if f.scope == FactScope.ORG]
         project_facts = [f for f in self._facts if f.scope == FactScope.PROJECT]
 
-        self._save_file(self._global_path, global_facts)
+        merged_global = self._merge_global_on_save(global_facts)
+        self._save_file(self._global_path, merged_global)
         if self._org_path:
             self._save_file(self._org_path, org_facts)
         if self._project_path:
             self._save_file(self._project_path, project_facts)
+
+    def _merge_global_on_save(self, our_facts: list[Fact]) -> list[Fact]:
+        """Best-effort merge: keep disk facts we don't have in memory.
+
+        Not concurrency-safe. Reduces data loss from sequential (not
+        simultaneous) cross-project saves, which is the common case.
+        """
+        disk_facts = self._load_file(self._global_path)
+        if not disk_facts:
+            return our_facts
+
+        our_ids = {f.id for f in our_facts}
+        new_from_disk = [f for f in disk_facts if f.id not in our_ids]
+        if new_from_disk:
+            logger.info(f"Preserved {len(new_from_disk)} global fact(s) from disk")
+        return our_facts + new_from_disk
 
     def purge_dead_facts(self) -> int:
         """Remove invalid facts whose chain resolves to a valid successor.
@@ -619,8 +668,8 @@ class FactStore:
                 continue
             if (now - fact.metadata.created_at) < stale_age:
                 continue
-            # Synthesized facts already distilled value — skip
-            if "synthesized" in fact.tags:
+            # Curated facts (seed, community, synthesized) are protected
+            if PROTECTED_TAGS & set(fact.tags):
                 continue
 
             fact.is_valid = False
@@ -651,6 +700,9 @@ class FactStore:
             if not fact.is_valid:
                 continue
             if fact.kind == FactKind.CONSTRAINT:
+                continue
+            # Curated facts (seed, community, synthesized) are protected
+            if PROTECTED_TAGS & set(fact.tags):
                 continue
             if (now - fact.metadata.created_at) < min_age:
                 continue
@@ -694,6 +746,38 @@ class FactStore:
         if self._project_path:
             self._facts.extend(self._load_file(self._project_path))
         logger.info(f"FactStore: Loaded {len(self._facts)} facts")
+        # Cap runs in-memory only; save is deferred to initialize()
+        self._cap_independent_facts(save=False)
+
+    def _cap_independent_facts(self, save: bool = True) -> None:
+        """Prevent bloat: invalidate excess independent-tagged facts.
+
+        Active repos can generate hundreds of independent outcomes per week.
+        Keep only the newest MAX_INDEPENDENT_FACTS to maintain retrieval quality.
+        Protected-tag facts are never capped.
+
+        Args:
+            save: If True, persist after capping. Set False when called from
+                  load() to avoid save-during-load (deferred to initialize()).
+        """
+        indep = [
+            f for f in self._facts
+            if f.is_valid and "independent" in f.tags
+            and not (PROTECTED_TAGS & set(f.tags))
+        ]
+        if len(indep) <= MAX_INDEPENDENT_FACTS:
+            return
+        indep.sort(key=lambda f: f.metadata.created_at, reverse=True)
+        pruned = 0
+        for f in indep[MAX_INDEPENDENT_FACTS:]:
+            f.is_valid = False
+            pruned += 1
+        if pruned:
+            if save:
+                self.save()
+            else:
+                self._cap_pending = True
+            logger.info(f"Capped independent facts: invalidated {pruned}, kept {MAX_INDEPENDENT_FACTS}")
 
     def _save_file(self, path: Path, facts: list[Fact]) -> None:
         """Save a list of facts to a JSON file atomically.
