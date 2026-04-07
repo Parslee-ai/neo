@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.15.0] - 2026-04-07
+
+### Fixed
+- Close broken feedback loop: false "accepted" signals when suggested diffs were empty, unbounded independent outcome flooding (2800+ noise facts in active repos), and community facts silently lost on cross-project saves
+- Fix diff overlap conflating additions and removals (`+foo` and `-foo` treated as same line)
+- Fix empty actual diff fallthrough incorrectly classifying outcomes as "accepted"
+- Fix test suite polluting real `~/.neo/constraints/checksums.json` with pytest temp paths
+- Fix `_cap_independent_facts` calling `save()` during `load()` (deferred via `_cap_pending` flag)
+
+### Added
+- `OutcomeType` enum replacing stringly-typed outcome classification (ACCEPTED, MODIFIED, UNVERIFIED, INDEPENDENT)
+- "Unverified" outcome type for suggestions where no diff comparison is possible (+0.05 confidence boost, no success_count increment)
+- Rate-limit independent outcomes to 5 per session, sorted by diff size with deterministic tiebreaking
+- Cap independent facts at 50 per project with automatic invalidation of excess on load
+- `PROTECTED_TAGS` (seed, community, synthesized) — protected from pruning, demotion, and eviction
+- Best-effort merge on global fact save to prevent cross-project data loss
+- Cross-referenced documentation between `MAX_INDEPENDENT_OUTCOMES` (5/session) and `MAX_INDEPENDENT_FACTS` (50/project)
+
+### Changed
+- Independent fact confidence lowered from 0.3 to 0.2 for faster stale pruning
+- Diff filter logic simplified from nested if/elif to single list comprehension
+- Test fixture converted to generator (yield) for proper patch lifetime
+- Inline `import datetime` moved to module level
+
 ## [0.14.0] - 2026-04-05
 
 ### Fixed
