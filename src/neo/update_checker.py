@@ -26,7 +26,9 @@ def _pip_install_cmd(package: str, quiet: bool = False) -> list[str]:
     """Build a pip install command that works in PEP 668 environments.
 
     Detects externally-managed Python installs (Homebrew, system packages)
-    and adds --break-system-packages when needed.
+    and adds --break-system-packages when needed. Also adds
+    --ignore-installed to work around broken dependency RECORD files
+    (e.g., Homebrew-managed pillow missing its RECORD).
     """
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", package]
     if quiet:
@@ -37,6 +39,9 @@ def _pip_install_cmd(package: str, quiet: bool = False) -> list[str]:
     externally_managed = list(stdlib_path.glob("python*/EXTERNALLY-MANAGED"))
     if externally_managed:
         cmd.append("--break-system-packages")
+        # Externally-managed envs often have packages without RECORD files,
+        # which causes "Cannot uninstall" errors during dependency resolution.
+        cmd.append("--ignore-installed")
 
     return cmd
 PYPI_PACKAGE_NAME = "neo-reasoner"
