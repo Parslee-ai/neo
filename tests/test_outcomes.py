@@ -17,6 +17,7 @@ class FakeSuggestion:
     description: str = ""
     confidence: float = 0.8
     unified_diff: str = ""
+    code_block: str = ""
 
 
 @pytest.fixture
@@ -118,6 +119,22 @@ class TestSessionRecordWithFactIds:
         assert len(outcomes) == 1
         assert returned_ids == {"src/foo.py": "fact123"}
 
+    def test_suggested_code_persisted_in_session(self, tracker):
+        suggestions = [
+            FakeSuggestion(
+                file_path="src/foo.py",
+                description="Rewrite handler",
+                confidence=0.9,
+                code_block="def handler():\n    return 42\n",
+            ),
+        ]
+
+        tracker.save_session(suggestions, "rewrite")
+
+        session = tracker._load_previous_session()
+        assert session is not None
+        assert session.suggestions[0]["suggested_code"] == "def handler():\n    return 42\n"
+
 
 class TestDetectOutcomesAccepted:
     def test_accepted_when_suggested_file_changed(self, tracker):
@@ -156,6 +173,44 @@ class TestDetectOutcomesAccepted:
         assert len(outcomes) == 1
         assert outcomes[0].outcome_type == OutcomeType.INDEPENDENT
         assert "new_helper" in outcomes[0].diff_summary
+
+    def test_accepted_when_code_block_matches_added_lines(self, tracker):
+        suggestions = [
+            FakeSuggestion(
+                file_path="src/foo.py",
+                description="Rewrite handler",
+                confidence=0.9,
+                code_block="def handler():\n    return 42\n",
+            ),
+        ]
+        tracker.save_session(suggestions, "fix bug")
+
+        actual_diff = "@@ -1,0 +1,2 @@\n+def handler():\n+    return 42"
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value=actual_diff):
+            outcomes, _ = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome_type == OutcomeType.ACCEPTED
+
+    def test_modified_when_code_block_diverges_from_added_lines(self, tracker):
+        suggestions = [
+            FakeSuggestion(
+                file_path="src/foo.py",
+                description="Rewrite handler",
+                confidence=0.9,
+                code_block="def handler():\n    return 42\n",
+            ),
+        ]
+        tracker.save_session(suggestions, "fix bug")
+
+        actual_diff = "@@ -1,0 +1,2 @@\n+def handler():\n+    return 7"
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value=actual_diff):
+            outcomes, _ = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome_type == OutcomeType.MODIFIED
 
 
 class TestDetectOutcomesNoChanges:

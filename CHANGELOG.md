@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.2] - 2026-04-08
+
+### Fixed
+- Outcome learning now persists `code_block` suggestions in session records and uses them to classify accepted vs modified edits when `unified_diff` is empty, restoring feedback learning for Neo's code-first output mode
+
 ## [0.15.1] - 2026-04-07
 
 ### Fixed

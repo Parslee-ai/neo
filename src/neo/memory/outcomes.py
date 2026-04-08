@@ -28,6 +28,7 @@ SESSIONS_DIR = Path.home() / ".neo" / "sessions"
 # caps the total across sessions. Together: 5/session * ~10 sessions before
 # cap kicks in, then oldest are invalidated.
 MAX_INDEPENDENT_OUTCOMES = 5
+CODE_OVERLAP_ACCEPTED_THRESHOLD = 0.8
 
 
 class OutcomeType(enum.Enum):
@@ -119,6 +120,7 @@ class OutcomeTracker:
                 "description": getattr(s, "description", "")[:500],
                 "confidence": getattr(s, "confidence", 0.0),
                 "suggested_diff": getattr(s, "unified_diff", "")[:2000],
+                "suggested_code": getattr(s, "code_block", "")[:4000],
             })
 
         session = SessionRecord(
@@ -259,11 +261,19 @@ class OutcomeTracker:
             if normalized in changed_files or file_path in changed_files:
                 diff = self._get_file_diff_since(normalized, session.timestamp)
                 suggested_diff = sugg.get("suggested_diff", "")
+                suggested_code = sugg.get("suggested_code", "")
 
                 # Determine if user applied our suggestion or did something different
                 if suggested_diff and diff:
                     overlap = self._compute_diff_overlap(suggested_diff, diff)
                     outcome_type = OutcomeType.ACCEPTED if overlap > 0.3 else OutcomeType.MODIFIED
+                elif suggested_code and diff:
+                    overlap = self._compute_code_overlap(suggested_code, diff)
+                    outcome_type = (
+                        OutcomeType.ACCEPTED
+                        if overlap >= CODE_OVERLAP_ACCEPTED_THRESHOLD
+                        else OutcomeType.MODIFIED
+                    )
                 else:
                     # Missing suggested_diff or actual diff — can't verify
                     outcome_type = OutcomeType.UNVERIFIED
@@ -359,6 +369,34 @@ class OutcomeTracker:
         except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.debug(f"File diff failed for {file_path} (non-fatal): {e}")
             return ""
+
+    @staticmethod
+    def _compute_code_overlap(suggested_code: str, actual_diff: str) -> float:
+        """Estimate overlap between a suggested code block and actual changed lines.
+
+        This supports Neo's code-first output mode, where suggestions may include
+        executable code but no unified diff. We compare the normalized added lines
+        from the actual diff against the normalized code block lines.
+        """
+        code_lines = {
+            line.strip()
+            for line in suggested_code.splitlines()
+            if line.strip()
+        }
+        changed_lines = {
+            line[1:].strip()
+            for line in actual_diff.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+            and line[1:].strip()
+        }
+
+        if not code_lines and not changed_lines:
+            return 1.0
+        if not code_lines or not changed_lines:
+            return 0.0
+
+        overlap = len(code_lines & changed_lines)
+        return overlap / min(len(code_lines), len(changed_lines))
 
     def _normalize_path(self, path: str) -> str:
         """Normalize a file path to relative form for comparison."""
