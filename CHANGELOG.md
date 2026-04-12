@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.3] - 2026-04-12
+
+### Fixed
+- Repair broken feedback loop so patterns actually rise in confidence: session log accumulation (JSONL) instead of single-session overwrite, path normalization for bare leading slashes, fallback path lookup with/without leading `/`, stronger confidence boosts (+0.2 accepted, +0.1 unverified), and log2-scaled success bonus in retrieval scoring
+- Non-git outcome detection now processes all previous sessions correctly (detect_outcomes runs before save_session, so all log entries are from prior invocations)
+
 ## [0.15.2] - 2026-04-08
 
 ### Fixed
