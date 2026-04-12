@@ -67,17 +67,6 @@ def parse_args():
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
 
-    # Detect if 'init' subcommand is being used
-    if len(sys.argv) > 1 and sys.argv[1] == 'init':
-        p = argparse.ArgumentParser(
-            prog="neo init",
-            description="Initialize Neo in a repository (installs git hooks, builds index)",
-            parents=[global_parser]
-        )
-        args = p.parse_args(sys.argv[2:])
-        args.command = 'init'
-        return args
-
     # Detect if 'contribute' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'contribute':
         p = argparse.ArgumentParser(
@@ -385,52 +374,6 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(1)
-
-    # Handle init subcommand
-    if hasattr(args, 'command') and args.command == 'init':
-        import shutil
-        import subprocess
-
-        codebase_root = args.cwd or os.getcwd()
-
-        # Check if we're in a git repo
-        try:
-            subprocess.run(
-                ['git', 'rev-parse', '--git-dir'],
-                cwd=codebase_root, capture_output=True, check=True
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print("[Neo] Error: not a git repository", file=sys.stderr)
-            sys.exit(1)
-
-        # Install git hooks
-        hooks_src = os.path.join(os.path.dirname(__file__), '..', '..', '.githooks')
-        hooks_src = os.path.normpath(hooks_src)
-
-        # Set core.hooksPath to .githooks
-        git_hooks_dir = os.path.join(codebase_root, '.githooks')
-        os.makedirs(git_hooks_dir, exist_ok=True)
-
-        # Copy hook files from package to repo
-        for hook_name in ['pre-commit', 'post-commit']:
-            src = os.path.join(hooks_src, hook_name)
-            dst = os.path.join(git_hooks_dir, hook_name)
-            if os.path.exists(src) and not os.path.exists(dst):
-                shutil.copy2(src, dst)
-                os.chmod(dst, 0o755)
-                print(f"[Neo] Installed {hook_name} hook")
-            elif os.path.exists(dst):
-                print(f"[Neo] {hook_name} hook already exists, skipping")
-
-        # Configure git to use .githooks directory
-        subprocess.run(
-            ['git', 'config', 'core.hooksPath', '.githooks'],
-            cwd=codebase_root, check=True
-        )
-        print("[Neo] Set git core.hooksPath to .githooks")
-        print("[Neo] Post-commit hook will auto-refresh the semantic index")
-        print("[Neo] Run 'neo --index' to build the initial index")
-        sys.exit(0)
 
     # Handle contribute subcommand
     if hasattr(args, 'command') and args.command == 'contribute':
