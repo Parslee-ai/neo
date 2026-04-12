@@ -274,16 +274,18 @@ class OutcomeTracker:
         When a suggestion targets /dev/null or a docs path, and the user invoked
         neo again afterward, that's a weak acceptance signal — the user continued
         working rather than abandoning the tool.
+
+        All sessions in the log are from PREVIOUS invocations (the current
+        session hasn't been written yet when detect_outcomes runs), so we
+        process all of them.
         """
-        if len(sessions) < 2:
+        if not sessions:
             return []
 
         outcomes: list[Outcome] = []
         non_trackable = {"/dev/null"}
 
-        # Only process sessions that aren't the most recent (the most recent
-        # is the current session being saved, not a completed one)
-        for prev in sessions[:-1]:
+        for prev in sessions:
             for sugg in prev.suggestions:
                 file_path = sugg.get("file_path", "")
                 normalized = self._normalize_path(file_path)
