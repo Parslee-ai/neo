@@ -9,6 +9,7 @@ and supersession chains.
 import hashlib
 import json
 import logging
+import math
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -254,7 +255,14 @@ class FactStore:
                 sim = self._cosine_similarity(query_embedding, fact.embedding)
 
             confidence = fact.metadata.confidence
-            score = sim * confidence
+            # Validated patterns get a bonus: each success adds 0.1 to score
+            # (diminishing via log) so patterns that actually worked rise above
+            # noise. 1 success = +0.1, 3 = +0.2, 10 = +0.33
+            success_bonus = 0.0
+            sc = fact.metadata.success_count
+            if sc > 0:
+                success_bonus = 0.1 * math.log2(sc + 1)
+            score = sim * confidence + success_bonus
             scored.append((fact, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -372,16 +380,29 @@ class FactStore:
         facts_by_id = {f.id: f for f in self._facts}
         linked_count = 0
 
+        def _lookup_fact_id(file_path: str) -> Optional[str]:
+            """Look up fact_id with fallback for path normalization mismatches."""
+            fid = suggestion_fact_ids.get(file_path)
+            if fid:
+                return fid
+            # Try with/without leading slash
+            if file_path.startswith("/"):
+                fid = suggestion_fact_ids.get(file_path.lstrip("/"))
+            else:
+                fid = suggestion_fact_ids.get("/" + file_path)
+            return fid
+
         for outcome in outcomes:
             if outcome.outcome_type == OutcomeType.ACCEPTED:
                 # Try to link back to the original suggestion fact
-                fact_id = suggestion_fact_ids.get(outcome.file_path)
+                fact_id = _lookup_fact_id(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
 
                 if original_fact and original_fact.is_valid:
                     # Boost original fact instead of creating orphan REVIEW
+                    # +0.2 per acceptance so patterns rise meaningfully
                     original_fact.metadata.confidence = min(
-                        1.0, original_fact.metadata.confidence + 0.1
+                        1.0, original_fact.metadata.confidence + 0.2
                     )
                     original_fact.metadata.success_count += 1
                     original_fact.metadata.last_accessed = time.time()
@@ -415,7 +436,7 @@ class FactStore:
                 confidence = 0.4
 
                 # Demote the original suggestion fact since it was corrected
-                fact_id = suggestion_fact_ids.get(outcome.file_path)
+                fact_id = _lookup_fact_id(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
                 if original_fact and original_fact.is_valid:
                     original_fact.metadata.confidence = max(
@@ -425,13 +446,14 @@ class FactStore:
                     linked_count += 1
             elif outcome.outcome_type == OutcomeType.UNVERIFIED:
                 # Suggested file changed, but no diff to compare — weak signal.
-                # Only update linked fact modestly; never create standalone REVIEW.
-                fact_id = suggestion_fact_ids.get(outcome.file_path)
+                # Only update linked fact; never create standalone REVIEW.
+                fact_id = _lookup_fact_id(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
                 if original_fact and original_fact.is_valid:
                     original_fact.metadata.confidence = min(
-                        1.0, original_fact.metadata.confidence + 0.05
+                        1.0, original_fact.metadata.confidence + 0.1
                     )
+                    original_fact.metadata.success_count += 1
                     original_fact.metadata.last_accessed = time.time()
                     linked_count += 1
                 continue  # Never create a REVIEW fact for unverified outcomes

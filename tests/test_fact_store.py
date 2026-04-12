@@ -605,7 +605,8 @@ class TestOutcomeLinkage:
             store.detect_implicit_feedback({"prompt": "test"}, [])
 
         # Original fact should be boosted, not a new REVIEW fact created
-        assert original.metadata.confidence == pytest.approx(0.8)
+        # +0.2 boost: 0.7 -> 0.9
+        assert original.metadata.confidence == pytest.approx(0.9)
         assert original.metadata.success_count == 1
         # No new REVIEW facts should exist
         review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
@@ -667,7 +668,8 @@ class TestOutcomeLinkage:
                 store.detect_implicit_feedback({"prompt": "test"}, [])
 
         assert original.metadata.success_count == 3
-        assert original.metadata.confidence == pytest.approx(0.8)
+        # 3 x +0.2 = 0.6, starting from 0.5, capped at 1.0
+        assert original.metadata.confidence == pytest.approx(1.0)
 
 
     def test_unverified_outcome_modest_boost_no_review(self, store):
@@ -690,10 +692,10 @@ class TestOutcomeLinkage:
                           return_value=(outcomes, {"src/foo.py": original.id})):
             store.detect_implicit_feedback({"prompt": "test"}, [])
 
-        # Modest boost (+0.05), NOT the full +0.1 of accepted
-        assert original.metadata.confidence == pytest.approx(0.75)
-        # success_count should NOT be incremented for unverified
-        assert original.metadata.success_count == 0
+        # Modest boost (+0.1) for unverified, weaker than accepted (+0.2)
+        assert original.metadata.confidence == pytest.approx(0.8)
+        # success_count IS incremented for unverified (weak acceptance signal)
+        assert original.metadata.success_count == 1
         # No REVIEW facts created
         review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
         assert len(review_facts) == 0

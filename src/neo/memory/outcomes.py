@@ -83,12 +83,20 @@ class OutcomeTracker:
         self.codebase_root = codebase_root
         self.project_id = project_id
         self._session_path = self._get_session_path()
+        self._session_log_path = self._get_session_log_path()
 
     def _get_session_path(self) -> Optional[Path]:
         if not self.project_id:
             return None
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         return SESSIONS_DIR / f"session_{self.project_id}.json"
+
+    def _get_session_log_path(self) -> Optional[Path]:
+        """Path for the append-only session log that accumulates across invocations."""
+        if not self.project_id:
+            return None
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        return SESSIONS_DIR / f"session_log_{self.project_id}.jsonl"
 
     def save_session(
         self,
@@ -135,6 +143,13 @@ class OutcomeTracker:
         try:
             with open(self._session_path, "w") as f:
                 json.dump(asdict(session), f, indent=2)
+
+            # Also append to session log so we don't lose prior sessions
+            log_path = self._session_log_path
+            if log_path:
+                with open(log_path, "a") as f:
+                    f.write(json.dumps(asdict(session)) + "\n")
+
             logger.info(
                 f"Saved session: {len(records)} suggestion(s), "
                 f"{len(suggestion_fact_ids or {})} linked fact(s)"
@@ -145,38 +160,59 @@ class OutcomeTracker:
     def detect_outcomes(self) -> tuple[list[Outcome], dict[str, str]]:
         """Detect outcomes by comparing previous suggestions to actual git changes.
 
+        Checks the session log for ALL unprocessed sessions, not just the most recent.
+        This prevents loss of outcome signals when neo is invoked multiple times
+        before the user acts on suggestions.
+
         Returns:
-            Tuple of (outcomes list, suggestion_fact_ids mapping from previous session).
+            Tuple of (outcomes list, merged suggestion_fact_ids from all sessions).
         """
-        prev = self._load_previous_session()
-        if not prev or not prev.timestamp:
-            logger.debug("No previous session found for outcome detection")
+        sessions = self._load_unprocessed_sessions()
+        if not sessions:
+            logger.debug("No unprocessed sessions found for outcome detection")
             return [], {}
 
-        # Only detect outcomes for the same project
-        if prev.project_id != self.project_id:
-            logger.debug(f"Previous session project mismatch: {prev.project_id} != {self.project_id}")
-            return [], {}
+        all_outcomes: list[Outcome] = []
+        merged_fact_ids: dict[str, str] = {}
 
-        # Get files changed since last session
-        changed_files = self._get_changed_files_since(prev.timestamp)
-        if not changed_files:
-            logger.debug("No files changed since last session")
-            return [], {}
+        for prev in sessions:
+            if prev.project_id != self.project_id:
+                continue
 
-        suggested = [s.get("file_path", "") for s in prev.suggestions]
+            changed_files = self._get_changed_files_since(prev.timestamp)
+            if not changed_files:
+                continue
+
+            suggested = [s.get("file_path", "") for s in prev.suggestions]
+            logger.info(
+                f"Outcome detection (session {prev.timestamp:.0f}): "
+                f"{len(changed_files)} changed files, "
+                f"{len(suggested)} suggestions, "
+                f"{len(prev.suggestion_fact_ids)} linked fact(s)"
+            )
+
+            outcomes = self._match_to_suggestions(changed_files, prev)
+            all_outcomes.extend(outcomes)
+            merged_fact_ids.update(prev.suggestion_fact_ids)
+
+        # Also check for non-git outcomes (implicit acceptance)
+        non_git = self._detect_non_git_outcomes(sessions)
+        all_outcomes.extend(non_git)
+        for prev in sessions:
+            merged_fact_ids.update(prev.suggestion_fact_ids)
+
+        # Clear processed sessions from the log
+        if all_outcomes or sessions:
+            self._clear_session_log()
+
+        accepted = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.ACCEPTED)
+        modified = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.MODIFIED)
+        independent = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.INDEPENDENT)
         logger.info(
-            f"Outcome detection: {len(changed_files)} changed files, "
-            f"{len(suggested)} suggestions, "
-            f"{len(prev.suggestion_fact_ids)} linked fact(s)"
+            f"Outcomes total: {accepted} accepted, {modified} modified, "
+            f"{independent} independent (from {len(sessions)} session(s))"
         )
-
-        outcomes = self._match_to_suggestions(changed_files, prev)
-        accepted = sum(1 for o in outcomes if o.outcome_type == OutcomeType.ACCEPTED)
-        modified = sum(1 for o in outcomes if o.outcome_type == OutcomeType.MODIFIED)
-        independent = sum(1 for o in outcomes if o.outcome_type == OutcomeType.INDEPENDENT)
-        logger.info(f"Outcomes: {accepted} accepted, {modified} modified, {independent} independent")
-        return outcomes, prev.suggestion_fact_ids
+        return all_outcomes, merged_fact_ids
 
     def _load_previous_session(self) -> Optional[SessionRecord]:
         """Load the previous session record from disk."""
@@ -189,6 +225,87 @@ class OutcomeTracker:
         except (json.JSONDecodeError, OSError, TypeError) as e:
             logger.warning(f"Failed to load previous session: {e}")
             return None
+
+    def _load_unprocessed_sessions(self) -> list[SessionRecord]:
+        """Load all unprocessed sessions from the session log.
+
+        Falls back to the single session file if no log exists (backward compat).
+        """
+        log_path = self._session_log_path
+        sessions: list[SessionRecord] = []
+
+        if log_path and log_path.exists():
+            try:
+                with open(log_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            sessions.append(SessionRecord(**data))
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+            except OSError as e:
+                logger.warning(f"Failed to read session log: {e}")
+
+        # Fallback: use single session file if log is empty/missing
+        if not sessions:
+            prev = self._load_previous_session()
+            if prev and prev.timestamp:
+                sessions.append(prev)
+
+        return sessions
+
+    def _clear_session_log(self) -> None:
+        """Clear the session log after outcomes have been processed."""
+        log_path = self._session_log_path
+        if log_path and log_path.exists():
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
+
+    def _detect_non_git_outcomes(
+        self, sessions: list[SessionRecord]
+    ) -> list[Outcome]:
+        """Detect implicit acceptance for suggestions that can't be tracked by git.
+
+        When a suggestion targets /dev/null or a docs path, and the user invoked
+        neo again afterward, that's a weak acceptance signal — the user continued
+        working rather than abandoning the tool.
+        """
+        if len(sessions) < 2:
+            return []
+
+        outcomes: list[Outcome] = []
+        non_trackable = {"/dev/null"}
+
+        # Only process sessions that aren't the most recent (the most recent
+        # is the current session being saved, not a completed one)
+        for prev in sessions[:-1]:
+            for sugg in prev.suggestions:
+                file_path = sugg.get("file_path", "")
+                normalized = self._normalize_path(file_path)
+
+                is_non_trackable = (
+                    file_path in non_trackable
+                    or normalized.startswith("docs/")
+                    or "/docs/" in normalized
+                )
+                if not is_non_trackable:
+                    continue
+
+                # User came back and ran neo again — weak acceptance signal
+                outcomes.append(Outcome(
+                    outcome_type=OutcomeType.UNVERIFIED,
+                    file_path=normalized,
+                    diff_summary="",
+                    suggestion_description=sugg.get("description", ""),
+                    suggestion_confidence=sugg.get("confidence", 0.0),
+                ))
+
+        return outcomes
 
     def _get_changed_files_since(self, since_timestamp: float) -> set[str]:
         """Get files that changed in git since a timestamp.
@@ -399,16 +516,33 @@ class OutcomeTracker:
         return overlap / min(len(code_lines), len(changed_lines))
 
     def _normalize_path(self, path: str) -> str:
-        """Normalize a file path to relative form for comparison."""
-        if not self.codebase_root:
+        """Normalize a file path to relative form for comparison.
+
+        Handles three cases:
+        1. True absolute paths under codebase_root -> relative
+        2. Bare leading slash under codebase_root (/src/bar.py) -> src/bar.py
+        3. Everything else unchanged
+        """
+        if not path:
             return path
-        try:
-            p = Path(path)
-            root = Path(self.codebase_root)
-            if p.is_absolute():
-                return str(p.relative_to(root))
-        except (ValueError, TypeError):
-            pass
+
+        if self.codebase_root:
+            try:
+                p = Path(path)
+                root = Path(self.codebase_root)
+                if p.is_absolute():
+                    return str(p.relative_to(root))
+            except (ValueError, TypeError):
+                pass
+
+            # Strip bare leading slash if the result exists relative to codebase_root
+            # (common in suggestion file_path values like "/src/foo.py")
+            if path.startswith("/"):
+                stripped = path.lstrip("/")
+                candidate = Path(self.codebase_root) / stripped
+                if candidate.exists() or candidate.parent.exists():
+                    return stripped
+
         return path
 
     @staticmethod
