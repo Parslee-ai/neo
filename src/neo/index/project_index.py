@@ -129,10 +129,12 @@ class ProjectIndex:
         self.neo_dir = self.repo_root / ".neo"
         self.snapshot_path = self.neo_dir / "index.json"
         self.chunks_path = self.neo_dir / "chunks.json"
+        self.edges_path = self.neo_dir / "edges.json"
         self.faiss_path = self.neo_dir / "faiss.index"
 
         # In-memory state
         self.chunks: List[CodeChunk] = []
+        self.edges: List[Dict[str, Any]] = []
         self.snapshot: Optional[IndexSnapshot] = None
         self.faiss_index: Optional[Any] = None
         self.embedding_model: Optional[TextEmbedding] = None
@@ -175,12 +177,18 @@ class ProjectIndex:
                         )
                         self.chunks.append(chunk)
 
+            # Load edges
+            if self.edges_path.exists():
+                with open(self.edges_path) as f:
+                    self.edges = json.load(f)
+                logger.info(f"Loaded {len(self.edges)} edges")
+
             # Load FAISS index if available
             if FAISS_AVAILABLE and self.faiss_path.exists():
                 self.faiss_index = faiss.read_index(str(self.faiss_path))
                 logger.info(f"Loaded FAISS index with {self.faiss_index.ntotal} vectors")
 
-            logger.info(f"Loaded project index: {len(self.chunks)} chunks from {self.snapshot.total_files} files")
+            logger.info(f"Loaded project index: {len(self.chunks)} chunks, {len(self.edges)} edges from {self.snapshot.total_files} files")
 
         except Exception as e:
             logger.error(f"Failed to load project index: {e}")
@@ -231,13 +239,20 @@ class ProjectIndex:
                 json.dump(chunks_data, f, indent=2)
             chunks_tmp.rename(self.chunks_path)
 
+            # Edges
+            if self.edges:
+                edges_tmp = self.edges_path.with_suffix('.tmp')
+                with open(edges_tmp, 'w') as f:
+                    json.dump(self.edges, f, indent=2)
+                edges_tmp.rename(self.edges_path)
+
             # FAISS index
             if FAISS_AVAILABLE and self.faiss_index:
                 faiss_tmp = self.faiss_path.with_suffix('.tmp')
                 faiss.write_index(self.faiss_index, str(faiss_tmp))
                 faiss_tmp.rename(self.faiss_path)
 
-            logger.info(f"Saved project index: {len(self.chunks)} chunks")
+            logger.info(f"Saved project index: {len(self.chunks)} chunks, {len(self.edges)} edges")
 
         except Exception as e:
             logger.error(f"Failed to save project index: {e}")
@@ -295,8 +310,9 @@ class ProjectIndex:
         files_to_index = files_to_index[:max_files]
         self.snapshot.total_files = len(files_to_index)
 
-        # Extract chunks from each file
+        # Extract chunks and edges from each file
         all_chunks = []
+        all_edges = []
         for file_path in files_to_index:
             # Security: Reject symlinks and paths outside repo
 
@@ -324,6 +340,10 @@ class ProjectIndex:
             chunks = self._extract_chunks_from_file(file_path, str(rel_path))
             all_chunks.extend(chunks)
 
+            # Extract edges
+            edges = self._extract_edges_from_file(file_path, str(rel_path))
+            all_edges.extend(edges)
+
             # Track file hash
             file_hash = self._compute_file_hash(file_path)
             self.snapshot.file_hashes[str(rel_path)] = file_hash
@@ -334,6 +354,7 @@ class ProjectIndex:
             all_chunks = all_chunks[:MAX_CHUNKS_PER_REPO]
 
         self.chunks = all_chunks
+        self.edges = all_edges
 
         # Generate embeddings
         self._embed_chunks(self.chunks)
@@ -346,7 +367,7 @@ class ProjectIndex:
         self._save()
 
         elapsed = time.time() - start_time
-        logger.info(f"Built project index: {len(self.chunks)} chunks from {len(files_to_index)} files in {elapsed:.1f}s")
+        logger.info(f"Built project index: {len(self.chunks)} chunks, {len(self.edges)} edges from {len(files_to_index)} files in {elapsed:.1f}s")
 
     def retrieve(self, query: str, k: int = 5) -> List[CodeChunk]:
         """
@@ -551,6 +572,60 @@ class ProjectIndex:
             logger.error(f"Failed to extract chunks from {file_path}: {e}")
             return []
 
+    def _extract_edges_from_file(self, file_path: Path, rel_path: str) -> List[Dict[str, Any]]:
+        """Extract relationship edges from a file using tree-sitter."""
+        if not self.parser:
+            return []
+
+        try:
+            if not self.parser.supports_extension(file_path.suffix):
+                return []
+
+            content = file_path.read_text(encoding='utf-8')
+            parser_edges = self.parser.extract_edges(file_path, content)
+
+            return [
+                {
+                    'source_file': rel_path,
+                    'source_symbol': e.source_symbol,
+                    'target_symbol': e.target_symbol,
+                    'edge_type': e.edge_type,
+                    'line_number': e.line_number,
+                }
+                for e in parser_edges
+            ]
+        except Exception as e:
+            logger.error(f"Failed to extract edges from {file_path}: {e}")
+            return []
+
+    def query_edges(
+        self,
+        symbol: str,
+        direction: str = "outgoing",
+        edge_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Query edges by symbol name.
+
+        Args:
+            symbol: Symbol name to search for
+            direction: "outgoing" (symbol is source) or "incoming" (symbol is target)
+            edge_type: Filter by edge type (imports/inherits/implements)
+
+        Returns:
+            List of matching edge dicts
+        """
+        results = []
+        for edge in self.edges:
+            if direction == "outgoing":
+                match = edge['source_symbol'] == symbol
+            else:
+                match = edge['target_symbol'] == symbol
+
+            if match and (edge_type is None or edge['edge_type'] == edge_type):
+                results.append(edge)
+        return results
+
     def _embed_chunks(self, chunks: List[CodeChunk]):
         """Generate embeddings for chunks."""
         if not chunks:
@@ -706,6 +781,7 @@ class ProjectIndex:
             'changed_files': changed_files,
             'commit_hash': self.snapshot.commit_hash[:7] if self.snapshot.commit_hash else 'unknown',
             'last_updated': self.snapshot.last_updated,
+            'total_edges': len(self.edges),
             'embedding_model': self.snapshot.embedding_model,
             'embedding_dim': self.snapshot.embedding_dim
         }

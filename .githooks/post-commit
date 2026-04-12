@@ -1,0 +1,8 @@
+#!/bin/sh
+# Post-commit hook: incrementally refresh .neo/ semantic index
+# Install: neo init (or: git config core.hooksPath .githooks)
+
+# Run in background so commits aren't blocked
+if command -v neo >/dev/null 2>&1; then
+    neo --index --update &
+fi

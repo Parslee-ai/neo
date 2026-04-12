@@ -38,6 +38,16 @@ MAX_CHUNK_LENGTH = 2000  # Characters per chunk
 
 
 @dataclass
+class CodeEdge:
+    """A relationship between code symbols (import, inheritance, etc.)."""
+    source_file: str
+    source_symbol: str  # Symbol where the edge originates (or "" for file-level)
+    target_symbol: str  # Symbol being referenced
+    edge_type: str      # "imports", "inherits", "implements"
+    line_number: int
+
+
+@dataclass
 class CodeChunk:
     """A semantic chunk of code (function, class, etc.)."""
     file_path: str
@@ -216,6 +226,122 @@ QUERIES = {
 # TSX uses same queries as TypeScript
 QUERIES['tsx'] = QUERIES['typescript']
 
+# Edge queries for relationship extraction (imports, inheritance)
+EDGE_QUERIES = {
+    'python': {
+        'imports': """
+            (import_statement
+                name: (dotted_name) @module) @import
+        """,
+        'import_from': """
+            (import_from_statement
+                module_name: (dotted_name) @module
+                name: (dotted_name) @name) @import
+        """,
+        'inheritance': """
+            (class_definition
+                name: (identifier) @class_name
+                superclasses: (argument_list
+                    (identifier) @base)) @class_def
+        """,
+    },
+    'c_sharp': {
+        'imports': """
+            (using_directive
+                (qualified_name) @module) @import
+        """,
+        'inheritance': """
+            (class_declaration
+                name: (identifier) @class_name
+                bases: (base_list
+                    (identifier) @base)) @class_def
+        """,
+    },
+    'typescript': {
+        'imports': """
+            (import_statement
+                source: (string) @module) @import
+        """,
+        'inheritance': """
+            (class_declaration
+                name: (type_identifier) @class_name
+                (class_heritage
+                    (extends_clause
+                        value: (identifier) @base))) @class_def
+        """,
+        'implements': """
+            (class_declaration
+                name: (type_identifier) @class_name
+                (class_heritage
+                    (implements_clause
+                        (type_identifier) @interface))) @class_def
+        """,
+    },
+    'javascript': {
+        'imports': """
+            (import_statement
+                source: (string) @module) @import
+        """,
+        'inheritance': """
+            (class_declaration
+                name: (identifier) @class_name
+                (class_heritage
+                    (identifier) @base)) @class_def
+        """,
+    },
+    'java': {
+        'imports': """
+            (import_declaration
+                (scoped_identifier) @module) @import
+        """,
+        'inheritance': """
+            (class_declaration
+                name: (identifier) @class_name
+                (superclass
+                    (type_identifier) @base)) @class_def
+        """,
+        'implements': """
+            (class_declaration
+                name: (identifier) @class_name
+                (super_interfaces
+                    (type_list
+                        (type_identifier) @interface))) @class_def
+        """,
+    },
+    'go': {
+        'imports': """
+            (import_spec
+                path: (interpreted_string_literal) @module) @import
+        """,
+    },
+    'rust': {
+        'imports': """
+            (use_declaration
+                argument: (scoped_identifier) @module) @import
+        """,
+    },
+    'c': {
+        'imports': """
+            (preproc_include
+                path: (_) @module) @import
+        """,
+    },
+    'cpp': {
+        'imports': """
+            (preproc_include
+                path: (_) @module) @import
+        """,
+        'inheritance': """
+            (class_specifier
+                name: (type_identifier) @class_name
+                (base_class_clause
+                    (type_identifier) @base)) @class_def
+        """,
+    },
+}
+
+EDGE_QUERIES['tsx'] = EDGE_QUERIES['typescript']
+
 
 class TreeSitterParser:
     """
@@ -319,6 +445,10 @@ class TreeSitterParser:
             chunks = []
             file_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
 
+            # Extract edges for import list
+            edges = self._extract_edges(tree, content, str(file_path), language)
+            import_symbols = [e.target_symbol for e in edges if e.edge_type == "imports"]
+
             # Extract each type of construct (functions, classes, etc.)
             for query_name in QUERIES[language].keys():
                 query = self._get_query(language, query_name)
@@ -331,7 +461,8 @@ class TreeSitterParser:
                     content,
                     str(file_path),
                     file_hash,
-                    query_name
+                    query_name,
+                    import_symbols
                 ))
 
             return chunks
@@ -340,13 +471,136 @@ class TreeSitterParser:
             logger.error(f"Failed to parse {file_path}: {e}")
             return []
 
+    def extract_edges(
+        self,
+        file_path: Path,
+        content: str,
+        language: Optional[str] = None
+    ) -> List[CodeEdge]:
+        """
+        Extract relationship edges (imports, inheritance) from file.
+
+        Args:
+            file_path: Path to source file
+            content: File content as string
+            language: Language name (auto-detected if None)
+
+        Returns:
+            List of CodeEdge objects
+        """
+        if language is None:
+            language = self.detect_language(file_path)
+
+        if not language:
+            return []
+
+        try:
+            parser = self._get_parser(language)
+            tree = parser.parse(bytes(content, 'utf8'))
+            return self._extract_edges(tree, content, str(file_path), language)
+        except Exception as e:
+            logger.error(f"Failed to extract edges from {file_path}: {e}")
+            return []
+
+    def _extract_edges(
+        self,
+        tree,
+        content: str,
+        file_path: str,
+        language: str
+    ) -> List[CodeEdge]:
+        """Extract edges from a parsed tree."""
+        if language not in EDGE_QUERIES:
+            return []
+
+        edges = []
+        content_bytes = content.encode('utf8')
+
+        for query_name, query_text in EDGE_QUERIES[language].items():
+            try:
+                lang_obj = self.languages.get(language)
+                if not lang_obj:
+                    self._get_parser(language)
+                    lang_obj = self.languages[language]
+
+                query = lang_obj.query(query_text)
+                captures = query.captures(tree.root_node)
+            except Exception as e:
+                logger.debug(f"Edge query {query_name} failed for {language}: {e}")
+                continue
+
+            if query_name in ('imports', 'import_from'):
+                edges.extend(self._process_import_captures(
+                    captures, content_bytes, file_path
+                ))
+            elif query_name == 'inheritance':
+                edges.extend(self._process_inheritance_captures(
+                    captures, content_bytes, file_path, "inherits"
+                ))
+            elif query_name == 'implements':
+                edges.extend(self._process_inheritance_captures(
+                    captures, content_bytes, file_path, "implements"
+                ))
+
+        return edges
+
+    def _process_import_captures(
+        self,
+        captures: List[Tuple],
+        content_bytes: bytes,
+        file_path: str
+    ) -> List[CodeEdge]:
+        """Process import query captures into CodeEdges."""
+        edges = []
+        for node, capture_name in captures:
+            if capture_name == 'module':
+                module_text = content_bytes[node.start_byte:node.end_byte].decode('utf8')
+                # Strip quotes from string literals (JS/TS/Go imports)
+                module_text = module_text.strip('\'"')
+                line = content_bytes[:node.start_byte].count(b'\n') + 1
+                edges.append(CodeEdge(
+                    source_file=file_path,
+                    source_symbol="",
+                    target_symbol=module_text,
+                    edge_type="imports",
+                    line_number=line,
+                ))
+        return edges
+
+    def _process_inheritance_captures(
+        self,
+        captures: List[Tuple],
+        content_bytes: bytes,
+        file_path: str,
+        edge_type: str
+    ) -> List[CodeEdge]:
+        """Process inheritance/implements query captures into CodeEdges."""
+        edges = []
+        # Track class_name and base pairs from captures
+        current_class = None
+        for node, capture_name in captures:
+            text = content_bytes[node.start_byte:node.end_byte].decode('utf8')
+            if capture_name == 'class_name':
+                current_class = text
+            elif capture_name in ('base', 'interface') and current_class:
+                line = content_bytes[:node.start_byte].count(b'\n') + 1
+                edges.append(CodeEdge(
+                    source_file=file_path,
+                    source_symbol=current_class,
+                    target_symbol=text,
+                    edge_type=edge_type,
+                    line_number=line,
+                ))
+        return edges
+
     def _process_captures(
         self,
         captures: List[Tuple],
         content: str,
         file_path: str,
         file_hash: str,
-        query_type: str
+        query_type: str,
+        import_symbols: Optional[List[str]] = None
     ) -> List[CodeChunk]:
         """Process tree-sitter query captures into CodeChunks."""
         chunks = []
@@ -420,7 +674,7 @@ class TreeSitterParser:
                 start_line=start_line,
                 end_line=end_line,
                 symbols=construct.get('symbols', []),
-                imports=[],  # TODO: Extract imports
+                imports=import_symbols or [],
                 file_hash=file_hash,
                 indexed_at=time.time()
             )

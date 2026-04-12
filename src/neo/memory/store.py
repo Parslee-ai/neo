@@ -178,6 +178,7 @@ class FactStore:
         source_prompt: str = "",
         tags: Optional[list[str]] = None,
         depends_on: Optional[list[str]] = None,
+        provenance: str = "inferred",
     ) -> Fact:
         """Add a new fact to the store.
 
@@ -194,6 +195,7 @@ class FactStore:
             source_prompt: Prompt that triggered this fact.
             tags: Optional tags for filtering.
             depends_on: Fact IDs this derives from.
+            provenance: Origin type - "structural", "inferred", or "observed".
 
         Returns:
             The newly created Fact.
@@ -213,6 +215,7 @@ class FactStore:
                 source_file=source_file,
                 source_prompt=source_prompt,
                 confidence=confidence,
+                provenance=provenance,
             ),
             embedding=embedding,
             tags=tags or [],
@@ -262,7 +265,13 @@ class FactStore:
             sc = fact.metadata.success_count
             if sc > 0:
                 success_bonus = 0.1 * math.log2(sc + 1)
-            score = sim * confidence + success_bonus
+            # Provenance boost: structural facts are more trustworthy
+            provenance_bonus = {
+                "structural": 0.05,
+                "observed": 0.02,
+                "inferred": 0.0,
+            }.get(fact.metadata.provenance, 0.0)
+            score = sim * confidence + success_bonus + provenance_bonus
             scored.append((fact, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)

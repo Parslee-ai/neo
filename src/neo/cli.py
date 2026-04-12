@@ -62,9 +62,21 @@ def parse_args():
     global_parser.add_argument('--regenerate-embeddings', action='store_true', help='Regenerate all embeddings with current model (safe, with automatic backup)')
     global_parser.add_argument('--index', action='store_true', help='Build semantic index for current directory')
     global_parser.add_argument('--languages', metavar='CSV', help='Languages to index (e.g., python,csharp,typescript)')
+    global_parser.add_argument('--update', action='store_true', help='Incremental index refresh (only changed files)')
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
+
+    # Detect if 'init' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'init':
+        p = argparse.ArgumentParser(
+            prog="neo init",
+            description="Initialize Neo in a repository (installs git hooks, builds index)",
+            parents=[global_parser]
+        )
+        args = p.parse_args(sys.argv[2:])
+        args.command = 'init'
+        return args
 
     # Detect if 'contribute' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'contribute':
@@ -333,9 +345,24 @@ def main():
         from neo.index.project_index import ProjectIndex
 
         codebase_root = args.cwd or os.getcwd()
-        print(f"[Neo] Building semantic index for {codebase_root}...")
-
         index = ProjectIndex(codebase_root)
+
+        # Incremental update mode (used by post-commit hook)
+        if hasattr(args, 'update') and args.update:
+            try:
+                if not index.snapshot:
+                    print("[Neo] No existing index found. Run 'neo --index' first.", file=sys.stderr)
+                    sys.exit(1)
+                index.refresh_changed_files()
+                status = index.status()
+                print(f"[Neo] Updated index: {status['total_chunks']} chunks, {status.get('total_edges', 0)} edges")
+                sys.exit(0)
+            except Exception as e:
+                print(f"[Neo] Failed to update index: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Full build mode
+        print(f"[Neo] Building semantic index for {codebase_root}...")
 
         # Parse languages if provided
         languages = None
@@ -348,7 +375,7 @@ def main():
         try:
             index.build_index(languages=languages, max_files=max_files)
             status = index.status()
-            print(f"[Neo] Built index: {status['total_chunks']} chunks from {status['total_files']} files")
+            print(f"[Neo] Built index: {status['total_chunks']} chunks, {status.get('total_edges', 0)} edges from {status['total_files']} files")
             print(f"[Neo] Index stored in {codebase_root}/.neo/")
             print("[Neo] Supported languages: Python, C#, TypeScript, JavaScript, Java, Go, Rust, C/C++")
             print("[Neo] Use '--semantic' flag to enable semantic search")
@@ -358,6 +385,52 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(1)
+
+    # Handle init subcommand
+    if hasattr(args, 'command') and args.command == 'init':
+        import shutil
+        import subprocess
+
+        codebase_root = args.cwd or os.getcwd()
+
+        # Check if we're in a git repo
+        try:
+            subprocess.run(
+                ['git', 'rev-parse', '--git-dir'],
+                cwd=codebase_root, capture_output=True, check=True
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("[Neo] Error: not a git repository", file=sys.stderr)
+            sys.exit(1)
+
+        # Install git hooks
+        hooks_src = os.path.join(os.path.dirname(__file__), '..', '..', '.githooks')
+        hooks_src = os.path.normpath(hooks_src)
+
+        # Set core.hooksPath to .githooks
+        git_hooks_dir = os.path.join(codebase_root, '.githooks')
+        os.makedirs(git_hooks_dir, exist_ok=True)
+
+        # Copy hook files from package to repo
+        for hook_name in ['pre-commit', 'post-commit']:
+            src = os.path.join(hooks_src, hook_name)
+            dst = os.path.join(git_hooks_dir, hook_name)
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
+                os.chmod(dst, 0o755)
+                print(f"[Neo] Installed {hook_name} hook")
+            elif os.path.exists(dst):
+                print(f"[Neo] {hook_name} hook already exists, skipping")
+
+        # Configure git to use .githooks directory
+        subprocess.run(
+            ['git', 'config', 'core.hooksPath', '.githooks'],
+            cwd=codebase_root, check=True
+        )
+        print("[Neo] Set git core.hooksPath to .githooks")
+        print("[Neo] Post-commit hook will auto-refresh the semantic index")
+        print("[Neo] Run 'neo --index' to build the initial index")
+        sys.exit(0)
 
     # Handle contribute subcommand
     if hasattr(args, 'command') and args.command == 'contribute':
