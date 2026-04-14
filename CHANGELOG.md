@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.15.4] - 2026-04-14
+
+### Fixed
+- Raise the bar above the base LM by closing four reasoning gaps that caused Neo to collapse to "LLM + logging":
+  - Objective early-exit gate: require self-confidence >0.8 AND static checks actually ran clean AND simulation traces agree, instead of trusting self-reported confidence alone (was bailing in 47.7% of sessions)
+  - Share `success_bonus(n)` between `FactStore.retrieve_relevant` and `ContextAssembler._score_facts` via `memory.models`, so outcome learning influences ranking on the main retrieval path; cap bonus at 0.2 so a narrow historical winner can't dominate cosine similarity
+  - Wire `ConstraintVerifier.extract_constraints` into the engine's main path with typed constraints threaded as parameters (no instance state), marker dict keyed by `ConstraintType` enum, comment/string stripping before substring match
+  - Community-facts fallback in `_retrieve_context` so prompts always carry some memory-derived context when `FactStore` retrieval returns empty
+
+### Changed
+- Extracted `NeoEngine._finalize_output` as single exit point for both early-exit and full-pipeline paths (eliminates duplicated save/log/telemetry blocks)
+- Narrowed silent `except Exception` in community fallback to `(OSError, json.JSONDecodeError)`
+
+### Removed
+- Unsafe `ConstraintVerifier.verify_code` subprocess path (executed arbitrary generated code; never called)
+
 ## [0.15.3] - 2026-04-12
 
 ### Fixed
