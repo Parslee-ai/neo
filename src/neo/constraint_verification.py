@@ -76,12 +76,18 @@ class Constraint:
         return "True"
 
 
-@dataclass
-class Violation:
-    """A constraint violation found in code."""
-    constraint: Constraint
-    explanation: str
-    fix_suggestion: str
+# Code-level markers that suggest a given constraint type is handled in the
+# generated code. Used by the static (no-exec) checker in engine.py.
+# Absence of a marker is a warning, not an error — the LM may satisfy the
+# constraint through other means.
+CONSTRAINT_CODE_MARKERS: Dict[ConstraintType, tuple] = {
+    ConstraintType.SORTED: ("sorted(", ".sort(", "heappush", "heappop", "bisect"),
+    ConstraintType.INCREASING: ("sorted(", ".sort(", "bisect"),
+    ConstraintType.DECREASING: ("sorted(", ".sort(", "reverse=True"),
+    ConstraintType.UNIQUE_ELEMENTS: ("set(", "dict.fromkeys"),
+    ConstraintType.NON_NEGATIVE: ("abs(", "max(0"),
+    ConstraintType.DIVISIBILITY: ("%",),
+}
 
 
 class ConstraintVerifier:
@@ -233,118 +239,3 @@ If no clear constraints, return "none"."""
         except Exception:
             return []
 
-    def verify_code(self, code: str, constraints: List[Constraint], test_input: str, test_output: str) -> List[Violation]:
-        """
-        Verify code against constraints using test synthesis.
-        Returns list of violations found.
-        """
-        if not constraints:
-            return []
-
-        violations = []
-
-        # Add constraint checks to code
-        check_code = code + "\n\n# Constraint verification\n"
-        check_code += f"_test_input = '''{test_input}'''\n"
-        check_code += "import sys\nfrom io import StringIO\n"
-        check_code += "_old_stdin = sys.stdin\n"
-        check_code += "sys.stdin = StringIO(_test_input)\n"
-
-        # Run code to capture result
-        check_code += "import io\n_output = io.StringIO()\n_old_stdout = sys.stdout\nsys.stdout = _output\n"
-        check_code += "try:\n"
-        check_code += "    exec(open(__file__).read().split('# Constraint verification')[0])\n"
-        check_code += "except: pass\n"
-        check_code += "sys.stdout = _old_stdout\n"
-        check_code += "result = _output.getvalue().strip()\n"
-        check_code += "sys.stdin = _old_stdin\n\n"
-
-        # Add constraint checks
-        for constraint in constraints:
-            check = constraint.to_check()
-            check_code += f"# Check: {constraint.description}\n"
-            check_code += "try:\n"
-            check_code += "    if isinstance(result, str) and result.strip():\n"
-            check_code += "        # Try parsing as int/float\n"
-            check_code += "        try:\n"
-            check_code += "            result = int(result)\n"
-            check_code += "        except:\n"
-            check_code += "            try:\n"
-            check_code += "                result = float(result)\n"
-            check_code += "            except:\n"
-            check_code += "                try:\n"
-            check_code += "                    result = eval(result)\n"
-            check_code += "                except: pass\n"
-            check_code += f"    assert {check}, '{constraint.description}'\n"
-            check_code += f"    print('✓ {constraint.type.value}')\n"
-            check_code += "except AssertionError:\n"
-            check_code += f"    print('✗ {constraint.type.value}')\n"
-            check_code += "except Exception as e:\n"
-            check_code += f"    print('? {constraint.type.value}')\n"
-
-        # Execute verification
-        import tempfile
-        import subprocess
-        import os
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(check_code)
-            temp_file = f.name
-
-        try:
-            result = subprocess.run(
-                ["python3", temp_file],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            # Parse results
-            for line in result.stdout.split('\n'):
-                if line.startswith('✗'):
-                    constraint_type = line.split()[1]
-                    constraint = next((c for c in constraints if c.type.value == constraint_type), None)
-                    if constraint:
-                        violation = Violation(
-                            constraint=constraint,
-                            explanation=f"Code output violates constraint: {constraint.description}",
-                            fix_suggestion=self._get_fix_suggestion(constraint)
-                        )
-                        violations.append(violation)
-        except Exception:
-            pass
-        finally:
-            os.unlink(temp_file)
-
-        return violations
-
-    def _get_fix_suggestion(self, constraint: Constraint) -> str:
-        """Generate fix suggestion for constraint violation."""
-        if constraint.type == ConstraintType.SORTED:
-            return "Add result.sort() or sorted(result) before returning"
-
-        elif constraint.type == ConstraintType.DIVISIBILITY:
-            divisor = constraint.parameters.get('divisor', 1)
-            return f"Ensure result is divisible by {divisor}, or round to nearest multiple"
-
-        elif constraint.type == ConstraintType.NON_NEGATIVE:
-            return "Check for negative values and use abs() or max(0, value)"
-
-        elif constraint.type == ConstraintType.UNIQUE_ELEMENTS:
-            return "Remove duplicates using set() or check before adding"
-
-        elif constraint.type == ConstraintType.INCREASING:
-            return "Sort result or ensure values are added in increasing order"
-
-        elif constraint.type == ConstraintType.DECREASING:
-            return "Sort result in reverse or ensure values are added in decreasing order"
-
-        elif constraint.type == ConstraintType.SUM_EQUALS:
-            target = constraint.parameters.get('target', 0)
-            return f"Verify sum of elements equals {target}"
-
-        elif constraint.type == ConstraintType.LENGTH:
-            length = constraint.parameters.get('length', 0)
-            return f"Ensure result has exactly {length} elements"
-
-        return "Verify constraint is satisfied before returning"

@@ -9,7 +9,6 @@ and supersession chains.
 import hashlib
 import json
 import logging
-import math
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -23,7 +22,7 @@ from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.seed import SeedIngester
-from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope
+from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, success_bonus
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
 from neo.memory.scope import detect_org_and_project
 from neo.pattern_extraction import extract_pattern_from_correction, get_library
@@ -258,20 +257,17 @@ class FactStore:
                 sim = self._cosine_similarity(query_embedding, fact.embedding)
 
             confidence = fact.metadata.confidence
-            # Validated patterns get a bonus: each success adds 0.1 to score
-            # (diminishing via log) so patterns that actually worked rise above
-            # noise. 1 success = +0.1, 3 = +0.2, 10 = +0.33
-            success_bonus = 0.0
-            sc = fact.metadata.success_count
-            if sc > 0:
-                success_bonus = 0.1 * math.log2(sc + 1)
             # Provenance boost: structural facts are more trustworthy
             provenance_bonus = {
                 "structural": 0.05,
                 "observed": 0.02,
                 "inferred": 0.0,
             }.get(fact.metadata.provenance, 0.0)
-            score = sim * confidence + success_bonus + provenance_bonus
+            score = (
+                sim * confidence
+                + success_bonus(fact.metadata.success_count)
+                + provenance_bonus
+            )
             scored.append((fact, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)

@@ -5,6 +5,7 @@ Replaces the flat ReasoningEntry list with a scoped, supersession-based
 fact store inspired by StateBench's four-layer state model.
 """
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -12,6 +13,24 @@ from enum import Enum
 from typing import Optional
 
 import numpy as np
+
+
+# Ranking policy shared across retrieval paths (FactStore.retrieve_relevant
+# and ContextAssembler._score_facts). MUST stay in one place — if the two
+# paths diverge, outcome learning ranks inconsistently.
+SUCCESS_BONUS_WEIGHT = 0.1
+SUCCESS_BONUS_CAP = 0.2  # Caps bonus so a narrow historical winner can't
+                         # dominate cosine similarity (bounded in [0,1]).
+
+
+def success_bonus(success_count: int) -> float:
+    """Log-scaled, capped bonus for facts with validated outcomes.
+
+    1 success → +0.10, 3 → +0.20 (cap), 10 → +0.20 (cap).
+    """
+    if success_count <= 0:
+        return 0.0
+    return min(SUCCESS_BONUS_CAP, SUCCESS_BONUS_WEIGHT * math.log2(success_count + 1))
 
 
 class FactKind(Enum):

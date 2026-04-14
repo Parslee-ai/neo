@@ -162,95 +162,133 @@ class NeoEngine:
         enriched_context["difficulty"] = difficulty
         enriched_context["time_budget"] = time_budget
 
+        # Extract verifiable constraints from the prompt so the LM sees them
+        # explicitly and we can check them post-hoc.
+        extracted_constraints = self._extract_prompt_constraints(neo_input.prompt)
+        if extracted_constraints:
+            enriched_context["verifiable_constraints"] = [
+                {"type": c.type.value, "description": c.description}
+                for c in extracted_constraints
+            ]
+
         # Single LLM call for all 3 phases (plan + simulation + code)
         # This is 59% faster than the old 3-call approach (22s vs 55s)
         plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
         self.last_simulation_traces = simulation_traces
 
-        # Phase 5: Early exit if high confidence solution found
-        # Rationale for 0.8 threshold: Balance speed vs accuracy
-        # - High confidence (>0.8) suggests strong pattern match from memory
-        # - Skipping static checks saves ~5-10s per problem
-        # - False positive rate <5% based on benchmark analysis
-        if code_suggestions:
-            max_confidence = max((s.confidence for s in code_suggestions), default=0.0)
-            if max_confidence > self.EARLY_EXIT_CONFIDENCE:
-                elapsed = time.time() - start_time
-                logger.info(f"High confidence solution ({max_confidence:.2f}), early exit")
-
-                # Store reasoning before returning
-                fact = None
-                if self.persistent_memory:
-                    fact = self._store_reasoning(
-                        neo_input, plan, code_suggestions, max_confidence, enriched_context
-                    )
-                # Save session for outcome detection on next invocation
-                if self.fact_store is not None:
-                    ids = self._build_suggestion_fact_ids(fact, code_suggestions)
-                    self.fact_store.save_session(code_suggestions, neo_input.prompt, ids)
-
-                # Log metrics
-                self._log_metrics(difficulty, time_budget, elapsed, early_exit=True)
-
-                # Create output
-                output = NeoOutput(
-                    plan=plan,
-                    simulation_traces=simulation_traces,
-                    code_suggestions=code_suggestions,
-                    static_checks=[],  # Skipped for early exit
-                    next_questions=[],
-                    confidence=max_confidence,
-                    notes=self._generate_notes(plan, simulation_traces, []),
-                    metadata={"early_exit": True, "max_confidence": max_confidence}
-                )
-
-                # Log usage telemetry (Phase 2 measurement)
-                self._log_usage_telemetry(output, neo_input)
-
-                return output
-
-        # Phase 5: Run static checks (only if time permits)
-        # Rationale for 10% buffer: Prevent timeout during static checks
-        # - Static checks are expensive (5-10s average)
-        # - Reserve 10% of budget as safety margin
-        # - If we're at 90% budget utilization, skip checks
+        # Phase 5: Run static checks BEFORE deciding early-exit.
+        # LM self-reported confidence alone is self-validation — we require an
+        # objective signal (no error-severity diagnostics) to skip the rest of
+        # the pipeline. Static checks are cheap enough to always run when the
+        # time budget allows.
         elapsed = time.time() - start_time
         static_checks = []
         if elapsed < time_budget * self.STATIC_CHECK_BUFFER:
-            static_checks = self._run_static_checks(code_suggestions)
+            static_checks = self._run_static_checks(code_suggestions, extracted_constraints)
         else:
             logger.info(f"Skipping static checks (at {elapsed/time_budget*100:.0f}% budget utilization)")
 
-        # Phase 6: Generate next questions
+        # Early exit only when BOTH signals agree: high self-confidence AND no
+        # error-severity diagnostics. An objective signal (static analysis
+        # actually ran and is clean) is required — we do NOT early-exit when
+        # static_checks is empty because no tools were available.
+        if code_suggestions and self._simulation_consensus(simulation_traces):
+            max_confidence = max((s.confidence for s in code_suggestions), default=0.0)
+            has_errors = any(
+                d.get("severity") == "error"
+                for check in static_checks
+                for d in check.diagnostics
+            )
+            static_ran = len(static_checks) > 0
+            if (
+                max_confidence > self.EARLY_EXIT_CONFIDENCE
+                and static_ran
+                and not has_errors
+            ):
+                logger.info(
+                    f"Early exit: confidence={max_confidence:.2f}, "
+                    f"static_checks={len(static_checks)} clean, "
+                    f"simulations agree"
+                )
+                return self._finalize_output(
+                    neo_input=neo_input,
+                    plan=plan,
+                    simulation_traces=simulation_traces,
+                    code_suggestions=code_suggestions,
+                    static_checks=static_checks,
+                    next_questions=[],
+                    confidence=max_confidence,
+                    enriched_context=enriched_context,
+                    start_time=start_time,
+                    difficulty=difficulty,
+                    time_budget=time_budget,
+                    early_exit=True,
+                    extra_metadata={
+                        "max_confidence": max_confidence,
+                        "static_checks_clean": True,
+                    },
+                )
+
         next_questions = self._generate_questions(
             plan, simulation_traces, code_suggestions, static_checks
         )
-
-        # Calculate overall confidence
         confidence = self._calculate_confidence(
             plan, simulation_traces, code_suggestions, static_checks
         )
 
-        # Phase 7: Store reasoning in persistent memory
-        # No code_suggestions gate - intentionally store all reasoning regardless of
-        # whether code suggestions were generated. Both fact_store and legacy backends
-        # benefit from recording the full reasoning chain for future retrieval.
+        return self._finalize_output(
+            neo_input=neo_input,
+            plan=plan,
+            simulation_traces=simulation_traces,
+            code_suggestions=code_suggestions,
+            static_checks=static_checks,
+            next_questions=next_questions,
+            confidence=confidence,
+            enriched_context=enriched_context,
+            start_time=start_time,
+            difficulty=difficulty,
+            time_budget=time_budget,
+            early_exit=False,
+        )
+
+    def _finalize_output(
+        self,
+        *,
+        neo_input: NeoInput,
+        plan: list[PlanStep],
+        simulation_traces: list[SimulationTrace],
+        code_suggestions: list[CodeSuggestion],
+        static_checks: list[StaticCheckResult],
+        next_questions: list[str],
+        confidence: float,
+        enriched_context: dict[str, Any],
+        start_time: float,
+        difficulty: str,
+        time_budget: float,
+        early_exit: bool,
+        extra_metadata: Optional[dict[str, Any]] = None,
+    ) -> NeoOutput:
+        """Persist reasoning, log metrics, and build the NeoOutput.
+
+        Single exit point for both early-exit and full-pipeline paths so the
+        save/log/telemetry sequence can't drift between them.
+        """
         fact = None
         if self.persistent_memory:
             fact = self._store_reasoning(
                 neo_input, plan, code_suggestions, confidence, enriched_context
             )
-
-        # Save session for outcome detection on next invocation
         if self.fact_store is not None:
             ids = self._build_suggestion_fact_ids(fact, code_suggestions)
             self.fact_store.save_session(code_suggestions, neo_input.prompt, ids)
 
-        # Log final metrics
         elapsed = time.time() - start_time
-        self._log_metrics(difficulty, time_budget, elapsed, early_exit=False)
+        self._log_metrics(difficulty, time_budget, elapsed, early_exit=early_exit)
 
-        # Create output
+        metadata: dict[str, Any] = {"early_exit": early_exit} if early_exit else {}
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
         output = NeoOutput(
             plan=plan,
             simulation_traces=simulation_traces,
@@ -259,13 +297,34 @@ class NeoEngine:
             next_questions=next_questions,
             confidence=confidence,
             notes=self._generate_notes(plan, simulation_traces, static_checks),
-            metadata={}
+            metadata=metadata,
         )
-
-        # Log usage telemetry (Phase 2 measurement)
         self._log_usage_telemetry(output, neo_input)
-
         return output
+
+    @staticmethod
+    def _simulation_consensus(traces: list[SimulationTrace]) -> bool:
+        """LM-independent sanity check: require ≥2 simulation traces with
+        matching expected_output OR no reported issues.
+
+        Returns True if we have enough trace agreement to trust the output,
+        False if we should fall through to the full verification pipeline.
+        When traces are unavailable (empty), returns True to avoid penalizing
+        task types that don't produce them — the confidence+static_checks
+        gates still apply.
+        """
+        if not traces:
+            return True
+        clean = [t for t in traces if not t.issues_found]
+        if len(clean) < 2:
+            return False
+        outputs = [(t.expected_output or "").strip() for t in clean]
+        # At least two clean traces with matching expected_output, OR all
+        # clean traces have no expected_output (non-algorithmic tasks).
+        non_empty = [o for o in outputs if o]
+        if not non_empty:
+            return True
+        return outputs.count(non_empty[0]) >= 2
 
     def _retrieve_context(self, neo_input: NeoInput) -> dict[str, Any]:
         """Retrieve and enrich context from input payload."""
@@ -335,6 +394,13 @@ class NeoEngine:
             formatted = self.fact_store.format_context_for_prompt(fact_context)
             if formatted:
                 past_learnings = [formatted]
+            else:
+                # Fallback: FactStore found nothing similar enough. Inject a
+                # small set of community-curated globals so the prompt always
+                # carries some memory-derived context.
+                fallback = self._community_fallback_learnings(prompt_text)
+                if fallback:
+                    past_learnings = [fallback]
 
             # Log retrieval for measurement (Fact-compatible attributes)
             self._log_pattern_retrieval(
@@ -621,21 +687,158 @@ RULES:
 - input_data and expected_output must be STRINGS (not JSON objects)"""
 
     def _run_static_checks(
-        self, suggestions: list[CodeSuggestion]
+        self,
+        suggestions: list[CodeSuggestion],
+        constraints: Optional[list] = None,
     ) -> list[StaticCheckResult]:
-        """Run static analysis tools in read-only mode."""
+        """Run static analysis tools in read-only mode.
+
+        Constraints are passed through explicitly (no instance state) so
+        callers can compose the check without ordering-dependent setup.
+        """
         from neo.static_analysis import run_static_checks
         from neo.config import NeoConfig
 
-        # Load config to check which tools are enabled (still use config for static analysis settings)
         config = NeoConfig.load()
 
-        return run_static_checks(
+        results = run_static_checks(
             suggestions,
             enable_ruff=config.enable_ruff,
             enable_pyright=config.enable_pyright,
             enable_mypy=config.enable_mypy,
             enable_eslint=config.enable_eslint,
+        )
+
+        # Phase 5.5: Static constraint verification (no code execution).
+        if constraints:
+            constraint_result = self._check_constraints_static(suggestions, constraints)
+            if constraint_result is not None:
+                results.append(constraint_result)
+
+        return results
+
+    def _community_fallback_learnings(self, prompt_text: str) -> str:
+        """Return formatted community facts when the primary store misses.
+
+        Reads ~/.neo/community_facts_cache.json directly and picks facts whose
+        subject contains any token from the prompt. Falls back to the first 2
+        facts if no token match.
+        """
+        cache = Path.home() / ".neo" / "community_facts_cache.json"
+        if not cache.exists():
+            return ""
+        try:
+            data = json.loads(cache.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug(f"Community cache unreadable: {e}")
+            return ""
+
+        facts = data.get("data", {}).get("facts", [])
+        if not facts:
+            return ""
+
+        tokens = {t for t in prompt_text.lower().split() if len(t) > 3}
+        scored: list[tuple[int, dict]] = []
+        for f in facts:
+            text = (f.get("subject", "") + " " + f.get("body", "")).lower()
+            hits = sum(1 for t in tokens if t in text)
+            scored.append((hits, f))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        picked = [f for h, f in scored if h > 0][:2] or [f for _, f in scored[:2]]
+        if not picked:
+            return ""
+
+        lines = ["## Community Patterns (fallback)"]
+        for f in picked:
+            subject = f.get("subject", "")
+            body = (f.get("body", "") or "")[:200]
+            lines.append(f"- **{subject}**: {body}")
+        return "\n".join(lines)
+
+    def _extract_prompt_constraints(self, prompt: str) -> list:
+        """Extract verifiable Constraint objects from the prompt (pattern-based).
+
+        Returns typed Constraint objects so callers pass them explicitly to
+        downstream checks rather than relying on instance state.
+        """
+        try:
+            from neo.constraint_verification import ConstraintVerifier
+        except ImportError:
+            return []
+
+        verifier = ConstraintVerifier()
+        try:
+            return verifier.extract_constraints(prompt)
+        except Exception as e:
+            logger.debug(f"Constraint extraction failed: {e}")
+            return []
+
+    @staticmethod
+    def _strip_comments_and_strings(code: str) -> str:
+        """Best-effort strip of Python comments and string/bytes literals.
+
+        Used before substring-matching constraint markers so the word
+        "sorted" inside a docstring or comment doesn't suppress a real
+        warning. Falls back to the original code if tokenization fails
+        (e.g. non-Python or syntactically broken input).
+        """
+        import io
+        import tokenize
+
+        try:
+            out = []
+            tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+            for tok in tokens:
+                if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                    continue
+                out.append(tok.string)
+            return " ".join(out)
+        except Exception:
+            return code
+
+    def _check_constraints_static(
+        self,
+        suggestions: list[CodeSuggestion],
+        constraints: list,
+    ) -> Optional[StaticCheckResult]:
+        """Flag generated code that appears to ignore declared constraints.
+
+        Pure textual checks with comment/string stripping. Does NOT execute
+        code. Absence of a handler marker is a warning, not an error.
+        """
+        if not constraints or not suggestions:
+            return None
+
+        from neo.constraint_verification import CONSTRAINT_CODE_MARKERS
+
+        diagnostics: list[dict[str, Any]] = []
+        for sug in suggestions:
+            raw = sug.code_block or sug.unified_diff or ""
+            code = self._strip_comments_and_strings(raw).lower()
+            for c in constraints:
+                hints = CONSTRAINT_CODE_MARKERS.get(c.type)
+                if not hints:
+                    continue
+                if not any(h.lower() in code for h in hints):
+                    diagnostics.append({
+                        "severity": "warning",
+                        "message": (
+                            f"Prompt declares constraint '{c.description}' but "
+                            f"generated code shows no obvious handler "
+                            f"(expected one of: {', '.join(hints)})"
+                        ),
+                        "constraint_type": c.type.value,
+                        "file_path": sug.file_path,
+                    })
+
+        if not diagnostics:
+            return None
+
+        return StaticCheckResult(
+            tool_name="constraint_verifier",
+            diagnostics=diagnostics,
+            summary=f"{len(diagnostics)} constraint(s) may not be handled",
         )
 
     def _generate_questions(

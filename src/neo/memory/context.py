@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 
 from neo.math_utils import cosine_similarity
-from neo.memory.models import ContextResult, Fact, FactKind, FactScope
+from neo.memory.models import ContextResult, Fact, FactKind, FactScope, success_bonus
 
 logger = logging.getLogger(__name__)
 
@@ -143,22 +143,20 @@ class ContextAssembler:
         facts: list[Fact],
         query_embedding: Optional[np.ndarray],
     ) -> list[tuple[Fact, float]]:
-        """Score facts by cosine similarity * confidence.
+        """Score facts by cosine similarity * confidence + outcome bonus.
 
-        Returns sorted list of (fact, score) tuples, highest first.
+        Shares the ranking policy with FactStore.retrieve_relevant via
+        memory.models.success_bonus so the two retrieval paths stay consistent.
         """
         scored: list[tuple[Fact, float]] = []
 
         for fact in facts:
-            # Cosine similarity component
-            sim = 0.5  # Default when no embedding available
+            sim = 0.5
             if query_embedding is not None and fact.embedding is not None:
                 sim = self._cosine_similarity(query_embedding, fact.embedding)
 
-            # Confidence component
             confidence = fact.metadata.confidence
-
-            score = sim * confidence
+            score = sim * confidence + success_bonus(fact.metadata.success_count)
             scored.append((fact, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
