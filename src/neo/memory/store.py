@@ -150,6 +150,16 @@ class FactStore:
             self.save()
             self._cap_pending = False
 
+        # Lifecycle maintenance on every cold start. Previously these only
+        # ran inside detect_implicit_feedback, so inactive projects accumulated
+        # stale REVIEW facts indefinitely.
+        try:
+            self.prune_stale_facts()
+            self.demote_unhelpful_facts()
+            self.purge_dead_facts()
+        except Exception as e:
+            logger.warning(f"Lifecycle maintenance on init failed (non-fatal): {e}")
+
     def _ensure_embedder(self) -> None:
         """Lazy-initialize the embedding model on first use."""
         if self._embedder_initialized:
@@ -676,12 +686,14 @@ class FactStore:
         """Remove valid-but-useless facts: low confidence, zero successes, old enough.
 
         Targets noise that was never validated. Does NOT touch CONSTRAINT facts
-        or recently-created facts.
+        or recently-created facts. INDEPENDENT-tagged facts are pure observation
+        noise and prune twice as fast (7 days instead of 14).
 
         Returns the number of pruned facts.
         """
         now = time.time()
-        stale_age = STALE_MIN_AGE_DAYS * 86400
+        default_stale_age = STALE_MIN_AGE_DAYS * 86400
+        independent_stale_age = 7 * 86400
         pruned = 0
 
         for fact in self._facts:
@@ -691,12 +703,18 @@ class FactStore:
                 continue
             if fact.metadata.success_count > 0:
                 continue
-            if fact.metadata.confidence >= STALE_MAX_CONFIDENCE:
-                continue
-            if (now - fact.metadata.created_at) < stale_age:
-                continue
             # Curated facts (seed, community, synthesized) are protected
             if PROTECTED_TAGS & set(fact.tags):
+                continue
+
+            is_independent = "independent" in fact.tags
+            stale_age = independent_stale_age if is_independent else default_stale_age
+            # INDEPENDENT facts are 0.2 confidence noise by construction; we
+            # don't gate them on STALE_MAX_CONFIDENCE so they always prune
+            # when their clock runs out.
+            if not is_independent and fact.metadata.confidence >= STALE_MAX_CONFIDENCE:
+                continue
+            if (now - fact.metadata.created_at) < stale_age:
                 continue
 
             fact.is_valid = False

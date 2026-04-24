@@ -1846,14 +1846,14 @@ This change improves security by...
 - Valid JSON array only between sentinels
 - No text before or after sentinels
 - file_path: absolute path string (use "/" or "N/A" for review-only findings without code changes)
-- unified_diff: max 5000 characters (can be empty "" for reviews)
-- code_block: executable Python code (OPTIONAL but strongly preferred - improves success rate)
+- unified_diff: max 5000 characters. REQUIRED non-empty whenever file_path is a real path. Empty "" ONLY when file_path="/" or "N/A" (pure review/analysis with no code change).
+- code_block: complete executable code for the target file. REQUIRED non-empty whenever file_path is a real path — the feedback loop depends on it. Empty "" ONLY for pure reviews.
 - description: max 1000 characters (be detailed for review findings!)
 - confidence: float 0.0 to 1.0
 - tradeoffs: array of strings, max 500 chars each
 - Always include schema_version: "3"
-- IMPORTANT: When providing code_block, include complete, executable Python code
 - For review/analysis tasks without code changes: use file_path="/", unified_diff="", code_block=""
+- For code changes: ALWAYS include BOTH unified_diff AND code_block. Never emit an empty diff for a real file path — it breaks Neo's learning.
 
 Generate precise unified diffs based on the plan and simulation results. Keep changes minimal and isolated."""
 
@@ -2109,13 +2109,65 @@ Generate unified diff patches. Keep changes minimal and isolated."""
         # Convert ParseResult.data to list[CodeSuggestion]
         suggestions = []
         for item in result.data:
+            file_path = item.get("file_path", "")
+            unified_diff = item.get("unified_diff", "")
+            code_block = item.get("code_block", "")
+
+            # Synthesize a diff when the LM omitted one for a real file path.
+            # Without this, outcome detection collapses to UNVERIFIED and
+            # success_count never grows — the learning loop stays dead.
+            if not unified_diff and code_block and file_path and file_path not in ("/", "N/A"):
+                synthesized = self._synthesize_unified_diff(file_path, code_block)
+                if synthesized:
+                    unified_diff = synthesized
+
             suggestions.append(CodeSuggestion(
-                file_path=item.get("file_path", ""),
-                unified_diff=item.get("unified_diff", ""),
+                file_path=file_path,
+                unified_diff=unified_diff,
                 description=item.get("description", ""),
                 confidence=item.get("confidence", 0.5),
                 tradeoffs=item.get("tradeoffs", []),
-                code_block=item.get("code_block", "")
+                code_block=code_block
             ))
 
         return suggestions
+
+    def _synthesize_unified_diff(self, file_path: str, code_block: str) -> str:
+        """Build a unified diff from code_block vs. current on-disk content.
+
+        Returns empty string if resolution or diffing fails (caller falls back
+        to an empty diff, which just degrades outcome detection to UNVERIFIED).
+        """
+        import difflib
+
+        try:
+            p = Path(file_path)
+            if not p.is_absolute() and self.codebase_root:
+                p = Path(self.codebase_root) / file_path.lstrip("/")
+
+            original = ""
+            if p.exists() and p.is_file():
+                try:
+                    original = p.read_text()
+                except (OSError, UnicodeDecodeError):
+                    return ""
+
+            rel_label = file_path.lstrip("/") or "file"
+            from_label = f"a/{rel_label}" if original else "/dev/null"
+            to_label = f"b/{rel_label}"
+
+            original_lines = original.splitlines(keepends=True)
+            new_lines = code_block.splitlines(keepends=True)
+            if original_lines and not original_lines[-1].endswith("\n"):
+                original_lines[-1] += "\n"
+            if new_lines and not new_lines[-1].endswith("\n"):
+                new_lines[-1] += "\n"
+
+            diff = "".join(difflib.unified_diff(
+                original_lines, new_lines,
+                fromfile=from_label, tofile=to_label, n=3,
+            ))
+            return diff[:5000]  # match schema cap
+        except Exception as e:
+            logger.debug(f"Diff synthesis failed for {file_path}: {e}")
+            return ""
