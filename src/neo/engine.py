@@ -550,13 +550,15 @@ class NeoEngine:
         # so we can size reasoning effort to query novelty.
         prompt, memory_signal = self._format_combined_prompt(context)
 
-        effort = effort_from_memory(memory_signal)
+        difficulty = context.get("difficulty", "medium")
+        effort = effort_from_memory(memory_signal, difficulty=difficulty)
         cap = getattr(self.config, "reasoning_effort_cap", None) if self.config else None
         effort = apply_cap(effort, cap)
         logger.info(
             f"Reasoning effort: {effort} "
             f"(patterns={memory_signal.pattern_count}, "
-            f"avg_conf={memory_signal.avg_confidence:.2f}, cap={cap})"
+            f"avg_conf={memory_signal.avg_confidence:.2f}, "
+            f"difficulty={difficulty}, cap={cap})"
         )
 
         # Single LLM call with strict format

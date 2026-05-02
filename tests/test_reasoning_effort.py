@@ -18,8 +18,22 @@ from neo.reasoning_effort import (
 
 class TestEffortFromMemory:
     def test_no_patterns_yields_high(self):
-        # Cold start: nothing to lean on, spend tokens on thinking.
+        # Cold start at default difficulty: nothing to lean on, spend on thinking.
         assert effort_from_memory(MemorySignal()) == "high"
+
+    def test_no_patterns_easy_yields_high(self):
+        # Cold start on an easy task — high is enough; don't burn xhigh.
+        assert effort_from_memory(MemorySignal(), difficulty="easy") == "high"
+
+    def test_no_patterns_hard_yields_xhigh(self):
+        # Worst case: zero memory + algorithmically hard. Spend max thinking.
+        assert effort_from_memory(MemorySignal(), difficulty="hard") == "xhigh"
+
+    def test_patterns_present_hard_does_not_force_xhigh(self):
+        # Memory present overrides the hard-difficulty escalation: confidence
+        # in retrieved patterns is the load-bearing signal.
+        signal = MemorySignal(pattern_count=4, avg_confidence=0.85)
+        assert effort_from_memory(signal, difficulty="hard") == "low"
 
     def test_low_confidence_yields_high(self):
         # Memory exists but isn't trustworthy — same as cold start.

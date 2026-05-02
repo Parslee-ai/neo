@@ -41,21 +41,23 @@ class MemorySignal:
     avg_confidence: float = 0.0
 
 
-def effort_from_memory(signal: MemorySignal) -> str:
-    """Map a memory signal to a reasoning-effort level.
+def effort_from_memory(signal: MemorySignal, *, difficulty: str = "medium") -> str:
+    """Map a memory signal (and difficulty) to a reasoning-effort level.
 
-    | Signal                                         | Effort |
-    |------------------------------------------------|--------|
-    | ≥3 patterns, avg confidence ≥ 0.8              | low    |
-    | Some patterns, avg confidence in [0.5, 0.8)    | medium |
-    | No patterns OR avg confidence < 0.5            | high   |
+    | Signal                                          | Effort |
+    |-------------------------------------------------|--------|
+    | ≥3 patterns, avg confidence ≥ 0.8               | low    |
+    | Some patterns, avg confidence in [0.5, 0.8)     | medium |
+    | No patterns OR avg confidence < 0.5             | high   |
+    | No patterns AND difficulty == "hard"            | xhigh  |
 
-    The "no patterns" case maps to high (not xhigh) because pessimizing the
-    cold-start case would tax greenfield use. xhigh is reserved for explicit
-    escalation (e.g. self-correction after a failed call).
+    `difficulty` comes from NeoEngine._estimate_difficulty() — one of
+    "easy", "medium", "hard". xhigh is reserved for the worst-case combo:
+    the engine has nothing in memory to lean on AND the prompt itself looks
+    algorithmically hard (large N, complexity-keyword hits).
     """
     if signal.pattern_count == 0:
-        return "high"
+        return "xhigh" if difficulty == "hard" else "high"
     if signal.avg_confidence < _LOW_CONFIDENCE:
         return "high"
     if (
