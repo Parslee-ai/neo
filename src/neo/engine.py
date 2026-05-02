@@ -687,6 +687,14 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             parts.append("\nSimilar Past Tasks:")
             parts.extend(f"- {ex}" for ex in exemplars[:3])
 
+        # Surface code smells in the gatherer-picked files so the model sees
+        # known issues alongside the source. Scoped to `files[:20]` to match
+        # what we actually showed the model above.
+        from neo.code_smells import format_for_prompt, scan_files
+        smells_section = format_for_prompt(scan_files(files[:20]))
+        if smells_section:
+            parts.append(smells_section)
+
         context_str = "\n".join(parts)
 
         # Format past learnings AFTER instructions to avoid confusion

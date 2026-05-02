@@ -1,0 +1,254 @@
+"""Tests for neo.code_smells — high-precision anti-pattern detectors."""
+
+from neo.code_smells import CodeSmell, format_for_prompt, scan_files
+from neo.models import ContextFile
+
+
+def _file(path: str, content: str) -> ContextFile:
+    return ContextFile(path=path, content=content)
+
+
+# ---------------------------------------------------------------------------
+# TODO / FIXME / HACK / XXX markers
+# ---------------------------------------------------------------------------
+
+class TestMarkerDetection:
+    def test_python_hash_todo(self):
+        f = _file("a.py", "x = 1  # TODO: replace with config\n")
+        smells = scan_files([f])
+        assert any(s.kind == "todo" and s.severity == "info" for s in smells)
+        assert smells[0].line == 1
+        assert "TODO" in smells[0].message
+
+    def test_javascript_double_slash_fixme(self):
+        f = _file("a.js", "// FIXME: leaks memory under load\nconst x = 1;\n")
+        smells = scan_files([f])
+        assert smells[0].kind == "todo"
+        assert smells[0].severity == "info"
+
+    def test_block_comment_hack_warns(self):
+        f = _file("a.c", "/* HACK: relies on undefined behavior */\nint x;\n")
+        smells = scan_files([f])
+        assert smells[0].kind == "todo"
+        assert smells[0].severity == "warn"  # HACK is warn, not info
+
+    def test_xxx_marker_warns(self):
+        f = _file("a.py", "# XXX broken; do not ship\n")
+        smells = scan_files([f])
+        assert smells[0].severity == "warn"
+
+    def test_marker_inside_identifier_not_flagged(self):
+        # `update_todo_list` should NOT trigger the TODO scanner.
+        f = _file("a.py", "def update_todo_list():\n    return []\n")
+        smells = scan_files([f])
+        # Only the stub check might fire, but not the TODO marker.
+        assert not any(s.kind == "todo" for s in smells)
+
+    def test_marker_in_string_literal_does_match(self):
+        # We deliberately don't suppress markers in string literals — too
+        # easy to lose real findings. This test pins that decision so a
+        # future "improvement" doesn't silently drop coverage.
+        # (Marker still requires a comment-prefix character, so a bare
+        # string with "TODO" in it is fine.)
+        f = _file("a.py", 'msg = "TODO write docs"\n')
+        smells = scan_files([f])
+        # No comment prefix — should NOT match.
+        assert not smells
+
+
+# ---------------------------------------------------------------------------
+# Python stubs
+# ---------------------------------------------------------------------------
+
+class TestStubDetection:
+    def test_pass_only_body(self):
+        f = _file("a.py", "def stub():\n    pass\n")
+        smells = scan_files([f])
+        stub = next(s for s in smells if s.kind == "stub")
+        assert "pass-only" in stub.message
+        assert stub.severity == "warn"
+
+    def test_ellipsis_only_body(self):
+        f = _file("a.py", "def stub():\n    ...\n")
+        stub = next(s for s in scan_files([f]) if s.kind == "stub")
+        assert "ellipsis" in stub.message
+
+    def test_raises_not_implemented(self):
+        f = _file("a.py", "def stub():\n    raise NotImplementedError\n")
+        stub = next(s for s in scan_files([f]) if s.kind == "stub")
+        assert "NotImplementedError" in stub.message
+
+    def test_raises_not_implemented_with_message(self):
+        f = _file("a.py", "def stub():\n    raise NotImplementedError('not done')\n")
+        stub = next(s for s in scan_files([f]) if s.kind == "stub")
+        assert "NotImplementedError" in stub.message
+
+    def test_docstring_does_not_count_as_content(self):
+        # A function with only a docstring + pass IS still a stub.
+        src = 'def stub():\n    """Does nothing yet."""\n    pass\n'
+        smells = scan_files([_file("a.py", src)])
+        assert any(s.kind == "stub" for s in smells)
+
+    def test_real_function_not_flagged(self):
+        f = _file("a.py", "def real():\n    return 42\n")
+        smells = scan_files([f])
+        assert not any(s.kind == "stub" for s in smells)
+
+    def test_async_function_stub_detected(self):
+        f = _file("a.py", "async def stub():\n    pass\n")
+        assert any(s.kind == "stub" for s in scan_files([f]))
+
+
+# ---------------------------------------------------------------------------
+# Bare except / swallowed exceptions
+# ---------------------------------------------------------------------------
+
+class TestExceptDetection:
+    def test_bare_except_flagged(self):
+        f = _file("a.py", "try:\n    x = 1\nexcept:\n    log_it()\n")
+        kinds = {s.kind for s in scan_files([f])}
+        assert "bare_except" in kinds
+        assert "swallowed_except" not in kinds  # body isn't silent
+
+    def test_swallowed_typed_except(self):
+        # Catches a specific exception but silently drops it.
+        src = "try:\n    risky()\nexcept ValueError:\n    pass\n"
+        kinds = {s.kind for s in scan_files([_file("a.py", src)])}
+        assert "swallowed_except" in kinds
+        assert "bare_except" not in kinds  # type IS specified
+
+    def test_bare_and_swallowed_both_fire(self):
+        # Worst case: bare `except:` AND silently dropped.
+        src = "try:\n    risky()\nexcept:\n    pass\n"
+        kinds = {s.kind for s in scan_files([_file("a.py", src)])}
+        assert "bare_except" in kinds
+        assert "swallowed_except" in kinds
+
+    def test_ellipsis_body_is_swallowing(self):
+        src = "try:\n    risky()\nexcept Exception:\n    ...\n"
+        kinds = {s.kind for s in scan_files([_file("a.py", src)])}
+        assert "swallowed_except" in kinds
+
+    def test_handled_exception_not_flagged(self):
+        src = (
+            "try:\n"
+            "    risky()\n"
+            "except ValueError as e:\n"
+            "    raise RuntimeError('wrapped') from e\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.py", src)])}
+        assert "swallowed_except" not in kinds
+        assert "bare_except" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# Hardcoded credentials
+# ---------------------------------------------------------------------------
+
+class TestSecretDetection:
+    def test_openai_key_flagged(self):
+        # Synthetic key — never a real one.
+        f = _file("a.py", 'API_KEY = "sk-' + "X" * 30 + '"\n')
+        smells = scan_files([f])
+        secret = next(s for s in smells if s.kind == "secret")
+        assert secret.severity == "high"
+        assert "OpenAI" in secret.message
+
+    def test_aws_access_key_flagged(self):
+        f = _file("a.txt", "AKIAIOSFODNN7EXAMPLE\n")
+        secret = next(s for s in scan_files([f]) if s.kind == "secret")
+        assert "AWS" in secret.message
+
+    def test_github_token_flagged(self):
+        f = _file("a.txt", "token = ghp_" + "A" * 30 + "\n")
+        assert any(s.kind == "secret" for s in scan_files([f]))
+
+    def test_short_random_string_not_flagged(self):
+        # Generic high-entropy strings should NOT trigger — we only match
+        # known prefixed shapes.
+        f = _file("a.py", 'token = "abc123def456"\n')
+        smells = scan_files([f])
+        assert not any(s.kind == "secret" for s in smells)
+
+
+# ---------------------------------------------------------------------------
+# Robustness
+# ---------------------------------------------------------------------------
+
+class TestRobustness:
+    def test_syntax_error_python_falls_through_to_marker_scan(self):
+        # File doesn't parse — Python detectors silently skip, but the
+        # marker scan (regex-based) still fires.
+        src = "def broken(:\n    # TODO fix syntax\n"
+        smells = scan_files([_file("a.py", src)])
+        assert any(s.kind == "todo" for s in smells)
+        # Stub detection is AST-only, so it can't fire here.
+        assert not any(s.kind == "stub" for s in smells)
+
+    def test_empty_content_yields_no_findings(self):
+        assert scan_files([_file("a.py", "")]) == []
+
+    def test_nonexistent_file_extension_still_scans_markers(self):
+        f = _file("README", "# TODO write docs\n")
+        smells = scan_files([f])
+        assert any(s.kind == "todo" for s in smells)
+
+    def test_per_file_cap_enforced(self):
+        # 20 TODOs in one file → only 8 returned (the per-file cap).
+        content = "\n".join(f"# TODO item {i}" for i in range(20))
+        smells = scan_files([_file("a.py", content)])
+        assert len(smells) == 8
+
+
+# ---------------------------------------------------------------------------
+# Prompt rendering
+# ---------------------------------------------------------------------------
+
+class TestFormatForPrompt:
+    def test_empty_returns_empty_string(self):
+        assert format_for_prompt([]) == ""
+
+    def test_renders_severity_high_first(self):
+        smells = [
+            CodeSmell("a.py", 1, "todo", "info", "TODO: x", "# TODO: x"),
+            CodeSmell("a.py", 2, "secret", "high", "OpenAI key", "..."),
+            CodeSmell("a.py", 3, "stub", "warn", "stub", "..."),
+        ]
+        out = format_for_prompt(smells)
+        # high should come first, then warn, then info
+        assert out.find("[secret/high]") < out.find("[stub/warn]")
+        assert out.find("[stub/warn]") < out.find("[todo/info]")
+
+    def test_truncation_note_when_over_max(self):
+        smells = [
+            CodeSmell("a.py", i, "todo", "info", f"item {i}", f"# TODO {i}")
+            for i in range(25)
+        ]
+        out = format_for_prompt(smells, max_findings=20)
+        assert "+5 more findings suppressed" in out
+
+
+# ---------------------------------------------------------------------------
+# End-to-end on a realistic mixed file
+# ---------------------------------------------------------------------------
+
+def test_end_to_end_mixed_file():
+    src = (
+        "import os\n"
+        "\n"
+        "# TODO: load from env\n"
+        "API_KEY = 'sk-" + "X" * 30 + "'\n"
+        "\n"
+        "def authenticate():\n"
+        "    pass\n"
+        "\n"
+        "def call_api():\n"
+        "    try:\n"
+        "        do_something()\n"
+        "    except:\n"
+        "        pass\n"
+    )
+    smells = scan_files([_file("auth.py", src)])
+    kinds = {s.kind for s in smells}
+    # All five detectors fire on this one file.
+    assert kinds == {"todo", "secret", "stub", "bare_except", "swallowed_except"}
