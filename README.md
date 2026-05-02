@@ -412,7 +412,7 @@ $ neo --version
 "What is real? How do you define 'real'?"
 
 neo 0.9.0
-Provider: openai | Model: gpt-5.3-codex
+Provider: openai | Model: gpt-5.5
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 0 facts | 0.00 avg confidence
@@ -578,7 +578,7 @@ neo --config reset
 
 **Exposed Configuration Fields:**
 - `provider` - LM provider (openai, anthropic, google, azure, ollama, local)
-- `model` - Model name (e.g., gpt-5.3-codex, claude-sonnet-4-5-20250929)
+- `model` - Model name (e.g., gpt-5.5, claude-sonnet-4-5-20250929)
 - `api_key` - API key for the chosen provider
 - `base_url` - Base URL for local/Ollama endpoints
 - `memory_backend` - Memory backend: "fact_store" (default) or "legacy"
@@ -602,10 +602,10 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 ```python
 from neo.adapters import OpenAIAdapter
-adapter = OpenAIAdapter(model="gpt-5.3-codex", api_key="sk-...")
+adapter = OpenAIAdapter(model="gpt-5.5", api_key="sk-...")
 ```
 
-Default model: `gpt-5.3-codex`. GPT-5/Codex models use the `/v1/responses` endpoint automatically.
+Default model: `gpt-5.5`. GPT-5/Codex models use the `/v1/responses` endpoint automatically.
 
 ### Anthropic
 

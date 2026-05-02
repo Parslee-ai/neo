@@ -56,7 +56,7 @@ class OpenAIAdapter(LMAdapter):
         temperature: float = 0.7,
     ) -> str:
         """Generate response using OpenAI API."""
-        # gpt-5-codex uses /v1/responses endpoint
+        # gpt-5* and codex models use /v1/responses endpoint
         if "codex" in self.model.lower() or "gpt-5" in self.model.lower():
             import httpx
             headers = {

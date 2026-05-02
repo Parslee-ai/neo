@@ -32,7 +32,7 @@ Expected output:
 "What is real? How do you define 'real'?"
 
 neo 0.9.0
-Provider: openai | Model: gpt-5.3-codex
+Provider: openai | Model: gpt-5.5
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 0 facts | 0.00 avg confidence
