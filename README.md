@@ -33,6 +33,8 @@ Neo is **_the missing context layer_** for AI Code Assistants.  It learns from e
 - [How It Works](#how-it-works)
 - [Quick Start](#quick-start)
 - [Claude Code Plugin](#claude-code-plugin)
+- [Codex Plugin](#codex-plugin)
+- [Works Alongside Your AI Tools](#works-alongside-your-ai-tools)
   - [Quick Examples](#quick-examples)
 - [Installation](#installation)
   - [From PyPI (Recommended)](#from-pypi-recommended)
@@ -243,6 +245,32 @@ Once installed, you get:
 **See [.claude-plugin/README.md](.claude-plugin/README.md) for full plugin documentation**
 
 
+## Codex Plugin
+
+Neo also ships as a **Codex plugin** with the same six skills the Claude Code plugin exposes — packaged for [OpenAI Codex CLI](https://developers.openai.com/codex/plugins) instead of slash commands.
+
+```bash
+# Add Neo's local marketplace (works in any clone of this repo)
+codex plugin marketplace add Parslee-ai/neo
+
+# Or, from a local checkout, point Codex at the in-tree marketplace:
+codex plugin marketplace add ./
+```
+
+Then open Codex's plugin directory and install **Neo** from the `Neo (local)` marketplace. Once installed, you get six skills:
+
+- `$neo` — semantic reasoning over the current codebase
+- `$neo-review` — code review with semantic pattern matching
+- `$neo-optimize` — performance/algorithmic optimization analysis
+- `$neo-architect` — architectural guidance and design decisions
+- `$neo-debug` — help debugging intermittent or hard-to-reproduce issues
+- `$neo-pattern` — extract patterns from code or find pattern instances
+
+Skills wrap the local `neo` CLI, so you still need the binary installed (`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set). Neo's persistent semantic memory in `~/.neo/` is shared across both plugins — anything you teach Neo from Claude Code is available from Codex too, and vice versa.
+
+**See [plugins/neo/](plugins/neo/) for the manifest and skill sources**
+
+
 ## Works Alongside Your AI Tools
 
 Neo automatically reads project-local agent instruction docs from a wide range
@@ -272,8 +300,8 @@ keep prompt growth bounded.
 **This means neo composes well with whichever AI coding workflow you already
 use:**
 
-- **Claude Code** users get the deepest integration via the [plugin](#claude-code-plugin), but neo runs standalone too.
-- **Codex CLI** users — neo automatically picks up `AGENTS.md` (the cross-tool standard Codex co-led) plus anything under `.codex/`.
+- **Claude Code** users get the deepest integration via the [Claude Code Plugin](#claude-code-plugin), but neo runs standalone too.
+- **Codex CLI** users get parity via the [Codex Plugin](#codex-plugin) — same six skills, packaged for Codex. Neo also automatically picks up `AGENTS.md` (the cross-tool standard Codex co-led) plus anything under `.codex/`.
 - **Cursor / Windsurf / Aider / Continue / Augment** users — the rules dirs you've curated land in every neo session's context.
 - **GitHub Copilot** users — `.github/copilot-instructions.md` is read on every invocation.
 - **Spec Kit** projects — your specs are folded into neo's reasoning context, no manual paste.

@@ -1,0 +1,31 @@
+{
+  "name": "neo",
+  "version": "0.15.5",
+  "description": "Multi-agent semantic reasoning system with persistent memory for code suggestions, architectural guidance, and optimization recommendations",
+  "author": {
+    "name": "Parslee AI",
+    "url": "https://parslee.ai"
+  },
+  "homepage": "https://github.com/Parslee-ai/neo",
+  "repository": "https://github.com/Parslee-ai/neo",
+  "license": "Apache-2.0",
+  "keywords": [
+    "reasoning",
+    "semantic-search",
+    "multi-agent",
+    "code-review",
+    "optimization",
+    "architecture",
+    "memory",
+    "patterns"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Neo",
+    "shortDescription": "Semantic reasoning with persistent memory",
+    "longDescription": "Neo is a read-only reasoning helper that suggests solutions via multi-agent reasoning (MapCoder/CodeSim style) over a persistent semantic memory of your codebase. Skills wrap the local `neo` CLI to give Codex one-shot access to its plan/simulate/code pipeline. Requires the neo CLI installed locally (`pip install neo-reasoner[openai]`).",
+    "developerName": "Parslee AI",
+    "category": "Productivity",
+    "capabilities": ["Read"]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "neo-local",
+  "interface": {
+    "displayName": "Neo (local)"
+  },
+  "plugins": [
+    {
+      "name": "neo",
+      "source": {
+        "source": "local",
+        "path": "./plugins/neo"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
