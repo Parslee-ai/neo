@@ -56,6 +56,9 @@ class SessionRecord:
     prompt: str = ""
     suggestions: list[dict] = field(default_factory=list)
     suggestion_fact_ids: dict[str, str] = field(default_factory=dict)
+    # Architectural snapshot at save time. Empty dict when computation
+    # failed or codebase_root was unavailable.
+    architecture_snapshot: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -138,6 +141,7 @@ class OutcomeTracker:
             prompt=prompt[:200],
             suggestions=records,
             suggestion_fact_ids=suggestion_fact_ids or {},
+            architecture_snapshot=self._snapshot_architecture(),
         )
 
         try:
@@ -156,6 +160,57 @@ class OutcomeTracker:
             )
         except OSError as e:
             logger.warning(f"Failed to save session: {e}")
+
+    def _snapshot_architecture(self) -> dict:
+        """Capture an ArchSnapshot of the codebase. Always best-effort."""
+        if not self.codebase_root:
+            return {}
+        try:
+            from neo.architecture_metrics import compute
+            return compute(self.codebase_root).to_dict()
+        except Exception as exc:
+            logger.debug("architecture snapshot failed (non-fatal): %s", exc)
+            return {}
+
+    def compute_arch_delta(self):
+        """Return an ArchDelta for the oldest unprocessed session, or None.
+
+        We use the oldest session's snapshot as the baseline because it
+        captures the longest-running drift across the batch we're about to
+        process. The current state is computed fresh.
+
+        Returns None when no baseline exists (first run, missing snapshot,
+        or computation failure on either side). Never raises.
+        """
+        try:
+            from neo.architecture_metrics import ArchSnapshot, compare, compute
+        except ImportError:
+            return None
+
+        sessions = self._load_unprocessed_sessions()
+        baseline_dict = None
+        for prev in sessions:
+            if prev.project_id != self.project_id:
+                continue
+            if prev.architecture_snapshot:
+                baseline_dict = prev.architecture_snapshot
+                break  # oldest match wins
+
+        if not baseline_dict:
+            return None
+
+        try:
+            baseline = ArchSnapshot.from_dict(baseline_dict)
+            current = compute(self.codebase_root) if self.codebase_root else ArchSnapshot()
+        except Exception as exc:
+            logger.debug("arch delta computation failed (non-fatal): %s", exc)
+            return None
+
+        # No useful comparison if we never managed to scan anything either round.
+        if baseline.files_scanned == 0 or current.files_scanned == 0:
+            return None
+
+        return compare(baseline, current)
 
     def detect_outcomes(self) -> tuple[list[Outcome], dict[str, str]]:
         """Detect outcomes by comparing previous suggestions to actual git changes.

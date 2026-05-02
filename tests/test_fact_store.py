@@ -744,6 +744,91 @@ class TestOutcomeLinkage:
         assert len(valid_indep) == MAX_INDEPENDENT_FACTS
 
 
+class TestArchDeltaModulation:
+    """Verify ArchDelta from outcomes changes the confidence adjustment math."""
+
+    def _setup(self, store):
+        from neo.architecture_metrics import ArchDelta
+        original = store.add_fact(
+            subject="bugfix: cycle-introducing change",
+            body="Suggestion: cross-import",
+            kind=FactKind.PATTERN,
+            confidence=0.7,
+        )
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED,
+            file_path="src/foo.py",
+            suggestion_description="introduce shared helper",
+            suggestion_confidence=0.7,
+        )
+        return original, outcome, ArchDelta
+
+    def test_neutral_arch_delta_uses_full_boost(self, store):
+        """Existing baseline behavior: +0.2 boost when arch is neutral."""
+        original, outcome, _ = self._setup(store)
+        with (
+            patch.object(store._outcome_tracker, "detect_outcomes",
+                         return_value=([outcome], {"src/foo.py": original.id})),
+            patch.object(store._outcome_tracker, "compute_arch_delta",
+                         return_value=None),
+        ):
+            store.detect_implicit_feedback({"prompt": "x"}, [])
+        # 0.7 + 0.2 = 0.9 (the existing accepted-linkage behavior)
+        assert original.metadata.confidence == pytest.approx(0.9)
+
+    def test_regression_arch_delta_softens_boost(self, store):
+        """A session that introduced a cycle earns less trust on accept."""
+        original, outcome, ArchDelta = self._setup(store)
+        regression = ArchDelta(cycles_delta=1, god_files_delta=0, max_depth_delta=0)
+        with (
+            patch.object(store._outcome_tracker, "detect_outcomes",
+                         return_value=([outcome], {"src/foo.py": original.id})),
+            patch.object(store._outcome_tracker, "compute_arch_delta",
+                         return_value=regression),
+        ):
+            store.detect_implicit_feedback({"prompt": "x"}, [])
+        # 0.7 + (0.2 - 0.1) = 0.8 — regression weakens the accept signal.
+        assert original.metadata.confidence == pytest.approx(0.8)
+
+    def test_improvement_arch_delta_amplifies_boost(self, store):
+        """A session that removed a cycle earns extra trust on accept."""
+        original, outcome, ArchDelta = self._setup(store)
+        improvement = ArchDelta(cycles_delta=-1, god_files_delta=0, max_depth_delta=0)
+        with (
+            patch.object(store._outcome_tracker, "detect_outcomes",
+                         return_value=([outcome], {"src/foo.py": original.id})),
+            patch.object(store._outcome_tracker, "compute_arch_delta",
+                         return_value=improvement),
+        ):
+            store.detect_implicit_feedback({"prompt": "x"}, [])
+        # 0.7 + (0.2 + 0.1) = 1.0 (clamped by min(1.0, ...))
+        assert original.metadata.confidence == pytest.approx(1.0)
+
+    def test_modified_outcome_regression_strengthens_penalty(self, store):
+        """MODIFIED + regression = stronger demote (accept already failed)."""
+        original = store.add_fact(
+            subject="bugfix: failed attempt", body="x",
+            kind=FactKind.PATTERN, confidence=0.7,
+        )
+        outcome = Outcome(
+            outcome_type=OutcomeType.MODIFIED,
+            file_path="src/foo.py",
+            suggestion_description="x",
+            suggestion_confidence=0.7,
+        )
+        from neo.architecture_metrics import ArchDelta
+        regression = ArchDelta(cycles_delta=1, god_files_delta=0, max_depth_delta=0)
+        with (
+            patch.object(store._outcome_tracker, "detect_outcomes",
+                         return_value=([outcome], {"src/foo.py": original.id})),
+            patch.object(store._outcome_tracker, "compute_arch_delta",
+                         return_value=regression),
+        ):
+            store.detect_implicit_feedback({"prompt": "x"}, [])
+        # 0.7 + (-0.2 - 0.1) = 0.4 — regression deepens the demotion.
+        assert original.metadata.confidence == pytest.approx(0.4)
+
+
 class TestSynthesizeReviews:
     """Tests for Step 2: periodic review synthesis."""
 

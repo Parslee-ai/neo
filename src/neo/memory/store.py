@@ -392,6 +392,27 @@ class FactStore:
             logger.warning(f"Outcome detection failed: {e}")
             return
 
+        # Architectural delta across the session batch — modulates how much
+        # we trust each accept/modify outcome. Best-effort: returns None if
+        # there's no baseline or if metrics computation fails.
+        arch_delta = self._outcome_tracker.compute_arch_delta()
+        arch_severity = arch_delta.severity() if arch_delta is not None else "neutral"
+        if arch_delta is not None and arch_severity != "neutral":
+            logger.info(
+                f"Arch delta over session batch: {arch_severity} "
+                f"(cycles={arch_delta.cycles_delta:+d}, "
+                f"god_files={arch_delta.god_files_delta:+d}, "
+                f"max_depth={arch_delta.max_depth_delta:+d})"
+            )
+
+        # Modulation amount: small enough not to overwhelm the base accept/
+        # modify signal, large enough to be felt over many iterations.
+        arch_mod = (
+            -0.1 if arch_severity == "regression"
+            else 0.1 if arch_severity == "improvement"
+            else 0.0
+        )
+
         facts_by_id = {f.id: f for f in self._facts}
         linked_count = 0
 
@@ -414,10 +435,12 @@ class FactStore:
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
 
                 if original_fact and original_fact.is_valid:
-                    # Boost original fact instead of creating orphan REVIEW
-                    # +0.2 per acceptance so patterns rise meaningfully
+                    # Boost original fact instead of creating orphan REVIEW.
+                    # Base +0.2; modulated by arch delta so a session that
+                    # regressed structure earns less trust than one that didn't.
+                    boost = max(-0.05, 0.2 + arch_mod)
                     original_fact.metadata.confidence = min(
-                        1.0, original_fact.metadata.confidence + 0.2
+                        1.0, max(0.0, original_fact.metadata.confidence + boost)
                     )
                     original_fact.metadata.success_count += 1
                     original_fact.metadata.last_accessed = time.time()
@@ -435,7 +458,7 @@ class FactStore:
                     body_parts.append(f"Actual changes:\n{outcome.diff_summary}")
                 body = "\n".join(body_parts)
                 tags = ["outcome", "accepted"]
-                confidence = min(1.0, outcome.suggestion_confidence + 0.1)
+                confidence = min(1.0, max(0.0, outcome.suggestion_confidence + 0.1 + arch_mod))
             elif outcome.outcome_type == OutcomeType.MODIFIED:
                 # User corrected neo's suggestion - learn from the correction
                 subject = f"outcome:modified {outcome.file_path}"
@@ -450,12 +473,17 @@ class FactStore:
                 tags = ["outcome", "modified"]
                 confidence = 0.4
 
-                # Demote the original suggestion fact since it was corrected
+                # Demote the original suggestion fact since it was corrected.
+                # arch_mod is negative for regression and positive for
+                # improvement, so adding it gives: regression deepens the
+                # penalty (-0.2 + -0.1 = -0.3), improvement softens it
+                # (-0.2 + 0.1 = -0.1).
                 fact_id = _lookup_fact_id(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
                 if original_fact and original_fact.is_valid:
+                    penalty = min(-0.05, -0.2 + arch_mod)
                     original_fact.metadata.confidence = max(
-                        0.1, original_fact.metadata.confidence - 0.2
+                        0.1, original_fact.metadata.confidence + penalty
                     )
                     original_fact.metadata.last_accessed = time.time()
                     linked_count += 1
@@ -465,8 +493,9 @@ class FactStore:
                 fact_id = _lookup_fact_id(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
                 if original_fact and original_fact.is_valid:
+                    boost = max(-0.05, 0.1 + arch_mod)
                     original_fact.metadata.confidence = min(
-                        1.0, original_fact.metadata.confidence + 0.1
+                        1.0, max(0.0, original_fact.metadata.confidence + boost)
                     )
                     original_fact.metadata.success_count += 1
                     original_fact.metadata.last_accessed = time.time()
