@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.0] - 2026-05-02
 
 ### Added
 - **Codex plugin** at `plugins/neo/` exposes the same six skills the Claude Code plugin offers (`$neo`, `$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`), packaged via `.codex-plugin/plugin.json` plus a repo marketplace at `.agents/plugins/marketplace.json`. Skills wrap the local `neo` CLI; persistent memory in `~/.neo/` is shared across both plugins.
