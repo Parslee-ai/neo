@@ -672,6 +672,17 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         task_type_str = task_type.value if hasattr(task_type, 'value') else str(task_type)
         parts = [f"Task: {context['prompt']}", f"Task Type: {task_type_str}"]
 
+        # Inject project-local agent instructions (CLAUDE.md, .cursor/rules, etc.)
+        # before the file dump so the model sees the team's written guidance
+        # even when relevance ranking would have skipped those files.
+        from neo.agent_context import (
+            discover as discover_agent_docs,
+            format_for_prompt as format_agent_docs,
+        )
+        agent_docs_section = format_agent_docs(discover_agent_docs(self.codebase_root))
+        if agent_docs_section:
+            parts.append(agent_docs_section)
+
         # Add context files if provided
         files = context.get('files', [])
         if files:
