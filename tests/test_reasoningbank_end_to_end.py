@@ -40,6 +40,14 @@ class TestReasoningBankImpact:
         """Create realistic memory with diverse patterns."""
         self.memory = PersistentReasoningMemory()
 
+        # These tests measure deterministic ranking behavior. The default
+        # exploration_rate (0.03) takes a `random.sample` branch in
+        # retrieve_relevant ~3% of the time, drawn from the stdlib `random`
+        # module's GLOBAL state — which is not seeded by our per-test numpy
+        # RandomState. Result: ~3% of CI runs flake when the lottery hits.
+        # Force exploration off for these specific tests.
+        self.memory.exploration_rate = 0.0
+
         # Clear any loaded entries for clean test environment
         self.memory.entries = []
 
