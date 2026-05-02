@@ -321,6 +321,106 @@ class TestCheckForUpdates:
                 os.environ["NEO_SKIP_UPDATE_CHECK"] = old_val
 
 
+class TestStaleWhileRevalidate:
+    """Tests for the SWR semantics introduced after 0.16.0."""
+
+    def _make_cache(self, cache_file: Path, *, age_seconds: float, new_version=None) -> None:
+        cache_file.write_text(json.dumps({
+            "last_check": time.time() - age_seconds,
+            "current_version": "0.9.0",
+            "latest_version": new_version or "0.9.0",
+            "new_version": new_version,
+        }))
+
+    def test_fresh_cache_does_not_trigger_background_refresh(self, monkeypatch):
+        """A cache younger than the interval must NOT call PyPI."""
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._make_cache(cache_file, age_seconds=10, new_version="1.0.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_refresh_in_background") as bg, \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi") as fetch:
+                result = check_for_updates(suppress_output=True)
+
+            assert result == "1.0.0"
+            bg.assert_not_called()
+            fetch.assert_not_called()
+
+    def test_stale_cache_returns_cached_and_kicks_background(self, monkeypatch):
+        """Stale cache must return cached answer instantly and start a refresh."""
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._make_cache(cache_file, age_seconds=UPDATE_CHECK_INTERVAL + 60,
+                             new_version=None)
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_refresh_in_background") as bg, \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi") as fetch:
+                result = check_for_updates(suppress_output=True)
+
+            # Returns the cached answer (None — no update known yet).
+            assert result is None
+            # Hot path did NOT block on PyPI...
+            fetch.assert_not_called()
+            # ...but did kick off a background refresh for next time.
+            bg.assert_called_once_with("0.9.0")
+
+    def test_background_refresh_writes_cache(self):
+        """The async refresh updates the cache for next invocation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker,
+                              "_fetch_latest_version_from_pypi",
+                              return_value="1.0.0"):
+                # Use the sync helper directly so we don't deal with thread timing.
+                update_checker._refresh_cache_sync("0.9.0")
+
+            written = json.loads(cache_file.read_text())
+            assert written["latest_version"] == "1.0.0"
+            assert written["new_version"] == "1.0.0"
+
+    def test_stale_cache_with_known_update_still_acts_immediately(self, monkeypatch):
+        """If stale cache says an update is available, act on it now —
+        don't wait for the refresh to confirm."""
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._make_cache(cache_file, age_seconds=UPDATE_CHECK_INTERVAL + 60,
+                             new_version="1.0.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_refresh_in_background") as bg, \
+                 patch.object(update_checker, "perform_auto_install") as install:
+                result = check_for_updates(suppress_output=True, auto_install=True)
+
+            assert result == "1.0.0"
+            install.assert_called_once_with("1.0.0")
+            # Background refresh still fires so the *next* invocation has fresh data.
+            bg.assert_called_once_with("0.9.0")
+
+    def test_interval_is_one_hour(self):
+        """Pin the interval choice so a future tweak is intentional."""
+        assert UPDATE_CHECK_INTERVAL == 3600
+
+    def test_atomic_cache_write_does_not_leak_tmp_file(self):
+        """The .tmp staging file from atomic write must be removed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file):
+                _write_cache("0.9.0", "1.0.0")
+
+            assert cache_file.exists()
+            assert not cache_file.with_suffix(cache_file.suffix + ".tmp").exists()
+
+
 class TestTimeoutHandling:
     """Test timeout handling in update operations."""
 

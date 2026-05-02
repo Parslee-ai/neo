@@ -1,8 +1,12 @@
 """
 Auto-update checker for Neo.
 
-Periodically checks PyPI for newer versions and notifies users.
-Uses local caching to avoid excessive API calls.
+Checks PyPI for newer versions using stale-while-revalidate semantics:
+the cached answer is returned immediately (zero added latency on the
+hot path), and if the cache is older than UPDATE_CHECK_INTERVAL a
+background thread refreshes the cache so the *next* invocation has
+fresh data. Users on auto-update see new releases within ~1 hour
+of publication, instead of up to 24h with the old fixed interval.
 """
 
 import importlib.metadata
@@ -10,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -19,7 +24,9 @@ from urllib.error import URLError
 logger = logging.getLogger(__name__)
 
 # Configuration
-UPDATE_CHECK_INTERVAL = 86400  # 24 hours in seconds
+UPDATE_CHECK_INTERVAL = 3600  # 1 hour in seconds. Was 24h, but with SWR
+# the per-invocation cost of a stale check is zero (background refresh),
+# so we can afford to be much more responsive to fresh releases.
 
 
 def _pip_install_cmd(package: str, quiet: bool = False) -> list[str]:
@@ -71,7 +78,11 @@ def _read_cache() -> Optional[dict]:
 
 
 def _write_cache(current_version: str, latest_version: str) -> None:
-    """Write update check results to cache."""
+    """Write update check results to cache atomically.
+
+    Uses write-temp-then-rename so a background refresh thread and a
+    foreground reader can't observe a partially-written file.
+    """
     cache_file = _get_cache_file()
     cache_data = {
         "last_check": time.time(),
@@ -81,7 +92,9 @@ def _write_cache(current_version: str, latest_version: str) -> None:
     }
 
     try:
-        cache_file.write_text(json.dumps(cache_data, indent=2))
+        tmp = cache_file.with_suffix(cache_file.suffix + ".tmp")
+        tmp.write_text(json.dumps(cache_data, indent=2))
+        tmp.replace(cache_file)  # atomic on POSIX and Windows ≥ 3.3
     except OSError as e:
         logger.debug(f"Failed to write update cache: {e}")
 
@@ -145,9 +158,48 @@ def _compare_versions(current: str, latest: str) -> bool:
             return False  # Can't compare, assume no update
 
 
+def _refresh_cache_sync(current_version: str) -> None:
+    """Fetch the latest version from PyPI and write it to the cache.
+
+    Exposed (with leading underscore) so tests can exercise the refresh
+    logic without dealing with thread timing. Production code uses the
+    background wrapper below.
+    """
+    try:
+        latest = _fetch_latest_version_from_pypi()
+        if latest:
+            _write_cache(current_version, latest)
+    except Exception as e:
+        logger.debug(f"Update cache refresh failed: {e}")
+
+
+def _refresh_in_background(current_version: str) -> threading.Thread:
+    """Kick off an async cache refresh.
+
+    Returns the thread so callers (tests, mostly) can `.join()` it. The
+    thread is daemonic — it will be killed if the main process exits
+    before it completes, which is acceptable for `neo --version` style
+    quick exits. Long-running neo invocations easily outlive the refresh.
+    """
+    thread = threading.Thread(
+        target=_refresh_cache_sync,
+        args=(current_version,),
+        daemon=True,
+        name="neo-update-check",
+    )
+    thread.start()
+    return thread
+
+
 def check_for_updates(suppress_output: bool = False, auto_install: bool = False) -> Optional[str]:
     """
     Check PyPI for a newer version of neo-reasoner.
+
+    Uses stale-while-revalidate semantics:
+      - Fresh cache (age < UPDATE_CHECK_INTERVAL): return cached answer.
+      - Stale cache: return cached answer immediately AND kick off a
+        background refresh whose result will be available next call.
+      - Cache miss: synchronous fetch (one-time tax for fresh installs).
 
     Args:
         suppress_output: If True, don't print update notifications
@@ -156,51 +208,42 @@ def check_for_updates(suppress_output: bool = False, auto_install: bool = False)
     Returns:
         The new version string if an update is available, None otherwise
     """
-    # Respect environment variable to skip update checks
     if os.getenv("NEO_SKIP_UPDATE_CHECK"):
         return None
 
     try:
         current_version = _get_current_version()
-
         if current_version == "unknown":
             logger.debug("Could not determine current version")
             return None
 
-        # Check cache first
-        if not _should_check_for_updates():
+        cache = _read_cache()
+
+        # Cache miss: do a synchronous fetch so first-ever run isn't blind.
+        if cache is None:
+            latest_version = _fetch_latest_version_from_pypi()
+            if latest_version is None:
+                return None
+            _write_cache(current_version, latest_version)
             cache = _read_cache()
-            if cache:
-                new_version = cache.get("new_version")
-                # Validate cached version is actually newer than current
-                # (handles case where user manually updated via pip)
-                if new_version and _compare_versions(current_version, new_version):
-                    # Auto-install if enabled (even from cache)
-                    if auto_install:
-                        perform_auto_install(new_version)
-                    elif not suppress_output:
-                        _print_update_notification(current_version, new_version)
-                    return new_version
-            return None  # No update needed if versions match or cache invalid
+            if cache is None:
+                return None
+        else:
+            # Cache hit. If stale, start a background refresh so the
+            # *next* invocation sees fresh data. This call still returns
+            # the cached answer immediately — that's the SWR pattern.
+            cache_age = time.time() - cache.get("last_check", 0)
+            if cache_age >= UPDATE_CHECK_INTERVAL:
+                _refresh_in_background(current_version)
 
-        # Fetch latest version from PyPI
-        latest_version = _fetch_latest_version_from_pypi()
-
-        if latest_version is None:
-            logger.debug("Could not fetch latest version from PyPI")
-            return None
-
-        # Update cache
-        _write_cache(current_version, latest_version)
-
-        # Check if update is available
-        if _compare_versions(current_version, latest_version):
-            # Auto-install if enabled
+        # Act on whatever's in the cache (just-fetched, fresh, or stale).
+        new_version = cache.get("new_version")
+        if new_version and _compare_versions(current_version, new_version):
             if auto_install:
-                perform_auto_install(latest_version)
+                perform_auto_install(new_version)
             elif not suppress_output:
-                _print_update_notification(current_version, latest_version)
-            return latest_version
+                _print_update_notification(current_version, new_version)
+            return new_version
 
         return None
 
