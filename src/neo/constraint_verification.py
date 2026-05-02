@@ -185,7 +185,8 @@ If no clear constraints, return "none"."""
             response = adapter.generate(
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=200
+                max_tokens=200,
+                reasoning_effort="low",  # Constraint extraction; not a reasoning task.
             )
 
             constraints = []

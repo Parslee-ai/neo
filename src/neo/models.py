@@ -134,8 +134,15 @@ class LMAdapter(ABC):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
-        """Generate a response from the model."""
+        """Generate a response from the model.
+
+        `reasoning_effort` (one of "none", "low", "medium", "high", "xhigh")
+        controls thinking budget on OpenAI gpt-5* models. None means the
+        provider's default. Adapters that don't support reasoning effort
+        accept and ignore the parameter.
+        """
         pass
 
     @abstractmethod

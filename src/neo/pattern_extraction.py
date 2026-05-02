@@ -142,7 +142,8 @@ Make the prevention rule ACTIONABLE and SPECIFIC."""
     response = adapter.generate(
         [{"role": "user", "content": extraction_prompt}],
         temperature=0.0,
-        max_tokens=500
+        max_tokens=500,
+        reasoning_effort="low",  # Pattern extraction; not a reasoning task.
     )
 
     # Parse response (simple parsing)

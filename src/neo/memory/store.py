@@ -1331,6 +1331,7 @@ class FactStore:
                 messages=messages,
                 max_tokens=300,
                 temperature=0.3,
+                reasoning_effort="low",  # Distilling clustered facts; not reasoning.
             )
 
             return self._parse_llm_synthesis(response)

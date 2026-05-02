@@ -125,7 +125,8 @@ Answer in this EXACT format:
     response = adapter.generate(
         [{"role": "user", "content": diagnostic_prompt}],
         temperature=0.0,
-        max_tokens=500
+        max_tokens=500,
+        reasoning_effort="high",  # Diagnosing why prior solution failed; spend on thinking.
     )
 
     # Parse response (simple parsing, could be improved)
@@ -197,7 +198,8 @@ Generate a CORRECTED Python solution. Return ONLY code, no explanations."""
     corrected = adapter.generate(
         [{"role": "user", "content": correction_prompt}],
         temperature=0.0,
-        max_tokens=2000
+        max_tokens=2000,
+        reasoning_effort="high",  # Repairing a failed solution; cheaper effort already failed.
     )
 
     # Extract code

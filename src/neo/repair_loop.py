@@ -141,7 +141,8 @@ def repair_response(
                 messages,
                 stop=["</neo>", "```"],
                 max_tokens=4096,
-                temperature=0.0  # Deterministic
+                temperature=0.0,  # Deterministic
+                reasoning_effort="low",  # Reformatting JSON, not reasoning.
             )
 
             # Parse the repaired response

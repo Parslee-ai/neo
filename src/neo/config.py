@@ -23,6 +23,11 @@ class NeoConfig:
     default_temperature: float = 0.7
     default_max_tokens: int = 4096
 
+    # Reasoning effort (OpenAI gpt-5* only). Acts as an upper bound on the
+    # memory-driven effort selected per-query. None = no cap.
+    # Valid: "none", "low", "medium", "high", "xhigh".
+    reasoning_effort_cap: Optional[str] = None
+
     # Safety settings
     safe_read_patterns: list[str] = field(default_factory=lambda: [
         "*.py", "*.js", "*.ts", "*.go", "*.rs", "*.java", "*.cpp", "*.c", "*.h",
@@ -50,6 +55,12 @@ class NeoConfig:
 
     # Logging settings
     log_level: str = "WARNING"  # DEBUG, INFO, WARNING, ERROR
+
+    def __post_init__(self) -> None:
+        # Validate reasoning_effort_cap up-front so a typo fails at config
+        # load rather than burning an API round-trip with `unsupported_value`.
+        from neo.reasoning_effort import validate_effort
+        self.reasoning_effort_cap = validate_effort(self.reasoning_effort_cap)
 
     @classmethod
     def from_file(cls, config_path: str) -> "NeoConfig":
@@ -116,6 +127,12 @@ class NeoConfig:
         if log_level := os.environ.get("NEO_LOG_LEVEL"):
             config.log_level = log_level.upper()
 
+        # Reasoning effort cap (validated by __post_init__ via assignment? no —
+        # __post_init__ ran on construction. Re-validate explicitly.)
+        if effort := os.environ.get("NEO_REASONING_EFFORT"):
+            from neo.reasoning_effort import validate_effort
+            config.reasoning_effort_cap = validate_effort(effort)
+
         return config
 
     @classmethod
@@ -165,6 +182,7 @@ class NeoConfig:
             'memory_backend': self.memory_backend,
             'constraint_auto_scan': self.constraint_auto_scan,
             'log_level': self.log_level,
+            'reasoning_effort_cap': self.reasoning_effort_cap,
         }
 
         # Mark explicit opt-out so migration doesn't override it

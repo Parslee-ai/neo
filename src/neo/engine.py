@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from neo.exemplar_index import ExemplarIndex  # noqa: F401
     from neo.memory.store import FactStore  # noqa: F401
     from neo.persistent_reasoning import PersistentReasoningMemory  # noqa: F401
+    from neo.reasoning_effort import MemorySignal  # noqa: F401
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class NeoEngine:
         self.context: Optional[NeoInput] = None
         self.enable_persistent_memory = enable_persistent_memory
         self.codebase_root = codebase_root
+        self.config = config  # NeoConfig | None (kept for downstream lookups like reasoning_effort_cap)
 
         # Load beat deck for personality templates (no LLM call)
         self.beat_deck = self._load_beat_deck()
@@ -539,8 +541,23 @@ class NeoEngine:
         Experimental: Combined LLM call for plan + simulation + code.
         Enable via: ENABLE_COMBINED_LLM_CALL=true
         """
-        # Build rich combined prompt (see COMBINED_PROMPT_EXAMPLE.md)
-        prompt = self._format_combined_prompt(context)
+        from neo.reasoning_effort import (
+            apply_cap,
+            effort_from_memory,
+        )
+
+        # Build rich combined prompt + capture the memory signal that drove it
+        # so we can size reasoning effort to query novelty.
+        prompt, memory_signal = self._format_combined_prompt(context)
+
+        effort = effort_from_memory(memory_signal)
+        cap = getattr(self.config, "reasoning_effort_cap", None) if self.config else None
+        effort = apply_cap(effort, cap)
+        logger.info(
+            f"Reasoning effort: {effort} "
+            f"(patterns={memory_signal.pattern_count}, "
+            f"avg_conf={memory_signal.avg_confidence:.2f}, cap={cap})"
+        )
 
         # Single LLM call with strict format
         messages = [
@@ -564,7 +581,12 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             {"role": "user", "content": prompt}
         ]
 
-        response = self.lm.generate(messages, max_tokens=8192, temperature=0.3)  # Generous limit for complex multi-file changes
+        response = self.lm.generate(
+            messages,
+            max_tokens=8192,
+            temperature=0.3,
+            reasoning_effort=effort,
+        )  # Generous limit for complex multi-file changes
 
         # Pre-split response into individual sections before parsing
         # This prevents parser from seeing other blocks as "stray text"
@@ -595,8 +617,19 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             # Block not found - return empty (parser will fail gracefully)
             return ""
 
-    def _format_combined_prompt(self, context: dict[str, Any]) -> str:
-        """Format prompt requesting plan + simulation + code in one response."""
+    def _format_combined_prompt(self, context: dict[str, Any]) -> tuple[str, "MemorySignal"]:
+        """Format the combined prompt and return it alongside the memory signal.
+
+        The signal is computed from the same retrieval used to build
+        past_learnings — surfacing it lets the caller size reasoning effort
+        without re-querying the store.
+        """
+        from neo.reasoning_effort import (
+            MemorySignal,
+            signal_from_facts,
+            signal_from_legacy_entries,
+        )
+
         # Get exemplars and past learnings (THE KEY CONTEXT WE WERE MISSING)
         exemplars = []
         if self.exemplar_index:
@@ -604,6 +637,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             exemplars = [f"{ex.prompt} -> {ex.solution[:100]}..." for ex in similar]
 
         past_learnings = []
+        memory_signal = MemorySignal()
         if self.fact_store is not None:
             prompt_text = context.get("prompt", "")
             k = self._adaptive_k_selection(prompt_text, context)
@@ -611,6 +645,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             formatted = self.fact_store.format_context_for_prompt(fact_context)
             if formatted:
                 past_learnings = [formatted]
+            memory_signal = signal_from_facts(fact_context.valid_facts)
         elif self.persistent_memory:
             # Legacy path: PersistentReasoningMemory
             k = self._adaptive_k_selection(context.get("prompt", ""), context)
@@ -628,6 +663,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
                     learning += f"Known Pitfalls:\n{pitfalls_str}\n"
                 learning += f"(confidence: {e.confidence:.2f})"
                 past_learnings.append(learning)
+            memory_signal = signal_from_legacy_entries(relevant)
 
         # Build context
         task_type = context.get('task_type', 'unknown')
@@ -665,7 +701,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             library
         )
 
-        return f"""Output 3 JSON blocks using this EXACT format:
+        prompt = f"""Output 3 JSON blocks using this EXACT format:
 
 <<<NEO:SCHEMA=v3:KIND=plan>>>
 [{{"id":"ps_1","description":"...","rationale":"...","dependencies":[],"schema_version":"3"}}]
@@ -685,6 +721,7 @@ RULES:
 - id must be "ps_1", "ps_2" (not "p1")
 - dependencies must be integers [0,1] (not strings)
 - input_data and expected_output must be STRINGS (not JSON objects)"""
+        return prompt, memory_signal
 
     def _run_static_checks(
         self,

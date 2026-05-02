@@ -54,6 +54,7 @@ class OpenAIAdapter(LMAdapter):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
         """Generate response using OpenAI API."""
         # gpt-5* and codex models use /v1/responses endpoint
@@ -66,10 +67,12 @@ class OpenAIAdapter(LMAdapter):
             base_url = self.base_url or "https://api.openai.com"
             url = f"{base_url}/v1/responses"
 
-            payload = {
+            payload: dict = {
                 "model": self.model,
                 "input": messages,
             }
+            if reasoning_effort is not None:
+                payload["reasoning"] = {"effort": reasoning_effort}
 
             response = httpx.post(url, headers=headers, json=payload, timeout=600.0)  # 10 minutes for complex queries
             if response.status_code != 200:
@@ -126,6 +129,7 @@ class AnthropicAdapter(LMAdapter):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using Anthropic API."""
         # Convert messages format if needed
@@ -189,6 +193,7 @@ class GoogleAdapter(LMAdapter):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using Google Generative AI SDK."""
         from google.genai import types
@@ -277,6 +282,7 @@ class LocalAdapter(LMAdapter):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using local API."""
         response = self.client.chat.completions.create(
@@ -319,6 +325,7 @@ class OllamaAdapter(LMAdapter):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using Ollama API."""
         # Convert messages to prompt
@@ -399,6 +406,7 @@ class AzureOpenAIAdapter(LMAdapter):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using Azure OpenAI API."""
         response = self.client.chat.completions.create(
@@ -465,6 +473,7 @@ class ClaudeCodeAdapter(LMAdapter):
         stop: Optional[list[str]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using Claude Code CLI."""
 
