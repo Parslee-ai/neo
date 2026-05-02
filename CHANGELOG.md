@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Memory-driven reasoning effort for OpenAI gpt-5* models. Each query's `reasoning.effort` is sized from the strength of the memory hit: high-confidence pattern match → `low` (cheap), no relevant memory → `high`, no memory + hard difficulty → `xhigh`. Cap with `NEO_REASONING_EFFORT` for cost control. End-to-end measurement on a familiar query: `Reasoning effort: low (patterns=5, avg_conf=0.91)` — neo's learning monetizes directly into inference cost.
+- Code-smell detection during context assembly. Surfaces TODO/FIXME/HACK/XXX markers, Python stubs (pass / `...` / `raise NotImplementedError`), bare `except:`, swallowed exceptions, and hardcoded credentials (OpenAI / AWS / GitHub / Slack token shapes) in the prompt under "KNOWN ISSUES IN NEARBY CODE." Per-file cap of 8 + global cap of 20 keeps growth bounded.
+- Automatic discovery of project-local AI agent instruction docs: `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.windsurfrules`, `.claude/`, `.cursor/rules/`, `.github/copilot-instructions.md`, `.continue/`, `.augment/`, `.specify/` (Spec Kit), `.aider/`, `.codeium/`. Markdown content surfaces unconditionally in the prompt under "PROJECT-LOCAL AGENT CONTEXT" — works whether you use Claude Code, Cursor, Copilot, Aider, Continue, Augment, or Windsurf.
+- Native architectural quality delta closes the outcome learning loop. At session save time neo snapshots three structural metrics — import-graph cycles (Tarjan SCC), god files (LOC + function-count thresholds), max nesting depth — and at outcome detection time it diffs against the current state. A regression weakens the accept/boost or strengthens the modify/penalty by 0.1; an improvement does the reverse. Failure-tolerant; collapses to neutral if metrics computation hits any error.
+
+### Changed
+- Default OpenAI model bumped to `gpt-5.5` (previous: `gpt-5.3-codex`). gpt-5.5 routes through the existing `/v1/responses` path; reasoning + message output shape handled unchanged.
+
+## [0.15.5] - 2026-04-15
+
+### Fixed
+- Revive the learning feedback loop after the recent gpt-5 routing changes had quietly broken it (#84).
+
 ## [0.15.4] - 2026-04-14
 
 ### Fixed

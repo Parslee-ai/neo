@@ -69,6 +69,10 @@ _DISCOVERY_RULES: list[tuple[str, list[str]]] = [
     ("augment",    [".augment/*.md", ".augment/**/*.md"]),
     ("specify",    [".specify/*.md", ".specify/**/*.md"]),
     ("aider",      [".aider/*.md"]),
+    # Codex's primary instruction file is AGENTS.md (cross-tool standard,
+    # already discovered above). The .codex/ dotdir is its own home for
+    # tool-specific overrides and prompt fragments.
+    ("codex",      [".codex/*.md", ".codex/**/*.md"]),
     ("codeium",    [".codeium/*.md"]),
 ]
 

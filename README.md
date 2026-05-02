@@ -243,6 +243,46 @@ Once installed, you get:
 **See [.claude-plugin/README.md](.claude-plugin/README.md) for full plugin documentation**
 
 
+## Works Alongside Your AI Tools
+
+Neo automatically reads project-local agent instruction docs from a wide range
+of ecosystems and folds them into its reasoning context — no configuration
+needed. If you've already invested in writing a `CLAUDE.md`, an `AGENTS.md`,
+`.cursor/rules/`, `.github/copilot-instructions.md`, or a Spec Kit project,
+neo respects that work.
+
+| Tool                  | Files / dirs neo discovers                                   |
+|-----------------------|--------------------------------------------------------------|
+| Claude / Claude Code  | `CLAUDE.md`, `.claude/CLAUDE.md`, `.claude/agents/*.md`, `.claude/commands/*.md` |
+| Codex / AGENTS.md spec| `AGENTS.md`, `.github/AGENTS.md`, `.codex/**/*.md`           |
+| Cursor                | `.cursorrules`, `.cursor/rules/**/*.md`, `.cursor/rules/**/*.mdc` |
+| GitHub Copilot        | `.github/copilot-instructions.md`                            |
+| Windsurf              | `.windsurfrules`                                             |
+| Continue              | `.continue/**/*.md`                                          |
+| Augment               | `.augment/**/*.md`                                           |
+| Spec Kit              | `.specify/**/*.md`                                           |
+| Aider                 | `.aider/*.md`                                                |
+| Codeium               | `.codeium/*.md`                                              |
+
+Discovered docs surface in neo's prompt under **PROJECT-LOCAL AGENT CONTEXT**,
+included unconditionally — independent of relevance ranking — because their
+value is global to the project. Per-file cap of 6KB and total cap of 32KB
+keep prompt growth bounded.
+
+**This means neo composes well with whichever AI coding workflow you already
+use:**
+
+- **Claude Code** users get the deepest integration via the [plugin](#claude-code-plugin), but neo runs standalone too.
+- **Codex CLI** users — neo automatically picks up `AGENTS.md` (the cross-tool standard Codex co-led) plus anything under `.codex/`.
+- **Cursor / Windsurf / Aider / Continue / Augment** users — the rules dirs you've curated land in every neo session's context.
+- **GitHub Copilot** users — `.github/copilot-instructions.md` is read on every invocation.
+- **Spec Kit** projects — your specs are folded into neo's reasoning context, no manual paste.
+
+Adding a new tool is a one-liner: extend the discovery rules in
+`src/neo/agent_context.py`. The list is the load-bearing surface for keeping
+this current as new agent ecosystems emerge.
+
+
 ## Installation
 
 ### From PyPI (Recommended)
@@ -539,6 +579,24 @@ These schemas enable:
 - **Multi-Agent Reasoning**: Verifier checks support MapCoder's Solver-Critic-Verifier pattern
 
 
+### Code Smell Detection in Context Assembly
+
+Neo scans the relevance-ranked file set during context assembly and surfaces
+known issues to the model under **KNOWN ISSUES IN NEARBY CODE**. Detectors
+are intentionally high-precision (false positives turn into prompt bloat
+that hurts more than it helps):
+
+- TODO / FIXME / HACK / XXX markers (any text file)
+- Python stubs: `pass`-only / `...`-only / `raise NotImplementedError`
+- Python bare `except:` and swallowed exceptions (`except ...: pass`)
+- Hardcoded credentials matching well-known prefixed shapes (OpenAI `sk-`,
+  AWS `AKIA`, GitHub `ghp_`, Slack `xox*-`)
+
+Per-file cap of 8 + global cap of 20 findings keeps the prompt bounded.
+Magic numbers and generic high-entropy secret detection are intentionally
+out of scope — they'd add more noise than signal at this stage.
+
+
 ### Storage Architecture
 
 - **Scoped JSON Files**: Facts stored in `~/.neo/facts/` — separate files per scope (global, org, project)
@@ -551,6 +609,35 @@ These schemas enable:
 ## Performance
 
 **Neo improves over time as it learns from experience.** Initial performance depends on available facts. Performance grows as the semantic memory builds up successful solutions, failure learnings, and architectural decisions.
+
+### Memory-Driven Reasoning Effort (gpt-5* models)
+
+Neo monetizes its learning into inference cost. Each query's `reasoning.effort`
+parameter is sized from the strength of the memory hit:
+
+| Memory + difficulty                              | Effort  |
+|--------------------------------------------------|---------|
+| ≥3 patterns, avg confidence ≥ 0.8                | `low`   |
+| Some patterns, avg confidence 0.5–0.8            | `medium` (API default) |
+| No relevant patterns OR avg confidence < 0.5     | `high`  |
+| No patterns AND difficulty == "hard"             | `xhigh` |
+
+Familiar queries get cheap thinking; novel-and-hard queries get max thinking.
+Cap with `NEO_REASONING_EFFORT={none,low,medium,high,xhigh}` for cost control.
+
+> **Model note:** the effort vocabulary differs by model. gpt-5.5 (the default)
+> accepts the full `none / low / medium / high / xhigh` range. Older
+> `gpt-5-codex` only accepts `low / medium / high` — if you switch back to
+> that model, set `NEO_REASONING_EFFORT=high` to cap the auto-selector.
+
+### Architectural Quality Feedback Loop
+
+When a session ends, neo snapshots three structural metrics — import cycles,
+god files (LOC + function-count thresholds), and max nesting depth — and
+diffs against the previous snapshot at the next outcome detection. A
+regression weakens the accept/boost or strengthens the modify/penalty by
+0.1; an improvement does the reverse. Confidence becomes a signal of
+"helped the codebase," not just "got accepted."
 
 
 ## Configuration

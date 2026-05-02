@@ -73,6 +73,16 @@ class TestDotDirectories:
         docs = discover(tmp_path)
         assert any(d.source == "specify" and "auth/login.md" in d.path for d in docs)
 
+    def test_codex_dotdir(self, tmp_path: Path):
+        # Codex CLI primarily uses AGENTS.md (cross-tool standard) but may
+        # also keep tool-specific overrides under .codex/.
+        _write(tmp_path, ".codex/prompt.md", "Codex-specific guidance.")
+        _write(tmp_path, ".codex/policies/security.md", "Don't log secrets.")
+        docs = discover(tmp_path)
+        codex_paths = {d.path for d in docs if d.source == "codex"}
+        assert ".codex/prompt.md" in codex_paths
+        assert ".codex/policies/security.md" in codex_paths
+
 
 # ---------------------------------------------------------------------------
 # Robustness / edge cases
