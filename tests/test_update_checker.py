@@ -24,8 +24,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from neo import update_checker
 from neo.update_checker import (
+    INSTALL_BREW,
+    INSTALL_EXTERNAL,
+    INSTALL_PIP_VENV,
+    INSTALL_PIPX,
     UPDATE_CHECK_INTERVAL,
     _compare_versions,
+    _detect_install_method,
     _get_cache_file,
     _get_current_version,
     _read_cache,
@@ -179,21 +184,21 @@ class TestAutoInstallIdempotency:
             assert result is True
 
     def test_attempts_install_when_versions_differ(self):
-        """Test that auto_install runs pip when versions differ."""
+        """Test that auto_install runs pip when versions differ (pip-venv path)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_file = Path(tmpdir) / "update_check.json"
 
             with patch.object(
                 update_checker, "_get_current_version", return_value="0.9.0"
-            ):
-                with patch.object(
-                    update_checker, "_get_cache_file", return_value=cache_file
-                ):
-                    with patch("subprocess.run") as mock_run:
-                        mock_run.return_value = MagicMock(returncode=0)
-                        result = perform_auto_install("1.0.0")
-                        assert mock_run.called
-                        assert result is True
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIP_VENV
+            ), patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+                result = perform_auto_install("1.0.0")
+                assert mock_run.called
+                assert result is True
 
 
 class TestCheckForUpdates:
@@ -433,16 +438,16 @@ class TestTimeoutHandling:
 
             with patch.object(
                 update_checker, "_get_current_version", return_value="0.9.0"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIP_VENV
+            ), patch(
+                "subprocess.run",
+                side_effect=subprocess.TimeoutExpired("pip", 120),
             ):
-                with patch.object(
-                    update_checker, "_get_cache_file", return_value=cache_file
-                ):
-                    with patch(
-                        "subprocess.run",
-                        side_effect=subprocess.TimeoutExpired("pip", 120),
-                    ):
-                        result = perform_auto_install("1.0.0")
-                        assert result is False
+                result = perform_auto_install("1.0.0")
+                assert result is False
 
     def test_pypi_fetch_respects_timeout(self):
         """Test that PyPI fetch handles timeout errors."""
@@ -528,45 +533,38 @@ class TestPerformUpdate:
                 assert result is True
 
     def test_perform_update_success(self):
-        """Test successful update via perform_update."""
+        """Test successful update via perform_update (pip-venv path)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_file = Path(tmpdir) / "update_check.json"
             cache_file.write_text("{}")
 
             with patch.object(
                 update_checker, "_get_cache_file", return_value=cache_file
-            ):
-                with patch.object(
-                    update_checker, "_get_current_version", return_value="0.9.0"
-                ):
-                    with patch.object(
-                        update_checker, "check_for_updates", return_value="1.0.0"
-                    ):
-                        with patch("subprocess.run") as mock_run:
-                            mock_run.return_value = MagicMock(returncode=0)
-                            result = perform_update()
-                            assert result is True
-                            assert mock_run.called
-                            assert not cache_file.exists()
+            ), patch.object(
+                update_checker, "_get_current_version", return_value="0.9.0"
+            ), patch.object(
+                update_checker, "check_for_updates", return_value="1.0.0"
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIP_VENV
+            ), patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+                result = perform_update()
+                assert result is True
+                assert mock_run.called
+                assert not cache_file.exists()
 
     def test_perform_update_pip_failure(self):
-        """Test perform_update when pip fails."""
-        import subprocess
-
+        """Test perform_update when pip exits non-zero."""
         with patch.object(
             update_checker, "_get_current_version", return_value="0.9.0"
-        ):
-            with patch.object(
-                update_checker, "check_for_updates", return_value="1.0.0"
-            ):
-                with patch(
-                    "subprocess.run",
-                    side_effect=subprocess.CalledProcessError(
-                        1, "pip", stderr="pip error"
-                    ),
-                ):
-                    result = perform_update()
-                    assert result is False
+        ), patch.object(
+            update_checker, "check_for_updates", return_value="1.0.0"
+        ), patch.object(
+            update_checker, "_detect_install_method", return_value=INSTALL_PIP_VENV
+        ), patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stderr="pip error")
+            result = perform_update()
+            assert result is False
 
     def test_perform_update_timeout(self):
         """Test perform_update handles timeout."""
@@ -574,16 +572,16 @@ class TestPerformUpdate:
 
         with patch.object(
             update_checker, "_get_current_version", return_value="0.9.0"
+        ), patch.object(
+            update_checker, "check_for_updates", return_value="1.0.0"
+        ), patch.object(
+            update_checker, "_detect_install_method", return_value=INSTALL_PIP_VENV
+        ), patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired("pip", 120),
         ):
-            with patch.object(
-                update_checker, "check_for_updates", return_value="1.0.0"
-            ):
-                with patch(
-                    "subprocess.run",
-                    side_effect=subprocess.TimeoutExpired("pip", 120),
-                ):
-                    result = perform_update()
-                    assert result is False
+            result = perform_update()
+            assert result is False
 
 
 class TestGetCurrentVersion:
@@ -615,6 +613,159 @@ class TestGetCacheFile:
         cache_file = _get_cache_file()
         assert cache_file.name == "update_check.json"
         assert cache_file.parent.name == ".neo"
+
+
+class TestInstallMethodDetection:
+    """Detect how this neo install was deployed: pipx / pip-venv / brew / external."""
+
+    def _stub_neo_path(self, fake_path: str):
+        """Patch neo.__file__ so detection sees a synthetic install location."""
+        return patch.object(update_checker, "Path", side_effect=lambda p: Path(fake_path) if p == fake_path else Path(p))
+
+    def test_detects_pipx_venv(self, monkeypatch):
+        fake = "/Users/me/.local/pipx/venvs/neo-reasoner/lib/python3.12/site-packages/neo/__init__.py"
+        fake_neo = MagicMock()
+        fake_neo.__file__ = fake
+        monkeypatch.setitem(sys.modules, "neo", fake_neo)
+        # Force fall-through past venv-prefix check to prove the pipx branch fires
+        # *first* when the path is in a pipx venv (even if also in a venv).
+        assert _detect_install_method() == INSTALL_PIPX
+
+    def test_detects_pip_venv(self, monkeypatch):
+        fake = "/tmp/myproject/.venv/lib/python3.12/site-packages/neo/__init__.py"
+        fake_neo = MagicMock()
+        fake_neo.__file__ = fake
+        monkeypatch.setitem(sys.modules, "neo", fake_neo)
+        # Force sys.prefix != sys.base_prefix to look like an isolated venv.
+        monkeypatch.setattr(sys, "prefix", "/tmp/myproject/.venv")
+        monkeypatch.setattr(sys, "base_prefix", "/usr")
+        assert _detect_install_method() == INSTALL_PIP_VENV
+
+    def test_detects_brew_when_brew_owns_formula(self, monkeypatch):
+        fake = "/opt/homebrew/lib/python3.14/site-packages/neo/__init__.py"
+        fake_neo = MagicMock()
+        fake_neo.__file__ = fake
+        monkeypatch.setitem(sys.modules, "neo", fake_neo)
+        monkeypatch.setattr(sys, "prefix", "/usr")
+        monkeypatch.setattr(sys, "base_prefix", "/usr")
+        with patch.object(update_checker, "_brew_owns", return_value=True):
+            assert _detect_install_method() == INSTALL_BREW
+
+    def test_brew_path_without_formula_is_external(self, monkeypatch):
+        """Pip-into-brew-Python looks like a brew path but brew doesn't own it.
+        That's the exact case Matt's install hit — must be classified as external."""
+        fake = "/opt/homebrew/lib/python3.14/site-packages/neo/__init__.py"
+        fake_neo = MagicMock()
+        fake_neo.__file__ = fake
+        monkeypatch.setitem(sys.modules, "neo", fake_neo)
+        monkeypatch.setattr(sys, "prefix", "/opt/homebrew")
+        monkeypatch.setattr(sys, "base_prefix", "/opt/homebrew")
+        with patch.object(update_checker, "_brew_owns", return_value=False):
+            assert _detect_install_method() == INSTALL_EXTERNAL
+
+    def test_detects_external_for_system_python(self, monkeypatch):
+        fake = "/usr/lib/python3.11/site-packages/neo/__init__.py"
+        fake_neo = MagicMock()
+        fake_neo.__file__ = fake
+        monkeypatch.setitem(sys.modules, "neo", fake_neo)
+        monkeypatch.setattr(sys, "prefix", "/usr")
+        monkeypatch.setattr(sys, "base_prefix", "/usr")
+        assert _detect_install_method() == INSTALL_EXTERNAL
+
+
+class TestInstallMethodDispatch:
+    """perform_auto_install must route to the right tool — and refuse pip
+    on brew/external installs to avoid the duplicate-metadata loop."""
+
+    def test_brew_install_skips_pip_and_prints_guidance(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.15.5"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_BREW
+            ), patch("subprocess.run") as mock_run:
+                result = perform_auto_install("0.16.0")
+
+            assert result is False
+            assert not mock_run.called  # no pip invocation
+            err = capsys.readouterr().err
+            assert "brew upgrade" in err
+
+    def test_external_install_skips_pip_and_prints_guidance(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.15.5"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_EXTERNAL
+            ), patch("subprocess.run") as mock_run:
+                result = perform_auto_install("0.16.0")
+
+            assert result is False
+            assert not mock_run.called
+            err = capsys.readouterr().err
+            assert "pipx" in err
+
+    def test_pipx_install_runs_pipx_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.15.5"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIPX
+            ), patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+                result = perform_auto_install("0.16.0")
+
+            assert result is True
+            assert mock_run.called
+            cmd = mock_run.call_args.args[0]
+            assert cmd[:2] == ["pipx", "upgrade"]
+            assert cmd[2] == "neo-reasoner"
+
+    def test_guidance_throttled_per_version(self, capsys):
+        """The brew/external guidance must not spam on every invocation —
+        once per known new version is enough."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.15.5"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_EXTERNAL
+            ):
+                perform_auto_install("0.16.0")
+                first = capsys.readouterr().err
+                perform_auto_install("0.16.0")
+                second = capsys.readouterr().err
+
+            assert "0.16.0" in first
+            assert second == ""  # silent on the second call
+
+    def test_guidance_reprints_when_new_version_appears(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.15.5"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_EXTERNAL
+            ):
+                perform_auto_install("0.16.0")
+                capsys.readouterr()  # discard
+                perform_auto_install("0.17.0")
+                second = capsys.readouterr().err
+
+            assert "0.17.0" in second
 
 
 if __name__ == "__main__":
