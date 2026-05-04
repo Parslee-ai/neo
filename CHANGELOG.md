@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.1] - 2026-05-04
+
+### Fixed
+- Auto-updater now routes through the install method that owns neo (#89). Previously it unconditionally shelled out to `pip install --upgrade --break-system-packages --ignore-installed`, which on Homebrew Python wrote a duplicate copy without removing the old one — `importlib.metadata` resolved the stale copy on next start, producing an infinite "upgrading from X to Y ✓ Success" loop in `~/.neo/auto_update.log`. Detection now distinguishes pipx / pip-venv / brew-formula / external (PEP-668) installs and uses the correct upgrade command (or prints user guidance, throttled per version, when pip would do harm).
+- Drop update-check interval from 24h to 1h with stale-while-revalidate so users on auto-update receive new releases within ~1 hour of publication instead of up to 24h (#87).
+- Disable exploration in ranking tests to eliminate the last 3% test flake (#88).
+- Stabilize ReasoningBank tests across Python versions (#86).
+
 ## [0.16.0] - 2026-05-02
 
 ### Added
