@@ -186,12 +186,19 @@ def run_server(
 
     cr.register_tool_handler(_handle_call)
 
-    params: dict[str, str] = {
+    params: dict[str, object] = {
         "bind": bind,
         "agent_name": agent_name,
         "agent_description": agent_description,
         "organization": organization,
         "organization_url": organization_url,
+        # Tell car-server to use THIS session's runtime for the A2A
+        # dispatcher. Without it, start_a2a spins up an isolated
+        # Runtime that only has register_agent_basics, and our
+        # neo.process tool + register_tool_handler callback are
+        # invisible to A2A peers. Requires car-server >= the commit
+        # that landed Parslee-ai/car#?? (share_session_runtime).
+        "share_session_runtime": True,
     }
     if public_url:
         params["public_url"] = public_url
@@ -220,14 +227,10 @@ def run_server(
         f"  Agent Card: http://{bound}/.well-known/agent-card.json",
         file=sys.stderr,
     )
-    # car-server's a2a.start spins up an isolated Runtime (only
-    # register_agent_basics on it), so FFI-registered tools don't yet
-    # appear in the card's skills list and tool dispatch from A2A peers
-    # doesn't route back to this Python handler. Tracked CAR-side; the
-    # CAR-native path above works end-to-end today.
     print(
-        "  Note: A2A `skills` enumeration / `message/send` dispatch for "
-        f"{TOOL_NAME} pending a CAR-side runtime-sharing fix in start_a2a.",
+        f"  A2A peers can call {TOOL_NAME} via message/send; "
+        "the daemon routes tool dispatch back to this process's "
+        "registered handler.",
         file=sys.stderr,
     )
     print("Ctrl-C to stop.", file=sys.stderr)
