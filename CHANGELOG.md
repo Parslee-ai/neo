@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`neo serve` — CAR-hosted tool surface for `neo.process` (Phase 1 of the CAR migration).** Opt-in via the new `[car]` extra (`pip install 'neo-reasoner[car]'`); requires a running `car-server` daemon. Boots a `CarRuntime`, registers `neo.process` with a JSON-Schema-typed `params` shape derived from `NeoInput`, installs a Python `tools.execute` handler (closes the consumer-facing half of Parslee-ai/car-releases#38 — first downstream user of the new PyO3 surface), and binds car-server's A2A HTTP listener so an Agent Card is served at `/.well-known/agent-card.json`. CAR-native callers can submit proposals against `neo.process` today and reach the handler end-to-end. **Known limitation**: car-server's `start_a2a` spins up an isolated Runtime, so FFI-registered tools don't yet appear in the Agent Card's `skills` list and A2A peer dispatch for `neo.process` doesn't route back to Python — pending a CAR-side runtime-sharing fix in `car-server-core::a2a::start_a2a`. Tracked CAR-side; the CAR-native path is unaffected.
+  - New: `src/neo/car_tool_schema.py` (tool schema + NeoInput/NeoOutput dict converters), `src/neo/car_host.py` (server entry, per-codebase NeoEngine cache, signal-driven shutdown), `tests/test_car_tool_schema.py` (15 unit tests), `tests/test_car_host_smoke.py` (live end-to-end smoke; auto-skipped without daemon).
+  - CLI: `neo serve --a2a-bind HOST:PORT [--public-url URL] [--agent-name NAME]`.
+
 ## [0.16.1] - 2026-05-04
 
 ### Fixed

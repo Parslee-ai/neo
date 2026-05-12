@@ -89,6 +89,36 @@ def parse_args():
         args.command = 'update'
         return args
 
+    # Detect if 'serve' subcommand is being used (CAR A2A host)
+    if len(sys.argv) > 1 and sys.argv[1] == 'serve':
+        p = argparse.ArgumentParser(
+            prog="neo serve",
+            description=(
+                "Host Neo as a CAR-backed Agent2Agent v1.0 endpoint. "
+                "Requires the [car] extra and a running car-server daemon."
+            ),
+            parents=[global_parser],
+        )
+        p.add_argument(
+            "--a2a-bind",
+            metavar="HOST:PORT",
+            default="127.0.0.1:9101",
+            help="A2A HTTP listener bind address (default: 127.0.0.1:9101)",
+        )
+        p.add_argument(
+            "--public-url",
+            metavar="URL",
+            help="Public URL advertised on the Agent Card (defaults to bind address)",
+        )
+        p.add_argument(
+            "--agent-name",
+            default="neo",
+            help="Identity name on the Agent Card (default: neo)",
+        )
+        args = p.parse_args(sys.argv[2:])
+        args.command = 'serve'
+        return args
+
     # Detect if 'construct' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'construct':
         # Parse construct subcommand with proper sub-subparsers
@@ -385,6 +415,11 @@ def main():
     if hasattr(args, 'command') and args.command == 'update':
         handle_update(args)
         sys.exit(0)
+
+    # Handle serve subcommand (CAR A2A host)
+    if hasattr(args, 'command') and args.command == 'serve':
+        from neo.subcommands import handle_serve
+        sys.exit(handle_serve(args))
 
     # Handle construct subcommand
     if hasattr(args, 'command') and args.command == 'construct':

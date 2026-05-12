@@ -45,6 +45,15 @@ anthropic = ["anthropic>=0.21.0"]
 openai = ["openai>=1.0.0"]
 google = ["google-genai>=0.2.0"]
 ollama = ["requests>=2.31.0"]
+# Optional CAR (Common Agent Runtime) backend. Enables `neo serve`,
+# which hosts Neo as an Agent2Agent v1.0 endpoint via car-server.
+# Kept optional so the default install path stays pure Apache-2.0 —
+# car-runtime ships as a sealed binary under a separate license.
+# Requires the car-server daemon (`python -m car_runtime.server`)
+# running locally; see INSTALL.md.
+car = [
+    "car-runtime>=0.8.0",
+]
 all = [
     "anthropic>=0.21.0",
     "openai>=1.0.0",

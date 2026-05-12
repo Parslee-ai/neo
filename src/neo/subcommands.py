@@ -526,6 +526,30 @@ def handle_update(args):
     sys.exit(0 if success else 1)
 
 
+def handle_serve(args) -> int:
+    """Handle the 'neo serve' command — host Neo over A2A via CAR.
+
+    Returns the process exit code (0 on clean shutdown, 1 on init
+    failure). Blocks until SIGINT/SIGTERM.
+    """
+    try:
+        from neo.car_host import run_server
+    except ImportError as e:
+        print(
+            f"Failed to load CAR host: {e}\n"
+            "The [car] extra is required:\n"
+            "    pip install 'neo-reasoner[car]'",
+            file=sys.stderr,
+        )
+        return 1
+
+    return run_server(
+        bind=args.a2a_bind,
+        public_url=getattr(args, "public_url", None),
+        agent_name=getattr(args, "agent_name", "neo"),
+    )
+
+
 def handle_construct(args):
     """Handle construct subcommand operations."""
     from neo.construct import ConstructIndex
