@@ -52,7 +52,7 @@ ollama = ["requests>=2.31.0"]
 # Requires the car-server daemon (`python -m car_runtime.server`)
 # running locally; see INSTALL.md.
 car = [
-    "car-runtime>=0.8.0",
+    "car-runtime>=0.9.0",
 ]
 all = [
     "anthropic>=0.21.0",
