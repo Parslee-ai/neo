@@ -44,7 +44,12 @@ logger = logging.getLogger(__name__)
 EMBEDDING_CACHE_MAX_SIZE = 500
 MAX_TEXT_LENGTH = 32000
 SUPERSESSION_THRESHOLD = 0.85  # Cosine similarity threshold for supersession
-SYNTHESIS_SIMILARITY = 0.80    # Cosine similarity threshold for review clustering
+SYNTHESIS_SIMILARITY = 0.85    # Cosine similarity threshold for review clustering.
+                                # Paper 2603.10600 (Trajectory-Memory) §7:
+                                # τ = 0.85 was their empirical sweet spot for
+                                # description-generalized clusters. Below this
+                                # we over-merge unrelated REVIEWs; above this
+                                # we get singleton clusters.
 
 # Per-scope capacity limits
 SCOPE_LIMITS: dict[str, int] = {
