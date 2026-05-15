@@ -34,13 +34,16 @@ dependencies = [
     "fastembed>=0.3.0",
     "faiss-cpu>=1.7.0",
     "jsonschema>=4.0.0",
+    # tree-sitter is required: empty-catch detection, multi-language
+    # god-file metrics, language_parser semantic chunking, and edge
+    # extraction all depend on it. Pinned to the 0.x line of
+    # tree-sitter-language-pack — 1.x changed the Parser.parse and
+    # Tree.root_node APIs in incompatible ways.
+    "tree-sitter>=0.23,<0.26",
+    "tree-sitter-language-pack>=0.13.0,<1.0",
 ]
 
 [project.optional-dependencies]
-tree-sitter = [
-    "tree-sitter>=0.21.0,<0.22",  # 0.22+ has API changes incompatible with tree-sitter-languages
-    "tree-sitter-languages>=1.10.0; python_version<'3.13'",
-]
 anthropic = ["anthropic>=0.21.0"]
 openai = ["openai>=1.0.0"]
 google = ["google-genai>=0.2.0"]
@@ -65,8 +68,6 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "tree-sitter>=0.21.0,<0.22; python_version<'3.13'",
-    "tree-sitter-languages>=1.10.0; python_version<'3.13'",
 ]
 
 [project.scripts]

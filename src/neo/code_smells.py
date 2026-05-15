@@ -24,18 +24,11 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union
 
+from tree_sitter_language_pack import get_parser as _ts_get_parser
+
+from neo.index.language_parser import _resolve_parser_name
 from neo.languages import language_for_path
 from neo.models import ContextFile
-
-# Share the tree-sitter availability flag with the rest of the codebase
-# (see neo/index/language_parser.py) so we have one place that decides
-# "do we have tree-sitter?" — two flags drift over time.
-from neo.index.language_parser import TREE_SITTER_AVAILABLE as _TS_AVAILABLE
-
-if _TS_AVAILABLE:
-    from tree_sitter_languages import get_parser as _ts_get_parser
-else:
-    _ts_get_parser = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +96,7 @@ def _scan_one(path: str, content: str) -> list[CodeSmell]:
 
     if path.endswith(".py"):
         findings.extend(_scan_python(path, content))
-    elif _TS_AVAILABLE:
+    else:
         lang = _ts_language_for(path)
         if lang is not None:
             findings.extend(_scan_tree_sitter(path, content, lang))
@@ -227,7 +220,7 @@ def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]
     on parser errors so a broken file can't take the whole scan down.
     """
     try:
-        parser = _ts_get_parser(language)
+        parser = _ts_get_parser(_resolve_parser_name(language))
         tree = parser.parse(content.encode("utf-8"))
     except Exception as e:  # noqa: BLE001
         logger.debug("tree-sitter parse failed for %s (%s): %s", path, language, e)

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed (breaking)
+
+- **`tree-sitter` is now a required dependency, not optional.** Empty-catch detection, multi-language god-file metrics, and the semantic-chunking code path it powers are core features — the previous `[tree-sitter]` extra was a fiction, and on Python 3.13+ it could not install at all because `tree-sitter-languages` had no wheels. Switched to `tree-sitter-language-pack` (>=0.13.0,<1.0, the maintained successor) and promoted both `tree-sitter` and the language pack into the base `dependencies` block. The graceful-degrade `TREE_SITTER_AVAILABLE` scaffolding in `language_parser.py`, `code_smells.py`, and `architecture_metrics.py` has been removed; install neo and tree-sitter installs with it.
+
 ### Removed
 
 - **`neo.self_correction` and `neo.input_templates` modules deleted.** Both dead since v0.7.0 — commit 6e35f5d acknowledged the pattern-learning system had been unreachable since the initial public release, but the "fix" only revived sibling modules. `self_correction.py` had no callers; `input_templates.py` was imported only from `self_correction.py` and an import-health smoke test, so deleting one orphaned the other. The live learning path runs through `neo.pattern_extraction.extract_pattern_from_correction` via `memory/store.py`. If you were importing from either module, the surviving surface lives in `neo.pattern_extraction` and `neo.algorithm_design`.

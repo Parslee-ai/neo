@@ -1,19 +1,10 @@
 """Tests for tree-sitter multi-language parser."""
 
-import pytest
 from pathlib import Path
 
-# Check if tree-sitter is available
-try:
-    from neo.index.language_parser import TreeSitterParser, TREE_SITTER_AVAILABLE
-except ImportError:
-    TREE_SITTER_AVAILABLE = False
-    TreeSitterParser = None
+import pytest
 
-pytestmark = pytest.mark.skipif(
-    not TREE_SITTER_AVAILABLE,
-    reason="tree-sitter-languages not installed (requires Python 3.8-3.12)"
-)
+from neo.index.language_parser import TreeSitterParser
 
 
 # Sample code for each language

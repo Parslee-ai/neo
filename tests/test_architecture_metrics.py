@@ -2,19 +2,11 @@
 
 from pathlib import Path
 
-import pytest
-
 from neo.architecture_metrics import (
     ArchSnapshot,
     compare,
     compute,
 )
-
-try:
-    import tree_sitter_languages  # noqa: F401
-    _TREE_SITTER_AVAILABLE = True
-except ImportError:
-    _TREE_SITTER_AVAILABLE = False
 
 
 def _write(root: Path, rel: str, content: str) -> Path:
@@ -296,10 +288,6 @@ class TestRobustness:
 # Multi-language god-file detection (tree-sitter)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    not _TREE_SITTER_AVAILABLE,
-    reason="tree-sitter-languages not installed (requires Python 3.8-3.12)",
-)
 class TestMultiLanguageGodFiles:
     def test_long_javascript_file_is_god(self, tmp_path: Path):
         _write(tmp_path, "a.js", "const x = 1;\n" * 1000)

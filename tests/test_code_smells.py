@@ -1,15 +1,7 @@
 """Tests for neo.code_smells — high-precision anti-pattern detectors."""
 
-import pytest
-
 from neo.code_smells import CodeSmell, format_for_prompt, scan_files
 from neo.models import ContextFile
-
-try:
-    import tree_sitter_languages  # noqa: F401
-    _TREE_SITTER_AVAILABLE = True
-except ImportError:
-    _TREE_SITTER_AVAILABLE = False
 
 
 def _file(path: str, content: str) -> ContextFile:
@@ -153,10 +145,6 @@ class TestExceptDetection:
 # Empty catch blocks (JS/TS/Java/C#/C++) — tree-sitter backed
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    not _TREE_SITTER_AVAILABLE,
-    reason="tree-sitter-languages not installed (requires Python 3.8-3.12)",
-)
 class TestSwallowedCatchDetection:
     def test_javascript_empty_catch(self):
         src = "try { doThing(); } catch (e) {}\n"

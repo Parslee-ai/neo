@@ -21,22 +21,24 @@ import time
 # will be removed once all consumers have migrated.
 from neo.languages import EXTENSION_TO_LANGUAGE as LANGUAGE_MAP  # noqa: F401
 
-try:
-    # Try py-tree-sitter-languages first (newer package)
-    try:
-        from tree_sitter_languages import get_parser, get_language
-    except ImportError:
-        # Fall back to individual language packages if available
-        # This will fail gracefully if not available
-        raise ImportError("tree-sitter-languages not available")
-    TREE_SITTER_AVAILABLE = True
-except ImportError:
-    TREE_SITTER_AVAILABLE = False
-    # Create dummy functions for when tree-sitter is not available
-    def get_parser(lang):
-        raise ImportError(f"tree-sitter not available, cannot parse {lang}")
-    def get_language(lang):
-        raise ImportError(f"tree-sitter not available, cannot get language {lang}")
+from tree_sitter import Query, QueryCursor
+from tree_sitter_language_pack import get_parser, get_language
+
+# tree-sitter-language-pack uses `csharp` while the rest of this
+# codebase uses the tree-sitter canonical name `c_sharp` (matching
+# what node types and grammar names look like in the parser).
+# Translate at the parser-load boundary so the canonical name flows
+# through QUERIES / EDGE_QUERIES / EXTENSION_TO_LANGUAGE unchanged.
+_PARSER_NAME_ALIASES = {"c_sharp": "csharp"}
+
+
+def _resolve_parser_name(language: str) -> str:
+    return _PARSER_NAME_ALIASES.get(language, language)
+
+# Kept for backward compatibility — older consumers conditionally gated
+# on TREE_SITTER_AVAILABLE. tree-sitter is now a hard dependency, so
+# this is always True. Remove once all references are gone.
+TREE_SITTER_AVAILABLE = True
 
 logger = logging.getLogger(__name__)
 
@@ -339,12 +341,6 @@ class TreeSitterParser:
 
     def __init__(self):
         """Initialize parser with lazy loading."""
-        if not TREE_SITTER_AVAILABLE:
-            raise ImportError(
-                "tree-sitter-languages not available. "
-                "Install with: pip install tree-sitter-languages"
-            )
-
         self.parsers: Dict[str, Any] = {}  # Lazy-loaded parsers per language
         self.languages: Dict[str, Any] = {}  # Language objects
         self.compiled_queries: Dict[str, Dict[str, Any]] = {}  # Compiled queries
@@ -362,8 +358,9 @@ class TreeSitterParser:
         """Get or create parser for language (lazy loading)."""
         if language not in self.parsers:
             try:
-                self.parsers[language] = get_parser(language)
-                self.languages[language] = get_language(language)
+                parser_name = _resolve_parser_name(language)
+                self.parsers[language] = get_parser(parser_name)
+                self.languages[language] = get_language(parser_name)
                 logger.debug(f"Loaded tree-sitter parser for {language}")
             except Exception as e:
                 logger.error(f"Failed to load parser for {language}: {e}")
@@ -385,14 +382,37 @@ class TreeSitterParser:
                 lang_obj = self.languages[language]
 
             try:
-                # In tree-sitter 0.21.x, queries are created via Language.query()
-                self.compiled_queries[cache_key] = lang_obj.query(query_text)
+                # tree-sitter 0.23+: Query(language, text). Older
+                # Language.query(text) is deprecated and removed in
+                # newer versions.
+                self.compiled_queries[cache_key] = Query(lang_obj, query_text)
                 logger.debug(f"Compiled query {cache_key}")
             except Exception as e:
                 logger.warning(f"Failed to compile query {cache_key}: {e}")
                 return None
 
         return self.compiled_queries.get(cache_key)
+
+    @staticmethod
+    def _run_query(query, root_node) -> List[Tuple[Any, str]]:
+        """Run a query and return captures as the legacy list of
+        (node, capture_name) tuples in document order.
+
+        tree-sitter 0.23+ returns `dict[capture_name, list[Node]]`
+        from QueryCursor.captures(); the existing _process_*_captures
+        methods expect the old list-of-tuples shape, and
+        _process_inheritance_captures specifically depends on document
+        order (it tracks `current_class` from a `class_name` capture
+        and applies it to subsequent `base`/`interface` captures).
+        """
+        cursor = QueryCursor(query)
+        captures_dict = cursor.captures(root_node)
+        pairs: List[Tuple[Any, str]] = []
+        for capture_name, nodes in captures_dict.items():
+            for node in nodes:
+                pairs.append((node, capture_name))
+        pairs.sort(key=lambda pair: pair[0].start_byte)
+        return pairs
 
     def parse_file(
         self,
@@ -441,7 +461,7 @@ class TreeSitterParser:
                 if not query:
                     continue
 
-                captures = query.captures(tree.root_node)
+                captures = self._run_query(query, tree.root_node)
                 chunks.extend(self._process_captures(
                     captures,
                     content,
@@ -509,8 +529,8 @@ class TreeSitterParser:
                     self._get_parser(language)
                     lang_obj = self.languages[language]
 
-                query = lang_obj.query(query_text)
-                captures = query.captures(tree.root_node)
+                query = Query(lang_obj, query_text)
+                captures = self._run_query(query, tree.root_node)
             except Exception as e:
                 logger.debug(f"Edge query {query_name} failed for {language}: {e}")
                 continue

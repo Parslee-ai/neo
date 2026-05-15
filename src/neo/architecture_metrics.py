@@ -32,11 +32,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Optional
 
-from neo.index.language_parser import (
-    QUERIES,
-    TREE_SITTER_AVAILABLE,
-    TreeSitterParser,
-)
+from neo.index.language_parser import QUERIES, TreeSitterParser
 from neo.languages import EXTENSION_TO_LANGUAGE
 
 logger = logging.getLogger(__name__)
@@ -219,11 +215,10 @@ def compute(root: Optional[Path | str]) -> ArchSnapshot:
 
 
 def _lazy_ts_parser() -> Optional[TreeSitterParser]:
-    """Construct a TreeSitterParser once per compute() if tree-sitter is
-    available, else None. Caller passes through to per-file analysis.
+    """Construct a TreeSitterParser once per compute(), or None if its
+    initialization fails (unlikely now that tree-sitter is a hard
+    dependency, but harmless to keep the safety net).
     """
-    if not TREE_SITTER_AVAILABLE:
-        return None
     try:
         return TreeSitterParser()
     except Exception as exc:  # noqa: BLE001
@@ -261,11 +256,8 @@ def _iter_source_files(root: Path) -> Iterable[Path]:
     # Only walk extensions whose languages have tree-sitter queries —
     # without QUERIES, parse_file returns [] and we'd produce no
     # function-count signal, just inflate files_scanned with no benefit.
-    if TREE_SITTER_AVAILABLE:
-        extras = {ext for ext, lang in EXTENSION_TO_LANGUAGE.items() if lang in QUERIES}
-        extras.discard(".py")  # Python is handled by the ast path regardless
-    else:
-        extras = set()
+    extras = {ext for ext, lang in EXTENSION_TO_LANGUAGE.items() if lang in QUERIES}
+    extras.discard(".py")  # Python is handled by the ast path regardless
 
     for dirpath, dirnames, filenames in _safe_walk(root):
         # Mutate dirnames in-place so os.walk skips ignored directories.
