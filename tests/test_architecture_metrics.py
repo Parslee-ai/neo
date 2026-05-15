@@ -333,3 +333,26 @@ class TestMultiLanguageGodFiles:
         )
         _write(tmp_path, "a.js", src)
         assert compute(tmp_path).max_nesting_depth == 0
+
+    # --- Ruby / Kotlin / Swift / PHP now have query coverage too ---
+
+    def test_long_ruby_file_is_god(self, tmp_path: Path):
+        _write(tmp_path, "a.rb", "x = 1\n" * 1000)
+        assert compute(tmp_path).god_file_count == 1
+
+    def test_many_ruby_methods_is_god(self, tmp_path: Path):
+        methods = "\n".join(f"def m{i}; end" for i in range(40))
+        _write(tmp_path, "a.rb", f"class Big\n{methods}\nend\n")
+        assert compute(tmp_path).god_file_count == 1
+
+    def test_long_kotlin_file_is_god(self, tmp_path: Path):
+        _write(tmp_path, "a.kt", "val x = 1\n" * 1000)
+        assert compute(tmp_path).god_file_count == 1
+
+    def test_long_swift_file_is_god(self, tmp_path: Path):
+        _write(tmp_path, "a.swift", "let x = 1\n" * 1000)
+        assert compute(tmp_path).god_file_count == 1
+
+    def test_long_php_file_is_god(self, tmp_path: Path):
+        _write(tmp_path, "a.php", "<?php\n" + "$x = 1;\n" * 1000)
+        assert compute(tmp_path).god_file_count == 1

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- **Full multi-language coverage for Ruby, Kotlin, Swift, and PHP.** Previously these extensions were recognized but produced no analysis. Now they get:
+  - **God-file detection** via LOC and function/method counts from tree-sitter queries.
+  - **Empty catch/rescue detection.** PHP uses the standard `catch_clause`; Kotlin and Swift use `catch_block` (empty = no `statements` child); Ruby uses `rescue` (empty = no `then` child), and the finding message reads "empty rescue block" so it isn't mis-labeled as a catch.
+  - **Semantic chunking + import edges** for Kotlin (`import_header`), Swift (`import_declaration`), and PHP (`namespace_use_declaration`). Ruby imports are runtime method calls (`require`, `require_relative`) so they're left out of edge extraction for now.
+
 ### Changed (breaking)
 
 - **`tree-sitter` is now a required dependency, not optional.** Empty-catch detection, multi-language god-file metrics, and the semantic-chunking code path it powers are core features — the previous `[tree-sitter]` extra was a fiction, and on Python 3.13+ it could not install at all because `tree-sitter-languages` had no wheels. Switched to `tree-sitter-language-pack` (>=0.13.0,<1.0, the maintained successor) and promoted both `tree-sitter` and the language pack into the base `dependencies` block. The graceful-degrade `TREE_SITTER_AVAILABLE` scaffolding in `language_parser.py`, `code_smells.py`, and `architecture_metrics.py` has been removed; install neo and tree-sitter installs with it.

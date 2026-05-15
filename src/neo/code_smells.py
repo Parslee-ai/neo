@@ -189,17 +189,9 @@ def _scan_python(path: str, content: str) -> list[CodeSmell]:
 # Tree-sitter detectors (non-Python languages with try/catch semantics)
 # ---------------------------------------------------------------------------
 
-# Languages with structured try/catch (catch_clause AST node). Used to
-# filter the canonical extension map down to the subset where this
-# detector applies. Go/Rust/C use different error idioms and would
-# need their own detectors. Ruby uses `begin/rescue`, also different.
-_CATCH_DETECTOR_LANGUAGES = frozenset({
-    "javascript", "typescript", "tsx", "java", "c_sharp", "cpp",
-})
-
 # Node types used as the body of a `catch_clause` across the supported
-# grammars. JS/TS use `statement_block`, Java/C# use `block`, C++ uses
-# `compound_statement`.
+# grammars. JS/TS use `statement_block`, Java/C#/Kotlin use `block`,
+# C++/PHP use `compound_statement`.
 _CATCH_BODY_TYPES = frozenset({"block", "statement_block", "compound_statement"})
 
 # Comment node types we should ignore when deciding if a body is empty.
@@ -207,18 +199,68 @@ _CATCH_BODY_TYPES = frozenset({"block", "statement_block", "compound_statement"}
 _COMMENT_NODE_TYPES = frozenset({"comment", "line_comment", "block_comment"})
 
 
+def _is_empty_catch_clause(node) -> bool:
+    """Standard catch_clause emptiness: body block has no statements.
+
+    Used by JS/TS/Java/C#/C++/PHP — all share the "catch_clause node
+    with a block-typed body" structure. Body found by reversing
+    through named children to skip parameters/type lists.
+    """
+    body = _find_catch_body(node)
+    return body is not None and _ts_body_is_empty(body)
+
+
+def _is_empty_catch_block_kotlin_swift(node) -> bool:
+    """Kotlin/Swift `catch_block` is empty when there's no `statements`
+    named child. Unlike catch_clause, there's no separate body node —
+    statements appear directly under the catch.
+    """
+    return not any(c.type == "statements" for c in node.named_children)
+
+
+def _is_empty_ruby_rescue(node) -> bool:
+    """Ruby's `rescue` clause is empty when it has no `then` child.
+    The `then` node holds the body; absence = empty rescue.
+    """
+    return not any(c.type == "then" for c in node.named_children)
+
+
+# Per-language catch-detector configuration.
+# Maps language → (target_node_type, emptiness_check, idiom_label).
+# idiom_label drives the message and finding kind so a Ruby `rescue`
+# isn't mis-reported as a `catch`.
+_CATCH_DETECTORS: dict[str, tuple[str, "callable", str]] = {
+    "javascript": ("catch_clause", _is_empty_catch_clause, "catch"),
+    "typescript": ("catch_clause", _is_empty_catch_clause, "catch"),
+    "tsx": ("catch_clause", _is_empty_catch_clause, "catch"),
+    "java": ("catch_clause", _is_empty_catch_clause, "catch"),
+    "c_sharp": ("catch_clause", _is_empty_catch_clause, "catch"),
+    "cpp": ("catch_clause", _is_empty_catch_clause, "catch"),
+    "php": ("catch_clause", _is_empty_catch_clause, "catch"),
+    "kotlin": ("catch_block", _is_empty_catch_block_kotlin_swift, "catch"),
+    "swift": ("catch_block", _is_empty_catch_block_kotlin_swift, "catch"),
+    "ruby": ("rescue", _is_empty_ruby_rescue, "rescue"),
+}
+
+
 def _ts_language_for(path: str) -> Optional[str]:
     """Map a file path to a tree-sitter language name, or None if the
-    language doesn't have a structured catch_clause.
+    language has no detector configured.
     """
     lang = language_for_path(path)
-    return lang if lang in _CATCH_DETECTOR_LANGUAGES else None
+    return lang if lang in _CATCH_DETECTORS else None
 
 
 def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]:
-    """Detect empty `catch` blocks via tree-sitter. Falls through silently
-    on parser errors so a broken file can't take the whole scan down.
+    """Detect empty catch (or rescue) blocks via tree-sitter. Falls
+    through silently on parser errors so a broken file can't take the
+    whole scan down.
     """
+    config = _CATCH_DETECTORS.get(language)
+    if config is None:
+        return []
+    target_type, is_empty, idiom = config
+
     try:
         parser = _ts_get_parser(_resolve_parser_name(language))
         tree = parser.parse(content.encode("utf-8"))
@@ -230,15 +272,20 @@ def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]
     out: list[CodeSmell] = []
 
     for node in _walk_ts(tree.root_node):
-        if node.type != "catch_clause":
+        if node.type != target_type:
+            continue
+        # Skip anonymous-token nodes that share the structural node's
+        # type name. Ruby is the offender — the `rescue` keyword and
+        # the structural `rescue` clause both have type "rescue", but
+        # only the structural one has is_named=True.
+        if not node.is_named:
             continue
         # Skip catches inside ERROR/MISSING subtrees — partially-typed
-        # code in a live editor (e.g. `try { } catch (e` mid-keystroke)
-        # produces a `catch_clause` whose body we can't trust.
+        # code in a live editor produces target nodes whose body we
+        # can't trust.
         if node.has_error:
             continue
-        body = _find_catch_body(node)
-        if body is None or not _ts_body_is_empty(body):
+        if not is_empty(node):
             continue
         line_no = node.start_point[0] + 1
         out.append(CodeSmell(
@@ -246,7 +293,7 @@ def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]
             line=line_no,
             kind="swallowed_catch",
             severity="warn",
-            message="empty catch block — exception silently dropped",
+            message=f"empty {idiom} block — exception silently dropped",
             snippet=_truncate(_line_at(lines, line_no)),
         ))
 

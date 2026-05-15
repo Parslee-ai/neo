@@ -209,6 +209,52 @@ QUERIES = {
                 body: (field_declaration_list) @body) @class
         """
     },
+    'ruby': {
+        'functions': """
+            (method
+                name: (identifier) @name) @method
+        """,
+        'classes': """
+            (class
+                name: (constant) @name
+                body: (body_statement) @body) @class
+        """,
+    },
+    'kotlin': {
+        'functions': """
+            (function_declaration
+                (simple_identifier) @name) @function
+        """,
+        'classes': """
+            (class_declaration
+                (type_identifier) @name
+                (class_body) @body) @class
+        """,
+    },
+    'swift': {
+        'functions': """
+            (function_declaration
+                name: (simple_identifier) @name) @function
+        """,
+        'classes': """
+            (class_declaration
+                name: (type_identifier) @name) @class
+        """,
+    },
+    'php': {
+        'functions': """
+            (function_definition
+                name: (name) @name) @function
+        """,
+        'methods': """
+            (method_declaration
+                name: (name) @name) @method
+        """,
+        'classes': """
+            (class_declaration
+                name: (name) @name) @class
+        """,
+    },
 }
 
 # TSX uses same queries as TypeScript
@@ -326,6 +372,25 @@ EDGE_QUERIES = {
                     (type_identifier) @base)) @class_def
         """,
     },
+    'kotlin': {
+        'imports': """
+            (import_header (identifier) @module) @import
+        """,
+    },
+    'swift': {
+        'imports': """
+            (import_declaration (identifier) @module) @import
+        """,
+    },
+    'php': {
+        'imports': """
+            (namespace_use_declaration
+                (namespace_use_clause (qualified_name) @module)) @import
+        """,
+    },
+    # Ruby imports are method calls (`require`, `require_relative`) rather
+    # than syntactic forms — skipped here. Adding them would need either
+    # a method-call pattern match or a runtime-style heuristic.
 }
 
 EDGE_QUERIES['tsx'] = EDGE_QUERIES['typescript']

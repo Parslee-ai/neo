@@ -250,6 +250,58 @@ class TestSwallowedCatchDetection:
         # The outer catch is on line 3 of this snippet.
         assert catches[0].line == 3
 
+    # --- PHP (catch_clause, like JS/Java/C#) ---
+
+    def test_php_empty_catch_flagged(self):
+        src = "<?php\ntry { x(); } catch (Exception $e) {}\n"
+        kinds = {s.kind for s in scan_files([_file("a.php", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_php_non_empty_catch_not_flagged(self):
+        src = "<?php\ntry { x(); } catch (Exception $e) { log($e); }\n"
+        kinds = {s.kind for s in scan_files([_file("a.php", src)])}
+        assert "swallowed_catch" not in kinds
+
+    # --- Kotlin (catch_block; empty = no `statements` child) ---
+
+    def test_kotlin_empty_catch_flagged(self):
+        src = "fun f() { try { x() } catch (e: Exception) {} }\n"
+        kinds = {s.kind for s in scan_files([_file("a.kt", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_kotlin_non_empty_catch_not_flagged(self):
+        src = "fun f() { try { x() } catch (e: Exception) { log(e) } }\n"
+        kinds = {s.kind for s in scan_files([_file("a.kt", src)])}
+        assert "swallowed_catch" not in kinds
+
+    # --- Swift (catch_block; empty = no `statements` child) ---
+
+    def test_swift_empty_catch_flagged(self):
+        src = "func f() throws { do { try x() } catch {} }\n"
+        kinds = {s.kind for s in scan_files([_file("a.swift", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_swift_non_empty_catch_not_flagged(self):
+        src = "func f() throws { do { try x() } catch { print(error) } }\n"
+        kinds = {s.kind for s in scan_files([_file("a.swift", src)])}
+        assert "swallowed_catch" not in kinds
+
+    # --- Ruby (rescue; empty = no `then` child) ---
+
+    def test_ruby_empty_rescue_flagged(self):
+        src = "begin\n  x = 1\nrescue StandardError => e\nend\n"
+        smells = [s for s in scan_files([_file("a.rb", src)]) if s.kind == "swallowed_catch"]
+        assert smells
+        # Idiom label should say "rescue" not "catch" for Ruby.
+        assert "rescue" in smells[0].message
+
+    def test_ruby_non_empty_rescue_not_flagged(self):
+        src = (
+            "begin\n  x = 1\nrescue StandardError => e\n  log(e)\nend\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.rb", src)])}
+        assert "swallowed_catch" not in kinds
+
 
 # ---------------------------------------------------------------------------
 # Hardcoded credentials
