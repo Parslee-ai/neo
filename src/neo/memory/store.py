@@ -21,6 +21,7 @@ from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
+from neo.memory.metrics import record as metrics_record, time_block
 from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, rank_score, update_recall
@@ -244,6 +245,14 @@ class FactStore:
         self._facts.append(fact)
         self._enforce_scope_limit(fact.scope)
         self.save()
+        metrics_record(
+            "add_fact",
+            kind=fact.kind.value,
+            scope=fact.scope.value,
+            confidence=fact.metadata.confidence,
+            provenance=fact.metadata.provenance,
+            corpus_size_after=len([f for f in self._facts if f.is_valid]),
+        )
         return fact
 
     def retrieve_relevant(self, query: str, k: int = 30) -> list[Fact]:
@@ -262,21 +271,42 @@ class FactStore:
         Returns:
             List of relevant Fact objects.
         """
-        query_embedding = self._embed_text(query)
+        with time_block() as timed:
+            query_embedding = self._embed_text(query)
 
-        valid_facts = [f for f in self._facts if f.is_valid and f.kind != FactKind.CONSTRAINT]
-        if not valid_facts:
-            return []
+            valid_facts = [f for f in self._facts if f.is_valid and f.kind != FactKind.CONSTRAINT]
+            if not valid_facts:
+                metrics_record(
+                    "retrieve",
+                    path="retrieve_relevant",
+                    k_requested=k,
+                    corpus_size=0,
+                    results=0,
+                    latency_ms=(time.perf_counter() - timed._t0) * 1000.0,
+                )
+                return []
 
-        now = time.time()
-        sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
-        scored = [(f, rank_score(f, s, now)) for f, s in zip(valid_facts, sims)]
-        scored.sort(key=lambda x: x[1], reverse=True)
+            now = time.time()
+            sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
+            scored = [(f, rank_score(f, s, now)) for f, s in zip(valid_facts, sims)]
+            scored.sort(key=lambda x: x[1], reverse=True)
 
-        results: list[Fact] = []
-        for fact, _ in scored[:k]:
-            self._mark_retrieved(fact, now)
-            results.append(fact)
+            results: list[Fact] = []
+            for fact, _ in scored[:k]:
+                self._mark_retrieved(fact, now)
+                results.append(fact)
+
+        top_scores = [s for _, s in scored[:k]]
+        metrics_record(
+            "retrieve",
+            path="retrieve_relevant",
+            k_requested=k,
+            corpus_size=len(valid_facts),
+            results=len(results),
+            latency_ms=timed.elapsed_ms,
+            top_score=top_scores[0] if top_scores else None,
+            mean_top_k=sum(top_scores) / len(top_scores) if top_scores else None,
+        )
         return results
 
     @staticmethod
@@ -315,6 +345,13 @@ class FactStore:
         for fact in result.valid_facts:
             self._mark_retrieved(fact, now)
 
+        metrics_record(
+            "retrieve",
+            path="build_context",
+            k_requested=k,
+            corpus_size=len([f for f in self._facts if f.is_valid]),
+            results=len(result.valid_facts),
+        )
         return result
 
     def format_context_for_prompt(self, ctx: ContextResult) -> str:
