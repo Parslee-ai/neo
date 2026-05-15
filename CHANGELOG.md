@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **`static_analysis`: pyright and mypy now both run when both are enabled.** Previously the dispatch had a hidden `pyright … elif mypy` mutex that suppressed mypy whenever pyright was enabled. They flag different things, so the coupling cost real diagnostics. Users running both intentionally now get both sets of findings.
+
 ### Added
 
 - **`neo serve` — CAR-hosted tool surface for `neo.process` (Phase 1 of the CAR migration).** Opt-in via the new `[car]` extra (`pip install 'neo-reasoner[car]'`); requires a running `car-server` daemon. Boots a `CarRuntime`, registers `neo.process` with a JSON-Schema-typed `params` shape derived from `NeoInput`, installs a Python `tools.execute` handler (closes the consumer-facing half of Parslee-ai/car-releases#38 — first downstream user of the new PyO3 surface), and binds car-server's A2A HTTP listener so an Agent Card is served at `/.well-known/agent-card.json`. CAR-native callers can submit proposals against `neo.process` today and reach the handler end-to-end. **Known limitation**: car-server's `start_a2a` spins up an isolated Runtime, so FFI-registered tools don't yet appear in the Agent Card's `skills` list and A2A peer dispatch for `neo.process` doesn't route back to Python — pending a CAR-side runtime-sharing fix in `car-server-core::a2a::start_a2a`. Tracked CAR-side; the CAR-native path is unaffected.

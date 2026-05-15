@@ -2,12 +2,22 @@
 Static analysis tool integrations for Neo.
 
 All tools run in read-only/check-only mode.
+
+Adding a new language analyzer:
+1. Implement `run_<tool>_check(suggestion) -> StaticCheckResult`.
+2. Add the tool's CLI name to `_KNOWN_TOOLS` (drives PATH detection).
+3. Register a `_LanguageChecker` in `_LANGUAGE_CHECKERS` for the
+   extensions it applies to.
+4. Add an `enable_<tool>` kwarg to `run_static_checks` and pass it
+   through via `_enable_map`.
 """
 
 import json
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from neo.models import CodeSuggestion, StaticCheckResult
 
@@ -337,18 +347,44 @@ def apply_diff_to_content(unified_diff: str, original_content: str) -> str:
 
 
 # ============================================================================
+# Language Checker Registry
+# ============================================================================
+
+@dataclass(frozen=True)
+class _LanguageChecker:
+    """Pairs a CLI tool with the extensions it analyzes.
+
+    `extensions` is matched against `Path.suffix` (leading dot, lower).
+    """
+    tool_name: str
+    run: Callable[[CodeSuggestion], StaticCheckResult]
+    extensions: frozenset[str]
+
+
+_LANGUAGE_CHECKERS: tuple[_LanguageChecker, ...] = (
+    _LanguageChecker("ruff", run_ruff_check, frozenset({".py"})),
+    _LanguageChecker("pyright", run_pyright_check, frozenset({".py"})),
+    _LanguageChecker("mypy", run_mypy_check, frozenset({".py"})),
+    _LanguageChecker(
+        "eslint", run_eslint_check,
+        frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}),
+    ),
+)
+
+# Drives `detect_available_tools()` — derived from the registry so adding a
+# checker doesn't require keeping a second list in sync.
+_KNOWN_TOOLS: frozenset[str] = frozenset(c.tool_name for c in _LANGUAGE_CHECKERS)
+
+
+# ============================================================================
 # Tool Detection
 # ============================================================================
 
 def detect_available_tools() -> set[str]:
-    """Detect which static analysis tools are available."""
+    """Detect which static analysis tools are on $PATH."""
     import shutil
 
-    tools = set()
-    for tool in ["ruff", "pyright", "mypy", "eslint"]:
-        if shutil.which(tool):
-            tools.add(tool)
-    return tools
+    return {tool for tool in _KNOWN_TOOLS if shutil.which(tool)}
 
 
 # ============================================================================
@@ -374,25 +410,30 @@ def run_static_checks(
 
     Returns:
         List of static check results
+
+    Note: enabling both pyright AND mypy runs both. They flag different
+    things, so co-enabling is rarely redundant — the previous fallback
+    semantics (only-mypy-if-pyright-disabled) coupled the two without a
+    real reason.
     """
-    results = []
+    enable_map = {
+        "ruff": enable_ruff,
+        "pyright": enable_pyright,
+        "mypy": enable_mypy,
+        "eslint": enable_eslint,
+    }
     available_tools = detect_available_tools()
+    results: list[StaticCheckResult] = []
 
     for suggestion in suggestions:
-        file_path = Path(suggestion.file_path)
-
-        # Python checks
-        if file_path.suffix == ".py":
-            if enable_ruff and "ruff" in available_tools:
-                results.append(run_ruff_check(suggestion))
-            if enable_pyright and "pyright" in available_tools:
-                results.append(run_pyright_check(suggestion))
-            elif enable_mypy and "mypy" in available_tools:
-                results.append(run_mypy_check(suggestion))
-
-        # JavaScript/TypeScript checks
-        elif file_path.suffix in {".js", ".ts", ".jsx", ".tsx"}:
-            if enable_eslint and "eslint" in available_tools:
-                results.append(run_eslint_check(suggestion))
+        suffix = Path(suggestion.file_path).suffix.lower()
+        for checker in _LANGUAGE_CHECKERS:
+            if suffix not in checker.extensions:
+                continue
+            if not enable_map.get(checker.tool_name, False):
+                continue
+            if checker.tool_name not in available_tools:
+                continue
+            results.append(checker.run(suggestion))
 
     return results
