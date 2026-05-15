@@ -18,6 +18,7 @@ import numpy as np
 
 from neo.math_utils import batched_cosine, cosine_similarity
 from neo.memory.bm25 import BM25, tokenize
+from neo.memory.query_routing import QueryShape, decompose as _decompose_query
 from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
@@ -302,18 +303,49 @@ class FactStore:
     def retrieve_relevant(self, query: str, k: int = 30) -> list[Fact]:
         """Retrieve the most relevant valid facts for a query.
 
-        Single-pass scoring: vectorized cosine over the full valid corpus,
-        then rank_score (sim * confidence + success_bonus + provenance_bonus).
-        At Neo's max scope of ~750 valid facts (200+100+500 across scopes),
-        the matrix-vector product is sub-millisecond — adding a separate
-        ANN index would buy nothing at this scale.
+        Pipeline:
+        1. Classify the query shape (DIRECT/CHAIN/SPLIT — paper 2604.04853
+           §5.3). Multi-hop and multi-entity queries get decomposed; the
+           per-branch results are merged with dedup by fact.id.
+        2. For each (sub-)query: hybrid dense + BM25 over the full valid
+           corpus, then rank_score (recall-probability * confidence +
+           success_bonus * effectiveness_f + provenance_bonus).
+        3. Half-by-rank-score / half-by-cosine selection over the merged
+           candidate pool.
 
-        Args:
-            query: The search query.
-            k: Maximum number of facts to return.
+        At Neo's max scope of ~850 valid facts, all of this is in the
+        single-millisecond range — no ANN index needed.
+        """
+        shape, sub_queries = _decompose_query(query)
+        if shape is QueryShape.DIRECT or len(sub_queries) <= 1:
+            return self._retrieve_single(query, k)
 
-        Returns:
-            List of relevant Fact objects.
+        # Multi-hop / multi-entity: per-branch retrieve, merge, dedup,
+        # then take top-k by best per-fact rank_score across branches.
+        per_branch_k = max(5, k // max(1, len(sub_queries)))
+        merged: dict[str, tuple[Fact, float]] = {}
+        for sq in sub_queries:
+            for fact in self._retrieve_single(sq, per_branch_k):
+                prev = merged.get(fact.id)
+                if prev is None or fact.metadata.confidence > prev[1]:
+                    merged[fact.id] = (fact, fact.metadata.confidence)
+        merged_facts = [v[0] for v in merged.values()]
+        merged_facts.sort(key=lambda f: rank_score(f, 1.0), reverse=True)
+        metrics_record(
+            "retrieve",
+            path="retrieve_relevant.multi",
+            shape=shape.value,
+            sub_queries=len(sub_queries),
+            k_requested=k,
+            results=min(k, len(merged_facts)),
+        )
+        return merged_facts[:k]
+
+    def _retrieve_single(self, query: str, k: int) -> list[Fact]:
+        """Single-pass retrieval — what retrieve_relevant used to be.
+
+        Split out so query-routing can call us per sub-query without
+        recursing through the decomposer.
         """
         with time_block() as timed:
             query_embedding = self._embed_text(query)
