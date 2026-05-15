@@ -307,15 +307,39 @@ class FactStore:
 
             now = time.time()
             sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
-            scored = [(f, rank_score(f, s, now)) for f, s in zip(valid_facts, sims)]
-            scored.sort(key=lambda x: x[1], reverse=True)
+            scored = [(f, sim, rank_score(f, sim, now)) for f, sim in zip(valid_facts, sims)]
+
+            # Half-by-rank-score / half-by-cosine policy (paper 2505.23946
+            # LessonL Algorithm 1): top ⌈k/2⌉ by full rank_score (which
+            # captures confidence + success_bonus + provenance + decay),
+            # then top ⌊k/2⌋ by raw cosine to the query — so a fresh fact
+            # with no track record but high semantic match can still
+            # surface alongside the validated winners. LessonL ablation
+            # showed this cuts retrieval-quality variance from σ=0.28 to
+            # σ=0.03 vs pure score-sort.
+            half_score = (k + 1) // 2
+            half_cos = k - half_score
+
+            by_score = sorted(scored, key=lambda x: x[2], reverse=True)
+            score_pick = by_score[:half_score]
+            score_pick_ids = {f.id for f, _, _ in score_pick}
+
+            by_cos = sorted(
+                (s for s in scored if s[0].id not in score_pick_ids),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            cos_pick = by_cos[:half_cos]
+
+            chosen = score_pick + cos_pick
+            chosen.sort(key=lambda x: x[2], reverse=True)
 
             results: list[Fact] = []
-            for fact, _ in scored[:k]:
+            for fact, _sim, _score in chosen:
                 self._mark_retrieved(fact, now)
                 results.append(fact)
 
-        top_scores = [s for _, s in scored[:k]]
+        chosen_scores = [s for _, _, s in chosen]
         metrics_record(
             "retrieve",
             path="retrieve_relevant",
@@ -323,8 +347,8 @@ class FactStore:
             corpus_size=len(valid_facts),
             results=len(results),
             latency_ms=timed.elapsed_ms,
-            top_score=top_scores[0] if top_scores else None,
-            mean_top_k=sum(top_scores) / len(top_scores) if top_scores else None,
+            top_score=chosen_scores[0] if chosen_scores else None,
+            mean_top_k=sum(chosen_scores) / len(chosen_scores) if chosen_scores else None,
         )
         return results
 
