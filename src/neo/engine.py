@@ -283,6 +283,7 @@ class NeoEngine:
         if self.fact_store is not None:
             ids = self._build_suggestion_fact_ids(fact, code_suggestions)
             self.fact_store.save_session(code_suggestions, neo_input.prompt, ids)
+            self._persist_simulation_episodes(simulation_traces, plan, neo_input.prompt)
 
         elapsed = time.time() - start_time
         self._log_metrics(difficulty, time_budget, elapsed, early_exit=early_exit)
@@ -303,6 +304,35 @@ class NeoEngine:
         )
         self._log_usage_telemetry(output, neo_input)
         return output
+
+    def _persist_simulation_episodes(
+        self,
+        traces: list[SimulationTrace],
+        plan: list[PlanStep],
+        prompt: str,
+    ) -> None:
+        """Write each simulation trace as an EPISODE fact for future retrieval.
+
+        Only persists when we have a fact_store. Failure to write a single
+        trace doesn't stop the others — and never propagates: simulation
+        episodes are nice-to-have, not load-bearing.
+        """
+        if not traces:
+            return
+        plan_summary = "; ".join(step.action[:80] for step in plan if step.action)[:300]
+        for trace in traces:
+            try:
+                self.fact_store.persist_simulation_episode(
+                    prompt=prompt,
+                    input_data=trace.input_data or "",
+                    expected_output=trace.expected_output or "",
+                    reasoning_steps=list(trace.reasoning_steps or []),
+                    issues_found=list(trace.issues_found or []),
+                    plan_summary=plan_summary,
+                    codebase_ref=self.fact_store.codebase_root or "",
+                )
+            except Exception as e:  # never block on episode-write failure
+                logger.debug(f"persist_simulation_episode failed: {e}")
 
     @staticmethod
     def _simulation_consensus(traces: list[SimulationTrace]) -> bool:

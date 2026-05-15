@@ -372,6 +372,83 @@ class FactStore:
         """Render ContextResult as a formatted string."""
         return self._assembler.format_context_for_prompt(ctx)
 
+    def persist_simulation_episode(
+        self,
+        *,
+        prompt: str,
+        input_data: str,
+        expected_output: str,
+        reasoning_steps: list[str],
+        issues_found: list[str],
+        plan_summary: str = "",
+        codebase_ref: str = "",
+    ) -> Fact:
+        """Persist a SimulationTrace as an EPISODE fact.
+
+        Uses the retrieval/context split (B1) intentionally:
+        - retrieval_text is concise (input → expected_output), so search
+          can match on the *shape* of the simulation, not the full trace.
+        - context_text holds the full reasoning_steps + issues for prompt
+          injection later.
+
+        EpisodeContext records when/where/why/with_whom so the EPISODE
+        passes the 5-property test (paper 2502.06975).
+        """
+        from neo.memory.models import EpisodeContext  # local: keep import light
+
+        clean = not issues_found
+        subject = f"Simulation: {input_data[:60].strip()}"
+        retrieval = (
+            f"{input_data.strip()} -> {expected_output.strip()}"
+            if expected_output
+            else input_data.strip()
+        )
+        narrative_parts = []
+        if plan_summary:
+            narrative_parts.append(f"Plan: {plan_summary.strip()}")
+        narrative_parts.append(f"Input: {input_data.strip()}")
+        if expected_output:
+            narrative_parts.append(f"Expected: {expected_output.strip()}")
+        if reasoning_steps:
+            narrative_parts.append("Reasoning:")
+            narrative_parts.extend(f"  - {step.strip()}" for step in reasoning_steps if step.strip())
+        if issues_found:
+            narrative_parts.append("Issues:")
+            narrative_parts.extend(f"  - {iss.strip()}" for iss in issues_found if iss.strip())
+        context_text = "\n".join(narrative_parts)
+
+        ts_now = time.time()
+        episode_context = EpisodeContext(
+            when=str(ts_now),
+            where=codebase_ref or (self.codebase_root or ""),
+            why=prompt[:200] if prompt else None,
+            with_whom="simulator",
+        )
+
+        tags = ["simulation", "episode"]
+        if clean:
+            tags.append("simulation:clean")
+
+        fact = self.add_fact(
+            subject=subject,
+            body=context_text,  # body kept in sync for backward callers
+            kind=FactKind.EPISODE,
+            scope=FactScope.PROJECT,
+            confidence=0.6 if clean else 0.3,
+            source_prompt=prompt,
+            tags=tags,
+            provenance=Provenance.OBSERVED,
+            retrieval_text=retrieval,
+            context_text=context_text,
+        )
+        fact.episode_context = episode_context
+        # Stamp event_time/ingest_time explicitly so bi-temporal queries
+        # know this represents a simulation that ran *now*.
+        fact.metadata.event_time = ts_now
+        fact.metadata.ingest_time = ts_now
+        self.save()
+        return fact
+
     def save_session(
         self,
         suggestions: list,
