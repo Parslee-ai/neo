@@ -60,6 +60,23 @@ class PlanStep:
     failure_signatures: list[str] = field(default_factory=list)
     verifier_checks: list[str] = field(default_factory=list)
     expanded: bool = False  # Track if this step has been expanded from seed
+    # MapCoder-style per-step confidence (paper 2405.11403): scaled to [0, 1].
+    # Default 1.0 so legacy single-plan paths behave as before. Future
+    # multi-plan generation can sort by this descending and try plans in
+    # confidence order with a fallback loop.
+    confidence: float = 1.0
+
+    @property
+    def aggregate_confidence(self) -> float:
+        """Compose self.confidence with risk to a single [0, 1] number.
+
+        Cheap heuristic: low/medium/high risk multiplies the planner-
+        emitted confidence by 1.0 / 0.8 / 0.5 respectively. Used as the
+        plan-level signal for early-exit decisions until the engine grows
+        a real multi-plan branch.
+        """
+        risk_multiplier = {"low": 1.0, "medium": 0.8, "high": 0.5}.get(self.risk, 1.0)
+        return max(0.0, min(1.0, self.confidence * risk_multiplier))
 
 
 @dataclass
