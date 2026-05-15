@@ -341,6 +341,56 @@ class FactStore:
         )
         return merged_facts[:k]
 
+    def _expand_episode_neighbors(
+        self, hits: list[Fact], *, max_per_episode: int = 2,
+    ) -> list[Fact]:
+        """Nucleus expansion (paper 2604.04853 §4.6): for each EPISODE hit,
+        pull a small neighborhood of peer episodes from the same session
+        and inject them in chronological order.
+
+        Sessions are keyed by ``metadata.source_prompt`` — the same prompt
+        triggered all simulator traces in one Neo run, so all the EPISODE
+        facts written by ``persist_simulation_episode`` for one run share
+        it. Neighbors are sorted by ``effective_event_time`` and capped
+        at ``max_per_episode`` to keep the prompt budget bounded.
+
+        Non-episode hits pass through unchanged. Duplicates (peer already
+        in ``hits``) are skipped. The result preserves the input ordering
+        and appends each episode's neighbors immediately after.
+        """
+        if not hits:
+            return hits
+
+        existing_ids = {f.id for f in hits}
+        episodes_by_prompt: dict[str, list[Fact]] = {}
+        for fact in self._facts:
+            if not fact.is_valid or fact.kind != FactKind.EPISODE:
+                continue
+            sp = fact.metadata.source_prompt
+            if not sp:
+                continue
+            episodes_by_prompt.setdefault(sp, []).append(fact)
+
+        expanded: list[Fact] = []
+        for hit in hits:
+            expanded.append(hit)
+            if hit.kind != FactKind.EPISODE:
+                continue
+            peers = episodes_by_prompt.get(hit.metadata.source_prompt, [])
+            if not peers:
+                continue
+            peers.sort(key=lambda f: f.metadata.effective_event_time)
+            added = 0
+            for peer in peers:
+                if added >= max_per_episode:
+                    break
+                if peer.id == hit.id or peer.id in existing_ids:
+                    continue
+                expanded.append(peer)
+                existing_ids.add(peer.id)
+                added += 1
+        return expanded
+
     def _retrieve_single(self, query: str, k: int) -> list[Fact]:
         """Single-pass retrieval — what retrieve_relevant used to be.
 
@@ -404,6 +454,12 @@ class FactStore:
             for fact, _sim, _score in chosen:
                 self._mark_retrieved(fact, now)
                 results.append(fact)
+
+        # Nucleus expansion: when any retrieved fact is an EPISODE, pull
+        # a small neighborhood of peer episodes from the same session so
+        # the prompt sees the surrounding context, not just the single
+        # turn whose cosine happened to score highest.
+        results = self._expand_episode_neighbors(results)
 
         chosen_scores = [s for _, _, s in chosen]
         metrics_record(
