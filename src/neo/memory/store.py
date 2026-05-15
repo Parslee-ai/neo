@@ -203,6 +203,8 @@ class FactStore:
         tags: Optional[list[str]] = None,
         depends_on: Optional[list[str]] = None,
         provenance: "str | Provenance" = Provenance.INFERRED,
+        retrieval_text: Optional[str] = None,
+        context_text: Optional[str] = None,
     ) -> Fact:
         """Add a new fact to the store.
 
@@ -227,10 +229,6 @@ class FactStore:
         # Coerce enum to its string value so storage stays JSON-clean.
         prov_value = provenance.value if isinstance(provenance, Provenance) else provenance
 
-        # Generate embedding
-        embed_text = f"{subject} {body}"
-        embedding = self._embed_text(embed_text)
-
         fact = Fact(
             subject=subject,
             body=body,
@@ -244,10 +242,14 @@ class FactStore:
                 confidence=confidence,
                 provenance=prov_value,
             ),
-            embedding=embedding,
             tags=tags or [],
             depends_on=depends_on or [],
+            retrieval_text=retrieval_text,
+            context_text=context_text,
         )
+
+        # Embed the retrieval_text (defaults to subject+body if unset).
+        fact.embedding = self._embed_text(fact.embed_text())
 
         # Check for supersession candidate
         candidate = self._find_supersession_candidate(fact)

@@ -175,11 +175,18 @@ class ContextAssembler:
         # Build lookup: old_fact.id → old_fact for inline annotations
         old_lookup: dict[str, Fact] = {f.id: f for f in ctx.invalidated_facts}
 
+        # Use ``Fact.render_for_context()`` so a fact with an explicit
+        # context_text (the MMS-style narrative form for episodes etc.)
+        # gets that content, while plain facts fall back to subject+body.
+        def _body_for_context(fact: Fact, limit: int) -> str:
+            text = fact.context_text or fact.body
+            return text[:limit] if limit > 0 and len(text) > limit else text
+
         if ctx.constraints:
             lines = ["## Project Constraints"]
             for fact in ctx.constraints:
                 lines.append(f"### {fact.subject}")
-                lines.append(fact.body)
+                lines.append(fact.context_text or fact.body)
             sections.append("\n".join(lines))
 
         if ctx.valid_facts:
@@ -188,25 +195,25 @@ class ContextAssembler:
                 conf = fact.metadata.confidence
                 line = (
                     f"- **{fact.subject}** ({fact.kind.value}, confidence={conf:.2f}): "
-                    f"{fact.body[:200]}"
+                    f"{_body_for_context(fact, 200)}"
                 )
                 # Inline change annotation
                 if fact.supersedes and fact.supersedes in old_lookup:
                     old = old_lookup[fact.supersedes]
-                    line += f" (changed from: {old.body[:80]})"
+                    line += f" (changed from: {_body_for_context(old, 80)})"
                 lines.append(line)
             sections.append("\n".join(lines))
 
         if ctx.known_unknowns:
             lines = ["## Known Unknowns"]
             for fact in ctx.known_unknowns:
-                lines.append(f"- {fact.subject}: {fact.body[:150]}")
+                lines.append(f"- {fact.subject}: {_body_for_context(fact, 150)}")
             sections.append("\n".join(lines))
 
         if ctx.working_set:
             lines = ["## Session Context"]
             for fact in ctx.working_set:
-                lines.append(f"- {fact.subject}: {fact.body[:200]}")
+                lines.append(f"- {fact.subject}: {_body_for_context(fact, 200)}")
             sections.append("\n".join(lines))
 
         return "\n\n".join(sections)

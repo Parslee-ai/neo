@@ -323,10 +323,34 @@ class Fact:
     # See EpisodeContext for the field set; None is the default for
     # non-episodic facts to keep JSON dumps tight.
     episode_context: Optional[EpisodeContext] = None
+    # Retrieval/context unit split (paper 2508.15294 §3, eqs 3-4). For most
+    # facts these stay None and ``embed_text()`` / ``context_text()`` fall
+    # back to ``subject + body``. Callers that have a richer separation
+    # (e.g. an EPISODE fact with concise keywords vs. a long episodic
+    # narrative) can populate them independently:
+    #   retrieval_text — what we EMBED and SEARCH ON  (short, keyword-y)
+    #   context_text   — what we INJECT into the prompt (long, narrative)
+    # The MMS paper shows this asymmetry adds 8-11 pts on multi-hop recall:
+    # M_sem embedded directly hurts retrieval, M_epi injected as context
+    # hurts generation; separating them is the fix.
+    retrieval_text: Optional[str] = None
+    context_text: Optional[str] = None
 
     def size_hint(self) -> int:
         """Approximate token count. Uses len//4 heuristic — not precise, just monotonic."""
-        return len(self.subject + self.body) // 4
+        return len(self.context_text or (self.subject + self.body)) // 4
+
+    def embed_text(self) -> str:
+        """Text to embed for retrieval. Falls back to subject + body."""
+        if self.retrieval_text:
+            return self.retrieval_text
+        return f"{self.subject} {self.body}"
+
+    def render_for_context(self) -> str:
+        """Text to inject into the LLM prompt. Falls back to subject + body."""
+        if self.context_text:
+            return self.context_text
+        return f"{self.subject}: {self.body}"
 
     def to_dict(self) -> dict:
         data = {
@@ -349,6 +373,10 @@ class Fact:
             data["embedding"] = self.embedding.tolist()
         if self.episode_context is not None:
             data["episode_context"] = self.episode_context.to_dict()
+        if self.retrieval_text is not None:
+            data["retrieval_text"] = self.retrieval_text
+        if self.context_text is not None:
+            data["context_text"] = self.context_text
         return data
 
     @classmethod
@@ -374,6 +402,8 @@ class Fact:
             embedding=embedding,
             tags=data.get("tags", []),
             episode_context=EpisodeContext.from_dict(data.get("episode_context")),
+            retrieval_text=data.get("retrieval_text"),
+            context_text=data.get("context_text"),
         )
 
 
