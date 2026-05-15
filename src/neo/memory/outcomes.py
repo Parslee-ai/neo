@@ -68,6 +68,66 @@ _INEFFICIENCY_RE = re.compile(
 )
 
 
+class CodeOutcome(enum.Enum):
+    """LessonL objective code-outcome categorizer (paper 2505.23946 §3).
+
+    For code suggestions with static-check / compile / test signals,
+    bucket the observed result deterministically. Distinct from
+    OutcomeIndicator (which works on prose) and OutcomeType (event shape).
+    """
+    SPEED_UP = "speed_up"
+    SLOW_DOWN = "slow_down"
+    FUNCTIONAL_INCORRECTNESS = "functional_incorrectness"
+    SYNTAX_ERROR = "syntax_error"
+    UNKNOWN = "unknown"  # not enough signal
+
+
+_SYNTAX_ERR_RE = re.compile(
+    r"\b(SyntaxError|ParseError|parse error|unexpected token|"
+    r"unterminated|invalid syntax)\b",
+    re.IGNORECASE,
+)
+_FUNCTIONAL_ERR_RE = re.compile(
+    r"\b(assertion ?error|expected .* got|test (failed|fail)|"
+    r"wrong (answer|output)|incorrect|FAIL(?:ED)?)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_code_outcome(
+    *,
+    diagnostics: Optional[list[dict]] = None,
+    runtime_log: str = "",
+    speedup_ratio: Optional[float] = None,
+) -> CodeOutcome:
+    """Deterministic LessonL outcome bucket from compiler/runtime evidence.
+
+    Order matters: explicit syntax errors first (compiler-shaped),
+    functional incorrectness second (runtime/test-shaped), then
+    speed signals if a measured ratio is supplied. Tests are
+    deliberately NOT included for the incorrectness path (paper §3
+    rationale: keeps lessons from overfitting to specific tests).
+    """
+    blob_parts = [runtime_log]
+    for d in diagnostics or []:
+        msg = d.get("message") or d.get("text") or ""
+        blob_parts.append(str(msg))
+    blob = "\n".join(p for p in blob_parts if p)
+
+    if _SYNTAX_ERR_RE.search(blob):
+        return CodeOutcome.SYNTAX_ERROR
+    if _FUNCTIONAL_ERR_RE.search(blob):
+        return CodeOutcome.FUNCTIONAL_INCORRECTNESS
+
+    if speedup_ratio is not None:
+        if speedup_ratio > 1.0:
+            return CodeOutcome.SPEED_UP
+        if speedup_ratio < 1.0:
+            return CodeOutcome.SLOW_DOWN
+
+    return CodeOutcome.UNKNOWN
+
+
 def classify_outcome_indicator(
     *,
     diff_text: str = "",
