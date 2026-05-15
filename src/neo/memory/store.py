@@ -17,6 +17,7 @@ from typing import Any, Optional
 import numpy as np
 
 from neo.math_utils import batched_cosine, cosine_similarity
+from neo.memory.bm25 import BM25, tokenize
 from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
@@ -331,7 +332,16 @@ class FactStore:
 
             now = time.time()
             sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
-            scored = [(f, sim, rank_score(f, sim, now)) for f, sim in zip(valid_facts, sims)]
+
+            # Hybrid dense + sparse (paper 2603.19935 Memori §3.3). BM25
+            # over the same corpus catches keyword matches the dense
+            # embedding smooths over. Min-max normalize both signals to
+            # [0, 1] then weighted-sum (0.7 dense + 0.3 sparse). Fused
+            # similarity replaces the raw cosine inside rank_score so the
+            # downstream Ebbinghaus decay and confidence multiplier still
+            # apply the same way.
+            fused_sims = self._fuse_dense_sparse(query, valid_facts, sims)
+            scored = [(f, fs, rank_score(f, fs, now)) for f, fs in zip(valid_facts, fused_sims)]
 
             # Half-by-rank-score / half-by-cosine policy (paper 2505.23946
             # LessonL Algorithm 1): top ⌈k/2⌉ by full rank_score (which
@@ -375,6 +385,41 @@ class FactStore:
             mean_top_k=sum(chosen_scores) / len(chosen_scores) if chosen_scores else None,
         )
         return results
+
+    @staticmethod
+    def _fuse_dense_sparse(
+        query: str, facts: list[Fact], dense_sims: list[float],
+        *, dense_weight: float = 0.7, sparse_weight: float = 0.3,
+    ) -> list[float]:
+        """Weighted fusion of dense cosine + BM25 sparse over the same corpus.
+
+        Both signals are min-max normalized to [0, 1] before mixing so the
+        weights are interpretable. Returns a list parallel to ``facts``.
+        When the BM25 channel produces zero signal (empty query tokens or
+        empty corpus), falls through to the raw dense sims unchanged.
+        """
+        if not facts:
+            return []
+        query_terms = tokenize(query)
+        if not query_terms:
+            return list(dense_sims)
+
+        docs = [tokenize(f.embed_text()) for f in facts]
+        index = BM25(docs)
+        sparse = index.scores(query_terms)
+
+        sparse_max = max(sparse) if sparse else 0.0
+        if sparse_max <= 0.0:
+            return list(dense_sims)
+        sparse_norm = [s / sparse_max for s in sparse]
+
+        # Dense sims are already in [-1, 1] from cosine; shift to [0, 1].
+        dense_norm = [max(0.0, min(1.0, (s + 1.0) / 2.0)) for s in dense_sims]
+
+        return [
+            dense_weight * d + sparse_weight * sp
+            for d, sp in zip(dense_norm, sparse_norm)
+        ]
 
     @staticmethod
     def _mark_retrieved(fact: Fact, now: float) -> None:
