@@ -824,7 +824,12 @@ RULES:
 - NO text before, between, or after blocks
 - id must be "ps_1", "ps_2" (not "p1")
 - dependencies must be integers [0,1] (not strings)
-- input_data and expected_output must be STRINGS (not JSON objects)"""
+- input_data and expected_output must be STRINGS (not JSON objects)
+- The FINAL reasoning_step in the LAST simulation trace must be exactly
+  either "**NO_MODIFY**" (if the plan correctly produces the expected
+  output) or "**MODIFY: <brief reason>**" (if the plan needs revision).
+  This token is parsed by Neo's consensus check and overrides the
+  output-agreement heuristic."""
         return prompt, memory_signal
 
     def _run_static_checks(
