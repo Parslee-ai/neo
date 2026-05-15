@@ -78,6 +78,16 @@ MAX_INDEPENDENT_FACTS = 50     # Cap per project to prevent bloat from active re
 # Tags that protect facts from pruning/demotion (curated knowledge)
 PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 
+# Dual-buffer consolidation (paper 2603.07670 §9.1). New non-curated
+# facts enter a "hot probation buffer" via the ``probation`` tag. They
+# get half the normal stale-pruning grace period and only become
+# permanent (probation tag removed) after re-verification: either
+# explicit observation (success_count > 0), being re-retrieved
+# (access_count ≥ 2), or surviving the probation window.
+PROBATION_TAG = "probation"
+PROBATION_AGE_DAYS = 3
+PROBATION_PROMOTE_ACCESS = 2  # accesses needed to promote out of probation
+
 # Try importing fastembed
 try:
     from fastembed import TextEmbedding
@@ -236,6 +246,18 @@ class FactStore:
         # Coerce enum to its string value so storage stays JSON-clean.
         prov_value = provenance.value if isinstance(provenance, Provenance) else provenance
 
+        initial_tags = list(tags or [])
+        # Dual-buffer: new fluid facts enter probation. Curated/structural
+        # facts (CLAUDE.md, seed corpus, synthesis output) skip probation
+        # because they're already vetted.
+        is_curated = (
+            kind in (FactKind.CONSTRAINT, FactKind.ARCHITECTURE)
+            or prov_value == Provenance.STRUCTURAL.value
+            or bool(PROTECTED_TAGS & set(initial_tags))
+        )
+        if not is_curated and PROBATION_TAG not in initial_tags:
+            initial_tags.append(PROBATION_TAG)
+
         fact = Fact(
             subject=subject,
             body=body,
@@ -249,7 +271,7 @@ class FactStore:
                 confidence=confidence,
                 provenance=prov_value,
             ),
-            tags=tags or [],
+            tags=initial_tags,
             depends_on=depends_on or [],
             retrieval_text=retrieval_text,
             context_text=context_text,
@@ -516,10 +538,20 @@ class FactStore:
         Single place that mutates per-fact retrieval-tracking state, so the
         two retrieval entry points (retrieve_relevant + build_context) can't
         drift in what they count.
+
+        Probation promotion: a probation-tagged fact that's been accessed
+        PROBATION_PROMOTE_ACCESS times has proven useful enough to leave
+        the hot buffer.
         """
         fact.metadata.last_accessed = now
         fact.metadata.access_count += 1
         update_recall(fact, now)
+
+        if (
+            PROBATION_TAG in fact.tags
+            and fact.metadata.access_count >= PROBATION_PROMOTE_ACCESS
+        ):
+            fact.tags = [t for t in fact.tags if t != PROBATION_TAG]
 
     def build_context(
         self,
@@ -1041,6 +1073,7 @@ class FactStore:
         now = time.time()
         default_stale_age = STALE_MIN_AGE_DAYS * 86400
         independent_stale_age = 7 * 86400
+        probation_stale_age = PROBATION_AGE_DAYS * 86400
         pruned = 0
 
         for fact in self._facts:
@@ -1055,11 +1088,23 @@ class FactStore:
                 continue
 
             is_independent = "independent" in fact.tags
-            stale_age = independent_stale_age if is_independent else default_stale_age
-            # INDEPENDENT facts are 0.2 confidence noise by construction; we
-            # don't gate them on STALE_MAX_CONFIDENCE so they always prune
-            # when their clock runs out.
-            if not is_independent and fact.metadata.confidence >= STALE_MAX_CONFIDENCE:
+            is_probation = PROBATION_TAG in fact.tags
+            # Probation has the shortest window — a hot-buffer fact that
+            # wasn't re-accessed within PROBATION_AGE_DAYS gets dropped.
+            if is_probation:
+                stale_age = probation_stale_age
+            elif is_independent:
+                stale_age = independent_stale_age
+            else:
+                stale_age = default_stale_age
+            # Promoted-out-of-probation facts AND independent facts share
+            # the "low confidence by construction" behavior — they prune
+            # purely on the clock, no STALE_MAX_CONFIDENCE gate.
+            if (
+                not is_independent
+                and not is_probation
+                and fact.metadata.confidence >= STALE_MAX_CONFIDENCE
+            ):
                 continue
             if (now - fact.metadata.created_at) < stale_age:
                 continue
