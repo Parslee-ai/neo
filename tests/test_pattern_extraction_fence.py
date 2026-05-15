@@ -2,7 +2,8 @@
 
 import re
 
-from neo.pattern_extraction import _FENCE_BY_LANGUAGE, extract_pattern_from_correction
+from neo.languages import _FENCE_TAGS
+from neo.pattern_extraction import extract_pattern_from_correction
 
 
 class _CapturingAdapter:
@@ -79,5 +80,5 @@ class TestFenceTagging:
     def test_fence_map_keys_are_lowercased(self):
         # The lookup lowercases the input; map keys should already be
         # lowercase so the contract is clean.
-        for key in _FENCE_BY_LANGUAGE:
+        for key in _FENCE_TAGS:
             assert key == key.lower()

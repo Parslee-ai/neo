@@ -33,10 +33,11 @@ from pathlib import Path
 from typing import Iterable, Literal, Optional
 
 from neo.index.language_parser import (
-    LANGUAGE_MAP,
+    QUERIES,
     TREE_SITTER_AVAILABLE,
     TreeSitterParser,
 )
+from neo.languages import EXTENSION_TO_LANGUAGE
 
 logger = logging.getLogger(__name__)
 
@@ -257,8 +258,14 @@ def _iter_source_files(root: Path) -> Iterable[Path]:
     otherwise yielding them would just waste a per-file open() that
     can't produce any signal.
     """
-    extras = set(LANGUAGE_MAP.keys()) if TREE_SITTER_AVAILABLE else set()
-    extras.discard(".py")  # Python is handled by the ast path regardless
+    # Only walk extensions whose languages have tree-sitter queries —
+    # without QUERIES, parse_file returns [] and we'd produce no
+    # function-count signal, just inflate files_scanned with no benefit.
+    if TREE_SITTER_AVAILABLE:
+        extras = {ext for ext, lang in EXTENSION_TO_LANGUAGE.items() if lang in QUERIES}
+        extras.discard(".py")  # Python is handled by the ast path regardless
+    else:
+        extras = set()
 
     for dirpath, dirnames, filenames in _safe_walk(root):
         # Mutate dirnames in-place so os.walk skips ignored directories.

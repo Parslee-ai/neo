@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union
 
+from neo.languages import language_for_path
 from neo.models import ContextFile
 
 # Share the tree-sitter availability flag with the rest of the codebase
@@ -195,24 +196,13 @@ def _scan_python(path: str, content: str) -> list[CodeSmell]:
 # Tree-sitter detectors (non-Python languages with try/catch semantics)
 # ---------------------------------------------------------------------------
 
-# Extension -> tree-sitter language name. Only languages with structured
-# try/catch are included. Go, Rust, and C use different error idioms and
-# would need their own detectors.
-_TS_LANGUAGE_MAP = {
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".ts": "typescript",
-    ".tsx": "tsx",
-    ".java": "java",
-    ".cs": "c_sharp",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".hpp": "cpp",
-    ".hh": "cpp",
-}
+# Languages with structured try/catch (catch_clause AST node). Used to
+# filter the canonical extension map down to the subset where this
+# detector applies. Go/Rust/C use different error idioms and would
+# need their own detectors. Ruby uses `begin/rescue`, also different.
+_CATCH_DETECTOR_LANGUAGES = frozenset({
+    "javascript", "typescript", "tsx", "java", "c_sharp", "cpp",
+})
 
 # Node types used as the body of a `catch_clause` across the supported
 # grammars. JS/TS use `statement_block`, Java/C# use `block`, C++ uses
@@ -225,12 +215,11 @@ _COMMENT_NODE_TYPES = frozenset({"comment", "line_comment", "block_comment"})
 
 
 def _ts_language_for(path: str) -> Optional[str]:
-    """Map a file path to a tree-sitter language name, or None if unsupported."""
-    lower = path.lower()
-    for ext, lang in _TS_LANGUAGE_MAP.items():
-        if lower.endswith(ext):
-            return lang
-    return None
+    """Map a file path to a tree-sitter language name, or None if the
+    language doesn't have a structured catch_clause.
+    """
+    lang = language_for_path(path)
+    return lang if lang in _CATCH_DETECTOR_LANGUAGES else None
 
 
 def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]:

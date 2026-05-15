@@ -22,7 +22,7 @@ from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.seed import SeedIngester
-from neo.index.language_parser import LANGUAGE_MAP
+from neo.languages import language_for_path
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, success_bonus
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
 from neo.memory.scope import detect_org_and_project
@@ -544,8 +544,7 @@ class FactStore:
                 try:
                     # Derive language from extension for accurate fence
                     # tagging in the extraction prompt.
-                    suffix = Path(outcome.file_path).suffix.lower()
-                    language = LANGUAGE_MAP.get(suffix)
+                    language = language_for_path(outcome.file_path)
 
                     pattern = extract_pattern_from_correction(
                         problem_description=outcome.suggestion_description,

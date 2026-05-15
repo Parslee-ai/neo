@@ -9,6 +9,8 @@ from typing import Optional, Dict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+from neo.languages import fence_tag_for
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,28 +100,6 @@ class PatternLibrary:
         return sorted(applicable, key=lambda p: p.confidence, reverse=True)
 
 
-# Markdown fence tag per language. Empty string = no tag, which is what
-# we want when the caller doesn't know the language — better than
-# misleading the LM with a wrong tag.
-_FENCE_BY_LANGUAGE = {
-    "python": "python",
-    "javascript": "javascript",
-    "typescript": "typescript",
-    "tsx": "tsx",
-    "java": "java",
-    "csharp": "csharp",
-    "c_sharp": "csharp",  # tree-sitter name normalization
-    "go": "go",
-    "rust": "rust",
-    "c": "c",
-    "cpp": "cpp",
-    "ruby": "ruby",
-    "php": "php",
-    "swift": "swift",
-    "kotlin": "kotlin",
-}
-
-
 def extract_pattern_from_correction(
     problem_description: str,
     failed_code: str,
@@ -138,7 +118,7 @@ def extract_pattern_from_correction(
     LM gets a consistent syntax cue. Passing None drops the tag — better
     than hardcoding ```python and lying when the code is JS/Go/Java.
     """
-    fence = _FENCE_BY_LANGUAGE.get((language or "").lower(), "")
+    fence = fence_tag_for(language)
 
     extraction_prompt = f"""Analyze this coding mistake and extract a PREVENTION RULE:
 

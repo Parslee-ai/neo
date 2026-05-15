@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Optional, List
 from enum import Enum
 
+from neo.languages import KNOWN_FENCE_TAGS, display_name_for
+
 
 class AlgorithmClass(Enum):
     """Common algorithm classes for coding problems."""
@@ -195,49 +197,6 @@ def _parse_design(response: str) -> AlgorithmDesign:
     )
 
 
-# Human-readable language names used in the prompt body. Falls back to
-# the raw `language` string for anything unmapped.
-_PROMPT_LANGUAGE_NAMES = {
-    "python": "Python",
-    "javascript": "JavaScript",
-    "typescript": "TypeScript",
-    "tsx": "TypeScript (TSX)",
-    "java": "Java",
-    "csharp": "C#",
-    "c_sharp": "C#",
-    "go": "Go",
-    "rust": "Rust",
-    "c": "C",
-    "cpp": "C++",
-    "ruby": "Ruby",
-    "php": "PHP",
-    "swift": "Swift",
-    "kotlin": "Kotlin",
-}
-
-# Fence tags we'll accept as a "leading language label" when falling
-# back to bare-fence extraction. Tight set on purpose: an LM line like
-# `pass`, `done`, `null`, or a single identifier should NOT be
-# mistaken for a tag and stripped.
-_KNOWN_FENCE_TAGS = frozenset({
-    "python", "py",
-    "javascript", "js", "jsx",
-    "typescript", "ts", "tsx",
-    "java",
-    "csharp", "cs", "c_sharp", "c#",
-    "go", "golang",
-    "rust", "rs",
-    "c", "cpp", "c++", "cc",
-    "ruby", "rb",
-    "php",
-    "swift",
-    "kotlin", "kt",
-    "sh", "bash", "zsh",
-    "html", "css", "json", "yaml", "yml", "toml", "xml",
-    "sql",
-})
-
-
 def generate_code_from_design(
     problem_description: str,
     design: AlgorithmDesign,
@@ -257,7 +216,7 @@ def generate_code_from_design(
     behavior; pass `"javascript"`, `"go"`, etc. for other targets.
     """
     lang_key = language.lower()
-    display_name = _PROMPT_LANGUAGE_NAMES.get(lang_key, language)
+    display_name = display_name_for(language)
 
     # Build guidance from design
     design_guidance = f"""
@@ -316,7 +275,7 @@ def _extract_code_block(response: str, language: str) -> str:
         first_newline = body.find("\n")
         if first_newline != -1:
             head = body[:first_newline].strip().lower()
-            if head in _KNOWN_FENCE_TAGS:
+            if head in KNOWN_FENCE_TAGS:
                 body = body[first_newline + 1:]
         return body.strip()
     return response.strip()

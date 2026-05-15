@@ -706,30 +706,16 @@ class ProjectIndex:
 
     def _patterns_from_languages(self, languages: List[str]) -> List[str]:
         """Convert language names to file patterns."""
-        from neo.index.language_parser import LANGUAGE_MAP
+        from neo.languages import EXTENSION_TO_LANGUAGE, normalize_language_name
 
-        # Language aliases for common names
-        LANGUAGE_ALIASES = {
-            'csharp': 'c_sharp',
-            'c#': 'c_sharp',
-            'js': 'javascript',
-            'ts': 'typescript',
-            'py': 'python',
-            'golang': 'go',
-            'c++': 'cpp',
-        }
-
-        # Invert the language map to get extensions for each language
-        lang_to_exts = {}
-        for ext, lang in LANGUAGE_MAP.items():
-            if lang not in lang_to_exts:
-                lang_to_exts[lang] = []
-            lang_to_exts[lang].append(ext)
+        # Invert the canonical language map to get extensions per language
+        lang_to_exts: dict[str, list[str]] = {}
+        for ext, lang in EXTENSION_TO_LANGUAGE.items():
+            lang_to_exts.setdefault(lang, []).append(ext)
 
         patterns = []
         for lang in languages:
-            # Normalize language name
-            lang_normalized = LANGUAGE_ALIASES.get(lang.lower(), lang.lower())
+            lang_normalized = normalize_language_name(lang)
 
             if lang_normalized in lang_to_exts:
                 for ext in lang_to_exts[lang_normalized]:

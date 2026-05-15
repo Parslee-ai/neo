@@ -14,6 +14,13 @@ from typing import List, Dict, Optional, Tuple, Any
 import hashlib
 import time
 
+# Deprecated re-export of the canonical extension → tree-sitter
+# language map. New code should `from neo.languages import
+# EXTENSION_TO_LANGUAGE` (or `language_for_path`). This shim exists
+# only so existing imports of `LANGUAGE_MAP` continue to work; it
+# will be removed once all consumers have migrated.
+from neo.languages import EXTENSION_TO_LANGUAGE as LANGUAGE_MAP  # noqa: F401
+
 try:
     # Try py-tree-sitter-languages first (newer package)
     try:
@@ -61,27 +68,6 @@ class CodeChunk:
     file_hash: str
     indexed_at: float
 
-
-# Language configuration: maps file extension to tree-sitter language name
-LANGUAGE_MAP = {
-    '.py': 'python',
-    '.pyi': 'python',
-    '.cs': 'c_sharp',
-    '.ts': 'typescript',
-    '.tsx': 'tsx',
-    '.js': 'javascript',
-    '.jsx': 'javascript',
-    '.java': 'java',
-    '.go': 'go',
-    '.rs': 'rust',
-    '.c': 'c',
-    '.cpp': 'cpp',
-    '.cc': 'cpp',
-    '.cxx': 'cpp',
-    '.h': 'c',
-    '.hpp': 'cpp',
-    '.hh': 'cpp',
-}
 
 # Tree-sitter queries for extracting code structures
 # Format: language -> (functions_query, classes_query)
