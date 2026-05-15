@@ -1528,11 +1528,16 @@ RULES:
         - Error traces present -> focused retrieval
         - Large codebases -> more context needed
 
+        Tuning anchor: MemMachine ablation (paper 2604.04853 §8.4.1) found
+        k=20→30 yields +4.2 pts on multi-hop retrieval; k=50 regresses due
+        to lost-in-the-middle. ContextAssembler still trims to budget, so
+        these are candidate-pool sizes, not LLM-visible fact counts.
+
         Design decision: Simple heuristics before ML - measure if needed
         """
         # Check if adaptive k is enabled via env var
         if os.getenv("NEO_ADAPTIVE_K", "true").lower() != "true":
-            return 3  # Default fallback
+            return 10  # Default fallback
 
         prompt_tokens = len(prompt.split())
         task_type = context.get("task_type")
@@ -1541,24 +1546,24 @@ RULES:
 
         # Heuristic 1 (highest priority): Specific bugfix with error trace -> laser focus
         if has_error_trace and task_type == TaskType.BUGFIX:
-            return 1  # High precision, pattern should be very relevant
+            return 3  # High precision, pattern should be very relevant
 
         # Heuristic 2: Large codebase -> comprehensive scan
         # (Check before vague prompt to avoid over-exploring large repos)
         if context_files > 20:
-            return 5  # More files = need more context
+            return 20  # More files = need more context
 
         # Heuristic 3: Complex prompt -> more patterns
         if prompt_tokens > 50:
-            return 5  # Detailed query suggests complex problem
+            return 20  # Detailed query suggests complex problem
 
         # Heuristic 4: Vague prompt -> exploration mode
         # (Lower priority - only if not a large codebase)
         if prompt_tokens < 5:
-            return 7  # Need more context to understand intent
+            return 30  # Need more context to understand intent
 
         # Default: balanced retrieval
-        return 3
+        return 10
 
     def _log_pattern_retrieval(self, patterns: list, context: dict[str, Any], k: int):
         """

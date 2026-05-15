@@ -246,7 +246,7 @@ class FactStore:
         self.save()
         return fact
 
-    def retrieve_relevant(self, query: str, k: int = 5) -> list[Fact]:
+    def retrieve_relevant(self, query: str, k: int = 30) -> list[Fact]:
         """Retrieve the most relevant valid facts for a query.
 
         Single-pass scoring: vectorized cosine over the full valid corpus,
