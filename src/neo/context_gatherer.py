@@ -362,6 +362,92 @@ def select_chunks(content: str, prompt_tokens: set[str], max_chunk_bytes: int = 
     return chunks
 
 
+def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
+    """If a ProjectIndex exists for ``root``, return per-file relevance boosts.
+
+    The index stores semantic embeddings of code chunks (functions, classes)
+    extracted by tree-sitter. Calling ``retrieve(prompt, k)`` returns the
+    top-k most semantically-relevant chunks; we project those back to file
+    paths and give each file a boost proportional to its best chunk's
+    similarity. Files surfaced by multiple chunk hits accumulate.
+
+    Falls through silently when the index doesn't exist or fails to load —
+    gather_context still works on the existing filename heuristics.
+    """
+    try:
+        from neo.index.project_index import ProjectIndex
+
+        index = ProjectIndex(root)
+        if not index.chunks:
+            return {}
+        chunks = index.retrieve(prompt, k=k)
+        boost: dict[str, float] = {}
+        for chunk in chunks:
+            # Normalize path the same way the rest of the gatherer does.
+            rel = os.path.relpath(chunk.file_path, root)
+            sim = float(getattr(chunk, "similarity", 0.0))
+            # 1.0 cosine = +1.0 boost (dominant signal). Cosine < 0
+            # is clamped — never penalize for an index near-miss.
+            prev = boost.get(rel, 0.0)
+            boost[rel] = max(prev, max(0.0, sim))
+        if boost:
+            print(
+                f"[Neo] ProjectIndex boost: {len(boost)} files matched semantically",
+                file=sys.stderr,
+            )
+        return boost
+    except Exception:  # missing index, faiss unavailable, etc.
+        # Quiet — index is opt-in, must-not-break path.
+        return {}
+
+
+def _symbol_score(
+    abs_path: str,
+    prompt_tokens: set[str],
+    parser_cache: dict,
+) -> float:
+    """Tree-sitter-extracted symbol overlap with the prompt.
+
+    Stronger signal than filename substring match: catches files whose
+    contents define the function or class the user is asking about even
+    when the filename is generic (``utils.py``, ``helpers.py``).
+
+    Returns at most +1.2 (3 symbol hits × 0.4). Failures (unsupported
+    language, parse error, OSError) return 0 — falls through to the
+    filename score.
+    """
+    try:
+        # Lazy-init the parser exactly once per gather call.
+        if "parser" not in parser_cache:
+            from neo.index.language_parser import TreeSitterParser
+            parser_cache["parser"] = TreeSitterParser()
+        parser = parser_cache["parser"]
+
+        path = Path(abs_path)
+        if not parser.supports_extension(path.suffix.lower()):
+            return 0.0
+
+        # Read with a hard byte cap so giant files don't dominate gather latency.
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(50_000)
+        chunks = parser.parse_file(path, content)
+        if not chunks:
+            return 0.0
+
+        # Collect all symbols across all chunks (function/class names + imports).
+        symbols: set[str] = set()
+        for c in chunks:
+            for s in c.symbols or []:
+                symbols.add(s.lower())
+            for imp in c.imports or []:
+                symbols.add(imp.lower())
+
+        hits = sum(1 for t in prompt_tokens if t in symbols)
+        return 0.4 * min(hits, 3)
+    except Exception:
+        return 0.0
+
+
 def gather_context(config: GatherConfig) -> list[ContextFile]:
     """Main context gathering pipeline."""
     root = config.root
@@ -370,6 +456,12 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # Calculate adaptive file limit based on prompt specificity
     adaptive_limit = calculate_adaptive_limit(config.prompt, config.max_files)
     print(f"[Neo] Adaptive limit: {adaptive_limit} files (based on prompt specificity)", file=sys.stderr)
+
+    # ProjectIndex semantic boost (uses pre-built tree-sitter + FAISS index
+    # if present in .neo/). Computed once up front — boosts apply to
+    # candidates' final scores below.
+    pi_boost = _project_index_boost(root, config.prompt, k=adaptive_limit * 2)
+    parser_cache: dict = {}
 
     # Discover candidates
     candidates = iter_paths(root, config.includes, config.excludes, config.exts)
@@ -419,6 +511,56 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         if filtered_count > 0:
             print(f"[Neo] Filtered {filtered_count} low-relevance files (score < {MIN_SCORE_THRESHOLD})", file=sys.stderr)
         scored = scored_filtered
+
+    # Re-rank pass: union in ProjectIndex semantic hits, then layer
+    # tree-sitter symbol relevance on the top filename-scored candidates.
+    # The two boosts are additive on top of the existing score.
+    #
+    # ProjectIndex boost dominates when present (+1.0 for a perfect
+    # cosine hit) because it's the strongest signal: it knows the file
+    # actually contains code semantically related to the prompt. Tree-
+    # sitter symbol overlap (+1.2 max) is a fallback when no index
+    # exists, or a tiebreaker when both signals fire.
+    scored_by_path = {r: (a, s, sc) for (a, r, s, sc) in scored}
+
+    # Union in any ProjectIndex hits not already in the filename-scored set.
+    # These deserve a chance even when filename matching missed them.
+    for rel_path, sim in pi_boost.items():
+        if rel_path not in scored_by_path:
+            abs_path = os.path.join(root, rel_path)
+            try:
+                size = os.path.getsize(abs_path)
+            except OSError:
+                continue
+            scored_by_path[rel_path] = (abs_path, size, 0.0)
+
+    # Symbol pass: cap at 3x adaptive_limit candidates by current score
+    # to keep parse-overhead bounded. Tree-sitter parsing is ~5-20ms per
+    # small file; 75 files * 10ms = ~1s worst case.
+    symbol_pass_limit = max(50, adaptive_limit * 3)
+    top_for_symbols = sorted(
+        scored_by_path.items(),
+        key=lambda kv: kv[1][2] + pi_boost.get(kv[0], 0.0),
+        reverse=True,
+    )[:symbol_pass_limit]
+
+    enriched: list[tuple[str, str, int, float]] = []
+    symbol_hit_count = 0
+    for rel_path, (abs_path, size, base_score) in top_for_symbols:
+        pi = pi_boost.get(rel_path, 0.0)
+        sym = _symbol_score(abs_path, prompt_tokens, parser_cache)
+        if sym > 0:
+            symbol_hit_count += 1
+        final_score = base_score + pi + sym
+        enriched.append((abs_path, rel_path, size, final_score))
+    if symbol_hit_count:
+        print(
+            f"[Neo] Symbol-relevance boost applied to {symbol_hit_count} files",
+            file=sys.stderr,
+        )
+
+    enriched.sort(key=lambda x: x[3], reverse=True)
+    scored = enriched
 
     # Budget: greedily fill up to max_bytes and adaptive max_files
     selected = []
