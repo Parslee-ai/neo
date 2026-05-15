@@ -1037,13 +1037,22 @@ class FactStore:
         """Find an existing fact that the new fact should supersede.
 
         Criteria: same scope + kind, cosine similarity > threshold.
+
+        Tiebreaker among multiple candidates above threshold follows the
+        survey-paper precedence (2603.07670 §7.3, 2603.19935 instr. #4):
+
+          1. Newer event_time wins         (most-recent reality)
+          2. Higher source-provenance wins (STRUCTURAL > OBSERVED > INFERRED)
+          3. Higher cosine wins            (closer semantic match)
+
+        This makes conflict resolution deterministic: when two old facts
+        both look like supersession candidates, we replace the most stale
+        one with the lower provenance — not just "whichever scored highest."
         """
         if new_fact.embedding is None:
             return None
 
-        best_match: Optional[Fact] = None
-        best_sim = 0.0
-
+        candidates: list[tuple[Fact, float]] = []
         for fact in self._facts:
             if not fact.is_valid:
                 continue
@@ -1051,13 +1060,31 @@ class FactStore:
                 continue
             if fact.embedding is None:
                 continue
-
             sim = self._cosine_similarity(new_fact.embedding, fact.embedding)
-            if sim > SUPERSESSION_THRESHOLD and sim > best_sim:
-                best_sim = sim
-                best_match = fact
+            if sim > SUPERSESSION_THRESHOLD:
+                candidates.append((fact, sim))
 
-        return best_match
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        # Deterministic precedence: oldest event_time gets superseded first
+        # (it's the most stale), with ties broken by lower provenance and
+        # lower cosine — so we replace the weakest match, not the strongest.
+        provenance_rank = {
+            Provenance.STRUCTURAL.value: 2,
+            Provenance.OBSERVED.value: 1,
+            Provenance.INFERRED.value: 0,
+        }
+        candidates.sort(
+            key=lambda fc: (
+                fc[0].metadata.effective_event_time,
+                provenance_rank.get(fc[0].metadata.provenance, 0),
+                fc[1],
+            )
+        )
+        return candidates[0][0]
 
     def _supersede(self, old: Fact, new: Fact) -> None:
         """Supersede an old fact with a new one and cascade needs_review.
