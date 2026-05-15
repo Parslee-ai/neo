@@ -1,12 +1,20 @@
-"""Tests for neo.architecture_metrics — Python-only structural snapshots."""
+"""Tests for neo.architecture_metrics — structural snapshots."""
 
 from pathlib import Path
+
+import pytest
 
 from neo.architecture_metrics import (
     ArchSnapshot,
     compare,
     compute,
 )
+
+try:
+    import tree_sitter_languages  # noqa: F401
+    _TREE_SITTER_AVAILABLE = True
+except ImportError:
+    _TREE_SITTER_AVAILABLE = False
 
 
 def _write(root: Path, rel: str, content: str) -> Path:
@@ -132,7 +140,13 @@ class TestNestingDepth:
 
 class TestSnapshotIO:
     def test_to_from_dict_roundtrip(self):
-        snap = ArchSnapshot(cycle_count=2, god_file_count=3, max_nesting_depth=5, files_scanned=42)
+        snap = ArchSnapshot(
+            cycle_count=2,
+            god_file_count=3,
+            max_nesting_depth=5,
+            files_scanned=42,
+            python_files_scanned=40,
+        )
         assert ArchSnapshot.from_dict(snap.to_dict()) == snap
 
     def test_from_dict_handles_missing_keys(self):
@@ -145,46 +159,104 @@ class TestSnapshotIO:
     def test_from_dict_handles_none(self):
         assert ArchSnapshot.from_dict(None) == ArchSnapshot()
 
+    def test_legacy_dict_without_python_files_scanned_falls_back(self):
+        # Snapshots predating the python_files_scanned split were
+        # Python-only by construction. Loading one should set the new
+        # field to match files_scanned so coverage gating still trusts
+        # the cycle/depth signal.
+        legacy = {
+            "cycle_count": 1,
+            "god_file_count": 0,
+            "max_nesting_depth": 3,
+            "files_scanned": 5,
+        }
+        snap = ArchSnapshot.from_dict(legacy)
+        assert snap.python_files_scanned == 5
+
 
 # ---------------------------------------------------------------------------
 # Delta + severity
 # ---------------------------------------------------------------------------
 
 class TestDeltaSeverity:
+    # All snapshots in this class declare python_files_scanned == files_scanned
+    # so the python_coverage gate is on — these tests exercise the legacy
+    # Python-only semantics.
+
     def test_no_change_is_neutral(self):
-        before = after = ArchSnapshot(1, 1, 3, 10)
+        before = after = ArchSnapshot(1, 1, 3, 10, 10)
         assert compare(before, after).severity() == "neutral"
 
     def test_new_cycle_is_regression(self):
-        before = ArchSnapshot(0, 0, 3, 10)
-        after = ArchSnapshot(1, 0, 3, 10)
+        before = ArchSnapshot(0, 0, 3, 10, 10)
+        after = ArchSnapshot(1, 0, 3, 10, 10)
         assert compare(before, after).severity() == "regression"
 
     def test_new_god_file_is_regression(self):
-        before = ArchSnapshot(0, 0, 3, 10)
-        after = ArchSnapshot(0, 1, 3, 10)
+        before = ArchSnapshot(0, 0, 3, 10, 10)
+        after = ArchSnapshot(0, 1, 3, 10, 10)
         assert compare(before, after).severity() == "regression"
 
     def test_depth_jitter_within_band_is_neutral(self):
         # depth_delta == 1 is within the noise band; not a regression.
-        before = ArchSnapshot(0, 0, 3, 10)
-        after = ArchSnapshot(0, 0, 4, 10)
+        before = ArchSnapshot(0, 0, 3, 10, 10)
+        after = ArchSnapshot(0, 0, 4, 10, 10)
         assert compare(before, after).severity() == "neutral"
 
     def test_depth_increase_above_band_is_regression(self):
-        before = ArchSnapshot(0, 0, 3, 10)
-        after = ArchSnapshot(0, 0, 5, 10)
+        before = ArchSnapshot(0, 0, 3, 10, 10)
+        after = ArchSnapshot(0, 0, 5, 10, 10)
         assert compare(before, after).severity() == "regression"
 
     def test_cycle_removed_is_improvement(self):
-        before = ArchSnapshot(2, 0, 3, 10)
-        after = ArchSnapshot(1, 0, 3, 10)
+        before = ArchSnapshot(2, 0, 3, 10, 10)
+        after = ArchSnapshot(1, 0, 3, 10, 10)
         assert compare(before, after).severity() == "improvement"
 
     def test_god_file_removed_is_improvement(self):
-        before = ArchSnapshot(0, 2, 3, 10)
-        after = ArchSnapshot(0, 1, 3, 10)
+        before = ArchSnapshot(0, 2, 3, 10, 10)
+        after = ArchSnapshot(0, 1, 3, 10, 10)
         assert compare(before, after).severity() == "improvement"
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gated severity (Python-only metric channels)
+# ---------------------------------------------------------------------------
+
+class TestCoverageGatedSeverity:
+    def test_no_python_coverage_suppresses_cycle_signal(self):
+        # JS-only sessions can't produce a real cycle signal. If both
+        # snapshots have python_files_scanned=0, the cycle delta is no
+        # signal — severity should ignore it.
+        before = ArchSnapshot(0, 0, 0, 5, 0)
+        after = ArchSnapshot(1, 0, 0, 5, 0)  # synthetic — real JS-only can't produce this
+        assert compare(before, after).severity() == "neutral"
+
+    def test_no_python_coverage_suppresses_depth_signal(self):
+        before = ArchSnapshot(0, 0, 0, 5, 0)
+        after = ArchSnapshot(0, 0, 5, 5, 0)
+        assert compare(before, after).severity() == "neutral"
+
+    def test_no_python_coverage_still_trusts_god_files(self):
+        # God-file detection is language-agnostic — a new JS god file
+        # IS a regression even without any Python in either snapshot.
+        before = ArchSnapshot(0, 0, 0, 5, 0)
+        after = ArchSnapshot(0, 1, 0, 5, 0)
+        assert compare(before, after).severity() == "regression"
+
+    def test_partial_coverage_loss_suppresses_python_channels(self):
+        # Python files existed before but were removed mid-session. The
+        # "improvement" reading on depth would be a false positive.
+        before = ArchSnapshot(0, 0, 5, 10, 10)
+        after = ArchSnapshot(0, 0, 0, 8, 0)
+        assert compare(before, after).severity() == "neutral"
+
+    def test_manually_constructed_delta_defaults_to_coverage(self):
+        # Constructing an ArchDelta directly (legacy tests, callers
+        # outside compare()) must keep working — default coverage=True.
+        from neo.architecture_metrics import ArchDelta
+        d = ArchDelta(cycles_delta=1, god_files_delta=0, max_depth_delta=0)
+        assert d.severity() == "regression"
 
 
 # ---------------------------------------------------------------------------
@@ -218,3 +290,58 @@ class TestRobustness:
         # The .venv god file shouldn't count.
         assert snap.god_file_count == 0
         assert snap.files_scanned == 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-language god-file detection (tree-sitter)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not _TREE_SITTER_AVAILABLE,
+    reason="tree-sitter-languages not installed (requires Python 3.8-3.12)",
+)
+class TestMultiLanguageGodFiles:
+    def test_long_javascript_file_is_god(self, tmp_path: Path):
+        _write(tmp_path, "a.js", "const x = 1;\n" * 1000)
+        snap = compute(tmp_path)
+        assert snap.god_file_count == 1
+        assert snap.files_scanned == 1
+
+    def test_many_typescript_functions_is_god(self, tmp_path: Path):
+        funcs = "\n".join(f"function f{i}(): void {{}}" for i in range(40))
+        _write(tmp_path, "a.ts", funcs)
+        snap = compute(tmp_path)
+        assert snap.god_file_count == 1
+
+    def test_short_java_file_not_god(self, tmp_path: Path):
+        _write(tmp_path, "A.java", "class A { void m() {} }\n")
+        assert compute(tmp_path).god_file_count == 0
+
+    def test_long_go_file_is_god(self, tmp_path: Path):
+        _write(tmp_path, "main.go", "package main\n" + "var x = 1\n" * 900)
+        assert compute(tmp_path).god_file_count == 1
+
+    def test_mixed_language_files_all_scanned(self, tmp_path: Path):
+        _write(tmp_path, "a.py", "x = 1\n")
+        _write(tmp_path, "a.js", "const x = 1;\n")
+        _write(tmp_path, "A.java", "class A {}\n")
+        snap = compute(tmp_path)
+        assert snap.files_scanned == 3
+
+    def test_non_python_does_not_contribute_to_cycles(self, tmp_path: Path):
+        # JS imports each other but cycle detection is Python-only by
+        # design — we don't try to reconcile JS module paths with
+        # Python's dotted scheme.
+        _write(tmp_path, "a.js", "import './b';\n")
+        _write(tmp_path, "b.js", "import './a';\n")
+        assert compute(tmp_path).cycle_count == 0
+
+    def test_non_python_does_not_contribute_to_depth(self, tmp_path: Path):
+        # Deeply nested JS — depth metric is Python-only and stays 0.
+        src = (
+            "function f() {\n"
+            "  if (a) { if (b) { if (c) { if (d) { x(); } } } }\n"
+            "}\n"
+        )
+        _write(tmp_path, "a.js", src)
+        assert compute(tmp_path).max_nesting_depth == 0
