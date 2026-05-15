@@ -24,7 +24,16 @@ from neo.memory.context import ContextAssembler
 from neo.memory.metrics import record as metrics_record, time_block
 from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
-from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, rank_score, update_recall
+from neo.memory.models import (
+    ContextResult,
+    Fact,
+    FactKind,
+    FactMetadata,
+    FactScope,
+    Provenance,
+    rank_score,
+    update_recall,
+)
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
 from neo.memory.scope import detect_org_and_project
 from neo.pattern_extraction import extract_pattern_from_correction, get_library
@@ -193,7 +202,7 @@ class FactStore:
         source_prompt: str = "",
         tags: Optional[list[str]] = None,
         depends_on: Optional[list[str]] = None,
-        provenance: str = "inferred",
+        provenance: "str | Provenance" = Provenance.INFERRED,
     ) -> Fact:
         """Add a new fact to the store.
 
@@ -210,11 +219,14 @@ class FactStore:
             source_prompt: Prompt that triggered this fact.
             tags: Optional tags for filtering.
             depends_on: Fact IDs this derives from.
-            provenance: Origin type - "structural", "inferred", or "observed".
+            provenance: Origin type — Provenance enum or its string value.
 
         Returns:
             The newly created Fact.
         """
+        # Coerce enum to its string value so storage stays JSON-clean.
+        prov_value = provenance.value if isinstance(provenance, Provenance) else provenance
+
         # Generate embedding
         embed_text = f"{subject} {body}"
         embedding = self._embed_text(embed_text)
@@ -230,7 +242,7 @@ class FactStore:
                 source_file=source_file,
                 source_prompt=source_prompt,
                 confidence=confidence,
-                provenance=provenance,
+                provenance=prov_value,
             ),
             embedding=embedding,
             tags=tags or [],

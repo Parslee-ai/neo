@@ -35,18 +35,33 @@ def success_bonus(success_count: int) -> float:
     return min(SUCCESS_BONUS_CAP, SUCCESS_BONUS_WEIGHT * math.log2(success_count + 1))
 
 
+class Provenance(str, Enum):
+    """Source attribution for a fact, ordered by trust.
+
+    Mirrors the user_statement > tool_output > agent_inference taxonomy
+    from the memory-systems survey (paper 2603.07670 §7.3) using the
+    existing Neo vocabulary:
+
+      STRUCTURAL — parsed from code/config/CLAUDE.md (authored by a human).
+      OBSERVED   — saw it happen at runtime (outcome detection / tool output).
+      INFERRED   — derived by the LLM, no direct evidence.
+
+    String-valued so existing JSON dumps round-trip unchanged.
+    """
+    STRUCTURAL = "structural"
+    OBSERVED = "observed"
+    INFERRED = "inferred"
+
+
 _PROVENANCE_BONUS = {
-    "structural": 0.05,
-    "observed": 0.02,
-    "inferred": 0.0,
+    Provenance.STRUCTURAL.value: 0.05,
+    Provenance.OBSERVED.value: 0.02,
+    Provenance.INFERRED.value: 0.0,
 }
 
 
 def provenance_bonus(provenance: str) -> float:
-    """Tiny bonus reflecting how the fact was sourced.
-
-    structural (parsed from code/config) > observed (saw it happen) > inferred.
-    """
+    """Tiny bonus reflecting how the fact was sourced (see ``Provenance``)."""
     return _PROVENANCE_BONUS.get(provenance, 0.0)
 
 
@@ -164,7 +179,7 @@ class FactMetadata:
     source_prompt: str = ""    # Prompt that triggered this fact
     confidence: float = 0.5    # 0.0 to 1.0
     success_count: int = 0     # Times this suggestion was validated
-    provenance: str = "inferred"  # "structural", "inferred", or "observed"
+    provenance: str = Provenance.INFERRED.value  # see Provenance enum
     # Ebbinghaus-style spaced-repetition fields. recall_count tracks how
     # often this fact has been returned by retrieval; g_n is the per-fact
     # decay-constant denominator (starts at 1.0, grows on each recall so
@@ -204,7 +219,7 @@ class FactMetadata:
             source_prompt=data.get("source_prompt", ""),
             confidence=data.get("confidence", 0.5),
             success_count=data.get("success_count", 0),
-            provenance=data.get("provenance", "inferred"),
+            provenance=data.get("provenance", Provenance.INFERRED.value),
             recall_count=data.get("recall_count", 0),
             g_n=data.get("g_n", 1.0),
             last_recall_ts=last_recall,
