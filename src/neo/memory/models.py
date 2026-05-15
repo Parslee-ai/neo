@@ -33,6 +33,39 @@ def success_bonus(success_count: int) -> float:
     return min(SUCCESS_BONUS_CAP, SUCCESS_BONUS_WEIGHT * math.log2(success_count + 1))
 
 
+_PROVENANCE_BONUS = {
+    "structural": 0.05,
+    "observed": 0.02,
+    "inferred": 0.0,
+}
+
+
+def provenance_bonus(provenance: str) -> float:
+    """Tiny bonus reflecting how the fact was sourced.
+
+    structural (parsed from code/config) > observed (saw it happen) > inferred.
+    """
+    return _PROVENANCE_BONUS.get(provenance, 0.0)
+
+
+def rank_score(fact: "Fact", similarity: float) -> float:
+    """Single source of truth for fact ranking.
+
+    Used by FactStore.retrieve_relevant and ContextAssembler._score_facts so
+    a query gets the same ordering whichever path runs it. Formula:
+
+        sim * confidence + success_bonus(success_count) + provenance_bonus
+
+    The provenance bonus is small (≤0.05) so it cannot swamp similarity, but
+    breaks ties between two facts of equal cosine and confidence.
+    """
+    return (
+        similarity * fact.metadata.confidence
+        + success_bonus(fact.metadata.success_count)
+        + provenance_bonus(fact.metadata.provenance)
+    )
+
+
 class FactKind(Enum):
     """Type of fact stored in memory."""
     CONSTRAINT = "constraint"       # Project rules (from CLAUDE.md etc.)

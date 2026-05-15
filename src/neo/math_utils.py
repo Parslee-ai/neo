@@ -27,6 +27,55 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
 
+
+def batched_cosine(
+    embeddings: list[Optional[np.ndarray]],
+    query: Optional[np.ndarray],
+    *,
+    default: float = 0.5,
+) -> list[float]:
+    """Cosine similarity of one query against many embeddings, one numpy pass.
+
+    Rows with None or non-finite embeddings — and the case where ``query`` is
+    None or zero-norm — fall back to ``default``. Vectorized: O(n * d) but in
+    one matrix-vector product rather than n Python iterations.
+    """
+    n = len(embeddings)
+    if n == 0:
+        return []
+    if query is None:
+        return [default] * n
+
+    q = np.asarray(query, dtype=np.float32)
+    q_norm = float(np.linalg.norm(q))
+    if q_norm == 0.0 or not np.isfinite(q_norm):
+        return [default] * n
+
+    rows: list[np.ndarray] = []
+    row_indices: list[int] = []
+    for i, e in enumerate(embeddings):
+        if e is None:
+            continue
+        rows.append(e)
+        row_indices.append(i)
+
+    sims = [default] * n
+    if not rows:
+        return sims
+
+    matrix = np.asarray(rows, dtype=np.float32)
+    row_norms = np.linalg.norm(matrix, axis=1)
+    safe = row_norms.copy()
+    safe[safe == 0.0] = 1.0
+    dots = matrix @ q
+    cos = dots / (safe * q_norm)
+
+    for idx, c, rn in zip(row_indices, cos, row_norms):
+        if rn == 0.0 or not np.isfinite(c):
+            continue
+        sims[idx] = float(c)
+    return sims
+
 NumberLike = Union[int, float, Decimal, str]
 
 

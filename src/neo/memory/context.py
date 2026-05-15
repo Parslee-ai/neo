@@ -10,8 +10,8 @@ from typing import Optional
 
 import numpy as np
 
-from neo.math_utils import cosine_similarity
-from neo.memory.models import ContextResult, Fact, FactKind, FactScope, success_bonus
+from neo.math_utils import batched_cosine, cosine_similarity
+from neo.memory.models import ContextResult, Fact, FactKind, FactScope, rank_score
 
 logger = logging.getLogger(__name__)
 
@@ -143,28 +143,23 @@ class ContextAssembler:
         facts: list[Fact],
         query_embedding: Optional[np.ndarray],
     ) -> list[tuple[Fact, float]]:
-        """Score facts by cosine similarity * confidence + outcome bonus.
+        """Score facts by sim * confidence + success_bonus + provenance_bonus.
 
+        Vectorized cosine in one numpy pass, then rank_score per fact.
         Shares the ranking policy with FactStore.retrieve_relevant via
-        memory.models.success_bonus so the two retrieval paths stay consistent.
+        memory.models.rank_score so the two retrieval paths stay consistent.
         """
-        scored: list[tuple[Fact, float]] = []
+        if not facts:
+            return []
 
-        for fact in facts:
-            sim = 0.5
-            if query_embedding is not None and fact.embedding is not None:
-                sim = self._cosine_similarity(query_embedding, fact.embedding)
-
-            confidence = fact.metadata.confidence
-            score = sim * confidence + success_bonus(fact.metadata.success_count)
-            scored.append((fact, score))
-
+        sims = batched_cosine([f.embedding for f in facts], query_embedding)
+        scored = [(f, rank_score(f, s)) for f, s in zip(facts, sims)]
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
 
     @staticmethod
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        """Compute cosine similarity between two vectors."""
+        """Compute cosine similarity between two vectors. Kept for callers."""
         return cosine_similarity(a, b)
 
     def format_context_for_prompt(self, ctx: ContextResult) -> str:

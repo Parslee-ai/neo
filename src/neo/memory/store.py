@@ -16,14 +16,14 @@ from typing import Any, Optional
 
 import numpy as np
 
-from neo.math_utils import cosine_similarity
+from neo.math_utils import batched_cosine, cosine_similarity
 from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
-from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, success_bonus
+from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, rank_score
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
 from neo.memory.scope import detect_org_and_project
 from neo.pattern_extraction import extract_pattern_from_correction, get_library
@@ -245,51 +245,35 @@ class FactStore:
     def retrieve_relevant(self, query: str, k: int = 5) -> list[Fact]:
         """Retrieve the most relevant valid facts for a query.
 
+        Single-pass scoring: vectorized cosine over the full valid corpus,
+        then rank_score (sim * confidence + success_bonus + provenance_bonus).
+        At Neo's max scope of ~750 valid facts (200+100+500 across scopes),
+        the matrix-vector product is sub-millisecond — adding a separate
+        ANN index would buy nothing at this scale.
+
         Args:
             query: The search query.
             k: Maximum number of facts to return.
 
         Returns:
-            List of relevant Fact objects, scored by similarity * confidence.
+            List of relevant Fact objects.
         """
         query_embedding = self._embed_text(query)
 
         valid_facts = [f for f in self._facts if f.is_valid and f.kind != FactKind.CONSTRAINT]
-
         if not valid_facts:
             return []
 
-        scored: list[tuple[Fact, float]] = []
-        now = time.time()
-
-        for fact in valid_facts:
-            sim = 0.5  # default when no embeddings
-            if query_embedding is not None and fact.embedding is not None:
-                sim = self._cosine_similarity(query_embedding, fact.embedding)
-
-            confidence = fact.metadata.confidence
-            # Provenance boost: structural facts are more trustworthy
-            provenance_bonus = {
-                "structural": 0.05,
-                "observed": 0.02,
-                "inferred": 0.0,
-            }.get(fact.metadata.provenance, 0.0)
-            score = (
-                sim * confidence
-                + success_bonus(fact.metadata.success_count)
-                + provenance_bonus
-            )
-            scored.append((fact, score))
-
+        sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
+        scored = [(f, rank_score(f, s)) for f, s in zip(valid_facts, sims)]
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        # Update access metadata for returned facts
-        results = []
+        now = time.time()
+        results: list[Fact] = []
         for fact, _ in scored[:k]:
             fact.metadata.last_accessed = now
             fact.metadata.access_count += 1
             results.append(fact)
-
         return results
 
     def build_context(
