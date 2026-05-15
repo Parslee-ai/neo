@@ -253,10 +253,34 @@ class FactStore:
             context_text=context_text,
         )
 
+        # Pre-write dedup: filter -> canonicalize -> exact-match check.
+        # Catches the "independent flood" failure mode where many near-
+        # identical facts get written before scope-cap eviction has a
+        # chance to fire. The supersession check below handles fuzzy
+        # near-duplicates; this catches exact (post-generalize) twins
+        # within the same scope, regardless of kind.
+        existing = self._exact_canonical_match(fact)
+        if existing is not None:
+            # Bump access metadata on the existing record and return it
+            # rather than writing a new row. Idempotent re-ingestion.
+            existing.metadata.access_count += 1
+            existing.metadata.last_accessed = time.time()
+            self.save()
+            metrics_record(
+                "add_fact",
+                kind=existing.kind.value,
+                scope=existing.scope.value,
+                confidence=existing.metadata.confidence,
+                provenance=existing.metadata.provenance,
+                corpus_size_after=len([f for f in self._facts if f.is_valid]),
+                deduped=True,
+            )
+            return existing
+
         # Embed the retrieval_text (defaults to subject+body if unset).
         fact.embedding = self._embed_text(fact.embed_text())
 
-        # Check for supersession candidate
+        # Check for supersession candidate (fuzzy near-duplicate, same kind+scope).
         candidate = self._find_supersession_candidate(fact)
         if candidate:
             self._supersede(candidate, fact)
@@ -1056,6 +1080,37 @@ class FactStore:
     # ------------------------------------------------------------------ #
     # Supersession
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _canonical_signature(fact: Fact) -> str:
+        """Stable signature for exact-twin detection.
+
+        Uses the generalize util (paper 2603.10600 §7) to strip identifiers,
+        version numbers, paths, etc. before hashing, so "Updated 5 files"
+        and "Updated 9 files" collapse to the same signature. Includes the
+        kind+scope so a CONSTRAINT can't accidentally dedup against a
+        PATTERN with similar text.
+        """
+        from neo.memory.generalize import generalize
+
+        canonical = generalize(f"{fact.subject} {fact.body}")
+        return f"{fact.kind.value}|{fact.scope.value}|{canonical}"
+
+    def _exact_canonical_match(self, new_fact: Fact) -> Optional[Fact]:
+        """Return an existing fact whose canonical signature matches new_fact.
+
+        O(n) over valid facts — fine at the per-scope caps. Cached signatures
+        would be a future optimization if write-throughput becomes a hotspot.
+        """
+        target = self._canonical_signature(new_fact)
+        for fact in self._facts:
+            if not fact.is_valid:
+                continue
+            if fact.scope != new_fact.scope or fact.kind != new_fact.kind:
+                continue
+            if self._canonical_signature(fact) == target:
+                return fact
+        return None
 
     def _find_supersession_candidate(self, new_fact: Fact) -> Optional[Fact]:
         """Find an existing fact that the new fact should supersede.
