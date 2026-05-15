@@ -159,7 +159,44 @@ class AnthropicAdapter(LMAdapter):
             kwargs["stop_sequences"] = stop
 
         response = self.client.messages.create(**kwargs)
+        self._emit_usage_metric(response)
         return response.content[0].text
+
+    def _emit_usage_metric(self, response: object) -> None:
+        """Record per-call token usage to metrics.jsonl.
+
+        Captures cache-read / cache-creation counts when the response
+        exposes them (Anthropic prompt caching), so the KV-cache hit
+        rate can be tracked over time (paper 2504.15228 Table 1: SICA
+        observed 31.9-40.9% cache hits across 15 iterations).
+        """
+        try:
+            from neo.memory.metrics import record as metrics_record
+
+            usage = getattr(response, "usage", None)
+            if usage is None:
+                return
+            input_tokens = getattr(usage, "input_tokens", 0) or 0
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            output_tokens = getattr(usage, "output_tokens", 0) or 0
+            cacheable_input = input_tokens + cache_read + cache_creation
+            cache_hit_rate = (
+                cache_read / cacheable_input if cacheable_input > 0 else 0.0
+            )
+            metrics_record(
+                "lm_call",
+                provider="anthropic",
+                model=self.model,
+                input_tokens=input_tokens,
+                cache_read_input_tokens=cache_read,
+                cache_creation_input_tokens=cache_creation,
+                output_tokens=output_tokens,
+                cache_hit_rate=round(cache_hit_rate, 4),
+            )
+        except Exception:
+            # Metrics are never load-bearing.
+            pass
 
     def name(self) -> str:
         return f"anthropic/{self.model}"
