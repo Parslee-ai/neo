@@ -189,6 +189,19 @@ class FactMetadata:
     recall_count: int = 0
     g_n: float = 1.0
     last_recall_ts: Optional[float] = None
+    # Bi-temporal model (Zep/AriGraph pattern; see paper 2512.13564 §5.2.2).
+    # ``event_time`` answers "when did the fact represent?" — typically the
+    # commit/observation time of the world-event the fact describes. For
+    # facts ingested at the same moment as the underlying event, it equals
+    # created_at; for facts retro-inserted from git history, it should be
+    # the commit timestamp.
+    # ``ingest_time`` answers "when did Neo learn it?" — equals created_at
+    # by default. The split lets us soft-delete by stamping event_time_end
+    # instead of dropping the row, and to resolve contradictions by the
+    # newer event_time without losing audit trail.
+    event_time: Optional[float] = None     # None ⇒ falls back to created_at
+    event_time_end: Optional[float] = None # set for soft-deleted/superseded
+    ingest_time: Optional[float] = None    # None ⇒ falls back to created_at
 
     def to_dict(self) -> dict:
         return {
@@ -203,6 +216,9 @@ class FactMetadata:
             "recall_count": self.recall_count,
             "g_n": self.g_n,
             "last_recall_ts": self.last_recall_ts,
+            "event_time": self.event_time,
+            "event_time_end": self.event_time_end,
+            "ingest_time": self.ingest_time,
         }
 
     @classmethod
@@ -223,7 +239,20 @@ class FactMetadata:
             recall_count=data.get("recall_count", 0),
             g_n=data.get("g_n", 1.0),
             last_recall_ts=last_recall,
+            event_time=data.get("event_time"),
+            event_time_end=data.get("event_time_end"),
+            ingest_time=data.get("ingest_time"),
         )
+
+    @property
+    def effective_event_time(self) -> float:
+        """The event_time, falling back to created_at when unset."""
+        return self.event_time if self.event_time is not None else self.created_at
+
+    @property
+    def effective_ingest_time(self) -> float:
+        """The ingest_time, falling back to created_at when unset."""
+        return self.ingest_time if self.ingest_time is not None else self.created_at
 
 
 @dataclass

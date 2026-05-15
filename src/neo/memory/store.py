@@ -976,7 +976,13 @@ class FactStore:
         return best_match
 
     def _supersede(self, old: Fact, new: Fact) -> None:
-        """Supersede an old fact with a new one and cascade needs_review."""
+        """Supersede an old fact with a new one and cascade needs_review.
+
+        Bi-temporal soft-delete: stamp event_time_end on the old fact at the
+        new fact's event_time (or now), so the old row stays auditable. The
+        is_valid flag still gates retrieval; event_time_end is for callers
+        who want to ask "what was true at time T?" without losing history.
+        """
         old.is_valid = False
         old.superseded_by = new.id
         new.supersedes = old.id
@@ -984,6 +990,10 @@ class FactStore:
         # Carry forward confidence with a small boost, but never downgrade
         carry_forward = min(1.0, old.metadata.confidence + 0.05)
         new.metadata.confidence = max(new.metadata.confidence, carry_forward)
+
+        # Bi-temporal: end the old fact's validity at the new fact's event time
+        if old.metadata.event_time_end is None:
+            old.metadata.event_time_end = new.metadata.effective_event_time
 
         # Cascade: mark dependents as needing review
         self._cascade_needs_review(old.id)
