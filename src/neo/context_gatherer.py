@@ -282,9 +282,21 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     if 'archive' in name_lower or 'old' in name_lower or 'deprecated' in name_lower:
         score -= 0.5
 
-    # Boost main implementation files for broad queries
-    main_impl_patterns = ['neo.py', 'persistent', 'context_gatherer', 'structured_parser', 'schemas.py']
-    if any(pat in basename for pat in main_impl_patterns):
+    # Boost main implementation files for broad queries. Match against
+    # the filename stem (no extension) so the bonus fires on `main.py`,
+    # `main.go`, `Main.java` (basename was lowercased above) but NOT
+    # on `library.py`, `accessibility.tsx`, or `reindex.py` — substring
+    # matching here would catch huge swaths of any real codebase.
+    #
+    # Note: there's intentional overlap with `entry_points` below. A file
+    # whose stem == "main" is both "THE main file" (this +0.4) and "looks
+    # like an entry point" (entry_points adds +0.2). Files that merely
+    # *start* with "main" (e.g. main_v2.py) only get the entry_points
+    # bonus — the stacking distinguishes "canonical" from "adjacent."
+    main_impl_stems = {"core", "engine", "main", "index", "app", "server", "lib"}
+    stem = os.path.splitext(basename)[0]
+    is_main_impl = stem in main_impl_stems
+    if is_main_impl:
         score += 0.4
 
     # Keyword overlap in filename
@@ -304,7 +316,6 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     score -= 0.05 * depth
 
     # Penalize by size (god objects are code smell), but not for main implementation
-    is_main_impl = any(pat in basename for pat in main_impl_patterns)
     size_kb = size / 1024
     if size_kb > 10 and not is_main_impl:
         # Penalty for large files: 10KB = -0.1, 50KB = -0.5, 100KB = -1.0
