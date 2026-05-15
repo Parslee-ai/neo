@@ -120,6 +120,11 @@ class NeoEngine:
         self.last_difficulty = None
         self.last_metrics: dict[str, Any] = {}
 
+        # Per-call action log for loop-detection watchdog (G3).
+        # Bounded ring; populated by _log_action; consumed by the
+        # overseer check function spawned in process().
+        self.action_log: deque = deque(maxlen=64)
+
     def process(self, neo_input: NeoInput) -> NeoOutput:
         """
         Main entry point: process input and return structured output.
@@ -137,7 +142,68 @@ class NeoEngine:
         """
         self.context = neo_input
         start_time = time.time()
+        self.action_log.clear()
 
+        # Spawn the loop-detection watchdog for this run (G3 wire-up).
+        # The overseer ticks on a deterministic schedule and emits
+        # ``overseer_tick`` events to metrics.jsonl; it cancels nothing
+        # in Neo's current single-shot engine but provides telemetry for
+        # iterative paths (repair_loop, future multi-pass orchestrators)
+        # and for callers wrapping NeoEngine in their own loops.
+        from neo.overseer import StructuredOverseer
+        overseer = StructuredOverseer(
+            check_fn=self._overseer_loop_check,
+            default_delay=10.0,
+            min_delay=1.0,
+        )
+        overseer.start()
+        self._log_action("process.start", neo_input.prompt[:60])
+
+        try:
+            return self._process_inner(neo_input, start_time)
+        finally:
+            overseer.stop()
+            self._log_action("process.end", "")
+
+    def _log_action(self, action: str, signature: str) -> None:
+        """Append an action to the loop-detection log.
+
+        Cheap (deque append, no I/O). Called at engine phase boundaries
+        to give the overseer something to look at. Signature is a short
+        string the watchdog compares for equality — typically the first
+        chars of a prompt, a fact id, a phase name.
+        """
+        self.action_log.append((time.time(), action, signature[:64]))
+
+    def _overseer_loop_check(self):
+        """Check function for StructuredOverseer (G3).
+
+        Inspects the last few entries in self.action_log. If the same
+        (action, signature) tuple repeats LOOP_THRESHOLD times in a row,
+        signals is_looping + force_cancel. Currently Neo's engine doesn't
+        run iterative LLM cycles, so this is mostly telemetry for the
+        repair_loop and future multi-pass paths — but the deterministic
+        check itself fires on every tick.
+        """
+        from neo.overseer import OverseerCheck
+        LOOP_THRESHOLD = 5
+        recent = list(self.action_log)[-LOOP_THRESHOLD:]
+        if len(recent) < LOOP_THRESHOLD:
+            return OverseerCheck(making_progress=True, next_check_delay=10.0)
+        keys = [(a, sig) for _, a, sig in recent]
+        is_looping = len(set(keys)) == 1
+        return OverseerCheck(
+            making_progress=not is_looping,
+            is_looping=is_looping,
+            needs_notification=(f"Loop on {keys[0]}" if is_looping else None),
+            force_cancel_agent=is_looping,
+            next_check_delay=5.0 if is_looping else 10.0,
+        )
+
+    def _process_inner(self, neo_input: NeoInput, start_time: float) -> NeoOutput:
+        """Internal process() body. Separated so process() can wrap
+        with overseer.start()/stop() in a try/finally.
+        """
         # Phase 5: Estimate difficulty and allocate time budget
         difficulty = self._estimate_difficulty(neo_input)
         time_budget = self._get_time_budget(difficulty)
@@ -159,6 +225,7 @@ class NeoEngine:
             self.request_history.append(current_request)
 
         # Phase 1: Retrieve additional context
+        self._log_action("retrieve_context", neo_input.prompt[:60])
         enriched_context = self._retrieve_context(neo_input)
 
         # Include difficulty in context for planning
@@ -176,6 +243,7 @@ class NeoEngine:
 
         # Single LLM call for all 3 phases (plan + simulation + code)
         # This is 59% faster than the old 3-call approach (22s vs 55s)
+        self._log_action("lm_call", neo_input.prompt[:60])
         plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
         self.last_simulation_traces = simulation_traces
 
