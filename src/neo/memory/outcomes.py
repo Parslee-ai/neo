@@ -510,7 +510,7 @@ class OutcomeTracker:
                 ["git", "log", "--since", since_iso, "--name-only", "--pretty=format:"],
                 cwd=self.codebase_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
             committed = set()
@@ -526,7 +526,7 @@ class OutcomeTracker:
                 ["git", "diff", "--name-only", "HEAD"],
                 cwd=self.codebase_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
             working = set()
@@ -539,7 +539,7 @@ class OutcomeTracker:
 
             return committed | working
 
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
             logger.debug(f"Git diff failed (non-fatal): {e}")
             return set()
 
@@ -631,7 +631,7 @@ class OutcomeTracker:
                 ["git", "log", "--since", since_iso, "-p", "--", file_path],
                 cwd=self.codebase_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
             diff = ""
@@ -643,7 +643,7 @@ class OutcomeTracker:
                 ["git", "diff", "HEAD", "--", file_path],
                 cwd=self.codebase_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
             if result2.returncode == 0 and result2.stdout.strip():
@@ -667,7 +667,7 @@ class OutcomeTracker:
 
             return summary
 
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
             logger.debug(f"File diff failed for {file_path} (non-fatal): {e}")
             return ""
 
@@ -843,7 +843,7 @@ class OutcomeTracker:
                 cmd,
                 cwd=self.codebase_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=15,
             )
             if result.returncode != 0 or not result.stdout.strip():
@@ -872,7 +872,7 @@ class OutcomeTracker:
 
             return commits
 
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
             logger.debug(f"Git log failed (non-fatal): {e}")
             return []
 
@@ -888,7 +888,7 @@ class OutcomeTracker:
                 ["git", "show", "--stat", "--patch", "--format=", commit_hash],
                 cwd=self.codebase_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
             )
             if result.returncode != 0 or not result.stdout.strip():
@@ -905,7 +905,7 @@ class OutcomeTracker:
                 summary = summary[:MAX_DIFF_CHARS] + "\n... (truncated)"
             return summary
 
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
             logger.debug(f"Commit diff failed for {commit_hash} (non-fatal): {e}")
             return ""
 
