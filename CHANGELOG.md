@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Removed
+
+- **`neo.self_correction` and `neo.input_templates` modules deleted.** Both dead since v0.7.0 — commit 6e35f5d acknowledged the pattern-learning system had been unreachable since the initial public release, but the "fix" only revived sibling modules. `self_correction.py` had no callers; `input_templates.py` was imported only from `self_correction.py` and an import-health smoke test, so deleting one orphaned the other. The live learning path runs through `neo.pattern_extraction.extract_pattern_from_correction` via `memory/store.py`. If you were importing from either module, the surviving surface lives in `neo.pattern_extraction` and `neo.algorithm_design`.
+
 ### Changed
 
 - **`static_analysis`: pyright and mypy now both run when both are enabled.** Previously the dispatch had a hidden `pyright … elif mypy` mutex that suppressed mypy whenever pyright was enabled. They flag different things, so the coupling cost real diagnostics. Users running both intentionally now get both sets of findings.

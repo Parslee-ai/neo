@@ -31,28 +31,24 @@ def test_module_imports(module):
     importlib.import_module(module)
 
 
-def test_self_correction_imports_are_direct():
-    """Internal modules in self_correction must not use try/except fallback."""
+def test_learning_pipeline_imports_are_direct():
+    """Pattern-learning pipeline modules must import their public symbols
+    directly (no try/except fallback). Historically these were imported
+    via bare paths inside a try/except ImportError that swallowed
+    failures silently — see commit 6e35f5d for the fix.
+    """
     from neo.pattern_extraction import (
         extract_pattern_from_correction,
         generate_prevention_warnings,
         get_library,
     )
     from neo.algorithm_design import design_algorithm, generate_code_from_design
-    from neo.input_templates import (
-        extract_input_template,
-        generate_solution_with_template,
-        should_use_template,
-    )
     # If any of these fail, the import is broken
     assert callable(extract_pattern_from_correction)
     assert callable(generate_prevention_warnings)
     assert callable(get_library)
     assert callable(design_algorithm)
     assert callable(generate_code_from_design)
-    assert callable(extract_input_template)
-    assert callable(generate_solution_with_template)
-    assert callable(should_use_template)
 
 
 def test_engine_has_no_phantom_modules():
@@ -61,7 +57,6 @@ def test_engine_has_no_phantom_modules():
     for module_name in [
         "neo.pattern_extraction",
         "neo.algorithm_design",
-        "neo.input_templates",
         "neo.constraint_verification",
         "neo.static_analysis",
     ]:
