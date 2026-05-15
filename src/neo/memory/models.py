@@ -97,15 +97,26 @@ def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> 
 
         s_recall = recall_probability(sim, t, g_n) if fact decays else sim
         score    = s_recall * confidence
-                 + success_bonus(success_count)
+                 + success_bonus(success_count) * effectiveness_f
                  + provenance_bonus
 
     The Ebbinghaus transform (Hou et al., 2404.00573) gives spaced-repetition
     semantics: frequently-recalled fluid facts decay slower, dormant ones
     decay faster, and the gap between two recalls shapes future decay.
     Curated/stable facts (see ``_decays``) bypass the transform entirely.
+
+    Legacy mode: when env NEO_LEGACY_SCORING=1 is set, returns the pre-W1
+    formula (no recall-probability transform, no effectiveness multiplier).
+    Used by the A/B baseline benchmark to quantify whether W1-W4 improved
+    retrieval on real workloads.
     """
-    if _decays(fact):
+    import os
+    legacy = os.getenv("NEO_LEGACY_SCORING", "").strip() == "1"
+
+    if legacy or not _decays(fact):
+        sim = similarity
+        eff = 1.0
+    else:
         ts = fact.metadata.last_recall_ts
         if ts is None:
             ts = fact.metadata.created_at
@@ -115,12 +126,11 @@ def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> 
             days_since_recall=elapsed_days,
             g_n=fact.metadata.g_n,
         )
-    else:
-        sim = similarity
+        eff = fact.metadata.effectiveness_f
 
     return (
         sim * fact.metadata.confidence
-        + success_bonus(fact.metadata.success_count) * fact.metadata.effectiveness_f
+        + success_bonus(fact.metadata.success_count) * eff
         + provenance_bonus(fact.metadata.provenance)
     )
 

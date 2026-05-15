@@ -9,6 +9,7 @@ and supersession chains.
 import hashlib
 import json
 import logging
+import os
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -338,6 +339,11 @@ class FactStore:
         At Neo's max scope of ~850 valid facts, all of this is in the
         single-millisecond range — no ANN index needed.
         """
+        # Legacy A/B mode: skip query decomposition (always treat as DIRECT).
+        legacy = os.getenv("NEO_LEGACY_SCORING", "").strip() == "1"
+        if legacy:
+            return self._retrieve_single(query, k)
+
         shape, sub_queries = _decompose_query(query)
         if shape is QueryShape.DIRECT or len(sub_queries) <= 1:
             return self._retrieve_single(query, k)
@@ -443,8 +449,10 @@ class FactStore:
             # [0, 1] then weighted-sum (0.7 dense + 0.3 sparse). Fused
             # similarity replaces the raw cosine inside rank_score so the
             # downstream Ebbinghaus decay and confidence multiplier still
-            # apply the same way.
-            fused_sims = self._fuse_dense_sparse(query, valid_facts, sims)
+            # apply the same way. NEO_LEGACY_SCORING=1 disables the fusion
+            # and the half-by-cosine selection below.
+            legacy = os.getenv("NEO_LEGACY_SCORING", "").strip() == "1"
+            fused_sims = sims if legacy else self._fuse_dense_sparse(query, valid_facts, sims)
             scored = [(f, fs, rank_score(f, fs, now)) for f, fs in zip(valid_facts, fused_sims)]
 
             # Half-by-rank-score / half-by-cosine policy (paper 2505.23946
@@ -455,22 +463,26 @@ class FactStore:
             # surface alongside the validated winners. LessonL ablation
             # showed this cuts retrieval-quality variance from σ=0.28 to
             # σ=0.03 vs pure score-sort.
-            half_score = (k + 1) // 2
-            half_cos = k - half_score
+            if legacy:
+                # Pre-W1 top-k: pure score-sort, no cosine-rescue half.
+                chosen = sorted(scored, key=lambda x: x[2], reverse=True)[:k]
+            else:
+                half_score = (k + 1) // 2
+                half_cos = k - half_score
 
-            by_score = sorted(scored, key=lambda x: x[2], reverse=True)
-            score_pick = by_score[:half_score]
-            score_pick_ids = {f.id for f, _, _ in score_pick}
+                by_score = sorted(scored, key=lambda x: x[2], reverse=True)
+                score_pick = by_score[:half_score]
+                score_pick_ids = {f.id for f, _, _ in score_pick}
 
-            by_cos = sorted(
-                (s for s in scored if s[0].id not in score_pick_ids),
-                key=lambda x: x[1],
-                reverse=True,
-            )
-            cos_pick = by_cos[:half_cos]
+                by_cos = sorted(
+                    (s for s in scored if s[0].id not in score_pick_ids),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                cos_pick = by_cos[:half_cos]
 
-            chosen = score_pick + cos_pick
-            chosen.sort(key=lambda x: x[2], reverse=True)
+                chosen = score_pick + cos_pick
+                chosen.sort(key=lambda x: x[2], reverse=True)
 
             results: list[Fact] = []
             for fact, _sim, _score in chosen:
