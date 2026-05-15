@@ -302,6 +302,135 @@ class TestSwallowedCatchDetection:
         kinds = {s.kind for s in scan_files([_file("a.rb", src)])}
         assert "swallowed_catch" not in kinds
 
+    # --- Go (`if err != nil { }` and variants) ---
+
+    def test_go_empty_err_nil_check_flagged(self):
+        src = (
+            "package main\n"
+            "func a() {\n"
+            "  err := doStuff()\n"
+            "  if err != nil {\n"
+            "  }\n"
+            "}\n"
+        )
+        smells = [s for s in scan_files([_file("a.go", src)]) if s.kind == "swallowed_catch"]
+        assert smells
+        assert "nil-check" in smells[0].message
+
+    def test_go_err_nil_check_with_initializer_flagged(self):
+        # `if err := f(); err != nil { }` — initializer form
+        src = (
+            "package main\n"
+            "func a() {\n"
+            "  if err := doStuff(); err != nil {\n"
+            "  }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.go", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_go_non_empty_err_check_not_flagged(self):
+        src = (
+            "package main\n"
+            "func a() {\n"
+            "  err := doStuff()\n"
+            "  if err != nil {\n"
+            "    log.Print(err)\n"
+            "  }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.go", src)])}
+        assert "swallowed_catch" not in kinds
+
+    def test_go_non_nil_condition_not_flagged(self):
+        # Only nil-comparison conditions are flagged. An empty `if x > 0`
+        # block isn't an error-handling smell.
+        src = (
+            "package main\n"
+            "func a() {\n"
+            "  x := 5\n"
+            "  if x > 0 {\n"
+            "  }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.go", src)])}
+        assert "swallowed_catch" not in kinds
+
+    # --- Rust (`if let Err` and `match Err =>`) ---
+
+    def test_rust_empty_if_let_err_flagged(self):
+        src = (
+            "fn a() {\n"
+            "    if let Err(_) = result() {\n"
+            "    }\n"
+            "}\n"
+        )
+        smells = [s for s in scan_files([_file("a.rs", src)]) if s.kind == "swallowed_catch"]
+        assert smells
+        assert "if-let Err" in smells[0].message
+
+    def test_rust_non_empty_if_let_err_not_flagged(self):
+        src = (
+            "fn a() {\n"
+            "    if let Err(e) = result() {\n"
+            "        log(e);\n"
+            "    }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.rs", src)])}
+        assert "swallowed_catch" not in kinds
+
+    def test_rust_if_let_ok_not_flagged(self):
+        # Only Err patterns are flagged; if let Ok with an empty body is
+        # unusual but isn't error swallowing.
+        src = (
+            "fn a() {\n"
+            "    if let Ok(_) = result() {\n"
+            "    }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.rs", src)])}
+        assert "swallowed_catch" not in kinds
+
+    def test_rust_empty_err_match_arm_flagged(self):
+        src = (
+            "fn a() {\n"
+            "    match result() {\n"
+            "        Err(_) => {},\n"
+            "        Ok(v) => use_it(v),\n"
+            "    }\n"
+            "}\n"
+        )
+        smells = [s for s in scan_files([_file("a.rs", src)]) if s.kind == "swallowed_catch"]
+        assert smells
+        assert "Err match arm" in smells[0].message
+
+    def test_rust_non_empty_err_arm_not_flagged(self):
+        src = (
+            "fn a() {\n"
+            "    match result() {\n"
+            "        Err(e) => { log(e); },\n"
+            "        Ok(v) => use_it(v),\n"
+            "    }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.rs", src)])}
+        assert "swallowed_catch" not in kinds
+
+    def test_rust_empty_ok_arm_not_flagged(self):
+        # Empty Ok arm isn't an error-swallow — Ok with no body just
+        # means "success requires no action". Only Err arms are flagged.
+        src = (
+            "fn a() {\n"
+            "    match result() {\n"
+            "        Ok(_) => {},\n"
+            "        Err(e) => log(e),\n"
+            "    }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.rs", src)])}
+        assert "swallowed_catch" not in kinds
+
 
 # ---------------------------------------------------------------------------
 # Hardcoded credentials

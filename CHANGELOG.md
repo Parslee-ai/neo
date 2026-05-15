@@ -8,6 +8,10 @@
   - **God-file detection** via LOC and function/method counts from tree-sitter queries.
   - **Empty catch/rescue detection.** PHP uses the standard `catch_clause`; Kotlin and Swift use `catch_block` (empty = no `statements` child); Ruby uses `rescue` (empty = no `then` child), and the finding message reads "empty rescue block" so it isn't mis-labeled as a catch.
   - **Semantic chunking + import edges** for Kotlin (`import_header`), Swift (`import_declaration`), and PHP (`namespace_use_declaration`). Ruby imports are runtime method calls (`require`, `require_relative`) so they're left out of edge extraction for now.
+- **Error-swallow detection for Go and Rust.** These languages don't have try/catch but do have idiomatic error-swallow patterns:
+  - **Go:** `if err != nil { }` (and the `if err := f(); err != nil { }` initializer form) with an empty body. Detection matches any `if <expr-containing-nil> { }` empty block — catches both the canonical error pattern and the rarer nil-pointer-guard variant; both are smells in idiomatic Go.
+  - **Rust:** `if let Err(...) = expr { }` with an empty body, and `match` arms with `Err(...)` patterns whose body is an empty block. `Err(_) => continue` and other non-empty-block bodies are not flagged. Discard idioms like `let _ = result;` and `result.ok();` are intentionally not flagged because they're often deliberate; flagging would produce too many false positives.
+  - C error-handling patterns (`if (rc != 0) { }`, `(void)write(...)`) are deliberately skipped — reliable detection requires semantic knowledge about which functions return errors, which our structural-only detector can't provide.
 
 ### Changed (breaking)
 

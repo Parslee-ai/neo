@@ -225,21 +225,102 @@ def _is_empty_ruby_rescue(node) -> bool:
     return not any(c.type == "then" for c in node.named_children)
 
 
-# Per-language catch-detector configuration.
-# Maps language → (target_node_type, emptiness_check, idiom_label).
-# idiom_label drives the message and finding kind so a Ruby `rescue`
-# isn't mis-reported as a `catch`.
-_CATCH_DETECTORS: dict[str, tuple[str, "callable", str]] = {
-    "javascript": ("catch_clause", _is_empty_catch_clause, "catch"),
-    "typescript": ("catch_clause", _is_empty_catch_clause, "catch"),
-    "tsx": ("catch_clause", _is_empty_catch_clause, "catch"),
-    "java": ("catch_clause", _is_empty_catch_clause, "catch"),
-    "c_sharp": ("catch_clause", _is_empty_catch_clause, "catch"),
-    "cpp": ("catch_clause", _is_empty_catch_clause, "catch"),
-    "php": ("catch_clause", _is_empty_catch_clause, "catch"),
-    "kotlin": ("catch_block", _is_empty_catch_block_kotlin_swift, "catch"),
-    "swift": ("catch_block", _is_empty_catch_block_kotlin_swift, "catch"),
-    "ruby": ("rescue", _is_empty_ruby_rescue, "rescue"),
+def _is_empty_go_nil_check(node) -> bool:
+    """Go: `if <expr> != nil { }` or `if <expr> == nil { }` with an
+    empty body. Catches the canonical swallowed-error pattern
+    `if err != nil { }` along with the rarer nil-pointer-guard
+    variants — in idiomatic Go both with an empty body are smells.
+    Also handles `if x := f(); x != nil { }` form by finding the
+    binary_expression among the if's named children regardless of
+    initializer position.
+    """
+    cond = None
+    body = None
+    for child in node.named_children:
+        if child.type == "binary_expression" and cond is None:
+            cond = child
+        elif child.type == "block":
+            body = child
+    if cond is None or body is None:
+        return False
+    cond_text = cond.text.decode("utf-8", errors="replace")
+    if "nil" not in cond_text:
+        return False
+    return _ts_body_is_empty(body)
+
+
+def _rust_pattern_is_err(pattern_node) -> bool:
+    """Whether a Rust pattern starts with `Err` (the Result error
+    variant). Catches `Err(_)`, `Err(e)`, `Err(SomeError)`, etc.
+    """
+    text = pattern_node.text.decode("utf-8", errors="replace").strip()
+    return text.startswith("Err")
+
+
+def _is_empty_rust_if_let_err(node) -> bool:
+    """Rust: `if let Err(...) = expr { }` with an empty body.
+
+    Structure: if_expression -> let_condition -> tuple_struct_pattern
+    where the pattern is `Err(...)`. Body is a `block` child.
+    """
+    cond = None
+    body = None
+    for child in node.named_children:
+        if child.type == "let_condition" and cond is None:
+            cond = child
+        elif child.type == "block":
+            body = child
+    if cond is None or body is None:
+        return False
+    if not cond.named_children:
+        return False
+    pattern = cond.named_children[0]
+    if not _rust_pattern_is_err(pattern):
+        return False
+    return _ts_body_is_empty(body)
+
+
+def _is_empty_rust_err_match_arm(node) -> bool:
+    """Rust: `match_arm` whose pattern is `Err(...)` with empty body.
+
+    Structure: match_arm -> match_pattern (text starts with "Err")
+    + a body that's either a `block` or an expression. Only flags
+    when the body is an empty block; `Err(_) => continue` and
+    `Err(_) => some_expr` are not flagged.
+    """
+    pattern = None
+    body = None
+    for child in node.named_children:
+        if child.type == "match_pattern" and pattern is None:
+            pattern = child
+        elif child.type == "block":
+            body = child
+    if pattern is None or body is None:
+        return False
+    if not _rust_pattern_is_err(pattern):
+        return False
+    return _ts_body_is_empty(body)
+
+
+# Per-language error-swallow detector configuration.
+# Each entry: (target_node_type, emptiness_check, idiom_label).
+# Languages with multiple idioms (Rust) appear in multiple entries.
+_ERROR_SWALLOW_DETECTORS: dict[str, list[tuple[str, "callable", str]]] = {
+    "javascript": [("catch_clause", _is_empty_catch_clause, "catch")],
+    "typescript": [("catch_clause", _is_empty_catch_clause, "catch")],
+    "tsx": [("catch_clause", _is_empty_catch_clause, "catch")],
+    "java": [("catch_clause", _is_empty_catch_clause, "catch")],
+    "c_sharp": [("catch_clause", _is_empty_catch_clause, "catch")],
+    "cpp": [("catch_clause", _is_empty_catch_clause, "catch")],
+    "php": [("catch_clause", _is_empty_catch_clause, "catch")],
+    "kotlin": [("catch_block", _is_empty_catch_block_kotlin_swift, "catch")],
+    "swift": [("catch_block", _is_empty_catch_block_kotlin_swift, "catch")],
+    "ruby": [("rescue", _is_empty_ruby_rescue, "rescue")],
+    "go": [("if_statement", _is_empty_go_nil_check, "nil-check")],
+    "rust": [
+        ("if_expression", _is_empty_rust_if_let_err, "if-let Err"),
+        ("match_arm", _is_empty_rust_err_match_arm, "Err match arm"),
+    ],
 }
 
 
@@ -248,18 +329,22 @@ def _ts_language_for(path: str) -> Optional[str]:
     language has no detector configured.
     """
     lang = language_for_path(path)
-    return lang if lang in _CATCH_DETECTORS else None
+    return lang if lang in _ERROR_SWALLOW_DETECTORS else None
 
 
 def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]:
-    """Detect empty catch (or rescue) blocks via tree-sitter. Falls
-    through silently on parser errors so a broken file can't take the
-    whole scan down.
+    """Detect empty error-handling blocks (catch / rescue / nil-check /
+    Err arm) via tree-sitter. Falls through silently on parser errors
+    so a broken file can't take the whole scan down.
     """
-    config = _CATCH_DETECTORS.get(language)
-    if config is None:
+    detectors = _ERROR_SWALLOW_DETECTORS.get(language)
+    if not detectors:
         return []
-    target_type, is_empty, idiom = config
+
+    # Group detectors by node type so the walker hits each node once.
+    by_type: dict[str, list[tuple[str, "callable", str]]] = {}
+    for entry in detectors:
+        by_type.setdefault(entry[0], []).append(entry)
 
     try:
         parser = _ts_get_parser(_resolve_parser_name(language))
@@ -272,30 +357,32 @@ def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]
     out: list[CodeSmell] = []
 
     for node in _walk_ts(tree.root_node):
-        if node.type != target_type:
+        candidates = by_type.get(node.type)
+        if not candidates:
             continue
-        # Skip anonymous-token nodes that share the structural node's
+        # Skip anonymous-token nodes that share a structural node's
         # type name. Ruby is the offender — the `rescue` keyword and
         # the structural `rescue` clause both have type "rescue", but
         # only the structural one has is_named=True.
         if not node.is_named:
             continue
-        # Skip catches inside ERROR/MISSING subtrees — partially-typed
-        # code in a live editor produces target nodes whose body we
-        # can't trust.
+        # Skip nodes inside ERROR/MISSING subtrees — partially-typed
+        # code in a live editor produces nodes whose body we can't trust.
         if node.has_error:
             continue
-        if not is_empty(node):
-            continue
-        line_no = node.start_point[0] + 1
-        out.append(CodeSmell(
-            file_path=path,
-            line=line_no,
-            kind="swallowed_catch",
-            severity="warn",
-            message=f"empty {idiom} block — exception silently dropped",
-            snippet=_truncate(_line_at(lines, line_no)),
-        ))
+        for _, is_empty, idiom in candidates:
+            if not is_empty(node):
+                continue
+            line_no = node.start_point[0] + 1
+            out.append(CodeSmell(
+                file_path=path,
+                line=line_no,
+                kind="swallowed_catch",
+                severity="warn",
+                message=f"empty {idiom} block — error silently dropped",
+                snippet=_truncate(_line_at(lines, line_no)),
+            ))
+            break  # one finding per node, even if multiple detectors match
 
     return out
 
