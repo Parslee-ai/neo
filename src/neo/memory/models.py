@@ -120,9 +120,35 @@ def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> 
 
     return (
         sim * fact.metadata.confidence
-        + success_bonus(fact.metadata.success_count)
+        + success_bonus(fact.metadata.success_count) * fact.metadata.effectiveness_f
         + provenance_bonus(fact.metadata.provenance)
     )
+
+
+# LessonL ε for effectiveness adjustment. ε ∈ (0, 1); paper 2505.23946
+# uses 0.5 in the worked examples — small enough to not swing wildly,
+# large enough that several confirming reuses can lift f past 1.0.
+EFFECTIVENESS_EPSILON = 0.5
+
+
+def update_effectiveness(fact: "Fact", *, outcome: str) -> None:
+    """LessonL c/n update on a reuse outcome.
+
+    Call once per observed downstream outcome for a fact that was
+    previously surfaced by retrieval. ``outcome`` is one of:
+
+      "better"   — the suggestion built on this fact succeeded; c += 1 + ε
+      "worse"    — the suggestion built on this fact failed;    c -= 1 - ε
+      "neutral"  — observed but no signal;                       no-op
+
+    ``n`` increments whenever a real signal arrives (better or worse).
+    """
+    if outcome == "better":
+        fact.metadata.effectiveness_c += 1.0 + EFFECTIVENESS_EPSILON
+        fact.metadata.effectiveness_n += 1
+    elif outcome == "worse":
+        fact.metadata.effectiveness_c -= 1.0 - EFFECTIVENESS_EPSILON
+        fact.metadata.effectiveness_n += 1
 
 
 def update_recall(fact: "Fact", now: Optional[float] = None) -> None:
@@ -202,6 +228,14 @@ class FactMetadata:
     recall_count: int = 0
     g_n: float = 1.0
     last_recall_ts: Optional[float] = None
+    # LessonL effectiveness adjustment (paper 2505.23946).
+    # ``effectiveness_c`` is the running correction variable;
+    # ``effectiveness_n`` counts the reuses observed. The ratio
+    # f = c / n acts as a multiplier on the fact's success bonus —
+    # f > 1 means the fact paid off more than its history suggests;
+    # f < 1 means it's losing value with each reuse.
+    effectiveness_c: float = 0.0
+    effectiveness_n: int = 0
     # Bi-temporal model (Zep/AriGraph pattern; see paper 2512.13564 §5.2.2).
     # ``event_time`` answers "when did the fact represent?" — typically the
     # commit/observation time of the world-event the fact describes. For
@@ -232,6 +266,8 @@ class FactMetadata:
             "event_time": self.event_time,
             "event_time_end": self.event_time_end,
             "ingest_time": self.ingest_time,
+            "effectiveness_c": self.effectiveness_c,
+            "effectiveness_n": self.effectiveness_n,
         }
 
     @classmethod
@@ -255,7 +291,16 @@ class FactMetadata:
             event_time=data.get("event_time"),
             event_time_end=data.get("event_time_end"),
             ingest_time=data.get("ingest_time"),
+            effectiveness_c=data.get("effectiveness_c", 0.0),
+            effectiveness_n=data.get("effectiveness_n", 0),
         )
+
+    @property
+    def effectiveness_f(self) -> float:
+        """LessonL ratio f = c/n; 1.0 when never observed."""
+        if self.effectiveness_n <= 0:
+            return 1.0
+        return self.effectiveness_c / self.effectiveness_n
 
     @property
     def effective_event_time(self) -> float:
