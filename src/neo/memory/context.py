@@ -6,6 +6,7 @@ then renders them as a formatted string for prompt injection.
 """
 
 import logging
+import time
 from typing import Optional
 
 import numpy as np
@@ -152,8 +153,9 @@ class ContextAssembler:
         if not facts:
             return []
 
+        now = time.time()
         sims = batched_cosine([f.embedding for f in facts], query_embedding)
-        scored = [(f, rank_score(f, s)) for f, s in zip(facts, sims)]
+        scored = [(f, rank_score(f, s, now)) for f, s in zip(facts, sims)]
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
 

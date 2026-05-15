@@ -23,7 +23,7 @@ from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
-from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, rank_score
+from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, rank_score, update_recall
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
 from neo.memory.scope import detect_org_and_project
 from neo.pattern_extraction import extract_pattern_from_correction, get_library
@@ -80,6 +80,10 @@ class FactStore:
     - Supersession instead of merge/consolidation
     - Scoped storage (global, org, project)
     - Constraint ingestion from CLAUDE.md etc.
+
+    Not thread-safe. Retrieval mutates per-fact metadata (last_accessed,
+    access_count, recall_count, g_n); concurrent retrievals over the same
+    instance would race on those bumps.
     """
 
     def __init__(
@@ -264,17 +268,28 @@ class FactStore:
         if not valid_facts:
             return []
 
+        now = time.time()
         sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
-        scored = [(f, rank_score(f, s)) for f, s in zip(valid_facts, sims)]
+        scored = [(f, rank_score(f, s, now)) for f, s in zip(valid_facts, sims)]
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        now = time.time()
         results: list[Fact] = []
         for fact, _ in scored[:k]:
-            fact.metadata.last_accessed = now
-            fact.metadata.access_count += 1
+            self._mark_retrieved(fact, now)
             results.append(fact)
         return results
+
+    @staticmethod
+    def _mark_retrieved(fact: Fact, now: float) -> None:
+        """Apply retrieval bookkeeping to a fact: access metadata + recall update.
+
+        Single place that mutates per-fact retrieval-tracking state, so the
+        two retrieval entry points (retrieve_relevant + build_context) can't
+        drift in what they count.
+        """
+        fact.metadata.last_accessed = now
+        fact.metadata.access_count += 1
+        update_recall(fact, now)
 
     def build_context(
         self,
@@ -298,8 +313,7 @@ class FactStore:
         # Update access metadata on retrieved facts (mirrors retrieve_relevant)
         now = time.time()
         for fact in result.valid_facts:
-            fact.metadata.last_accessed = now
-            fact.metadata.access_count += 1
+            self._mark_retrieved(fact, now)
 
         return result
 

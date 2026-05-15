@@ -14,6 +14,8 @@ from typing import Optional
 
 import numpy as np
 
+from neo.math_utils import g_n_update, recall_probability
+
 
 # Ranking policy shared across retrieval paths (FactStore.retrieve_relevant
 # and ContextAssembler._score_facts). MUST stay in one place — if the two
@@ -48,22 +50,89 @@ def provenance_bonus(provenance: str) -> float:
     return _PROVENANCE_BONUS.get(provenance, 0.0)
 
 
-def rank_score(fact: "Fact", similarity: float) -> float:
+SECONDS_PER_DAY = 86400.0
+
+# Tags that mark a fact as curated knowledge — seeded, community-sourced,
+# or distilled by synthesis. Curated facts skip Ebbinghaus decay because
+# their relevance isn't a function of how often the user happens to query
+# them: a CLAUDE.md rule still applies after a year of silence.
+_CURATED_TAGS = frozenset({"seed", "community", "synthesized"})
+
+
+def _decays(fact: "Fact") -> bool:
+    """True iff this fact's similarity should be transformed by recall decay.
+
+    CONSTRAINT/ARCHITECTURE/DECISION are stable knowledge — they don't
+    decay. Curated-tagged facts are explicitly marked as do-not-touch and
+    also skip decay. Everything else (PATTERN, REVIEW, FAILURE,
+    KNOWN_UNKNOWN) is fluid and decays.
+    """
+    if fact.kind in (FactKind.CONSTRAINT, FactKind.ARCHITECTURE, FactKind.DECISION):
+        return False
+    if _CURATED_TAGS & set(fact.tags):
+        return False
+    return True
+
+
+def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> float:
     """Single source of truth for fact ranking.
 
     Used by FactStore.retrieve_relevant and ContextAssembler._score_facts so
-    a query gets the same ordering whichever path runs it. Formula:
+    a query gets the same ordering whichever path runs it.
 
-        sim * confidence + success_bonus(success_count) + provenance_bonus
+        s_recall = recall_probability(sim, t, g_n) if fact decays else sim
+        score    = s_recall * confidence
+                 + success_bonus(success_count)
+                 + provenance_bonus
 
-    The provenance bonus is small (≤0.05) so it cannot swamp similarity, but
-    breaks ties between two facts of equal cosine and confidence.
+    The Ebbinghaus transform (Hou et al., 2404.00573) gives spaced-repetition
+    semantics: frequently-recalled fluid facts decay slower, dormant ones
+    decay faster, and the gap between two recalls shapes future decay.
+    Curated/stable facts (see ``_decays``) bypass the transform entirely.
     """
+    if _decays(fact):
+        ts = fact.metadata.last_recall_ts
+        if ts is None:
+            ts = fact.metadata.created_at
+        elapsed_days = max(0.0, ((now if now is not None else time.time()) - ts) / SECONDS_PER_DAY)
+        sim = recall_probability(
+            similarity,
+            days_since_recall=elapsed_days,
+            g_n=fact.metadata.g_n,
+        )
+    else:
+        sim = similarity
+
     return (
-        similarity * fact.metadata.confidence
+        sim * fact.metadata.confidence
         + success_bonus(fact.metadata.success_count)
         + provenance_bonus(fact.metadata.provenance)
     )
+
+
+def update_recall(fact: "Fact", now: Optional[float] = None) -> None:
+    """Bookkeeping when retrieval has surfaced a fact.
+
+    Increments recall_count and stamps last_recall_ts. Strengthens g_n on
+    the *second* recall onward (the gap between two real recalls is the
+    spaced-repetition signal). On the first recall there is no gap to
+    reward, so g_n stays put — only the recall_count and timestamp move.
+
+    Skipped entirely for non-decaying facts: curated/stable facts don't
+    use these fields for ranking, so we don't churn them.
+    """
+    if not _decays(fact):
+        return
+
+    if now is None:
+        now = time.time()
+
+    if fact.metadata.last_recall_ts is not None:
+        elapsed_days = max(0.0, (now - fact.metadata.last_recall_ts) / SECONDS_PER_DAY)
+        fact.metadata.g_n = g_n_update(fact.metadata.g_n, elapsed_days)
+
+    fact.metadata.last_recall_ts = now
+    fact.metadata.recall_count += 1
 
 
 class FactKind(Enum):
@@ -96,6 +165,15 @@ class FactMetadata:
     confidence: float = 0.5    # 0.0 to 1.0
     success_count: int = 0     # Times this suggestion was validated
     provenance: str = "inferred"  # "structural", "inferred", or "observed"
+    # Ebbinghaus-style spaced-repetition fields. recall_count tracks how
+    # often this fact has been returned by retrieval; g_n is the per-fact
+    # decay-constant denominator (starts at 1.0, grows on each recall so
+    # consistent re-use slows future decay); last_recall_ts is the last
+    # time retrieval surfaced the fact (None = never recalled).
+    # See math_utils.recall_probability.
+    recall_count: int = 0
+    g_n: float = 1.0
+    last_recall_ts: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -107,10 +185,17 @@ class FactMetadata:
             "confidence": self.confidence,
             "success_count": self.success_count,
             "provenance": self.provenance,
+            "recall_count": self.recall_count,
+            "g_n": self.g_n,
+            "last_recall_ts": self.last_recall_ts,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "FactMetadata":
+        # Legacy: pre-A2 dumps used 0.0 as the "never recalled" sentinel.
+        last_recall = data.get("last_recall_ts")
+        if last_recall == 0.0:
+            last_recall = None
         return cls(
             created_at=data.get("created_at", time.time()),
             last_accessed=data.get("last_accessed", time.time()),
@@ -120,6 +205,9 @@ class FactMetadata:
             confidence=data.get("confidence", 0.5),
             success_count=data.get("success_count", 0),
             provenance=data.get("provenance", "inferred"),
+            recall_count=data.get("recall_count", 0),
+            g_n=data.get("g_n", 1.0),
+            last_recall_ts=last_recall,
         )
 
 

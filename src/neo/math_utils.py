@@ -28,6 +28,48 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
+_RECALL_NORMALIZER = 1.0 - math.exp(-1.0)  # ≈ 0.6321, so r=1,t=0 → p=1
+
+
+def recall_probability(
+    cosine: float,
+    *,
+    days_since_recall: float,
+    g_n: float,
+) -> float:
+    """Ebbinghaus-style recall probability (Hou et al., paper 2404.00573).
+
+        p_n(t) = (1 - exp(-r · exp(-t / g_n))) / (1 - e^-1)
+
+    Where r is cosine similarity, t is elapsed time in days since the last
+    recall, and g_n is a per-fact strength that grows with each spaced recall.
+    Returned value is clamped to [0, 1].
+    """
+    if cosine <= 0.0:
+        return 0.0
+    if g_n <= 0.0:
+        _logger.warning("recall_probability: invalid g_n=%r, falling back to 1.0", g_n)
+        g_n = 1.0
+    inner = cosine * math.exp(-max(0.0, days_since_recall) / g_n)
+    p = (1.0 - math.exp(-inner)) / _RECALL_NORMALIZER
+    if not math.isfinite(p):
+        return 0.0
+    return max(0.0, min(1.0, p))
+
+
+def g_n_update(g_n: float, days_since_last: float) -> float:
+    """Spaced-repetition strengthening for g_n.
+
+        g_{n+1} = g_n + (1 - e^-t) / (1 + e^-t)
+
+    Equivalent to ``g_n + tanh(t/2)``. Bounded growth: each recall adds at
+    most 1.0 (long gaps) and at least ~0 (immediate re-recall).
+    """
+    t = max(0.0, days_since_last)
+    e = math.exp(-t)
+    return g_n + (1.0 - e) / (1.0 + e)
+
+
 def batched_cosine(
     embeddings: list[Optional[np.ndarray]],
     query: Optional[np.ndarray],
