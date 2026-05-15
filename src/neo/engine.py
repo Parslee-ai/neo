@@ -320,7 +320,13 @@ class NeoEngine:
         """
         if not traces:
             return
-        plan_summary = "; ".join(step.action[:80] for step in plan if step.action)[:300]
+        # PlanStep has ``actions: list[str]`` (plural) and a top-level
+        # ``description`` — both useful for a compact plan summary. Join
+        # description preferentially; fall back to first action when missing.
+        plan_summary = "; ".join(
+            (step.description or (step.actions[0] if step.actions else ""))[:80]
+            for step in plan
+        )[:300]
         for trace in traces:
             try:
                 self.fact_store.persist_simulation_episode(

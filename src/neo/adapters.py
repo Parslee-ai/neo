@@ -78,6 +78,7 @@ class OpenAIAdapter(LMAdapter):
             if response.status_code != 200:
                 raise ValueError(f"API error {response.status_code}: {response.text}")
             data = response.json()
+            self._emit_usage_metric(data.get("usage", {}))
 
             # Extract text from output array
             output = data.get("output", [])
@@ -98,7 +99,73 @@ class OpenAIAdapter(LMAdapter):
                 temperature=temperature,
                 stop=stop,
             )
+            self._emit_usage_metric(getattr(response, "usage", None))
             return response.choices[0].message.content
+
+    def _emit_usage_metric(self, usage: object) -> None:
+        """Record per-call token usage to metrics.jsonl.
+
+        Handles both response shapes the OpenAI client surfaces:
+          - /v1/chat/completions: response.usage.prompt_tokens,
+            completion_tokens, prompt_tokens_details.cached_tokens
+          - /v1/responses (gpt-5*/codex): usage dict with input_tokens,
+            output_tokens, input_tokens_details.cached_tokens
+
+        cache_hit_rate = cached / (prompt_or_input + cached) — same
+        normalization shape as AnthropicAdapter so the metric is
+        directly comparable across providers.
+        """
+        try:
+            from neo.memory.metrics import record as metrics_record
+
+            if usage is None:
+                return
+
+            # Best-effort field extraction — supports both dict and object
+            # shapes (httpx returns dict, openai SDK returns Pydantic).
+            def get(obj: object, *path: str) -> object:
+                cur = obj
+                for key in path:
+                    if cur is None:
+                        return None
+                    if isinstance(cur, dict):
+                        cur = cur.get(key)
+                    else:
+                        cur = getattr(cur, key, None)
+                return cur
+
+            input_tokens = (
+                get(usage, "prompt_tokens")
+                or get(usage, "input_tokens")
+                or 0
+            )
+            output_tokens = (
+                get(usage, "completion_tokens")
+                or get(usage, "output_tokens")
+                or 0
+            )
+            cached = (
+                get(usage, "prompt_tokens_details", "cached_tokens")
+                or get(usage, "input_tokens_details", "cached_tokens")
+                or 0
+            )
+            input_tokens = int(input_tokens or 0)
+            output_tokens = int(output_tokens or 0)
+            cached = int(cached or 0)
+            cache_hit_rate = (
+                cached / input_tokens if input_tokens > 0 else 0.0
+            )
+            metrics_record(
+                "lm_call",
+                provider="openai",
+                model=self.model,
+                input_tokens=input_tokens,
+                cache_read_input_tokens=cached,
+                output_tokens=output_tokens,
+                cache_hit_rate=round(cache_hit_rate, 4),
+            )
+        except Exception:
+            pass  # Metrics are never load-bearing.
 
     def name(self) -> str:
         return f"openai/{self.model}"
