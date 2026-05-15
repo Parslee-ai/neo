@@ -11,6 +11,7 @@ import ast
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -339,6 +340,12 @@ class NeoEngine:
         """LM-independent sanity check: require ≥2 simulation traces with
         matching expected_output OR no reported issues.
 
+        Augmented by the CodeSim-style explicit decision token
+        (paper 2502.05664): if ANY trace's reasoning emits **NO_MODIFY**
+        the planner has explicitly approved its own plan; if any emits
+        **MODIFY** the planner has explicitly flagged itself. The token
+        check overrides the output-agreement heuristic — explicit > implicit.
+
         Returns True if we have enough trace agreement to trust the output,
         False if we should fall through to the full verification pipeline.
         When traces are unavailable (empty), returns True to avoid penalizing
@@ -347,6 +354,17 @@ class NeoEngine:
         """
         if not traces:
             return True
+
+        # Explicit decision token: planner-emitted MODIFY / NO_MODIFY beats
+        # the implicit consensus heuristic. The simulator prompt may emit
+        # either "**Plan Modification Needed**" / "**No Need to Modify Plan**"
+        # (CodeSim canonical phrasing) or a bare MODIFY / NO_MODIFY token.
+        decision = NeoEngine._extract_plan_decision(traces)
+        if decision == "NO_MODIFY":
+            return True
+        if decision == "MODIFY":
+            return False
+
         clean = [t for t in traces if not t.issues_found]
         if len(clean) < 2:
             return False
@@ -357,6 +375,35 @@ class NeoEngine:
         if not non_empty:
             return True
         return outputs.count(non_empty[0]) >= 2
+
+    @staticmethod
+    def _extract_plan_decision(traces: list[SimulationTrace]) -> Optional[str]:
+        """Scan reasoning_steps for an explicit MODIFY / NO_MODIFY token.
+
+        Returns "NO_MODIFY" if any trace approves the plan, "MODIFY" if
+        any trace flags it for revision, or None when no token is present.
+        Approval beats rejection within a single batch — the planner is
+        usually right when it explicitly green-lights.
+        """
+        no_modify_re = re.compile(
+            r"\b(NO_MODIFY|NO\s+NEED\s+TO\s+MODIFY|NO\s+MODIFICATION\s+NEEDED)\b",
+            re.IGNORECASE,
+        )
+        modify_re = re.compile(
+            r"\b(MODIFY|PLAN\s+MODIFICATION\s+NEEDED|REVISE\s+PLAN)\b",
+            re.IGNORECASE,
+        )
+        for trace in traces:
+            blob = " ".join(trace.reasoning_steps or [])
+            if not blob:
+                continue
+            if no_modify_re.search(blob):
+                return "NO_MODIFY"
+        for trace in traces:
+            blob = " ".join(trace.reasoning_steps or [])
+            if modify_re.search(blob):
+                return "MODIFY"
+        return None
 
     def _retrieve_context(self, neo_input: NeoInput) -> dict[str, Any]:
         """Retrieve and enrich context from input payload."""
