@@ -98,19 +98,47 @@ class PatternLibrary:
         return sorted(applicable, key=lambda p: p.confidence, reverse=True)
 
 
+# Markdown fence tag per language. Empty string = no tag, which is what
+# we want when the caller doesn't know the language — better than
+# misleading the LM with a wrong tag.
+_FENCE_BY_LANGUAGE = {
+    "python": "python",
+    "javascript": "javascript",
+    "typescript": "typescript",
+    "tsx": "tsx",
+    "java": "java",
+    "csharp": "csharp",
+    "c_sharp": "csharp",  # tree-sitter name normalization
+    "go": "go",
+    "rust": "rust",
+    "c": "c",
+    "cpp": "cpp",
+    "ruby": "ruby",
+    "php": "php",
+    "swift": "swift",
+    "kotlin": "kotlin",
+}
+
+
 def extract_pattern_from_correction(
     problem_description: str,
     failed_code: str,
     corrected_code: str,
     bug_category: str,
     root_cause: str,
-    adapter
+    adapter,
+    language: Optional[str] = None,
 ) -> PreventionPattern:
     """
     Use LLM to analyze a failed→corrected pair and extract a reusable pattern.
 
     This is the 100x move: Neo learns from its own corrections.
+
+    `language` (when provided) is used as the markdown fence tag so the
+    LM gets a consistent syntax cue. Passing None drops the tag — better
+    than hardcoding ```python and lying when the code is JS/Go/Java.
     """
+    fence = _FENCE_BY_LANGUAGE.get((language or "").lower(), "")
 
     extraction_prompt = f"""Analyze this coding mistake and extract a PREVENTION RULE:
 
@@ -118,12 +146,12 @@ PROBLEM TYPE:
 {problem_description[:300]}
 
 FAILED CODE:
-```python
+```{fence}
 {failed_code[:500]}
 ```
 
 CORRECTED CODE:
-```python
+```{fence}
 {corrected_code[:500]}
 ```
 

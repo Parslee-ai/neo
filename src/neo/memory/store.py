@@ -22,6 +22,7 @@ from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.seed import SeedIngester
+from neo.index.language_parser import LANGUAGE_MAP
 from neo.memory.models import ContextResult, Fact, FactKind, FactMetadata, FactScope, success_bonus
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
 from neo.memory.scope import detect_org_and_project
@@ -541,6 +542,11 @@ class FactStore:
         if modified_outcomes and self._lm_adapter:
             for outcome in modified_outcomes[:3]:  # Limit to 3 per session
                 try:
+                    # Derive language from extension for accurate fence
+                    # tagging in the extraction prompt.
+                    suffix = Path(outcome.file_path).suffix.lower()
+                    language = LANGUAGE_MAP.get(suffix)
+
                     pattern = extract_pattern_from_correction(
                         problem_description=outcome.suggestion_description,
                         failed_code=outcome.suggestion_description,  # Best we have
@@ -548,6 +554,7 @@ class FactStore:
                         bug_category="suggestion-mismatch",
                         root_cause=f"Neo's suggestion for {outcome.file_path} was modified by user",
                         adapter=self._lm_adapter,
+                        language=language,
                     )
                     library = get_library()
                     library.add_pattern(pattern)
