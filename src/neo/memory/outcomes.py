@@ -13,6 +13,7 @@ import datetime
 import enum
 import json
 import logging
+import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -37,6 +38,72 @@ class OutcomeType(enum.Enum):
     MODIFIED = "modified"       # User changed the file differently (overlap <= 0.3)
     UNVERIFIED = "unverified"   # File changed but no diff to compare
     INDEPENDENT = "independent" # User changed a file neo didn't suggest
+
+
+class OutcomeIndicator(enum.Enum):
+    """Trajectory-Memory semantic indicator (paper 2603.10600 §4).
+
+    Independent from OutcomeType (which describes *event shape* — did the
+    diff land, did the user edit elsewhere). OutcomeIndicator describes
+    the *semantic shape* of what happened — failure, recovery from a
+    prior failure, inefficient-but-correct, or clean success.
+    """
+    FAILURE = "failure"           # error/test-fail/exception signals
+    RECOVERY = "recovery"         # failure followed by clean completion
+    INEFFICIENCY = "inefficiency" # works but repeats / batches poorly
+    SUCCESS = "success"           # clean completion, no error trail
+
+
+_FAILURE_RE = re.compile(
+    r"\b(error|exception|traceback|fail(?:ed|ure)?|assert(?:ion)?error|"
+    r"raised|panic|aborted|invalid|missing|undefined|broken|crash)\b",
+    re.IGNORECASE,
+)
+_RECOVERY_HINTS = ("fix", "fixed", "fixes", "resolve", "resolved", "patch",
+                    "corrected", "recovers", "recover", "fall back", "fallback")
+_INEFFICIENCY_RE = re.compile(
+    r"\b(loop[ _-]?in[ _-]?loop|n\+1|nplus(?:one)?|repeat(?:ed|edly)?|"
+    r"redundant|slow|inefficient|quadratic)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_outcome_indicator(
+    *,
+    diff_text: str = "",
+    issues_found: Optional[list[str]] = None,
+    error_trace: str = "",
+    prior_failure: bool = False,
+    reasoning_steps: Optional[list[str]] = None,
+) -> OutcomeIndicator:
+    """Deterministic semantic classification (paper 2603.10600 §4-5).
+
+    Pure pattern matching on the action log — no LLM. Order matters:
+
+      1. error_trace OR explicit "error|exception|fail" in diff/issues
+         → FAILURE  (unless prior_failure is True AND we now see clean
+         completion in reasoning_steps → RECOVERY)
+      2. INEFFICIENCY tokens in diff/reasoning → INEFFICIENCY
+      3. Otherwise → SUCCESS
+    """
+    blob_parts = [diff_text, error_trace]
+    blob_parts.extend(issues_found or [])
+    blob_parts.extend(reasoning_steps or [])
+    blob = " ".join(p for p in blob_parts if p)
+
+    has_failure = bool(error_trace.strip()) or bool(_FAILURE_RE.search(blob))
+    if has_failure:
+        # Recovery only when we'd previously seen failure AND now the
+        # current message looks like a fix/recovery — distinguishes
+        # "we landed a fix" from "still broken".
+        if prior_failure and any(h in blob.lower() for h in _RECOVERY_HINTS):
+            return OutcomeIndicator.RECOVERY
+        return OutcomeIndicator.FAILURE
+
+    if _INEFFICIENCY_RE.search(blob):
+        return OutcomeIndicator.INEFFICIENCY
+
+    return OutcomeIndicator.SUCCESS
 
 
 @dataclass
