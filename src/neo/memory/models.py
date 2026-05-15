@@ -104,19 +104,8 @@ def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> 
     semantics: frequently-recalled fluid facts decay slower, dormant ones
     decay faster, and the gap between two recalls shapes future decay.
     Curated/stable facts (see ``_decays``) bypass the transform entirely.
-
-    Legacy mode: when env NEO_LEGACY_SCORING=1 is set, returns the pre-W1
-    formula (no recall-probability transform, no effectiveness multiplier).
-    Used by the A/B baseline benchmark to quantify whether W1-W4 improved
-    retrieval on real workloads.
     """
-    import os
-    legacy = os.getenv("NEO_LEGACY_SCORING", "").strip() == "1"
-
-    if legacy or not _decays(fact):
-        sim = similarity
-        eff = 1.0
-    else:
+    if _decays(fact):
         ts = fact.metadata.last_recall_ts
         if ts is None:
             ts = fact.metadata.created_at
@@ -127,6 +116,9 @@ def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> 
             g_n=fact.metadata.g_n,
         )
         eff = fact.metadata.effectiveness_f
+    else:
+        sim = similarity
+        eff = 1.0
 
     return (
         sim * fact.metadata.confidence
