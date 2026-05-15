@@ -151,7 +151,19 @@ def update_recall(fact: "Fact", now: Optional[float] = None) -> None:
 
 
 class FactKind(Enum):
-    """Type of fact stored in memory."""
+    """Type of fact stored in memory.
+
+    EPISODE is a single, instance-specific event with full context (when,
+    where, why, with whom). Episodes satisfy the 5-property test from the
+    episodic-memory position paper (2502.06975 Table 1): long-term + explicit
+    + single-shot + instance-specific + contextual. Episodes are the input
+    to consolidation — when multiple episodes agree, synthesis distills them
+    into a PATTERN or FAILURE. Episodes themselves are fluid (decay applies).
+
+    PATTERN/REVIEW/DECISION/FAILURE/KNOWN_UNKNOWN are derived/semantic kinds;
+    CONSTRAINT/ARCHITECTURE are curated/stable kinds (bypass decay; see
+    models._decays).
+    """
     CONSTRAINT = "constraint"       # Project rules (from CLAUDE.md etc.)
     ARCHITECTURE = "architecture"   # Architectural decisions and patterns
     PATTERN = "pattern"             # Reusable code/design patterns
@@ -159,6 +171,7 @@ class FactKind(Enum):
     DECISION = "decision"           # Feature/design decisions made
     KNOWN_UNKNOWN = "known_unknown" # Explicit gaps in knowledge
     FAILURE = "failure"             # Failed approaches and their reasons
+    EPISODE = "episode"             # One specific event w/ when/where/why/who
 
 
 class FactScope(Enum):
@@ -256,6 +269,36 @@ class FactMetadata:
 
 
 @dataclass
+class EpisodeContext:
+    """Five-property episodic context (paper 2502.06975 Table 1).
+
+    Required for EPISODE-kind facts to actually be episodic. Fields:
+      when   — ISO-8601 timestamp or freeform timeline marker
+      where  — file path / module / repo / location of the event
+      why    — triggering goal or reason
+      with_whom — the agent, user, tool, or fact ID involved
+    """
+    when: Optional[str] = None
+    where: Optional[str] = None
+    why: Optional[str] = None
+    with_whom: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {"when": self.when, "where": self.where, "why": self.why, "with_whom": self.with_whom}
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> Optional["EpisodeContext"]:
+        if not data:
+            return None
+        return cls(
+            when=data.get("when"),
+            where=data.get("where"),
+            why=data.get("why"),
+            with_whom=data.get("with_whom"),
+        )
+
+
+@dataclass
 class Fact:
     """A single piece of knowledge in the fact store.
 
@@ -276,6 +319,10 @@ class Fact:
     metadata: FactMetadata = field(default_factory=FactMetadata)
     embedding: Optional[np.ndarray] = None
     tags: list[str] = field(default_factory=list)
+    # Episodic context — required for kind=EPISODE, ignored otherwise.
+    # See EpisodeContext for the field set; None is the default for
+    # non-episodic facts to keep JSON dumps tight.
+    episode_context: Optional[EpisodeContext] = None
 
     def size_hint(self) -> int:
         """Approximate token count. Uses len//4 heuristic — not precise, just monotonic."""
@@ -300,6 +347,8 @@ class Fact:
         }
         if self.embedding is not None:
             data["embedding"] = self.embedding.tolist()
+        if self.episode_context is not None:
+            data["episode_context"] = self.episode_context.to_dict()
         return data
 
     @classmethod
@@ -324,6 +373,7 @@ class Fact:
             metadata=FactMetadata.from_dict(data.get("metadata", {})),
             embedding=embedding,
             tags=data.get("tags", []),
+            episode_context=EpisodeContext.from_dict(data.get("episode_context")),
         )
 
 
