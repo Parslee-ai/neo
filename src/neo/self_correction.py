@@ -337,8 +337,12 @@ Return ONLY executable Python code, no explanations.{memory_context}{prevention_
                     problem['question_content'],
                     algorithm_design,
                     adapter,
+                    # Task #7 will thread language through this loop;
+                    # until then the wider self_correction path is
+                    # still Python-only, so be explicit about it.
+                    language="python",
                     memory_context=f"\n\nPREVIOUS FAILURE:\n{autopsy.root_cause}\nCorrect approach: {autopsy.correct_approach}",
-                    prevention_warnings=prevention_warnings
+                    prevention_warnings=prevention_warnings,
                 )
             else:
                 # Subsequent failures: Use diagnosis-based correction

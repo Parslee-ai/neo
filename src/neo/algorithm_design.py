@@ -195,17 +195,69 @@ def _parse_design(response: str) -> AlgorithmDesign:
     )
 
 
+# Human-readable language names used in the prompt body. Falls back to
+# the raw `language` string for anything unmapped.
+_PROMPT_LANGUAGE_NAMES = {
+    "python": "Python",
+    "javascript": "JavaScript",
+    "typescript": "TypeScript",
+    "tsx": "TypeScript (TSX)",
+    "java": "Java",
+    "csharp": "C#",
+    "c_sharp": "C#",
+    "go": "Go",
+    "rust": "Rust",
+    "c": "C",
+    "cpp": "C++",
+    "ruby": "Ruby",
+    "php": "PHP",
+    "swift": "Swift",
+    "kotlin": "Kotlin",
+}
+
+# Fence tags we'll accept as a "leading language label" when falling
+# back to bare-fence extraction. Tight set on purpose: an LM line like
+# `pass`, `done`, `null`, or a single identifier should NOT be
+# mistaken for a tag and stripped.
+_KNOWN_FENCE_TAGS = frozenset({
+    "python", "py",
+    "javascript", "js", "jsx",
+    "typescript", "ts", "tsx",
+    "java",
+    "csharp", "cs", "c_sharp", "c#",
+    "go", "golang",
+    "rust", "rs",
+    "c", "cpp", "c++", "cc",
+    "ruby", "rb",
+    "php",
+    "swift",
+    "kotlin", "kt",
+    "sh", "bash", "zsh",
+    "html", "css", "json", "yaml", "yml", "toml", "xml",
+    "sql",
+})
+
+
 def generate_code_from_design(
     problem_description: str,
     design: AlgorithmDesign,
     adapter,
+    *,
+    language: str,
     memory_context: str = "",
-    prevention_warnings: str = ""
+    prevention_warnings: str = "",
 ) -> str:
     """
     Generate code based on algorithm design.
     Uses design to guide implementation and avoid common pitfalls.
+
+    `language` is required (keyword-only) — a Python default would
+    silently mislabel prompts when callers don't actually know the
+    language. Pass `"python"` explicitly to preserve historical
+    behavior; pass `"javascript"`, `"go"`, etc. for other targets.
     """
+    lang_key = language.lower()
+    display_name = _PROMPT_LANGUAGE_NAMES.get(lang_key, language)
 
     # Build guidance from design
     design_guidance = f"""
@@ -224,15 +276,15 @@ Data structures: {', '.join(design.data_structures[:3])}
 Expected complexity: {design.complexity}
 """
 
-    code_prompt = f"""Implement the following algorithm design in Python:
+    code_prompt = f"""Implement the following algorithm design in {display_name}:
 
 PROBLEM:
 {problem_description[:500]}
 
 {design_guidance}
 
-Generate Python code that reads from stdin and prints to stdout.
-Return ONLY executable Python code, no explanations.
+Generate {display_name} code that reads from stdin and prints to stdout.
+Return ONLY executable {display_name} code, no explanations.
 Follow the algorithm design EXACTLY, paying special attention to:
 - Boundary conditions (off-by-one errors)
 - Loop invariants
@@ -244,10 +296,27 @@ Follow the algorithm design EXACTLY, paying special attention to:
         max_tokens=2000
     )
 
-    # Extract code
-    if "```python" in code:
-        code = code.split("```python")[1].split("```")[0].strip()
-    elif "```" in code:
-        code = code.split("```")[1].split("```")[0].strip()
+    return _extract_code_block(code, lang_key)
 
-    return code
+
+def _extract_code_block(response: str, language: str) -> str:
+    """Pull a fenced code block out of an LM response.
+
+    Tries the language-specific fence first (anchored with a newline
+    so ```pythonic doesn't match ```python). Falls back to a bare
+    ``` and strips a leading line only if it matches a known fence
+    tag — `pass`, `null`, `done`, single identifiers, etc. are not
+    stripped. Returns the raw response when no fences are present.
+    """
+    tagged = f"```{language}\n"
+    if tagged in response:
+        return response.split(tagged, 1)[1].split("```", 1)[0].strip()
+    if "```" in response:
+        body = response.split("```", 1)[1].split("```", 1)[0]
+        first_newline = body.find("\n")
+        if first_newline != -1:
+            head = body[:first_newline].strip().lower()
+            if head in _KNOWN_FENCE_TAGS:
+                body = body[first_newline + 1:]
+        return body.strip()
+    return response.strip()
