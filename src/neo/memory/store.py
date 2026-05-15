@@ -1638,18 +1638,60 @@ class FactStore:
                 if len(cluster) < 3:
                     continue
 
+                # NREM Hebbian strengthening (paper 2604.20943 §3, the
+                # consolidation phase): facts that survived clustering
+                # co-occurred — their mutual reinforcement is the cluster
+                # itself. Bump each member's confidence by η · |cluster|
+                # before synthesis runs, so the synthesized fact
+                # inherits a strengthened lineage.
+                self._hebbian_strengthen(cluster)
+
                 new_fact = self._synthesize_cluster(cluster, group_key)
                 if new_fact:
                     self._facts.append(new_fact)
                     synthesized_count += 1
 
         if synthesized_count:
+            # Global downscale (paper 2604.20943 §3, α = 0.8 → too
+            # aggressive at our scale; we use a gentler 0.97 multiplier
+            # so an unused fact loses ~3% per consolidation cycle).
+            # Keeps confidence values from drifting upward forever as
+            # the Hebbian step accumulates.
+            self._global_confidence_downscale(alpha=0.97)
             self.save()
             logger.info(f"Synthesized {synthesized_count} fact(s) from REVIEW clusters")
 
         # Save total count as watermark (valid + invalidated)
         self._save_synthesis_watermark(all_review_count)
         return synthesized_count
+
+    @staticmethod
+    def _hebbian_strengthen(cluster: list[Fact], *, eta: float = 0.02) -> None:
+        """Bump each cluster member's confidence by η · cluster_size.
+
+        Bounded by the [0, 1] interval. Small η keeps individual
+        strengthens from dominating success_bonus.
+        """
+        boost = min(0.1, eta * len(cluster))
+        for fact in cluster:
+            fact.metadata.confidence = min(1.0, fact.metadata.confidence + boost)
+
+    def _global_confidence_downscale(self, *, alpha: float) -> None:
+        """Multiply all non-curated, valid facts' confidence by alpha.
+
+        Curated/CONSTRAINT/ARCHITECTURE/DECISION facts skip the decay
+        (mirrors the rank_score curated-bypass policy). Floor at 0.05 so
+        nothing collapses to zero — a long-dormant fact stays visible.
+        """
+        from neo.memory.models import _decays  # local: cycle
+
+        for fact in self._facts:
+            if not fact.is_valid:
+                continue
+            if not _decays(fact):
+                continue
+            new_conf = max(0.05, fact.metadata.confidence * alpha)
+            fact.metadata.confidence = new_conf
 
     @staticmethod
     def _synthesis_group_key(fact: Fact) -> str:
