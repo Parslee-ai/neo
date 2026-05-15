@@ -10,15 +10,33 @@ Scope:
 - Python-specific stubs: `pass`-only / `...`-only / NotImplementedError
 - Python bare `except:` (catches everything, including KeyboardInterrupt)
 - Python swallowed errors: `except ...:` whose body is exactly pass / ...
+- Empty `catch` blocks in JS/TS/TSX/Java/C#/C++ (via tree-sitter)
 - Hardcoded credentials matching well-known prefixes (OpenAI, AWS, GitHub)
+
+Languages without try/catch (Go, Rust, C) are intentionally skipped here —
+their error-suppression idioms (`if err != nil {}`, `let _ = ...`) are
+shaped differently and would need their own detectors.
 """
 
 import ast
+import logging
 import re
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union
 
 from neo.models import ContextFile
+
+# Share the tree-sitter availability flag with the rest of the codebase
+# (see neo/index/language_parser.py) so we have one place that decides
+# "do we have tree-sitter?" — two flags drift over time.
+from neo.index.language_parser import TREE_SITTER_AVAILABLE as _TS_AVAILABLE
+
+if _TS_AVAILABLE:
+    from tree_sitter_languages import get_parser as _ts_get_parser
+else:
+    _ts_get_parser = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +47,7 @@ from neo.models import ContextFile
 class CodeSmell:
     file_path: str
     line: int
-    kind: str       # "todo" | "stub" | "bare_except" | "swallowed_except" | "secret"
+    kind: str       # "todo" | "stub" | "bare_except" | "swallowed_except" | "swallowed_catch" | "secret"
     severity: str   # "info" | "warn" | "high"
     message: str
     snippet: str    # offending line, truncated for prompt safety
@@ -84,6 +102,10 @@ def _scan_one(path: str, content: str) -> list[CodeSmell]:
 
     if path.endswith(".py"):
         findings.extend(_scan_python(path, content))
+    elif _TS_AVAILABLE:
+        lang = _ts_language_for(path)
+        if lang is not None:
+            findings.extend(_scan_tree_sitter(path, content, lang))
 
     return findings
 
@@ -167,6 +189,125 @@ def _scan_python(path: str, content: str) -> list[CodeSmell]:
                 ))
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Tree-sitter detectors (non-Python languages with try/catch semantics)
+# ---------------------------------------------------------------------------
+
+# Extension -> tree-sitter language name. Only languages with structured
+# try/catch are included. Go, Rust, and C use different error idioms and
+# would need their own detectors.
+_TS_LANGUAGE_MAP = {
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".java": "java",
+    ".cs": "c_sharp",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+}
+
+# Node types used as the body of a `catch_clause` across the supported
+# grammars. JS/TS use `statement_block`, Java/C# use `block`, C++ uses
+# `compound_statement`.
+_CATCH_BODY_TYPES = frozenset({"block", "statement_block", "compound_statement"})
+
+# Comment node types we should ignore when deciding if a body is empty.
+# Different grammars name these differently.
+_COMMENT_NODE_TYPES = frozenset({"comment", "line_comment", "block_comment"})
+
+
+def _ts_language_for(path: str) -> Optional[str]:
+    """Map a file path to a tree-sitter language name, or None if unsupported."""
+    lower = path.lower()
+    for ext, lang in _TS_LANGUAGE_MAP.items():
+        if lower.endswith(ext):
+            return lang
+    return None
+
+
+def _scan_tree_sitter(path: str, content: str, language: str) -> list[CodeSmell]:
+    """Detect empty `catch` blocks via tree-sitter. Falls through silently
+    on parser errors so a broken file can't take the whole scan down.
+    """
+    try:
+        parser = _ts_get_parser(language)
+        tree = parser.parse(content.encode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("tree-sitter parse failed for %s (%s): %s", path, language, e)
+        return []
+
+    lines = content.splitlines()
+    out: list[CodeSmell] = []
+
+    for node in _walk_ts(tree.root_node):
+        if node.type != "catch_clause":
+            continue
+        # Skip catches inside ERROR/MISSING subtrees — partially-typed
+        # code in a live editor (e.g. `try { } catch (e` mid-keystroke)
+        # produces a `catch_clause` whose body we can't trust.
+        if node.has_error:
+            continue
+        body = _find_catch_body(node)
+        if body is None or not _ts_body_is_empty(body):
+            continue
+        line_no = node.start_point[0] + 1
+        out.append(CodeSmell(
+            file_path=path,
+            line=line_no,
+            kind="swallowed_catch",
+            severity="warn",
+            message="empty catch block — exception silently dropped",
+            snippet=_truncate(_line_at(lines, line_no)),
+        ))
+
+    return out
+
+
+def _walk_ts(node) -> Iterable:
+    """Pre-order tree-sitter node walk. Generator to keep memory bounded."""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        # Reverse so we visit children in document order.
+        stack.extend(reversed(current.children))
+
+
+def _find_catch_body(catch_node) -> Optional[object]:
+    """Return the block-like child of a catch_clause that holds the body.
+
+    Verified against tree-sitter grammars for: javascript, typescript,
+    tsx, java, c_sharp, cpp. In all six, earlier named children are
+    parameters / type filters (Java `catch_formal_parameter`, C#
+    `catch_declaration` / `catch_filter_clause`, JS/TS exception
+    identifier, C++ `parameter_declaration`), and the body is the
+    last block-typed named child. JS optional-catch-binding
+    (`catch {}`, ES2019) has only the body — also handled.
+    """
+    for child in reversed(catch_node.named_children):
+        if child.type in _CATCH_BODY_TYPES:
+            return child
+    return None
+
+
+def _ts_body_is_empty(body_node) -> bool:
+    """True if a catch body contains no real statements (only comments
+    or whitespace). Matches the spirit of `_body_is_silent` for Python:
+    we flag bodies that affirmatively choose to do nothing.
+    """
+    for child in body_node.named_children:
+        if child.type in _COMMENT_NODE_TYPES:
+            continue
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

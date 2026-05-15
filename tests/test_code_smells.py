@@ -1,7 +1,15 @@
 """Tests for neo.code_smells — high-precision anti-pattern detectors."""
 
+import pytest
+
 from neo.code_smells import CodeSmell, format_for_prompt, scan_files
 from neo.models import ContextFile
+
+try:
+    import tree_sitter_languages  # noqa: F401
+    _TREE_SITTER_AVAILABLE = True
+except ImportError:
+    _TREE_SITTER_AVAILABLE = False
 
 
 def _file(path: str, content: str) -> ContextFile:
@@ -139,6 +147,120 @@ class TestExceptDetection:
         kinds = {s.kind for s in scan_files([_file("a.py", src)])}
         assert "swallowed_except" not in kinds
         assert "bare_except" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# Empty catch blocks (JS/TS/Java/C#/C++) — tree-sitter backed
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not _TREE_SITTER_AVAILABLE,
+    reason="tree-sitter-languages not installed (requires Python 3.8-3.12)",
+)
+class TestSwallowedCatchDetection:
+    def test_javascript_empty_catch(self):
+        src = "try { doThing(); } catch (e) {}\n"
+        kinds = {s.kind for s in scan_files([_file("a.js", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_typescript_empty_catch(self):
+        src = "try { doThing(); } catch (e: unknown) {}\n"
+        kinds = {s.kind for s in scan_files([_file("a.ts", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_tsx_empty_catch(self):
+        src = "function f() { try { x(); } catch (e) {} }\n"
+        kinds = {s.kind for s in scan_files([_file("a.tsx", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_java_empty_catch(self):
+        src = (
+            "class A {\n"
+            "  void m() {\n"
+            "    try { risky(); } catch (Exception e) {}\n"
+            "  }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("A.java", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_csharp_empty_catch(self):
+        src = (
+            "class A {\n"
+            "  void M() {\n"
+            "    try { Risky(); } catch (Exception e) {}\n"
+            "  }\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("A.cs", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_cpp_empty_catch(self):
+        src = (
+            "void m() {\n"
+            "  try { risky(); } catch (const std::exception& e) {}\n"
+            "}\n"
+        )
+        kinds = {s.kind for s in scan_files([_file("a.cpp", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_comment_only_body_flagged(self):
+        # Body has only a comment — structurally equivalent to an empty
+        # body. The developer affirmatively chose to do nothing.
+        src = "try { x(); } catch (e) { /* ignore */ }\n"
+        kinds = {s.kind for s in scan_files([_file("a.js", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_non_empty_body_not_flagged(self):
+        src = "try { x(); } catch (e) { console.error(e); }\n"
+        kinds = {s.kind for s in scan_files([_file("a.js", src)])}
+        assert "swallowed_catch" not in kinds
+
+    def test_rethrow_not_flagged(self):
+        src = "try { x(); } catch (e) { throw e; }\n"
+        kinds = {s.kind for s in scan_files([_file("a.js", src)])}
+        assert "swallowed_catch" not in kinds
+
+    def test_line_number_points_to_catch(self):
+        src = "function f() {\n  try {\n    x();\n  } catch (e) {}\n}\n"
+        smells = [s for s in scan_files([_file("a.js", src)]) if s.kind == "swallowed_catch"]
+        assert smells
+        assert smells[0].line == 4
+
+    def test_parse_error_does_not_crash(self):
+        # Severely malformed source — scanner must not raise.
+        src = "function f( { try { x() catch \n"
+        # Should produce zero smells (or just markers) rather than crash.
+        result = scan_files([_file("a.js", src)])
+        assert isinstance(result, list)
+
+    def test_parse_error_does_not_emit_false_positive(self):
+        # Mid-keystroke source: a half-typed catch is structurally a
+        # `catch_clause` to tree-sitter (with an ERROR descendant), but
+        # we can't trust its body — skip rather than fire.
+        src = "try { x(); } catch (e\n"
+        kinds = {s.kind for s in scan_files([_file("a.js", src)])}
+        assert "swallowed_catch" not in kinds
+
+    def test_optional_catch_binding(self):
+        # ES2019: `catch` without a parameter. Body is still the only
+        # named child; must still flag when empty.
+        src = "try { x(); } catch {}\n"
+        kinds = {s.kind for s in scan_files([_file("a.js", src)])}
+        assert "swallowed_catch" in kinds
+
+    def test_nested_catch_only_outer_fires(self):
+        # Inner catch has real handling; outer is empty. Only outer
+        # should fire.
+        src = (
+            "try {\n"
+            "  try { x(); } catch (inner) { console.error(inner); }\n"
+            "} catch (outer) {}\n"
+        )
+        catches = [s for s in scan_files([_file("a.js", src)]) if s.kind == "swallowed_catch"]
+        assert len(catches) == 1
+        # The outer catch is on line 3 of this snippet.
+        assert catches[0].line == 3
 
 
 # ---------------------------------------------------------------------------
