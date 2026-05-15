@@ -1391,13 +1391,19 @@ class FactStore:
     def synthesize_reviews(self) -> int:
         """Distill clusters of REVIEW facts into higher-level PATTERN/FAILURE facts.
 
-        Triggers every 10 new REVIEW facts after 20+ valid exist. Groups by tag,
-        clusters by cosine similarity, and synthesizes clusters of 3+ into a
-        single fact that supersedes the source facts.
+        Triple-trigger from SCM (paper 2604.20943 §3.6): consolidation fires
+        when ANY of the following holds:
 
-        The watermark tracks total REVIEW facts ever seen (valid + invalidated)
-        to avoid the count-drift bug where synthesis invalidates facts and
-        the watermark comparison breaks.
+          1. count-delta  ≥ 10  — the legacy gate (preserved for back-compat)
+          2. elapsed time ≥ 1h since last consolidation
+          3. entropy(value-score over REVIEW facts) > 0.9  — high-uncertainty
+             corpus state where consolidation usually pays off most
+
+        Groups by tag, clusters by cosine similarity, synthesizes clusters of
+        3+ into a single fact that supersedes the sources. The watermark
+        tracks total REVIEW facts ever seen (valid + invalidated) to avoid
+        the count-drift bug where synthesis invalidates facts and the
+        watermark comparison breaks.
 
         Returns:
             Number of synthesized facts created.
@@ -1414,10 +1420,27 @@ class FactStore:
         if len(valid_review_facts) < 20:
             return 0
 
-        # Check watermark against total count (not just valid)
+        # Triple-trigger gate. Any single condition is enough.
         watermark = self._load_synthesis_watermark()
-        if all_review_count - watermark < 10:
+        count_delta = all_review_count - watermark
+        elapsed_seconds = time.time() - self._load_synthesis_timestamp()
+        entropy_score = self._review_entropy(valid_review_facts)
+
+        # Logs are deliberately one-line so it's easy to grep which trigger
+        # fired in production: most consolidations should be count-driven,
+        # but a corpus that goes high-entropy without writes (e.g. lots of
+        # outcome-driven confidence shifts) should still consolidate.
+        if (
+            count_delta < 10
+            and elapsed_seconds < 3600.0
+            and entropy_score <= 0.9
+        ):
             return 0
+
+        logger.info(
+            "synthesis-trigger: count_delta=%d elapsed=%.1fs entropy=%.3f",
+            count_delta, elapsed_seconds, entropy_score,
+        )
 
         synthesized_count = 0
 
@@ -1678,6 +1701,45 @@ class FactStore:
             return data.get("review_count", 0)
         except (json.JSONDecodeError, OSError):
             return 0
+
+    def _load_synthesis_timestamp(self) -> float:
+        """Wall-clock time of the last completed consolidation, or 0 if none."""
+        if not self._project_path:
+            return 0.0
+        watermark_path = self._project_path.parent / f"synthesis_watermark_{self.project_id}.json"
+        if not watermark_path.exists():
+            return 0.0
+        try:
+            data = json.loads(watermark_path.read_text())
+            return float(data.get("updated_at", 0.0))
+        except (json.JSONDecodeError, OSError):
+            return 0.0
+
+    @staticmethod
+    def _review_entropy(facts: list[Fact]) -> float:
+        """Shannon entropy of REVIEW facts' confidence distribution.
+
+        Buckets confidence into deciles [0.0..1.0] and computes
+        H = −Σ p_i log2 p_i, normalized by log2(num_nonzero_bins) so the
+        result is in [0, 1]. High entropy ≈ uniform → consolidation gets a
+        lot of leverage. Low entropy ≈ already-clustered → not much to gain.
+        """
+        if not facts:
+            return 0.0
+        import math as _math
+
+        buckets = [0] * 10
+        for fact in facts:
+            c = max(0.0, min(0.999, fact.metadata.confidence))
+            buckets[int(c * 10)] += 1
+        total = sum(buckets)
+        if total <= 0:
+            return 0.0
+        probs = [b / total for b in buckets if b > 0]
+        if len(probs) <= 1:
+            return 0.0
+        h = -sum(p * _math.log2(p) for p in probs)
+        return h / _math.log2(len(probs))
 
     def _save_synthesis_watermark(self, count: int) -> None:
         """Save the current REVIEW fact count as synthesis watermark."""
