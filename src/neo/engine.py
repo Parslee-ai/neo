@@ -352,7 +352,9 @@ class NeoEngine:
         if self.fact_store is not None:
             ids = self._build_suggestion_fact_ids(fact, code_suggestions)
             self.fact_store.save_session(code_suggestions, neo_input.prompt, ids)
-            self._persist_simulation_episodes(simulation_traces, plan, neo_input.prompt)
+            self._persist_simulation_episodes(
+                simulation_traces, plan, neo_input.prompt, code_suggestions=code_suggestions
+            )
 
         elapsed = time.time() - start_time
         self._log_metrics(difficulty, time_budget, elapsed, early_exit=early_exit)
@@ -379,12 +381,17 @@ class NeoEngine:
         traces: list[SimulationTrace],
         plan: list[PlanStep],
         prompt: str,
+        code_suggestions: Optional[list[CodeSuggestion]] = None,
     ) -> None:
         """Write each simulation trace as an EPISODE fact for future retrieval.
 
         Only persists when we have a fact_store. Failure to write a single
         trace doesn't stop the others — and never propagates: simulation
         episodes are nice-to-have, not load-bearing.
+
+        ``code_suggestions``'s file_paths are stashed as ``file:<path>``
+        tags on each episode so future runs can ask "which files did past
+        prompts like this one touch?" — closing the learning loop.
         """
         if not traces:
             return
@@ -395,6 +402,7 @@ class NeoEngine:
             (step.description or (step.actions[0] if step.actions else ""))[:80]
             for step in plan
         )[:300]
+        file_paths = list({s.file_path for s in (code_suggestions or []) if s.file_path})
         for trace in traces:
             try:
                 self.fact_store.persist_simulation_episode(
@@ -404,6 +412,7 @@ class NeoEngine:
                     reasoning_steps=list(trace.reasoning_steps or []),
                     issues_found=list(trace.issues_found or []),
                     plan_summary=plan_summary,
+                    file_paths=file_paths,
                     codebase_ref=self.fact_store.codebase_root or "",
                 )
             except Exception as e:  # never block on episode-write failure

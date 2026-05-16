@@ -600,6 +600,7 @@ class FactStore:
         issues_found: list[str],
         plan_summary: str = "",
         codebase_ref: str = "",
+        file_paths: Optional[list[str]] = None,
     ) -> Fact:
         """Persist a SimulationTrace as an EPISODE fact.
 
@@ -612,6 +613,7 @@ class FactStore:
         EpisodeContext records when/where/why/with_whom so the EPISODE
         passes the 5-property test (paper 2502.06975).
         """
+        import os  # local: top-level was dropped with the legacy flag
         from neo.memory.models import EpisodeContext  # local: keep import light
 
         clean = not issues_found
@@ -646,6 +648,23 @@ class FactStore:
         tags = ["simulation", "episode"]
         if clean:
             tags.append("simulation:clean")
+
+        # Stash file paths that this simulation's code suggestions touched,
+        # one per tag, normalized to relative paths against codebase_ref so
+        # downstream consumers (gather_context history-boost) can compare
+        # apples-to-apples with their own rel_path conventions. The "file:"
+        # prefix gives a stable namespace future tag-based queries can grep.
+        ref = codebase_ref or self.codebase_root or ""
+        for fp in file_paths or []:
+            if not fp:
+                continue
+            try:
+                rel = os.path.relpath(fp, ref) if ref else fp
+            except ValueError:  # absolute path on a different drive (Windows)
+                rel = fp
+            tag = f"file:{rel}"
+            if tag not in tags:
+                tags.append(tag)
 
         fact = self.add_fact(
             subject=subject,

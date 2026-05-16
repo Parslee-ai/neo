@@ -427,6 +427,49 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
         return {}
 
 
+def _history_boost(root: str, prompt: str, k: int = 10) -> dict[str, float]:
+    """If a FactStore exists for the user, boost files that past similar
+    Neo runs touched.
+
+    The feedback loop B3 set up: every Neo run persists each simulation
+    as an EPISODE fact tagged ``file:<rel_path>`` for each file the run's
+    code_suggestions touched. Here we query the store for facts similar
+    to the current prompt, scrape ``file:*`` tags off the EPISODE hits,
+    and produce a per-file boost weighted by:
+
+      boost = min(0.5, hits_count * 0.15)
+
+    Capped at +0.5 so a hot-history file can't drown out fresh semantic
+    signals — past behavior is signal, not destiny. Returns {} when no
+    fact store exists or no episodes match. The actual past behavior is
+    "the user re-ran a similar prompt before" → it's worth telling the
+    gatherer "these files were probably relevant last time."
+    """
+    try:
+        from neo.memory.store import FactStore  # heavy import — defer
+        store = FactStore(codebase_root=root, eager_init=False)
+        if not store._facts:
+            return {}
+        hits = store.retrieve_relevant(prompt, k=k)
+        counts: dict[str, int] = {}
+        for fact in hits:
+            for tag in fact.tags or []:
+                if isinstance(tag, str) and tag.startswith("file:"):
+                    path = tag[len("file:"):]
+                    counts[path] = counts.get(path, 0) + 1
+        if not counts:
+            return {}
+        boost = {p: min(0.5, n * 0.15) for p, n in counts.items()}
+        print(
+            f"[Neo] EPISODE-history boost: {len(boost)} files seen in past similar runs",
+            file=sys.stderr,
+        )
+        return boost
+    except Exception:
+        # FactStore missing, fact_store init crashed, etc. — never break gather.
+        return {}
+
+
 def _symbol_score(
     abs_path: str,
     prompt_tokens: set[str],
@@ -496,6 +539,13 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # if present in .neo/). Computed once up front — boosts apply to
     # candidates' final scores below.
     pi_boost = _project_index_boost(root, config.prompt, k=adaptive_limit * 2)
+
+    # EPISODE-history boost from FactStore (the W2.B3 feedback loop):
+    # past Neo runs persist file paths as ``file:*`` tags on EPISODE
+    # facts. Similar past prompts → similar files were touched → boost
+    # those files for the current run.
+    hist_boost = _history_boost(root, config.prompt, k=10)
+
     parser_cache: dict = {}
 
     # Discover candidates
@@ -558,16 +608,18 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # exists, or a tiebreaker when both signals fire.
     scored_by_path = {r: (a, s, sc) for (a, r, s, sc) in scored}
 
-    # Union in any ProjectIndex hits not already in the filename-scored set.
-    # These deserve a chance even when filename matching missed them.
-    for rel_path, sim in pi_boost.items():
-        if rel_path not in scored_by_path:
-            abs_path = os.path.join(root, rel_path)
-            try:
-                size = os.path.getsize(abs_path)
-            except OSError:
-                continue
-            scored_by_path[rel_path] = (abs_path, size, 0.0)
+    # Union in any ProjectIndex or history hits not already in the
+    # filename-scored set. These deserve a chance even when filename
+    # matching missed them.
+    for boost_map in (pi_boost, hist_boost):
+        for rel_path in boost_map:
+            if rel_path not in scored_by_path:
+                abs_path = os.path.join(root, rel_path)
+                try:
+                    size = os.path.getsize(abs_path)
+                except OSError:
+                    continue
+                scored_by_path[rel_path] = (abs_path, size, 0.0)
 
     # Symbol pass: cap at 3x adaptive_limit candidates by current score
     # to keep parse-overhead bounded. Tree-sitter parsing is ~5-20ms per
@@ -575,7 +627,11 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     symbol_pass_limit = max(50, adaptive_limit * 3)
     top_for_symbols = sorted(
         scored_by_path.items(),
-        key=lambda kv: kv[1][2] + pi_boost.get(kv[0], 0.0),
+        key=lambda kv: (
+            kv[1][2]
+            + pi_boost.get(kv[0], 0.0)
+            + hist_boost.get(kv[0], 0.0)
+        ),
         reverse=True,
     )[:symbol_pass_limit]
 
@@ -583,10 +639,11 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     symbol_hit_count = 0
     for rel_path, (abs_path, size, base_score) in top_for_symbols:
         pi = pi_boost.get(rel_path, 0.0)
+        hist = hist_boost.get(rel_path, 0.0)
         sym = _symbol_score(abs_path, prompt_tokens, parser_cache)
         if sym > 0:
             symbol_hit_count += 1
-        final_score = base_score + pi + sym
+        final_score = base_score + pi + hist + sym
         enriched.append((abs_path, rel_path, size, final_score))
     if symbol_hit_count:
         print(
