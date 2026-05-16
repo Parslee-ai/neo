@@ -23,6 +23,7 @@ from typing import Optional
 
 # Constants
 MIN_SCORE_THRESHOLD = 0.2  # Filter files with very low relevance (was 0.3, reduced for broad prompts)
+MAX_CHUNKS_PER_FILE = 2    # Cap chunks per file so one large file doesn't dominate the budget
 
 
 @dataclass
@@ -623,6 +624,12 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
                         large_files_warned.append(rel_path)
 
                 chunks = select_chunks(content, prompt_tokens)
+                # Cap chunks per file. Without this a 90KB engine.py with
+                # 5 keyword windows consumes 5 slots of the adaptive_limit
+                # budget, starving other distinct files. 2 chunks keeps
+                # the highest-relevance windows for a large file without
+                # letting it dominate the prompt context.
+                chunks = chunks[:MAX_CHUNKS_PER_FILE]
                 for chunk_content, start, end in chunks:
                     # Prepend warning for large files
                     if size_kb > 50:
@@ -644,6 +651,10 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
                         score=score
                     ))
                     total_bytes += chunk_bytes
+                    # Recheck the file-cap mid-chunk-loop so a single
+                    # large file can't push selected past adaptive_limit.
+                    if len(selected) >= adaptive_limit:
+                        break
             else:
                 content_bytes = len(content.encode('utf-8'))
                 if total_bytes + content_bytes > config.max_bytes:
