@@ -339,17 +339,28 @@ class OutcomeTracker:
 
         return compare(baseline, current)
 
-    def detect_outcomes(self) -> tuple[list[Outcome], dict[str, str]]:
-        """Detect outcomes by comparing previous suggestions to actual git changes.
+    def collect_outcomes(
+        self, *, clear_processed: bool = True, include_fallback: bool = True
+    ) -> tuple[list[Outcome], dict[str, str]]:
+        """Collect outcomes by comparing previous suggestions to actual git changes.
 
         Checks the session log for ALL unprocessed sessions, not just the most recent.
         This prevents loss of outcome signals when neo is invoked multiple times
         before the user acts on suggestions.
 
+        Args:
+            clear_processed: If True, clear persisted session state after
+                collection. Set False for dry-runs or maintenance commands that
+                need to inspect outcomes before deciding whether to consume them.
+            include_fallback: If True, use the legacy single-session file when
+                the append-only log is absent. Maintenance replay defaults this
+                off because old fallback files may already have been processed
+                by a prior version that only cleared the log.
+
         Returns:
             Tuple of (outcomes list, merged suggestion_fact_ids from all sessions).
         """
-        sessions = self._load_unprocessed_sessions()
+        sessions = self._load_unprocessed_sessions(include_fallback=include_fallback)
         if not sessions:
             logger.debug("No unprocessed sessions found for outcome detection")
             return [], {}
@@ -384,7 +395,7 @@ class OutcomeTracker:
             merged_fact_ids.update(prev.suggestion_fact_ids)
 
         # Clear processed sessions from the log
-        if all_outcomes or sessions:
+        if clear_processed and (all_outcomes or sessions):
             self._clear_session_log()
 
         accepted = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.ACCEPTED)
@@ -395,6 +406,10 @@ class OutcomeTracker:
             f"{independent} independent (from {len(sessions)} session(s))"
         )
         return all_outcomes, merged_fact_ids
+
+    def detect_outcomes(self) -> tuple[list[Outcome], dict[str, str]]:
+        """Detect outcomes and consume processed session state."""
+        return self.collect_outcomes(clear_processed=True, include_fallback=True)
 
     def _load_previous_session(self) -> Optional[SessionRecord]:
         """Load the previous session record from disk."""
@@ -408,7 +423,7 @@ class OutcomeTracker:
             logger.warning(f"Failed to load previous session: {e}")
             return None
 
-    def _load_unprocessed_sessions(self) -> list[SessionRecord]:
+    def _load_unprocessed_sessions(self, *, include_fallback: bool = True) -> list[SessionRecord]:
         """Load all unprocessed sessions from the session log.
 
         Falls back to the single session file if no log exists (backward compat).
@@ -431,8 +446,8 @@ class OutcomeTracker:
             except OSError as e:
                 logger.warning(f"Failed to read session log: {e}")
 
-        # Fallback: use single session file if log is empty/missing
-        if not sessions:
+        # Fallback: use single session file if log is empty/missing.
+        if include_fallback and not sessions:
             prev = self._load_previous_session()
             if prev and prev.timestamp:
                 sessions.append(prev)
@@ -440,11 +455,20 @@ class OutcomeTracker:
         return sessions
 
     def _clear_session_log(self) -> None:
-        """Clear the session log after outcomes have been processed."""
+        """Clear processed session state after outcomes have been processed."""
         log_path = self._session_log_path
         if log_path and log_path.exists():
             try:
                 log_path.unlink()
+            except OSError:
+                pass
+        # The single-session file is a backward-compat fallback when the
+        # append-only log is missing. Remove it too, otherwise the same
+        # processed session can replay on the next invocation.
+        session_path = self._session_path
+        if session_path and session_path.exists():
+            try:
+                session_path.unlink()
             except OSError:
                 pass
 

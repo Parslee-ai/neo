@@ -230,6 +230,29 @@ class TestDetectOutcomesNoChanges:
         assert outcomes == []
         assert fact_ids == {}
 
+    def test_processed_session_not_replayed_from_fallback_file(self, tracker):
+        """Clearing the log also clears the legacy single-session fallback."""
+
+        suggestions = [
+            FakeSuggestion(file_path="src/foo.py", description="Add validation"),
+        ]
+        tracker.save_session(suggestions, "fix bug")
+
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value="+code"):
+            outcomes, _ = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert not tracker._session_log_path.exists()
+        assert not tracker._session_path.exists()
+
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value="+code"):
+            outcomes, fact_ids = tracker.detect_outcomes()
+
+        assert outcomes == []
+        assert fact_ids == {}
+
 
 class TestDetectOutcomesIndependent:
     def test_independent_changes_detected(self, tracker):

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neo-reasoner"
-version = "0.18.0"
+version = "0.18.1"
 description = "A self-improving code reasoning engine with persistent semantic memory"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -83,10 +83,21 @@ Changelog = "https://github.com/Parslee-ai/neo/blob/main/CHANGELOG.md"
 [tool.hatch.build.targets.wheel]
 packages = ["src/neo"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.coverage",
+    "/papers",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = ["--import-mode=importlib", "-v"]
+filterwarnings = [
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
 
 [tool.black]
 line-length = 100

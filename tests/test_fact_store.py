@@ -608,7 +608,36 @@ class TestOutcomeLinkage:
         # +0.2 boost: 0.7 -> 0.9
         assert original.metadata.confidence == pytest.approx(0.9)
         assert original.metadata.success_count == 1
+        assert original.metadata.effectiveness_n == 1
+        assert original.metadata.effectiveness_c == pytest.approx(1.5)
         # No new REVIEW facts should exist
+        review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
+        assert len(review_facts) == 0
+
+    def test_linked_outcome_normalizes_absolute_suggestion_path(self, store):
+        """Absolute saved suggestion paths should match relative outcome paths."""
+
+        original = store.add_fact(
+            subject="bugfix: normalize linkage",
+            body="Suggestion: fix path lookup",
+            kind=FactKind.PATTERN,
+            confidence=0.7,
+        )
+        absolute_path = f"{store.codebase_root}/src/foo.py"
+        outcomes = [Outcome(
+            outcome_type=OutcomeType.ACCEPTED,
+            file_path="src/foo.py",
+            suggestion_description="fix path lookup",
+            suggestion_confidence=0.7,
+        )]
+
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=(outcomes, {absolute_path: original.id})):
+            store.detect_implicit_feedback({"prompt": "test"}, [])
+
+        assert original.metadata.confidence == pytest.approx(0.9)
+        assert original.metadata.success_count == 1
+        assert original.metadata.effectiveness_n == 1
         review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
         assert len(review_facts) == 0
 
@@ -668,6 +697,8 @@ class TestOutcomeLinkage:
                 store.detect_implicit_feedback({"prompt": "test"}, [])
 
         assert original.metadata.success_count == 3
+        assert original.metadata.effectiveness_n == 3
+        assert original.metadata.effectiveness_c == pytest.approx(4.5)
         # 3 x +0.2 = 0.6, starting from 0.5, capped at 1.0
         assert original.metadata.confidence == pytest.approx(1.0)
 
@@ -696,6 +727,8 @@ class TestOutcomeLinkage:
         assert original.metadata.confidence == pytest.approx(0.8)
         # success_count IS incremented for unverified (weak acceptance signal)
         assert original.metadata.success_count == 1
+        assert original.metadata.effectiveness_n == 1
+        assert original.metadata.effectiveness_c == pytest.approx(1.5)
         # No REVIEW facts created
         review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
         assert len(review_facts) == 0
@@ -742,6 +775,75 @@ class TestOutcomeLinkage:
 
         valid_indep = [f for f in store._facts if f.is_valid and "independent" in f.tags]
         assert len(valid_indep) == MAX_INDEPENDENT_FACTS
+
+    def test_replay_linked_feedback_updates_only_linked_facts(self, store):
+        """Maintenance replay updates linked facts without creating REVIEW noise."""
+
+        original = store.add_fact(
+            subject="bugfix: replay linkage",
+            body="Suggestion: add guard",
+            kind=FactKind.PATTERN,
+            confidence=0.6,
+        )
+        outcomes = [
+            Outcome(
+                outcome_type=OutcomeType.ACCEPTED,
+                file_path="src/foo.py",
+                suggestion_description="add guard",
+                suggestion_confidence=0.6,
+            ),
+            Outcome(
+                outcome_type=OutcomeType.INDEPENDENT,
+                file_path="src/bar.py",
+                diff_summary="+noise",
+            ),
+        ]
+
+        with (
+            patch.object(store._outcome_tracker, "collect_outcomes",
+                         return_value=(outcomes, {"src/foo.py": original.id})) as collect,
+            patch.object(store._outcome_tracker, "_clear_session_log") as clear,
+        ):
+            stats = store.replay_linked_feedback()
+
+        collect.assert_called_once_with(clear_processed=False, include_fallback=False)
+        clear.assert_called_once()
+        assert stats["linked_updates"] == 1
+        assert stats["skipped_independent"] == 1
+        assert original.metadata.confidence == pytest.approx(0.8)
+        assert original.metadata.success_count == 1
+        assert original.metadata.effectiveness_n == 1
+        review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
+        assert len(review_facts) == 0
+
+    def test_replay_linked_feedback_dry_run_does_not_mutate_or_clear(self, store):
+        """Dry-run reports linked outcomes without changing memory."""
+
+        original = store.add_fact(
+            subject="bugfix: dry run",
+            body="Suggestion: add guard",
+            kind=FactKind.PATTERN,
+            confidence=0.6,
+        )
+        outcomes = [Outcome(
+            outcome_type=OutcomeType.MODIFIED,
+            file_path="src/foo.py",
+            suggestion_description="add guard",
+            suggestion_confidence=0.6,
+        )]
+
+        with (
+            patch.object(store._outcome_tracker, "collect_outcomes",
+                         return_value=(outcomes, {"src/foo.py": original.id})),
+            patch.object(store._outcome_tracker, "_clear_session_log") as clear,
+        ):
+            stats = store.replay_linked_feedback(dry_run=True)
+
+        clear.assert_not_called()
+        assert stats["linked_updates"] == 1
+        assert stats["modified"] == 1
+        assert original.metadata.confidence == pytest.approx(0.6)
+        assert original.metadata.effectiveness_n == 0
 
 
 class TestArchDeltaModulation:
@@ -827,6 +929,8 @@ class TestArchDeltaModulation:
             store.detect_implicit_feedback({"prompt": "x"}, [])
         # 0.7 + (-0.2 - 0.1) = 0.4 — regression deepens the demotion.
         assert original.metadata.confidence == pytest.approx(0.4)
+        assert original.metadata.effectiveness_n == 1
+        assert original.metadata.effectiveness_c == pytest.approx(-0.5)
 
 
 class TestSynthesizeReviews:

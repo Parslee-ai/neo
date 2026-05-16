@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.18.1] - 2026-05-16
+
+### Fixed
+
+- **Linked memory feedback now actually improves retrieval ranking.** Accepted and unverified linked outcomes update LessonL-style effectiveness as positive feedback; modified linked outcomes update it as negative feedback. Previously facts could gain confidence/success counts without improving the effectiveness signal used by ranking.
+- **Outcome linkage now survives absolute/relative path differences.** Suggestion fact IDs are normalized before matching outcome paths, so saved absolute suggestion paths match relative git outcome paths.
+- **`neo memory replay-feedback` added for safe post-fix reprocessing.** Supports current-project replay, `--all` cross-project replay, `--dry-run`, `--limit`, and opt-in `--include-legacy-fallback`. Replays only linked outcomes and avoids independent-review synthesis/pruning side effects.
+- **Processed session logs no longer replay through legacy fallback files.** Clearing a processed session now removes both `session_log_<project>.jsonl` entries and the legacy `session_<project>.json` fallback, preventing duplicate learning updates.
+- **API keys no longer need to live in plaintext config.** `neo --config set --config-key api_key` securely prompts and stores provider keys in macOS Keychain; `NeoConfig.load()` reads them automatically. `config.json` writes `api_key: null` by default unless `NEO_ALLOW_PLAINTEXT_API_KEY` is explicitly set.
+- **Pytest warning cleanup.** Script-style smoke tests now use normal pytest assertions/skips, and external SWIG deprecation noise is narrowly filtered.
+- **Release artifact size.** Source distributions now exclude checked-in research PDFs and local coverage data, keeping the PyPI sdist small.
+
 ## [0.18.0] - 2026-05-15
 
 This release is the result of a focused synthesis: 17 arxiv papers on multi-agent code generation, semantic memory, outcome detection, and consolidation were read, the deterministic techniques extracted, and the highest-leverage ones implemented end-to-end with neo + Linus agent reviews on the substantive changes. 38 commits, all paths verified against a real OpenAI run.

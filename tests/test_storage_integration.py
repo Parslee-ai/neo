@@ -82,14 +82,12 @@ def test_storage_backend_integration():
 
     try:
         memory.load()
-        print("  ✗ FAILED: load() should have raised exception from backend")
-        return False
+        raise AssertionError("load() should have raised exception from backend")
     except Exception as e:
         if "Backend failed" in str(e):
             print("  ✓ load() propagated backend exception (no fallback)")
         else:
-            print(f"  ✗ FAILED: Wrong exception: {e}")
-            return False
+            raise AssertionError(f"Wrong exception: {e}") from e
 
     # Test 6: Helper methods removed
     print("\n[6] Checking helper methods are removed...")
@@ -114,9 +112,12 @@ def test_storage_backend_integration():
 
     print("\n" + "=" * 50)
     print("ALL TESTS PASSED - Storage integration correct!")
-    return True
 
 
 if __name__ == "__main__":
-    success = test_storage_backend_integration()
-    sys.exit(0 if success else 1)
+    try:
+        test_storage_backend_integration()
+    except Exception as exc:
+        print(f"FAILED: {exc}")
+        sys.exit(1)
+    sys.exit(0)

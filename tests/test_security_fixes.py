@@ -47,7 +47,6 @@ def test_fix2_deepcopy_prevents_mutation():
     assert original_entry["pitfalls"][0]["description"] == "pitfall1", "Pitfalls should be unchanged"
 
     print("✅ PASS: deepcopy prevents mutation of nested dicts")
-    return True
 
 
 def test_fix3_symlink_rejection():
@@ -94,7 +93,6 @@ def test_fix3_symlink_rejection():
         assert accepted[0] == real_file, "Only real file should be accepted"
 
         print("✅ PASS: Symlinks rejected before resolve()")
-        return True
 
 
 def test_fix4_path_containment():
@@ -144,7 +142,6 @@ def test_fix4_path_containment():
         assert accepted[0] == inside_file, "Only inside file should be accepted"
 
         print("✅ PASS: Path containment prevents /project vs /project_evil attack")
-        return True
 
 
 def test_existence_check():
@@ -167,7 +164,6 @@ def test_existence_check():
         assert result == "skipped", "Non-existent files should be skipped"
 
         print("✅ PASS: Existence check handles missing files gracefully")
-        return True
 
 
 def main():
@@ -186,8 +182,8 @@ def main():
     results = []
     for test in tests:
         try:
-            passed = test()
-            results.append((test.__name__, "PASS" if passed else "FAIL"))
+            test()
+            results.append((test.__name__, "PASS"))
         except Exception as e:
             print(f"❌ FAIL: {test.__name__}: {e}")
             results.append((test.__name__, "FAIL"))

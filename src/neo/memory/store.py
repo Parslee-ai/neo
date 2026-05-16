@@ -34,6 +34,7 @@ from neo.memory.models import (
     FactScope,
     Provenance,
     rank_score,
+    update_effectiveness,
     update_recall,
 )
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
@@ -780,16 +781,26 @@ class FactStore:
         facts_by_id = {f.id: f for f in self._facts}
         linked_count = 0
 
+        normalized_fact_ids: dict[str, str] = {}
+        for path, fid in suggestion_fact_ids.items():
+            normalized_fact_ids[path] = fid
+            normalized = self._outcome_tracker._normalize_path(path)
+            normalized_fact_ids[normalized] = fid
+
         def _lookup_fact_id(file_path: str) -> Optional[str]:
             """Look up fact_id with fallback for path normalization mismatches."""
-            fid = suggestion_fact_ids.get(file_path)
+            fid = normalized_fact_ids.get(file_path)
+            if fid:
+                return fid
+            normalized = self._outcome_tracker._normalize_path(file_path)
+            fid = normalized_fact_ids.get(normalized)
             if fid:
                 return fid
             # Try with/without leading slash
             if file_path.startswith("/"):
-                fid = suggestion_fact_ids.get(file_path.lstrip("/"))
+                fid = normalized_fact_ids.get(file_path.lstrip("/"))
             else:
-                fid = suggestion_fact_ids.get("/" + file_path)
+                fid = normalized_fact_ids.get("/" + file_path)
             return fid
 
         for outcome in outcomes:
@@ -807,6 +818,7 @@ class FactStore:
                         1.0, max(0.0, original_fact.metadata.confidence + boost)
                     )
                     original_fact.metadata.success_count += 1
+                    update_effectiveness(original_fact, outcome="better")
                     original_fact.metadata.last_accessed = time.time()
                     linked_count += 1
                     continue
@@ -849,6 +861,7 @@ class FactStore:
                     original_fact.metadata.confidence = max(
                         0.1, original_fact.metadata.confidence + penalty
                     )
+                    update_effectiveness(original_fact, outcome="worse")
                     original_fact.metadata.last_accessed = time.time()
                     linked_count += 1
             elif outcome.outcome_type == OutcomeType.UNVERIFIED:
@@ -862,6 +875,7 @@ class FactStore:
                         1.0, max(0.0, original_fact.metadata.confidence + boost)
                     )
                     original_fact.metadata.success_count += 1
+                    update_effectiveness(original_fact, outcome="better")
                     original_fact.metadata.last_accessed = time.time()
                     linked_count += 1
                 continue  # Never create a REVIEW fact for unverified outcomes
@@ -923,6 +937,103 @@ class FactStore:
                     logger.info(f"Learned prevention pattern from correction on {outcome.file_path}")
                 except Exception as e:
                     logger.warning(f"Pattern extraction from correction failed: {e}")
+
+    def replay_linked_feedback(
+        self, *, dry_run: bool = False, include_fallback: bool = False
+    ) -> dict[str, Any]:
+        """Replay persisted linked feedback without broad maintenance side effects.
+
+        This is the update/migration path for repairing memory after feedback
+        loop bugs. It only updates facts explicitly linked by
+        ``suggestion_fact_ids`` and deliberately skips architecture deltas,
+        independent-change review creation, synthesis, and pruning. That keeps
+        replay fast and safe enough for a user-facing maintenance command.
+        """
+        try:
+            outcomes, suggestion_fact_ids = self._outcome_tracker.collect_outcomes(
+                clear_processed=False,
+                include_fallback=include_fallback,
+            )
+        except Exception as e:
+            logger.warning(f"Feedback replay outcome collection failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+        facts_by_id = {f.id: f for f in self._facts}
+        normalized_fact_ids: dict[str, str] = {}
+        for path, fid in suggestion_fact_ids.items():
+            normalized_fact_ids[path] = fid
+            normalized_fact_ids[self._outcome_tracker._normalize_path(path)] = fid
+
+        def _lookup_fact(file_path: str) -> Optional[Fact]:
+            candidates = [
+                file_path,
+                self._outcome_tracker._normalize_path(file_path),
+                file_path.lstrip("/") if file_path.startswith("/") else "/" + file_path,
+            ]
+            for candidate in candidates:
+                fid = normalized_fact_ids.get(candidate)
+                fact = facts_by_id.get(fid) if fid else None
+                if fact and fact.is_valid:
+                    return fact
+            return None
+
+        stats: dict[str, Any] = {
+            "status": "ok",
+            "outcomes_seen": len(outcomes),
+            "linked_updates": 0,
+            "accepted": 0,
+            "modified": 0,
+            "unverified": 0,
+            "skipped_unlinked": 0,
+            "skipped_independent": 0,
+            "dry_run": dry_run,
+        }
+
+        for outcome in outcomes:
+            if outcome.outcome_type == OutcomeType.INDEPENDENT:
+                stats["skipped_independent"] += 1
+                continue
+
+            original_fact = _lookup_fact(outcome.file_path)
+            if original_fact is None:
+                stats["skipped_unlinked"] += 1
+                continue
+
+            if outcome.outcome_type == OutcomeType.ACCEPTED:
+                stats["accepted"] += 1
+                stats["linked_updates"] += 1
+                if not dry_run:
+                    original_fact.metadata.confidence = min(
+                        1.0, max(0.0, original_fact.metadata.confidence + 0.2)
+                    )
+                    original_fact.metadata.success_count += 1
+                    update_effectiveness(original_fact, outcome="better")
+                    original_fact.metadata.last_accessed = time.time()
+            elif outcome.outcome_type == OutcomeType.UNVERIFIED:
+                stats["unverified"] += 1
+                stats["linked_updates"] += 1
+                if not dry_run:
+                    original_fact.metadata.confidence = min(
+                        1.0, max(0.0, original_fact.metadata.confidence + 0.1)
+                    )
+                    original_fact.metadata.success_count += 1
+                    update_effectiveness(original_fact, outcome="better")
+                    original_fact.metadata.last_accessed = time.time()
+            elif outcome.outcome_type == OutcomeType.MODIFIED:
+                stats["modified"] += 1
+                stats["linked_updates"] += 1
+                if not dry_run:
+                    original_fact.metadata.confidence = max(
+                        0.1, original_fact.metadata.confidence - 0.2
+                    )
+                    update_effectiveness(original_fact, outcome="worse")
+                    original_fact.metadata.last_accessed = time.time()
+
+        if not dry_run and stats["linked_updates"]:
+            self.save()
+            self._outcome_tracker._clear_session_log()
+
+        return stats
 
     @property
     def entries(self) -> list[Fact]:

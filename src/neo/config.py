@@ -4,9 +4,82 @@ Configuration management for Neo.
 
 import json
 import os
+import platform
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+KEYCHAIN_SERVICE_PREFIX = "neo-reasoner"
+
+
+def _keychain_service(provider: str) -> str:
+    return f"{KEYCHAIN_SERVICE_PREFIX}:{provider}:api_key"
+
+
+def keychain_available() -> bool:
+    """Return True when the platform has the macOS security CLI."""
+    return platform.system() == "Darwin"
+
+
+def load_api_key_from_keychain(provider: str) -> Optional[str]:
+    """Load a provider API key from macOS Keychain, if available."""
+    if not provider or not keychain_available():
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                _keychain_service(provider),
+                "-a",
+                provider,
+                "-w",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+    key = result.stdout.strip()
+    return key or None
+
+
+def store_api_key_in_keychain(provider: str, api_key: str) -> None:
+    """Persist a provider API key in macOS Keychain."""
+    if not provider:
+        raise ValueError("Provider is required to store an API key")
+    if not api_key:
+        raise ValueError("API key is required")
+    if not keychain_available():
+        raise RuntimeError("Durable secret storage is only implemented for macOS Keychain")
+
+    result = subprocess.run(
+        [
+            "security",
+            "add-generic-password",
+            "-U",
+            "-s",
+            _keychain_service(provider),
+            "-a",
+            provider,
+            "-w",
+            api_key,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(f"Failed to store API key in Keychain: {detail}")
 
 
 @dataclass
@@ -160,6 +233,9 @@ class NeoConfig:
             if value is not None and value != getattr(cls(), key):
                 setattr(config, key, value)
 
+        if not config.api_key:
+            config.api_key = load_api_key_from_keychain(config.provider)
+
         return config
 
     def save(self, config_path: Optional[str] = None):
@@ -176,7 +252,7 @@ class NeoConfig:
         exposed_fields = {
             'provider': self.provider,
             'model': self.model,
-            'api_key': self.api_key,
+            'api_key': self.api_key if os.environ.get("NEO_ALLOW_PLAINTEXT_API_KEY") else None,
             'base_url': self.base_url,
             'auto_install_updates': self.auto_install_updates,
             'memory_backend': self.memory_backend,

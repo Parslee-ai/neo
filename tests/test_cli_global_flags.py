@@ -10,6 +10,7 @@ checked after the construct subcommand check, causing AttributeError
 when running commands like `neo --version`.
 """
 
+import os
 import subprocess
 import sys
 import pytest
@@ -130,6 +131,31 @@ class TestCLIGlobalFlags:
             f"Expected version info in output, got: stdout={result.stdout}, stderr={result.stderr}"
 
         # Should not contain error messages
+        assert "attributeerror" not in output_lower, f"Unexpected AttributeError in output: {output}"
+        assert "traceback" not in output_lower, f"Unexpected traceback in output: {output}"
+
+    def test_memory_replay_feedback_dry_run_works(self):
+        """
+        Test that the memory replay maintenance command is wired into the CLI.
+
+        Expected behavior:
+        - Command exits with code 0
+        - Prints a replay summary
+        - No traceback occurs
+        """
+        result = subprocess.run(
+            [sys.executable, "-m", "neo", "memory", "replay-feedback", "--dry-run"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
+            timeout=30
+        )
+
+        assert result.returncode == 0, f"Expected exit code 0, got {result.returncode}. stderr: {result.stderr}"
+        output = result.stdout + result.stderr
+        output_lower = output.lower()
+        assert "feedback dry run" in output_lower, \
+            f"Expected replay summary in output, got: stdout={result.stdout}, stderr={result.stderr}"
         assert "attributeerror" not in output_lower, f"Unexpected AttributeError in output: {output}"
         assert "traceback" not in output_lower, f"Unexpected traceback in output: {output}"
 

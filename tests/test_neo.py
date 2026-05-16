@@ -10,6 +10,8 @@ Usage:
 import os
 import sys
 
+import pytest
+
 # Load environment variables from .env file
 try:
     from load_env import load_env
@@ -22,6 +24,14 @@ from neo.cli import NeoEngine, NeoInput, ContextFile, TaskType
 from neo.exemplar_index import create_exemplar_index
 
 
+def _require_anthropic_api_key() -> None:
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        pytest.skip("ANTHROPIC_API_KEY not set")
+    raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+
 def test_simple_algorithm():
     """Test Neo on a simple algorithm task."""
     print("=" * 80)
@@ -29,10 +39,7 @@ def test_simple_algorithm():
     print("=" * 80 + "\n")
 
     # Check for API key
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ERROR: ANTHROPIC_API_KEY not set")
-        print("Set it with: export ANTHROPIC_API_KEY=sk-...")
-        return False
+    _require_anthropic_api_key()
 
     # Create adapter
     adapter = create_adapter("anthropic", model="claude-sonnet-4-5-20250929")
@@ -84,8 +91,6 @@ def test_simple_algorithm():
 
     print(f"Notes: {output.notes}\n")
 
-    return True
-
 
 def test_bugfix():
     """Test Neo on a bugfix task."""
@@ -93,9 +98,7 @@ def test_bugfix():
     print("Test 2: Bug Fix")
     print("=" * 80 + "\n")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ERROR: ANTHROPIC_API_KEY not set")
-        return False
+    _require_anthropic_api_key()
 
     adapter = create_adapter("anthropic")
     engine = NeoEngine(lm_adapter=adapter)
@@ -144,8 +147,6 @@ ZeroDivisionError: division by zero
             print(f"  - {q}")
         print()
 
-    return True
-
 
 def test_with_exemplars():
     """Test Neo with exemplar retrieval."""
@@ -153,9 +154,7 @@ def test_with_exemplars():
     print("Test 3: With Exemplar Learning")
     print("=" * 80 + "\n")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ERROR: ANTHROPIC_API_KEY not set")
-        return False
+    _require_anthropic_api_key()
 
     # Create exemplar index
     index = create_exemplar_index()
@@ -199,8 +198,6 @@ def test_with_exemplars():
     index.clear()
     index.save()
 
-    return True
-
 
 def main():
     """Run all tests."""
@@ -216,8 +213,8 @@ def main():
     results = []
     for name, test_func in tests:
         try:
-            success = test_func()
-            results.append((name, success))
+            test_func()
+            results.append((name, True))
         except Exception as e:
             print(f"\nERROR in {name}: {e}\n")
             import traceback

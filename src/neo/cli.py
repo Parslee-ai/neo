@@ -38,7 +38,7 @@ from neo.engine import NeoEngine  # noqa: E402, F401
 from neo.subcommands import (  # noqa: E402, F401
     show_version, show_help, _interpret_confidence, _restore_from_backup,
     _regenerate_entry_embeddings, regenerate_embeddings, handle_load_program,
-    handle_update, handle_construct, handle_prompt, handle_config,
+    handle_update, handle_construct, handle_prompt, handle_config, handle_memory,
     _print_prompt_analysis, _print_prompt_enhancement, _print_prompt_patterns,
     _print_prompt_suggestions, _print_prompt_evolutions, _print_prompt_stats,
 )
@@ -151,6 +151,33 @@ def parse_args():
         args = p.parse_args(sys.argv[2:])
         args.command = 'construct'
         args.construct_action = args.action
+        return args
+
+    # Detect if 'memory' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'memory':
+        p = argparse.ArgumentParser(
+            prog="neo memory",
+            description="Memory maintenance commands",
+            parents=[global_parser],
+        )
+        subparsers = p.add_subparsers(dest='action', help='Memory actions')
+
+        replay_p = subparsers.add_parser(
+            'replay-feedback',
+            help='Replay linked feedback after memory-loop fixes',
+        )
+        replay_p.add_argument('--all', action='store_true', help='Replay linked feedback for all saved local projects')
+        replay_p.add_argument('--dry-run', action='store_true', help='Show what would be replayed without mutating memory')
+        replay_p.add_argument(
+            '--include-legacy-fallback',
+            action='store_true',
+            help='Also inspect legacy session_*.json fallback files (may replay already-processed old sessions)',
+        )
+        replay_p.add_argument('--limit', type=int, help='Limit number of projects when using --all')
+
+        args = p.parse_args(sys.argv[2:])
+        args.command = 'memory'
+        args.memory_action = args.action
         return args
 
     # Detect if 'prompt' subcommand is being used
@@ -424,6 +451,11 @@ def main():
     # Handle construct subcommand
     if hasattr(args, 'command') and args.command == 'construct':
         handle_construct(args)
+        sys.exit(0)
+
+    # Handle memory subcommand
+    if hasattr(args, 'command') and args.command == 'memory':
+        handle_memory(args)
         sys.exit(0)
 
     # Handle prompt subcommand

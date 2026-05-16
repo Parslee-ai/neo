@@ -187,6 +187,117 @@ def handle_contribute(args):
     print("  https://github.com/Parslee-ai/neo/edit/main/community_facts.json")
 
 
+def _linked_feedback_projects(*, include_fallback: bool = False) -> list[tuple[str, str]]:
+    """Return unique (project_id, root) pairs with linked session feedback."""
+    sessions_dir = Path.home() / ".neo" / "sessions"
+    projects: dict[str, tuple[str, float]] = {}
+    if not sessions_dir.exists():
+        return []
+
+    session_files = list(sessions_dir.glob("session_log_*.jsonl"))
+    if include_fallback:
+        session_files += list(sessions_dir.glob("session_*.json"))
+    for path in session_files:
+        if path.name.startswith("session_log_"):
+            docs = []
+            try:
+                for line in path.read_text(errors="replace").splitlines():
+                    if line.strip():
+                        docs.append(json.loads(line))
+            except (OSError, json.JSONDecodeError):
+                continue
+        else:
+            try:
+                docs = [json.loads(path.read_text(errors="replace"))]
+            except (OSError, json.JSONDecodeError):
+                continue
+
+        for data in docs:
+            pid = data.get("project_id")
+            root = data.get("codebase_root")
+            links = data.get("suggestion_fact_ids") or {}
+            ts = data.get("timestamp", 0.0)
+            if not pid or not root or not links:
+                continue
+            if not Path(root).exists():
+                continue
+            prev = projects.get(pid)
+            if prev is None or ts > prev[1]:
+                projects[pid] = (root, ts)
+
+    return [(pid, root_ts[0]) for pid, root_ts in sorted(projects.items(), key=lambda item: item[1][1], reverse=True)]
+
+
+def handle_memory(args):
+    """Memory maintenance subcommands."""
+    action = getattr(args, "memory_action", None)
+    if action != "replay-feedback":
+        print("Usage: neo memory replay-feedback [--all] [--dry-run] [--limit N]")
+        return
+
+    from neo.config import NeoConfig
+    from neo.memory.store import FactStore
+
+    config = NeoConfig.load()
+    if getattr(args, "all", False):
+        projects = _linked_feedback_projects(
+            include_fallback=getattr(args, "include_legacy_fallback", False)
+        )
+    else:
+        root = getattr(args, "cwd", None) or os.getcwd()
+        projects = [("", root)]
+
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        projects = projects[:limit]
+
+    totals = {
+        "projects": 0,
+        "updated_projects": 0,
+        "linked_updates": 0,
+        "accepted": 0,
+        "modified": 0,
+        "unverified": 0,
+        "skipped_independent": 0,
+        "skipped_unlinked": 0,
+        "errors": 0,
+    }
+
+    for pid, root in projects:
+        totals["projects"] += 1
+        store = FactStore(codebase_root=root, config=config, eager_init=False)
+        stats = store.replay_linked_feedback(
+            dry_run=getattr(args, "dry_run", False),
+            include_fallback=getattr(args, "include_legacy_fallback", False),
+        )
+        if stats.get("status") == "error":
+            totals["errors"] += 1
+            print(f"[Neo] replay error {root}: {stats.get('error')}")
+            continue
+
+        updates = int(stats.get("linked_updates", 0))
+        if updates:
+            totals["updated_projects"] += 1
+        for key in ("linked_updates", "accepted", "modified", "unverified", "skipped_independent", "skipped_unlinked"):
+            totals[key] += int(stats.get(key, 0))
+        label = pid or getattr(store, "project_id", "")
+        if updates or getattr(args, "verbose", False):
+            mode = "would update" if getattr(args, "dry_run", False) else "updated"
+            print(
+                f"[Neo] {mode} {updates} linked outcome(s) for {label or root} "
+                f"(accepted={stats.get('accepted', 0)}, modified={stats.get('modified', 0)}, "
+                f"unverified={stats.get('unverified', 0)})"
+            )
+
+    mode = "dry run" if getattr(args, "dry_run", False) else "replay"
+    print(
+        f"[Neo] feedback {mode}: {totals['linked_updates']} linked update(s) "
+        f"across {totals['updated_projects']}/{totals['projects']} project(s)"
+    )
+    if totals["errors"]:
+        print(f"[Neo] {totals['errors']} project(s) failed", file=sys.stderr)
+
+
 def show_help():
     """Show help documentation."""
     help_text = """
@@ -856,7 +967,7 @@ def _print_prompt_stats(stats: dict) -> None:
 
 def handle_config(args):
     """Handle --config flag operations."""
-    from neo.config import NeoConfig
+    from neo.config import NeoConfig, store_api_key_in_keychain
 
     VALID_PROVIDERS = ['openai', 'anthropic', 'google', 'azure', 'ollama', 'local', 'claude-code']
     EXPOSED_FIELDS = ['provider', 'model', 'api_key', 'base_url', 'auto_install_updates']
@@ -903,8 +1014,8 @@ def handle_config(args):
 
     elif args.config == 'set':
         # Set field value
-        if not args.config_key or not args.config_value:
-            print("Error: --config-key and --config-value required for 'set' operation", file=sys.stderr)
+        if not args.config_key:
+            print("Error: --config-key required for 'set' operation", file=sys.stderr)
             sys.exit(1)
 
         if args.config_key not in EXPOSED_FIELDS:
@@ -916,22 +1027,43 @@ def handle_config(args):
             print(f"Error: Invalid provider. Valid providers: {', '.join(VALID_PROVIDERS)}", file=sys.stderr)
             sys.exit(1)
 
+        if args.config_key == 'api_key' and not args.config_value:
+            import getpass
+            value = getpass.getpass(f"API key for {config.provider}: ")
+            if not value:
+                print("Error: API key cannot be empty", file=sys.stderr)
+                sys.exit(1)
+        elif not args.config_value:
+            print("Error: --config-value required for this config key", file=sys.stderr)
+            sys.exit(1)
+        else:
+            value = args.config_value
+
         # Convert boolean values
         if args.config_key == 'auto_install_updates':
-            if args.config_value.lower() in ('true', '1', 'yes', 'on'):
+            if str(value).lower() in ('true', '1', 'yes', 'on'):
                 value = True
-            elif args.config_value.lower() in ('false', '0', 'no', 'off'):
+            elif str(value).lower() in ('false', '0', 'no', 'off'):
                 value = False
             else:
                 print("Error: Invalid boolean value. Use: true/false, 1/0, yes/no, on/off", file=sys.stderr)
                 sys.exit(1)
-        else:
-            value = args.config_value
 
         # Set the value
-        setattr(config, args.config_key, value)
+        if args.config_key == 'api_key':
+            try:
+                store_api_key_in_keychain(config.provider, str(value))
+            except Exception as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            value = None
+        else:
+            setattr(config, args.config_key, value)
         config.save()
-        print(f"\u2713 Set {args.config_key} = {value if args.config_key != 'api_key' else mask_secret(value)}")
+        if args.config_key == 'api_key':
+            print(f"\u2713 Stored api_key in Keychain for provider {config.provider}")
+        else:
+            print(f"\u2713 Set {args.config_key} = {value}")
 
     elif args.config == 'reset':
         # Reset to defaults
