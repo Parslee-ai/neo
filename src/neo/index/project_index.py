@@ -108,6 +108,29 @@ class IndexSnapshot:
     file_hashes: Dict[str, str] = field(default_factory=dict)  # rel_path -> hash
 
 
+def _chunk_embed_text(chunk: CodeChunk) -> str:
+    """Build a structured text from a chunk for embedding.
+
+    Format: ``symbols imports head_of_body``. Each segment is space-
+    separated; segments missing from the chunk are skipped. The head is
+    capped at 600 chars to keep the embedding focused on signature +
+    docstring rather than diluting with implementation details.
+
+    Empty body or missing symbols/imports return the empty string —
+    fastembed's tokenizer treats that as a zero vector, which is the
+    correct behavior for a chunk we can't characterize.
+    """
+    parts: list[str] = []
+    if chunk.symbols:
+        parts.append(" ".join(chunk.symbols))
+    if chunk.imports:
+        parts.append(" ".join(chunk.imports))
+    if chunk.content:
+        head = chunk.content[:600]
+        parts.append(head)
+    return " ".join(parts)
+
+
 class ProjectIndex:
     """
     Project-specific semantic index for code retrieval.
@@ -627,7 +650,21 @@ class ProjectIndex:
         return results
 
     def _embed_chunks(self, chunks: List[CodeChunk]):
-        """Generate embeddings for chunks."""
+        """Generate embeddings for chunks.
+
+        Embeds a structured representation of each chunk (symbols +
+        imports + first ~600 chars of body) rather than the raw body,
+        for two reasons:
+
+        - Test files contain a query's prompt-keywords verbatim as
+          assertion strings, so embedding the raw body causes tests to
+          systematically outrank the source files they test. Symbols
+          and imports are the durable, non-keyword-heavy summary of
+          what the chunk is *about*.
+        - The first ~600 chars capture the docstring and function
+          signature, which carry semantic weight the body's
+          implementation details dilute.
+        """
         if not chunks:
             return
 
@@ -639,8 +676,8 @@ class ProjectIndex:
             logger.warning("No embedding model available, skipping embeddings")
             return
 
-        # Prepare texts
-        texts = [chunk.content for chunk in chunks]
+        # Build structured texts: symbols + imports + head-of-body.
+        texts = [_chunk_embed_text(chunk) for chunk in chunks]
 
         # Generate embeddings in batch
         try:
