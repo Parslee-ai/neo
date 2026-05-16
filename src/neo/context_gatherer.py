@@ -315,14 +315,20 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     depth = rel_path.count(os.sep)
     score -= 0.05 * depth
 
-    # Penalize by size (god objects are code smell), but not for main implementation
+    # Penalize by size (god objects are code smell). main_impl files
+    # (engine.py, server.py, app.py, etc.) get a much gentler penalty
+    # — they're large *because* they're central, and the old 0.002
+    # multiplier was pushing THE relevant file (93KB engine.py) below
+    # threshold on prompts about it. New main_impl penalty is 0.001
+    # per KB-over-50, so 93KB loses 0.043 instead of 0.086.
     size_kb = size / 1024
     if size_kb > 10 and not is_main_impl:
         # Penalty for large files: 10KB = -0.1, 50KB = -0.5, 100KB = -1.0
         score -= 0.01 * size_kb
     elif size_kb > 50 and is_main_impl:
-        # Lighter penalty for main implementation files: 50KB = -0.1, 100KB = -0.2
-        score -= 0.002 * (size_kb - 50)
+        # Lighter penalty for main implementation files: 50KB = 0,
+        # 100KB = -0.05, 500KB = -0.45.
+        score -= 0.001 * (size_kb - 50)
 
     return max(0.0, score)
 
@@ -381,15 +387,34 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
         if not index.chunks:
             return {}
         chunks = index.retrieve(prompt, k=k)
+
+        # Test files often contain the prompt's literal keywords (because
+        # they assert against named behaviors), so the FAISS index ranks
+        # them above the source file the prompt is actually about.
+        # Demote test-file hits unless the prompt is itself about testing.
+        prompt_lower = prompt.lower()
+        prompt_is_test = any(
+            t in prompt_lower for t in ("test", "pytest", "unit test", "spec")
+        )
+        TEST_PENALTY = 0.4  # multiplier; tests retain 60% of their cosine
+
         boost: dict[str, float] = {}
         for chunk in chunks:
             # Normalize path the same way the rest of the gatherer does.
             rel = os.path.relpath(chunk.file_path, root)
             sim = float(getattr(chunk, "similarity", 0.0))
-            # 1.0 cosine = +1.0 boost (dominant signal). Cosine < 0
-            # is clamped — never penalize for an index near-miss.
+            sim = max(0.0, sim)
+            is_test = (
+                rel.startswith("test")
+                or rel.startswith("tests" + os.sep)
+                or "/tests/" in rel
+                or os.path.basename(rel).startswith("test_")
+            )
+            if is_test and not prompt_is_test:
+                sim *= TEST_PENALTY
+            # 1.0 cosine = +1.0 boost (dominant signal); test demotion above.
             prev = boost.get(rel, 0.0)
-            boost[rel] = max(prev, max(0.0, sim))
+            boost[rel] = max(prev, sim)
         if boost:
             print(
                 f"[Neo] ProjectIndex boost: {len(boost)} files matched semantically",
@@ -442,7 +467,16 @@ def _symbol_score(
             for imp in c.imports or []:
                 symbols.add(imp.lower())
 
-        hits = sum(1 for t in prompt_tokens if t in symbols)
+        # Substring match: catches "simulator" matching "_simulation_consensus",
+        # "decode" matching "_decode_response", etc. Exact match is too strict
+        # for free-form prompts vs snake_case symbol names. Filter very short
+        # tokens (≤3 chars) to avoid spurious hits like "the" matching "thread".
+        hits = 0
+        for t in prompt_tokens:
+            if len(t) <= 3:
+                continue
+            if any(t in s or s in t for s in symbols):
+                hits += 1
         return 0.4 * min(hits, 3)
     except Exception:
         return 0.0
