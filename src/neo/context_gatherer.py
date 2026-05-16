@@ -386,6 +386,14 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
 
         index = ProjectIndex(root)
         if not index.chunks:
+            # First-run hint: surface the most impactful smart-gather upgrade
+            # the user can opt into. Cheap, silent on subsequent runs (we only
+            # print when the snapshot file is genuinely missing, not just empty).
+            if not index.snapshot_path.exists():
+                print(
+                    "[Neo] Tip: run 'neo --index' to enable semantic file selection",
+                    file=sys.stderr,
+                )
             return {}
         chunks = index.retrieve(prompt, k=k)
 

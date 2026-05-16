@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.18.0] - 2026-05-15
+
+This release is the result of a focused synthesis: 17 arxiv papers on multi-agent code generation, semantic memory, outcome detection, and consolidation were read, the deterministic techniques extracted, and the highest-leverage ones implemented end-to-end with neo + Linus agent reviews on the substantive changes. 38 commits, all paths verified against a real OpenAI run.
+
+### Added — memory architecture (W1–W4)
+
+- **Vectorized retrieval + unified scorer.** `FactStore.retrieve_relevant` and `ContextAssembler._score_facts` now share a single `rank_score(fact, similarity, now)` formula in `memory.models`. Cosine is batched in one numpy matrix-vector product (`math_utils.batched_cosine`) instead of per-fact loops. 3× speedup at 2000 facts; FAISS was prototyped and rejected after review showed numpy delivers the same win at this scale with half the code. Paper 2603.07670 §7.
+- **Ebbinghaus recall-probability decay for fluid facts.** `FactMetadata` gains `recall_count`, `g_n`, `last_recall_ts`. Similarity through the transform `p_n(t) = (1 − exp(−r·exp(−t/g_n))) / (1 − e^-1)` so frequently-recalled facts decay slowly and dormant ones fast. Curated kinds (CONSTRAINT/ARCHITECTURE/DECISION + seed/community/synthesized tags) bypass the transform entirely. Paper 2404.00573.
+- **LessonL effectiveness multiplier on `success_bonus`.** `FactMetadata.effectiveness_c` and `effectiveness_n` track per-fact reuse outcomes (`f = c/n` via `update_effectiveness(fact, outcome)`). f=1.0 default keeps legacy corpora ranking identically. Paper 2505.23946.
+- **SCM 4-D ValueTagger composite + adaptive forgetting threshold.** `memory.value_score` module: `I(c) = 0.30·novelty + 0.20·validation + 0.35·task + 0.15·repetition` plus `θ_f = μ − σ·(|G|/target_size)` with floor 0.05. Paper 2604.20943.
+- **NREM Hebbian strengthening + global downscale at synthesis.** Each cluster of ≥3 REVIEW facts bumps members' confidence by `min(0.1, 0.02·|cluster|)`; after the cycle, non-curated valid facts get a 0.97× global decay. Paper 2604.20943 §3.
+- **Triple-trigger consolidation gate.** `synthesize_reviews` fires on count-delta ≥10 OR elapsed ≥1h OR Shannon-entropy of confidence deciles > 0.9. The count-only gate missed entropy-driven drift. Paper 2604.20943 §3.6.
+- **Dual-buffer probation tagging.** New non-curated facts enter with a `probation` tag and the shortest stale-prune window (3 days vs 7 vs 14). Promoted out on `access_count ≥ 2`. Paper 2603.07670 §9.1.
+- **Pre-write canonical-signature dedup.** `add_fact` computes a generalized signature (`memory.generalize`: entity abstraction + verb-synonym fold + context strip) and short-circuits identical canonical twins by bumping the existing fact's access count. Root-cause fix for the "independent flood" bug previously patched by post-hoc capping. Paper 2603.10600 §7.
+- **Half-by-rank-score / half-by-cosine retrieval.** `retrieve_relevant` takes ⌈k/2⌉ by full rank_score and ⌊k/2⌋ by raw cosine — surfaces semantically-relevant facts with no track record alongside validated winners. Paper 2505.23946 Algorithm 1.
+- **Bi-temporal `event_time` / `event_time_end` / `ingest_time`** on FactMetadata. Supersession soft-deletes by stamping `event_time_end` rather than dropping the row. Paper 2512.13564 §5.2.2.
+- **Retrieval / context unit split.** `Fact.retrieval_text` (what we embed) and `Fact.context_text` (what we inject into the prompt) can now diverge — concise keywords for embedding, full narrative for context. Defaults to subject+body. Paper 2508.15294.
+- **EPISODE FactKind + EpisodeContext.** Instance-specific events with `{when, where, why, with_whom}` that satisfy the 5-property test. Paper 2502.06975.
+- **SimulationTrace persistence as EPISODE facts.** Every Neo run's simulator traces land in the fact store with retrieval/context split, episode_context, and bi-temporal stamps. Failure to persist is debug-logged, never propagates.
+- **Provenance enum.** `STRUCTURAL > OBSERVED > INFERRED`, replacing free-string convention. Used in conflict-resolution precedence (newer event_time → higher provenance → higher cosine).
+- **`memory.bm25` module + hybrid dense+BM25 retrieval.** Pure-stdlib BM25 (`k1=1.5, b=0.75`), min-max-normalized and weighted-summed `0.7·dense + 0.3·sparse`. Paper 2603.19935 §3.3.
+- **Query-shape classifier + decomposer.** `memory.query_routing` distinguishes DIRECT / CHAIN / SPLIT prompts via regex (`"of the X of the Y"`, `"compare/contrast/vs"`); multi-hop and multi-entity get per-branch retrieval and merged. Paper 2604.04853 §5.3.
+- **Nucleus episode expansion at retrieval.** Each surfaced EPISODE pulls up to 2 peer episodes from the same `source_prompt` (session), chronologically ordered. Paper 2604.04853 §4.6.
+- **`outcomes.OutcomeIndicator` 4-class semantic classifier.** Pure regex on action logs: FAILURE / RECOVERY / INEFFICIENCY / SUCCESS, orthogonal to the existing event-shape OutcomeType. Paper 2603.10600 §4-5.
+- **`outcomes.CodeOutcome` LessonL-style code classifier.** SPEED_UP / SLOW_DOWN / FUNCTIONAL_INCORRECTNESS / SYNTAX_ERROR from diagnostics + runtime logs + speedup ratios. Paper 2505.23946 §3.
+
+### Added — smart file selection
+
+- **ProjectIndex semantic boost in the gatherer.** `gather_context` now consults `.neo/index.json` (per-project FAISS over tree-sitter chunks) and projects top-k chunk hits back to per-file boosts up to +1.0 cosine. Test-file matches are demoted 0.4× unless the prompt itself mentions test/spec.
+- **Tree-sitter symbol overlap as a scoring signal.** For the top 3× adaptive_limit filename-scored candidates, `_symbol_score` runs the parser, extracts function/class names + imports, and adds up to +1.2 (3 hits × 0.4) for substring matches against prompt tokens.
+- **EPISODE-history feedback loop.** Each Neo run stashes touched file paths as `file:<rel>` tags on EPISODE facts. The gatherer's `_history_boost` queries the FactStore for similar past prompts and gives those files up to +0.5 boost on the *next* run. Closes the actual "Neo learns" loop — past behavior measurably influences future file selection.
+- **Structured index embedding.** ProjectIndex now embeds `symbols + imports + first 600 chars of body` per chunk instead of raw chunk content. Eliminates the "tests outrank source files" bias caused by assertion strings containing prompt keywords verbatim.
+- **Per-file chunk cap (2).** Large files no longer eat the adaptive-limit budget by splitting into 5+ chunks; the budget now produces +6 more unique files on representative prompts.
+- **Score-weight fixes for main_impl files.** Halved the large-file penalty (0.001 vs 0.002 per KB-over-50) and made symbol matching substring-based with a length-3 floor. A 93 KB `engine.py` that was previously excluded from "fix the engine" prompts now reliably surfaces at rank 5.
+- **First-run hint.** When `.neo/index.json` is absent, the gatherer prints `Tip: run 'neo --index' to enable semantic file selection` once.
+
+### Added — engine pipeline
+
+- **CodeSim-style MODIFY / NO_MODIFY decision token.** Simulator prompt instructs the model to emit `**NO_MODIFY**` or `**MODIFY: <reason>**` as the final reasoning step. `_simulation_consensus` parses the token (regex) and uses it as an explicit override of the agreement-of-outputs heuristic. Paper 2502.05664.
+- **PlanStep.confidence + aggregate_confidence.** MapCoder-style per-step confidence as schema scaffolding for future multi-plan iteration. Paper 2405.11403.
+- **`StructuredOverseer` watchdog wired into `process()`.** Daemon-thread tick loop emits `overseer_tick` events; detects 5-identical-actions-in-a-row as `is_looping=True`. Logged: `process.start`, `retrieve_context`, `lm_call`, `process.end`. Paper 2504.15228 §A.2.
+
+### Added — observability
+
+- **`memory.metrics` module — per-operation metrics jsonl.** Each retrieve / add_fact / lm_call / overseer_tick lands in `~/.neo/metrics.jsonl` with structured fields. Disable via `NEO_METRICS=off`. Path resolved lazily so test-harness HOME isolation works correctly.
+- **LM-call token + cache-hit-rate observability.** Both AnthropicAdapter and OpenAIAdapter emit `lm_call` events with `input_tokens / cache_read_input_tokens / output_tokens / cache_hit_rate`. The OpenAI emitter handles both `/v1/chat/completions` and `/v1/responses` (gpt-5*/codex) shapes. Paper 2504.15228 Table 1.
+
+### Fixed
+
+- **UTF-8 strict decode dropped all git history ingest.** Six `subprocess.run` sites in `memory/outcomes.py` used `text=True` (strict UTF-8); a single non-UTF8 byte in any commit message raised `UnicodeDecodeError`, which the existing `except` block didn't catch. All six now pass `encoding="utf-8", errors="replace"`, and four `except` blocks now also catch `UnicodeDecodeError`. Before this fix Neo's own repo init silently ingested 0 git-history facts; after, it ingests all 50.
+- **`engine._persist_simulation_episodes` referenced `step.action` (singular) but PlanStep declares `actions: list[str]`.** Every Neo run crashed at finalize, masking the simulation-episode persistence path entirely. Fixed.
+- **Provenance string is now an enum.** `Provenance.STRUCTURAL / OBSERVED / INFERRED`. Backward-compatible — `add_fact(provenance=...)` accepts either the enum or its `.value` string. Paper 2603.07670 §7.3.
+- **CLAUDE.md description of memory hygiene.** The "auto-consolidation every 10 entries" line was obsolete — replaced with accurate description of supersession + REVIEW-cluster synthesis + dual-buffer probation.
+
+### Internal
+
+- Single source of truth for fact ranking (`memory.models.rank_score`) used by both the FactStore and the ContextAssembler scoring paths.
+- 17 cited arxiv papers checked into `papers/` for reproducibility.
+- A 30-fact retrieval quality bench (`subject` + `body-snippet` queries) against a snapshot of the user's real `~/.neo` shows the new pipeline trades −3pp recall@1 for +4pp recall@5 vs pre-W1 baseline — matches the LessonL variance-reduction claim. Default `k=30` makes the breadth gain dominant.
+- The `NEO_LEGACY_SCORING` env flag added during the A/B benchmark was ripped out after the bench ran. Flags are not for long-term retention.
+
 ## [0.17.0] - 2026-05-15
 
 ### Added
