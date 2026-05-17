@@ -341,9 +341,9 @@ docs: update INSTALL.md with Docker instructions
 
 - [ ] Web UI for visualization
 - [ ] VS Code extension
-- [ ] GitHub Actions integration
-- [ ] Metrics and observability
 - [ ] Multi-language support for prompts
+- [ ] Linux/Windows Keychain-equivalent secure key storage (currently macOS-only)
+- [ ] Backends for `~/.neo/facts/` beyond JSON (e.g., SQLite) — only needed if a single scope file approaches ~10k facts
 
 ## Code of Conduct
 

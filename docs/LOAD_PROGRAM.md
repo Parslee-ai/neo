@@ -51,11 +51,8 @@ neo --load-program my_dataset --columns '{"text":"pattern","code":"solution"}'
 
 ### Optional Parameters
 - `--limit N`: Cap at N samples (default: 1000)
-- `--mode`: `append` (default) or `rebuild`
 - `--dry-run`: Preview without importing
-- `--dojo`: Run evaluation pass after import
 - `--quiet`: Suppress progress, show only final report
-- `--allow-license <SPDX>`: Override license check
 
 ## Data Flow
 

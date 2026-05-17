@@ -31,7 +31,7 @@ Expected output:
 ```
 "What is real? How do you define 'real'?"
 
-neo 0.9.0
+neo 0.18.1
 Provider: openai | Model: gpt-5.5
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
@@ -52,8 +52,8 @@ Expected: Neo will analyze the request, plan the solution, and provide code sugg
 from neo.cli import NeoEngine, NeoInput, TaskType
 from neo.adapters import create_adapter
 
-# Create adapter
-adapter = create_adapter("anthropic")
+# Create adapter (matches the OPENAI_API_KEY set in step 2)
+adapter = create_adapter("openai")
 
 # Create engine
 engine = NeoEngine(lm_adapter=adapter)

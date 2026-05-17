@@ -370,10 +370,10 @@ When enabled, Neo will:
 ```bash
 $ neo "your query"
 
-⚡ Auto-installing neo update: 0.9.0 → 0.10.0
+⚡ Auto-installing neo update: 0.18.0 → 0.18.1
    This happens in the background. Please wait...
 
-✓ Auto-update completed: 0.10.0
+✓ Auto-update completed: 0.18.1
    Restart neo to use the new version.
 
 [Neo] Processing your query...
@@ -440,6 +440,12 @@ neo "how do I fix the authentication bug?"
 # With working directory context
 neo --cwd /path/to/project "optimize this function"
 
+# Build the per-project semantic index (powers smart file selection)
+neo --index
+
+# Incrementally refresh the index after meaningful changes (re-embeds only changed files)
+neo --update
+
 # Check version and memory stats
 neo --version
 ```
@@ -479,7 +485,7 @@ Neo responds with personality _(Matrix-inspired quotes)_ when displaying version
 $ neo --version
 "What is real? How do you define 'real'?"
 
-neo 0.9.0
+neo 0.18.1
 Provider: openai | Model: gpt-5.5
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
@@ -547,12 +553,14 @@ Memory: 1247 total facts
 
 Neo uses a **scoped, supersession-based fact store** with **Jina Code v2** embeddings (768 dimensions) for semantic retrieval:
 
-1. **Fact Storage**: Knowledge is stored as typed facts (constraints, architecture, patterns, review learnings, decisions, known unknowns, failures)
-2. **Scoped Organization**: Facts are scoped to global, organization, or project level — automatically detected from git remotes
-3. **Supersession**: When a new fact closely matches an existing one (cosine similarity > 0.85), the old fact is superseded rather than duplicated
-4. **Confidence Scoring**: Facts carry confidence scores with automatic boosting on supersession
-5. **Four-Layer Context**: Retrieved facts are organized into constraints, relevant knowledge, recent changes, and known unknowns (inspired by StateBench)
-6. **Local Persistence**: Facts stored locally in JSON format in `~/.neo/facts/`
+1. **Typed Facts**: Eight kinds — CONSTRAINT, ARCHITECTURE, DECISION, PATTERN, REVIEW, FAILURE, KNOWN_UNKNOWN, and EPISODE (instance-specific events with `{when, where, why, with_whom}` context).
+2. **Scoped Organization**: Facts are scoped to global, organization, or project level, with per-scope valid-fact caps (200 / 100 / 500 / 50). Org and project are auto-detected from git remotes.
+3. **Supersession & Pre-Write Dedup**: New facts with cosine similarity ≥ 0.85 to an existing fact short-circuit (bump the existing fact's access count) or supersede it. The pre-write canonical-signature check uses entity abstraction + verb-synonym folding to catch near-duplicates before they hit the store.
+4. **Confidence + Effectiveness Ranking**: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f + provenance_bonus`. The Ebbinghaus recall-probability transform gives frequently-recalled facts slower decay; LessonL-style effectiveness (`c/n` over reuse outcomes) multiplies the success bonus. Curated facts (CONSTRAINT/ARCHITECTURE/DECISION and `seed`/`community`/`synthesized`-tagged facts) bypass decay.
+5. **Hybrid Retrieval**: 0.7·dense (Jina) + 0.3·BM25. Half the result slots ranked by full `rank_score`, half by raw cosine — novel-but-relevant facts aren't crowded out by validated winners.
+6. **Triple-Trigger Consolidation**: REVIEW facts cluster into PATTERN / FAILURE archetypes when ANY of count-delta ≥10, elapsed ≥1h, or confidence-decile entropy >0.9 fires. Clusters of ≥3 get an NREM-style Hebbian confidence bump; non-curated facts decay 3% globally after each pass.
+7. **Dual-Buffer Probation**: New non-curated facts enter with a `probation` tag and a 3-day stale window (vs 7/14 normal); promoted automatically on `access_count ≥ 2` or `success_count > 0` — quietly evicts noise while keeping real signal.
+8. **Four-Layer Context**: Retrieved facts are organized into constraints, relevant knowledge, recent changes, and known unknowns (inspired by StateBench).
 
 ### Output Schemas
 
@@ -625,13 +633,36 @@ Magic numbers and generic high-entropy secret detection are intentionally
 out of scope — they'd add more noise than signal at this stage.
 
 
+### Smart File Selection
+
+The context gatherer picks files using three signals:
+
+- **ProjectIndex semantic boost**: when `.neo/index.json` exists (run `neo --index` once per repo), per-project FAISS over tree-sitter chunks projects top-k chunk hits back to per-file boosts up to +1.0 cosine. Chunks embed `symbols + imports + first ~600 chars of body`, so prompt keywords match what a file *is*, not assertion strings inside tests. Test-file matches are demoted 0.4× unless the prompt mentions test/spec.
+- **Tree-sitter symbol overlap**: the parser extracts function/class names + imports from top candidates and adds up to +1.2 for substring matches against prompt tokens (length-3 floor).
+- **EPISODE-history feedback loop**: each Neo run stashes touched file paths as `file:<rel>` tags on EPISODE facts. On the next run, the gatherer queries for similar past prompts and gives those files up to +0.5 boost — past file selections measurably influence future ones.
+
+A per-file chunk cap of 2 prevents large files from eating the budget; a one-time first-run hint fires if the index is missing.
+
+
+### Learning Feedback Loop
+
+After each Neo run, the next invocation diffs your repo against the suggestions it made and classifies the result. All confidence deltas are modulated by `±arch_mod` (∈ {−0.1, 0, +0.1}) from the architectural-quality snapshot — see [Architectural Quality Feedback Loop](#architectural-quality-feedback-loop) below.
+
+| Outcome     | Trigger                                                                  | Effect                                                                              |
+|-------------|--------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
+| ACCEPTED    | Diff overlap ≥ 0.8 (or > 0.3 when Neo emitted no diff)                   | linked fact conf +0.2 ± arch_mod, success_count +1, effectiveness "better"          |
+| MODIFIED    | User changed the file differently                                        | linked fact conf −0.2 ± arch_mod (floored at 0.1) + new REVIEW at conf 0.4          |
+| UNVERIFIED  | File touched but suggestion had no diff to compare                       | linked fact conf +0.1 ± arch_mod, success_count +1 (no REVIEW)                      |
+| INDEPENDENT | File touched, never suggested by Neo                                     | new REVIEW at conf 0.2; capped 5/session, 50/project                                |
+
+
 ### Storage Architecture
 
-- **Scoped JSON Files**: Facts stored in `~/.neo/facts/` — separate files per scope (global, org, project)
-- **Inline Embeddings**: Vector embeddings stored alongside facts in JSON (no separate FAISS index for memory)
-- **Supersession**: Similar facts are superseded rather than merged — old facts remain but are marked invalid
-- **Constraint Auto-Ingestion**: CLAUDE.md and similar files are automatically scanned and ingested as CONSTRAINT facts
-- **Project Index** (separate system): Tree-sitter code indexing uses FAISS for per-repository semantic search in `.neo/`
+- **Scoped JSON Files**: Facts stored in `~/.neo/facts/` — separate files per scope (global, org, project), with inline embeddings (no separate FAISS index for memory).
+- **Bi-Temporal Supersession**: similar facts are soft-deleted by stamping `event_time_end` rather than dropped. Tombstones persist until `purge_dead_facts` runs on the next cold start.
+- **Constraint Auto-Ingestion**: CLAUDE.md and similar files are automatically scanned and ingested as CONSTRAINT facts.
+- **Sessions & Metrics**: `~/.neo/sessions/` holds session manifests + replay logs; `~/.neo/metrics.jsonl` logs every retrieve / add_fact / lm_call / overseer_tick (disable with `NEO_METRICS=off`).
+- **Project Index** (separate system): Tree-sitter code indexing uses FAISS for per-repository semantic search in `.neo/`.
 
 
 ## Performance
@@ -702,14 +733,53 @@ neo --config reset
 
 Configuration is stored in `~/.neo/config.json` and takes precedence over environment variables.
 
-### Environment Variables
+### Secure API Key Storage
 
-Alternatively, use environment variables for configuration:
+On macOS, Neo stores API keys in **Keychain** rather than `config.json`. Run:
 
 ```bash
-# Required: LM Provider API Key
-export ANTHROPIC_API_KEY=sk-ant-...
+# Securely prompt for and store an API key in Keychain
+neo --config set --config-key api_key
 ```
+
+`NeoConfig.load()` reads the Keychain entry automatically.
+
+**Linux / Windows**: this command currently raises — Keychain support is macOS-only. Either set the provider env var directly (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) or export `NEO_ALLOW_PLAINTEXT_API_KEY=1` first so the key is persisted in `config.json`.
+
+
+### Environment Variables
+
+**Credentials**
+
+```bash
+# Provider-specific (read by NeoConfig.load() when set)
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
+export GOOGLE_API_KEY=...
+
+# Neo-generic (provider-specific keys take precedence)
+export NEO_PROVIDER=openai
+export NEO_MODEL=gpt-5.5
+export NEO_API_KEY=sk-...
+export NEO_BASE_URL=http://localhost:11434       # for Ollama/local endpoints
+```
+
+**Behavior**
+
+```bash
+export NEO_REASONING_EFFORT=high                  # cap auto-effort selection
+export NEO_AUTO_INSTALL_UPDATES=1                 # auto-install background updates
+export NEO_SKIP_UPDATE_CHECK=1                    # disable update checks entirely
+export NEO_LOG_LEVEL=INFO                         # DEBUG/INFO/WARNING/ERROR
+```
+
+**Observability**
+
+```bash
+export NEO_METRICS=off                            # disable ~/.neo/metrics.jsonl writes
+```
+
+Neo writes structured per-operation events (retrieve / add_fact / lm_call / overseer_tick) to `~/.neo/metrics.jsonl`, per-session manifests + JSONL logs to `~/.neo/sessions/`, and raw LM payloads to `~/.neo/lm_logs/` when `NEO_LOG_LEVEL=DEBUG`.
 
 ## LM Adapters
 

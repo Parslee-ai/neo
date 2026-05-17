@@ -18,12 +18,39 @@
 - Test all changes before committing
 - Use 3-5 minute timeout when executing `neo` commands
 - Semantic memory: Local embeddings (Jina 768-dim) preferred over OpenAI (1536-dim)
-- Memory hygiene: per-scope caps (global=200, org=100, project=500, session=50; max ~850 facts);
-  supersession on cosine ≥0.85; REVIEW clusters synthesize at ≥3 members (every 10 new REVIEWs
-  after 20+ valid); pruning sweeps run on every cold start (stale, demote, purge-dead).
-- Retrieval: vectorized cosine over the valid corpus, then `rank_score = sim * confidence +
-  success_bonus + provenance_bonus`. Fluid facts (PATTERN/REVIEW/FAILURE/KNOWN_UNKNOWN) have
-  Ebbinghaus recall-probability decay applied to sim; curated/stable kinds
-  (CONSTRAINT/ARCHITECTURE/DECISION, or tagged seed/community/synthesized) bypass decay.
-- Local storage uses JSON files in ~/.neo directory (efficient for <5000 entries)
+- Memory hygiene:
+  - Per-scope valid-fact caps (`SCOPE_LIMITS` in `store.py`): global=200, org=100,
+    project=500, session=50. Enforced per loaded scope set (project+org+global);
+    invalidated facts persist as tombstones until `purge_dead_facts` runs.
+  - Supersession & pre-write canonical-signature dedup at cosine ≥ 0.85
+    (`SYNTHESIS_SIMILARITY`, `memory.generalize`).
+  - REVIEW → PATTERN/FAILURE synthesis needs ≥20 valid REVIEWs and ≥3-member clusters;
+    triple-trigger gate fires when ANY of: count-delta ≥10, elapsed ≥1h, or
+    confidence-decile entropy >0.9.
+  - Probation: new non-curated facts enter with a `probation` tag and a 3-day stale window
+    (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
+  - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
+    `outcomes.py`) and 50/project (`MAX_INDEPENDENT_FACTS` in `store.py`).
+  - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` run on every
+    cold start (`store.py:190-192`).
+- Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`, ~`store.py:806-900`):
+  ACCEPTED/MODIFIED/UNVERIFIED act on the linked original fact when present —
+  confidence +0.2 / −0.2 / +0.1 (all ±arch_mod), and bump `success_count` (except
+  MODIFIED). MODIFIED also writes a REVIEW at confidence 0.4; ACCEPTED falls back to a
+  REVIEW (`suggestion_confidence + 0.1`) when no link is found; UNVERIFIED never creates
+  a REVIEW. INDEPENDENT writes a REVIEW at confidence 0.2. **Footgun**: if you add a new
+  `OutcomeType`, update both `outcomes.py` and `store.detect_implicit_feedback`.
+- Retrieval: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f
+  + provenance_bonus`. `memory.models.rank_score` is the single source of truth — if you
+  change the formula, audit `ContextAssembler._score_facts` too. Cosine is batched via
+  `math_utils.batched_cosine`. Hybrid: 0.7·dense + 0.3·BM25; half the result slots ranked
+  by `rank_score`, half by raw cosine. CONSTRAINT/ARCHITECTURE/DECISION and the
+  `seed`/`community`/`synthesized` tags bypass decay. Branching prompts (CHAIN/SPLIT)
+  get per-branch retrieval via `memory.query_routing`; each surfaced EPISODE pulls up to
+  2 peer episodes from the same session.
+- Local storage: per-scope JSON files in `~/.neo/facts/` with inline embeddings. Fine
+  while any single scope file stays under ~10k facts; revisit the backend past that.
+- Observability: retrieve / add_fact / lm_call / overseer_tick events land in
+  `~/.neo/metrics.jsonl` (disable with `NEO_METRICS=off`). Sessions and watermarks live
+  in `~/.neo/sessions/`.
 - When creating a pull request, always use the PR template included in the repo.

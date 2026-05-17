@@ -1,29 +1,28 @@
-# Tree-sitter Multi-Language Support Setup
+# Tree-sitter Multi-Language Support
 
 ## Overview
 
-Neo now supports multi-language code indexing using tree-sitter. This allows semantic indexing of Python, C#, TypeScript, JavaScript, Java, Go, Rust, and C/C++ codebases.
+Neo uses [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for multi-language parsing across the project index, empty-catch detection, god-file metrics, and edge extraction. Tree-sitter is a **required** core dependency — there is no Python-only fallback.
 
 ## Installation
 
-### Python Version Requirements
-
-**Important**: The `tree-sitter-languages` package currently only supports Python 3.8 - 3.12. If you're using Python 3.13+, tree-sitter support will be disabled, and indexing will fall back to Python-only AST parsing.
-
-### Install tree-sitter (Optional)
+Tree-sitter is installed automatically as part of `pip install neo-reasoner` (or `pip install -e .` for development). No extras flag is required:
 
 ```bash
-# For Python 3.8 - 3.12
-pip install -e ".[tree-sitter]"
-
-# Or install manually
-pip install tree-sitter tree-sitter-languages
+pip install neo-reasoner
 ```
+
+This pulls in:
+
+- `tree-sitter` (core C library bindings)
+- `tree-sitter-language-pack` (the maintained successor to the deprecated `tree-sitter-languages` package, with binary wheels for current Python versions)
+
+> **Note on the 1.x boundary**: `tree-sitter-language-pack` 1.x changed `Parser.parse` and `Tree.root_node` incompatibly. Neo pins to the 0.x line until those changes are absorbed — see the `dependencies` block in `pyproject.toml`.
 
 ### Verify Installation
 
 ```bash
-python -c "from tree_sitter_languages import get_parser; print('tree-sitter OK')"
+python -c "from tree_sitter_language_pack import get_parser; print('tree-sitter OK')"
 ```
 
 ## Usage
@@ -34,138 +33,71 @@ python -c "from tree_sitter_languages import get_parser; print('tree-sitter OK')
 # Index all supported languages (auto-detect)
 neo --index
 
-# Index specific languages only
-neo --index --languages python,csharp,typescript
+# Incrementally refresh after edits (re-embeds only changed files)
+neo --update
 
 # Index from a specific directory
 neo --index --cwd /path/to/project
 ```
 
+The resulting index lives at `.neo/index.json` inside the target repo and powers Neo's [Smart File Selection](../README.md#smart-file-selection).
+
 ### Supported Languages
 
-| Language   | Extensions        | Status       |
-|------------|-------------------|--------------|
-| Python     | .py, .pyi         | ✅ Full Support |
-| C#         | .cs               | ✅ Full Support |
-| TypeScript | .ts, .tsx         | ✅ Full Support |
-| JavaScript | .js, .jsx         | ✅ Full Support |
-| Java       | .java             | ✅ Full Support |
-| Go         | .go               | ✅ Full Support |
-| Rust       | .rs               | ✅ Full Support |
-| C/C++      | .c, .cpp, .h, .hpp | ✅ Full Support |
+The canonical map lives in `src/neo/languages.py:30-54`.
 
-## Troubleshooting
+| Language   | Extensions                  |
+|------------|-----------------------------|
+| Python     | `.py`, `.pyi`               |
+| C#         | `.cs`                       |
+| TypeScript | `.ts`, `.tsx`               |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Java       | `.java`                     |
+| Go         | `.go`                       |
+| Rust       | `.rs`                       |
+| C / C++    | `.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.hh` |
+| Ruby       | `.rb`                       |
+| PHP        | `.php`                      |
+| Swift      | `.swift`                    |
+| Kotlin     | `.kt`                       |
 
-### tree-sitter-languages not found
-
-If you see:
-```
-ImportError: tree-sitter-languages not available
-```
-
-This usually means:
-1. You're using Python 3.13+ (not yet supported by tree-sitter-languages)
-2. The package isn't installed: `pip install tree-sitter-languages`
-
-### Fallback Behavior
-
-When tree-sitter is not available:
-- Neo will log a warning
-- Indexing will fail with a helpful error message
-- You can still use Neo for other features (reasoning, memory, etc.)
-
-### Using Python 3.13+
-
-If you need multi-language support with Python 3.13:
-
-**Option 1**: Use a virtual environment with Python 3.11
-```bash
-pyenv install 3.11.9
-pyenv virtualenv 3.11.9 neo-env
-pyenv activate neo-env
-pip install -e ".[tree-sitter]"
-```
-
-**Option 2**: Wait for tree-sitter-languages Python 3.13 support
-- Track issue: https://github.com/grantjenks/py-tree-sitter-languages/issues
-
-**Option 3**: Build language parsers manually (advanced)
-- Install tree-sitter: `pip install tree-sitter`
-- Compile language grammars yourself
-- See: https://tree-sitter.github.io/tree-sitter/
+Per-subsystem coverage isn't uniform. For example, `code_smells` empty-catch detection registers a per-language detector in `_ERROR_SWALLOW_DETECTORS` (Ruby uses a custom `_is_empty_ruby_rescue` predicate because Ruby's grammar doesn't expose `catch_clause`); Go, Rust, and C have no try/catch construct, so they're omitted from that detector entirely. New languages need explicit registration there before empty-catch detection picks them up.
 
 ## Architecture
 
 ### How It Works
 
-1. **Language Detection**: File extension → language mapping
-2. **Parsing**: Tree-sitter parses source code into AST
-3. **Chunk Extraction**: Queries extract functions, classes, methods
-4. **Embedding**: Code chunks are embedded using fastembed (Jina Code v2)
-5. **Indexing**: FAISS index enables fast semantic search
+1. **Language Detection**: file extension → canonical tree-sitter language name (`src/neo/languages.py`).
+2. **Parsing**: tree-sitter parses source code into an AST via `tree_sitter_language_pack.get_parser`.
+3. **Chunk Extraction**: queries extract functions, classes, methods — see `src/neo/index/language_parser.py`.
+4. **Embedding**: each chunk's `symbols + imports + first ~600 chars of body` is embedded via fastembed (Jina Code v2, 768 dims). Embedding the *signature surface* rather than the raw body is what defeats the "tests outrank source files" keyword-overlap bias — assertion strings inside tests no longer drown out the file's actual definitions.
+5. **Indexing**: FAISS index enables fast cosine search; per-file chunk cap of 2 prevents large files from eating the budget.
 
 ### Code Organization
 
-- `src/neo/index/language_parser.py`: Tree-sitter parser implementation
-- `src/neo/index/project_index.py`: Indexing orchestration
-- `src/neo/cli.py`: CLI integration (`--index`, `--languages` flags)
+- `src/neo/languages.py` — pure-data extension/alias/fence/display maps
+- `src/neo/index/language_parser.py` — tree-sitter parser wrappers + chunk extraction queries
+- `src/neo/index/project_index.py` — indexing orchestration, FAISS persistence, freshness tracking
+- `src/neo/cli.py` — CLI integration (`--index`, `--update`)
+- `src/neo/context_gatherer.py` — consumes the index to boost per-file scores during prompt assembly
 
-### Adding New Languages
+### Adding a New Language
 
-To add support for a new language:
+1. Add the extension(s) to `EXTENSION_TO_LANGUAGE` in `src/neo/languages.py` using the canonical tree-sitter language name (e.g. `c_sharp`, not `csharp`). Add the fence tag to `_FENCE_TAGS` and display name to `_DISPLAY_NAMES`.
+2. Confirm `tree-sitter-language-pack` ships the grammar: `python -c "from tree_sitter_language_pack import get_parser; get_parser('YOUR_LANG')"`.
+3. Add chunk-extraction queries to `language_parser.py` (functions, classes, methods) and register them in `QUERIES` — `architecture_metrics.py` walks files only when `lang in QUERIES`.
+4. If the language has try/catch-style error handling, register a detector in `code_smells._ERROR_SWALLOW_DETECTORS`; otherwise empty-catch detection is silently no-op for it.
 
-1. Add extension mapping to `LANGUAGE_MAP` in `language_parser.py`
-2. Define tree-sitter queries in `QUERIES` dictionary
-3. Test with sample files
-4. Update documentation
+## Operational Notes
 
-Example for adding Ruby support:
-```python
-LANGUAGE_MAP = {
-    # ... existing languages
-    '.rb': 'ruby',
-}
-
-QUERIES['ruby'] = {
-    'functions': """
-        (method
-            name: (identifier) @name
-            parameters: (method_parameters) @params
-            body: (_) @body) @method
-    """,
-    'classes': """
-        (class
-            name: (constant) @name
-            body: (_) @body) @class
-    """
-}
-```
-
-## Performance
-
-### Benchmarks (1000 files, mixed languages)
-
-| Operation | Time | Memory |
-|-----------|------|--------|
-| Index Build | ~30s | ~150MB |
-| Semantic Search (k=5) | ~50ms | - |
-| Refresh (10 changed files) | ~2s | - |
-
-### Optimization Tips
-
-1. **Limit max_files**: `neo --index --max-files 500`
-2. **Filter by language**: Only index languages you use
-3. **Use .gitignore**: Exclude node_modules, venv, build folders
-4. **Incremental refresh**: Index updates only changed files
-
-## Known Issues
-
-1. **Python 3.13 Support**: Waiting on upstream tree-sitter-languages
-2. **Large Files**: Files >100KB may timeout (set MAX_CHUNK_LENGTH)
-3. **Syntax Errors**: Malformed code returns empty chunks (by design)
+- Use `neo --update` instead of `--index` after the first build — it re-embeds only changed files.
+- `neo --index --max-files N` caps the walk when you only care about the active subtree.
+- Neo honors `.gitignore` by default; double-check large generated dirs aren't tracked.
+- `MAX_CHUNK_LENGTH` is set to **2000 characters** (defined in both `language_parser.py` and `project_index.py` — keep them in sync if you change one).
+- Malformed code returns empty chunks by design (better than half-parsed garbage propagating into embeddings).
 
 ## References
 
 - Tree-sitter: https://tree-sitter.github.io/tree-sitter/
-- tree-sitter-languages: https://github.com/grantjenks/py-tree-sitter-languages
+- tree-sitter-language-pack: https://github.com/Goldziher/tree-sitter-language-pack
 - Neo issues: https://github.com/Parslee-ai/neo/issues
