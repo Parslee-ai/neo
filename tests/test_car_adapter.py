@@ -16,14 +16,30 @@ from neo.adapters import CarAdapter, create_adapter
 
 
 class FakeRuntime:
-    """Minimal CarRuntime stand-in for unit tests."""
+    """Minimal CarRuntime stand-in for unit tests.
+
+    Mirrors the real ``infer_tracked`` response schema validated against
+    car-runtime 0.15.1: ``text``, ``model_used``, ``usage`` with
+    ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens`` /
+    ``context_window``, plus ``latency_ms``, ``time_to_first_token_ms``,
+    ``trace_id``, ``tool_calls``.
+    """
 
     def __init__(self, response: dict | str | None = None, raise_on: str | None = None):
         self.calls: list[tuple[str, dict]] = []
         self._response = response if response is not None else {
             "text": "ok",
-            "model": "qwen3-32b",
-            "usage": {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30},
+            "model_used": "gpt-4.1-mini",
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "context_window": 1_000_000,
+            },
+            "latency_ms": 250,
+            "time_to_first_token_ms": 80,
+            "trace_id": "t-fake-1",
+            "tool_calls": [],
         }
         self._raise_on = raise_on
 
@@ -59,34 +75,72 @@ def test_messages_to_prompt_passes_through_string():
 
 
 def test_generate_returns_text_field_from_infer_tracked():
-    rt = FakeRuntime({"text": "hello from car", "model": "gpt-5", "usage": {}})
+    rt = FakeRuntime({"text": "hello from car", "model_used": "gpt-4.1-mini", "usage": {}})
     adapter = CarAdapter(runtime=rt)
     out = adapter.generate([{"role": "user", "content": "hi"}])
     assert out == "hello from car"
     assert len(rt.calls) == 1
     prompt, kwargs = rt.calls[0]
-    assert "user: hi" in prompt
+    # When a chat-style list is passed we send messages_json and use the
+    # first user message as the (required-positional) prompt arg.
+    assert prompt == "hi"
     assert kwargs["max_tokens"] == 4096
+    assert "messages_json" in kwargs
+    assert json.loads(kwargs["messages_json"]) == [{"role": "user", "content": "hi"}]
     assert "model" not in kwargs  # model=None means let router decide
+    # Temperature is NOT passed to CAR — infer_tracked doesn't accept it.
+    assert "temperature" not in kwargs
+
+
+def test_generate_string_prompt_skips_messages_json():
+    rt = FakeRuntime()
+    adapter = CarAdapter(runtime=rt)
+    adapter.generate("just a string prompt", max_tokens=128)
+    prompt, kwargs = rt.calls[0]
+    assert prompt == "just a string prompt"
+    assert "messages_json" not in kwargs
 
 
 def test_generate_pins_model_when_set():
     rt = FakeRuntime()
-    adapter = CarAdapter(model="qwen3-32b", runtime=rt)
-    adapter.generate([{"role": "user", "content": "hi"}], max_tokens=512, temperature=0.2)
+    adapter = CarAdapter(model="Qwen3-4B", runtime=rt)
+    adapter.generate([{"role": "user", "content": "hi"}], max_tokens=512)
     _, kwargs = rt.calls[0]
-    assert kwargs["model"] == "qwen3-32b"
+    assert kwargs["model"] == "Qwen3-4B"
     assert kwargs["max_tokens"] == 512
-    assert kwargs["temperature"] == 0.2
 
 
-def test_generate_passes_intent_hint():
+def test_generate_passes_intent_hint_as_intent_json():
     rt = FakeRuntime()
     intent = {"task": "code", "prefer_local": True}
     adapter = CarAdapter(intent_hint=intent, runtime=rt)
     adapter.generate([{"role": "user", "content": "refactor this"}])
     _, kwargs = rt.calls[0]
-    assert kwargs["intent_hint"] == intent
+    # CAR's API takes intent_json as a JSON string, not a dict
+    assert "intent_json" in kwargs
+    assert json.loads(kwargs["intent_json"]) == intent
+    assert "intent_hint" not in kwargs
+
+
+def test_metrics_capture_real_car_schema():
+    """Metrics emit must use CAR's actual field names (model_used,
+    prompt_tokens, completion_tokens, latency_ms, trace_id)."""
+    recorded: list[tuple[str, dict]] = []
+    rt = FakeRuntime()
+    adapter = CarAdapter(runtime=rt)
+    with patch("neo.memory.metrics.record", side_effect=lambda event, **f: recorded.append((event, f))):
+        adapter.generate([{"role": "user", "content": "hi"}])
+    assert len(recorded) == 1
+    event, fields = recorded[0]
+    assert event == "lm_call"
+    assert fields["provider"] == "car"
+    assert fields["model"] == "gpt-4.1-mini"      # from model_used
+    assert fields["input_tokens"] == 100          # from prompt_tokens
+    assert fields["output_tokens"] == 20          # from completion_tokens
+    assert fields["context_window"] == 1_000_000
+    assert fields["latency_ms"] == 250
+    assert fields["time_to_first_token_ms"] == 80
+    assert fields["trace_id"] == "t-fake-1"
 
 
 def test_generate_tolerates_non_json_response():
@@ -148,8 +202,48 @@ def test_singleton_shared_across_adapter_instances():
 
 def test_metrics_emit_is_best_effort():
     """Metrics failures must not break the adapter."""
-    rt = FakeRuntime({"text": "x", "model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}})
+    rt = FakeRuntime({"text": "x", "model_used": "m", "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
     adapter = CarAdapter(runtime=rt)
     with patch("neo.memory.metrics.record", side_effect=RuntimeError("metrics down")):
         out = adapter.generate([{"role": "user", "content": "hi"}])
     assert out == "x"  # adapter still returned successfully
+
+
+# ----------------------------------------------------------------------------
+# Live integration test — runs only when car_runtime is importable AND the
+# car-server daemon is reachable. Catches real schema drift between the
+# adapter and the binding (signatures, kwarg names, response field names).
+# ----------------------------------------------------------------------------
+
+@pytest.mark.skipif(not car_inference.is_available(), reason="car_runtime not installed")
+def test_real_round_trip_against_live_daemon(monkeypatch):
+    """End-to-end smoke against a real CarRuntime + live car-server.
+
+    Skipped if car-runtime isn't installed; surfaces a clear failure (not a
+    hang) if the daemon isn't reachable. Acts as the canary that catches the
+    mock-vs-reality schema drift that bit us during 0.18.x integration
+    (model_used vs model, prompt_tokens vs input_tokens, intent_json vs
+    intent_hint).
+
+    The repo's conftest patches ``$HOME`` to a tmp dir for filesystem
+    isolation; CAR reads its per-launch auth token from
+    ``~/Library/Application Support/ai.parslee.car/auth-token`` (macOS) or
+    ``$XDG_RUNTIME_DIR/ai.parslee.car/auth-token`` (Linux). We restore the
+    real home for the duration of this test via ``pwd.getpwuid`` so the
+    auth handshake on first connection finds the token.
+    """
+    import os
+    import pwd
+    real_home = pwd.getpwuid(os.getuid()).pw_dir
+    monkeypatch.setenv("HOME", real_home)
+
+    car_inference.reset_for_testing()
+    adapter = CarAdapter()  # router-picked model
+    text = adapter.generate(
+        [{"role": "user", "content": "Reply with exactly the word OK and nothing else."}],
+        max_tokens=8,
+    )
+    assert isinstance(text, str)
+    assert len(text) > 0
+    # The router routinely picks a chatty model; just require OK appears.
+    assert "OK" in text.upper()

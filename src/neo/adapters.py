@@ -702,11 +702,24 @@ class CarAdapter(LMAdapter):
 
     With ``model=None`` (default), CAR's adaptive ``route_model`` picks local
     vs. remote per call using the supplied ``intent_hint``. Pin a backend by
-    passing e.g. ``model='gpt-5'`` or ``model='qwen3-32b'``.
+    passing e.g. ``model='gpt-4.1-mini'`` or ``model='Qwen3-4B'``.
 
     Reuses the process-wide ``CarRuntime`` singleton in ``neo.car_inference``,
     so a single ``neo serve`` host and an outbound ``CarAdapter`` in the same
     process share state, policies, and the eventlog.
+
+    CAR ``infer_tracked`` signature (validated against car-runtime 0.15.x)::
+
+        infer_tracked(prompt, model=None, max_tokens=None, context=None,
+                      tools_json=None, messages_json=None,
+                      tool_choice=None, parallel_tool_calls=None,
+                      intent_json=None) -> str
+
+    Returns a JSON string with: ``text``, ``model_used``, ``usage``
+    (``prompt_tokens`` / ``completion_tokens`` / ``total_tokens`` /
+    ``context_window``), ``latency_ms``, ``time_to_first_token_ms``,
+    ``trace_id``, ``tool_calls``. Note CAR does NOT accept ``temperature``
+    via this API — the underlying backend's default is used.
     """
 
     def __init__(
@@ -726,9 +739,8 @@ class CarAdapter(LMAdapter):
     def _messages_to_prompt(messages) -> str:
         """Flatten a chat-style message list into a single prompt.
 
-        CAR's ``infer_tracked`` takes a string. Future: switch to a chat API
-        if/when ``car_runtime`` exposes one and we want to leverage CAR's
-        automatic conversation compaction.
+        Used as a fallback when we don't have a structured messages array;
+        ``generate()`` prefers passing ``messages_json`` to CAR directly.
         """
         if isinstance(messages, str):
             return messages
@@ -749,18 +761,33 @@ class CarAdapter(LMAdapter):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> str:
-        prompt = self._messages_to_prompt(messages)
-
+        # ``temperature`` is accepted for LMAdapter compatibility but CAR's
+        # infer_tracked does not expose it as a kwarg — backend default wins.
+        # ``stop`` likewise has no equivalent in the current CAR API surface.
         kwargs: dict = {"max_tokens": int(max_tokens)}
-        # CAR honors temperature when the underlying backend supports it.
-        if temperature is not None:
-            kwargs["temperature"] = float(temperature)
         if self.model:
             kwargs["model"] = self.model
-        if self.intent_hint:
-            kwargs["intent_hint"] = self.intent_hint
+        if self.intent_hint is not None:
+            # CAR expects intent_json as a JSON string, not a dict.
+            kwargs["intent_json"] = json.dumps(self.intent_hint)
 
-        result_raw = self._rt.infer_tracked(prompt, **kwargs)
+        # Prefer structured messages so CAR can apply its conversation
+        # compaction and chat-template handling. Fall back to a flattened
+        # prompt when the caller passed a bare string.
+        if isinstance(messages, str):
+            result_raw = self._rt.infer_tracked(messages, **kwargs)
+        elif isinstance(messages, list):
+            kwargs["messages_json"] = json.dumps(messages)
+            # Prompt arg is still required by infer_tracked; pass the first
+            # user message (or an empty string) — messages_json takes priority.
+            first_user = next(
+                (m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+                "",
+            )
+            result_raw = self._rt.infer_tracked(first_user, **kwargs)
+        else:
+            result_raw = self._rt.infer_tracked(str(messages), **kwargs)
+
         try:
             result = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
         except (ValueError, TypeError):
@@ -771,18 +798,18 @@ class CarAdapter(LMAdapter):
         try:
             from neo.memory.metrics import record as metrics_record
             usage = result.get("usage") or {}
-            input_tokens = int(usage.get("input_tokens") or 0)
-            output_tokens = int(usage.get("output_tokens") or 0)
-            cached = int(usage.get("cache_read_input_tokens") or 0)
-            cache_hit_rate = (cached / input_tokens) if input_tokens > 0 else 0.0
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
             metrics_record(
                 "lm_call",
                 provider="car",
-                model=result.get("model") or self.model or "router",
-                input_tokens=input_tokens,
-                cache_read_input_tokens=cached,
-                output_tokens=output_tokens,
-                cache_hit_rate=round(cache_hit_rate, 4),
+                model=result.get("model_used") or self.model or "router",
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                context_window=int(usage.get("context_window") or 0),
+                latency_ms=int(result.get("latency_ms") or 0),
+                time_to_first_token_ms=int(result.get("time_to_first_token_ms") or 0),
+                trace_id=result.get("trace_id") or "",
             )
         except Exception:
             pass  # Metrics are never load-bearing.
