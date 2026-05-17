@@ -79,8 +79,17 @@ def run_server(
     # Single CarRuntime for the server's lifetime — the daemon scopes
     # session state to the WS connection, so one runtime keeps the
     # tool registry, policy set, and (eventual) memgine partition
-    # consistent across A2A calls.
-    rt = cr.CarRuntime()
+    # consistent across A2A calls. We pull from the process-wide
+    # singleton in neo.car_inference so an outbound CarAdapter in the
+    # same process (e.g. when Neo also makes its own LLM calls during
+    # a tool execution) shares this runtime — same state, same policies,
+    # same eventlog, single auth handshake.
+    #
+    # Late import on purpose: car_inference lazy-loads car_runtime to
+    # preserve error-timing for "[car] extra not installed" callers.
+    # Top-level import here would eagerly resolve and break that.
+    from neo.car_inference import get_runtime
+    rt = get_runtime()
 
     # Declare the tool to the daemon. car-a2a's auto-generated Agent
     # Card lifts the schema into the skill list — peers discover Neo's
@@ -255,6 +264,12 @@ def run_server(
         while not _SHUTDOWN.is_set():
             _SHUTDOWN.wait(timeout=1.0)
     finally:
+        # Server-side teardown only: `stop_a2a_server` stops accepting A2A
+        # connections, `unregister_tool_handler` removes our neo.process
+        # callback from the daemon. Neither destroys the runtime itself,
+        # which is intentional — `rt` is the process-wide singleton from
+        # car_inference, potentially in use by an outbound CarAdapter on
+        # another thread. Runtime destruction is left to process exit.
         for action_name, action in (
             ("stop_a2a_server", lambda: cr.stop_a2a_server(rt)),
             ("unregister_tool_handler", cr.unregister_tool_handler),

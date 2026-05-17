@@ -232,6 +232,57 @@ def test_singleton_shared_across_adapter_instances():
     assert a._rt is b._rt is fake
 
 
+def test_car_host_uses_runtime_singleton_not_direct_constructor():
+    """car_host.run_server must reuse the process-wide CarRuntime singleton
+    so an inbound `neo serve` host and an outbound CarAdapter in the same
+    process share state, policies, eventlog, and the auth handshake.
+
+    Verified by identity: patch ``car_inference.get_runtime`` to return a
+    sentinel, then invoke ``run_server``'s runtime-acquisition path with the
+    rest of the function short-circuited via a stub that raises immediately
+    after the runtime is bound. Assert the sentinel was returned.
+
+    Behavior, not source shape — `inspect.getsource` would also accept
+    `# get_runtime()` in a comment and break on whitespace edits.
+    """
+    sentinel = FakeRuntime()
+    car_inference.set_runtime(sentinel)
+
+    # Patch the schema-register call (the first thing run_server does with
+    # the runtime) to record what it received and immediately abort, so
+    # we can assert identity without booting the full A2A listener.
+    captured: dict = {}
+
+    class _Abort(Exception):
+        pass
+
+    def _capture_and_abort(self, *_args, **_kwargs):
+        captured["rt"] = self
+        raise _Abort
+
+    with patch.object(FakeRuntime, "register_tool_schema", _capture_and_abort, create=True):
+        # Mock the rest of the imports inside run_server so it gets to the
+        # register_tool_schema call without needing a real daemon.
+        with patch("neo.car_host.cr", create=True) as fake_cr:
+            fake_cr.CarRuntime = FakeRuntime  # never used now — singleton path
+            from neo import car_host
+            try:
+                car_host.run_server()
+            except _Abort:
+                pass
+            except Exception:
+                # Any earlier-stage failure (config load, etc.) is fine —
+                # the assertion below catches whether we made it to the
+                # runtime-binding step at all.
+                pass
+
+    assert captured.get("rt") is sentinel, (
+        "car_host.run_server did not use the shared CarRuntime singleton — "
+        "outbound CarAdapter and inbound `neo serve` are running on "
+        "different runtime instances. Use car_inference.get_runtime()."
+    )
+
+
 def test_metrics_emit_is_best_effort():
     """Metrics failures must not break the adapter."""
     rt = FakeRuntime({"text": "x", "model_used": "m", "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
