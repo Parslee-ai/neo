@@ -71,30 +71,48 @@ for step in output.plan:
     print(f"- {step.description}")
 ```
 
-## 6. Claude Code Plugin (Optional)
+## 6. Use Neo from Your AI CLI (Optional)
 
-If you use Claude Code, install the Neo plugin for integrated reasoning:
+Neo ships as a plugin for both major AI coding CLIs. Pick whichever you use — the same six commands are available in each, and the fact store is shared.
+
+**Claude Code:**
 
 ```bash
 /plugin marketplace add Parslee-ai/claude-code-plugins
 /plugin install neo
 ```
 
-Then use slash commands:
+Then: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`.
+
+**OpenAI Codex CLI:**
+
 ```bash
-/neo How should I structure this feature?
-/neo-review src/auth.py
-/neo-optimize slow_function
+codex plugin marketplace add Parslee-ai/neo
+# then install "Neo" from Codex's plugin directory
 ```
 
-**Important:** The plugin requires the Neo CLI (step 1) to be installed first.
+Then: `$neo`, `$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`.
+
+**Important:** Both plugins require the Neo CLI (step 1) installed and an API key (step 2) set.
+
+## 7. Host Neo as an Agent (Optional)
+
+For orchestrators and other agents that speak [Agent2Agent v1.0](https://github.com/Parslee-ai/car-releases), Neo can run as a CAR-backed A2A endpoint instead of a CLI:
+
+```bash
+pip install "neo-reasoner[car]"
+python -m car_runtime.server &   # CAR daemon
+neo serve                         # Neo as an A2A tool
+```
+
+This is the inference path other agents call directly — see [Run as an Agent (CAR / A2A)](README.md#run-as-an-agent-car--a2a) in the README for the full setup.
 
 ## Next Steps
 
 - **Full Documentation**: See [README.md](README.md)
 - **Installation Guide**: See [INSTALL.md](INSTALL.md)
 - **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Plugin Sources**: [`.claude-plugin/`](.claude-plugin/) (manifest, agent, slash commands)
+- **Plugin Sources**: [`.claude-plugin/`](.claude-plugin/) (Claude Code) · [`plugins/neo/`](plugins/neo/) (Codex)
 
 ## Common Issues
 
