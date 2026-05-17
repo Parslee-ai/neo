@@ -66,7 +66,7 @@ Neo is **_the missing context layer_** for AI Code Assistants.  It learns from e
   - [Running Tests](#running-tests)
 - [Research & References](#research--references)
   - [Academic Papers](#academic-papers)
-  - [Technologies](#technologies)
+  - [Technologies & Libraries](#technologies--libraries)
 - [License](#license)
 - [Contributing](#contributing)
 - [Changelog](#changelog)
