@@ -60,6 +60,7 @@ Neo is **_the missing context layer_** for AI Code Assistants.  It learns from e
   - [Anthropic](#anthropic)
   - [Google](#google)
   - [Ollama](#ollama)
+  - [CAR (Common Agent Runtime)](#car-common-agent-runtime)
 - [Extending Neo](#extending-neo)
   - [Add a New LM Provider](#add-a-new-lm-provider)
 - [Key Features](#key-features)
@@ -210,18 +211,23 @@ neo --version
 
 ## Run as an Agent (CAR / A2A)
 
-Neo can run as a first-class **Agent2Agent v1.0** endpoint via Parslee's **Common Agent Runtime (CAR)**. Once `neo serve` is up, other agents and orchestrators call Neo's `neo.process` tool over A2A — there's no CLI shell-out, no subprocess parsing, and no environment translation. This is the right surface when you want Neo's semantic memory + multi-agent reasoning available as **inference infrastructure** for other systems.
+Neo integrates with Parslee's **Common Agent Runtime (CAR)** as a first-class peer of the CLI and the plugins. The integration runs **both directions**:
+
+- **Inbound (host)** — `neo serve` exposes Neo as an Agent2Agent v1.0 endpoint. Other agents and orchestrators call Neo's `neo.process` tool over A2A directly. No CLI shell-out, no subprocess parsing.
+- **Outbound (inference)** — set `provider="car"` to route Neo's *own* LLM calls through CAR's unified inference layer. CAR's adaptive router picks **local backends** (Candle + MLX for Qwen3, Gemma 4) or **remote providers** (OpenAI, Anthropic, Google) per call based on task complexity, context-window headroom, and per-model latency/cost. Rust-enforced policies, deterministic eventlog/replay, and semantic conversation compaction all come for free.
+
+A single `CarRuntime` is shared per process — if `neo serve` is running and the same process makes outbound calls, both surfaces see the same state, policies, tool registry, and eventlog.
 
 ### Install the CAR extras
 
 ```bash
-# CAR-backed serving requires the car-runtime Python bindings
+# CAR-backed serving and inference both require the car-runtime Python bindings
 pip install "neo-reasoner[car]"
 ```
 
-`car-runtime` ships as a sealed binary under a separate license (the rest of Neo stays Apache-2.0). Skip this extra if you only need the plugins and CLI.
+`car-runtime` ships as a sealed binary under a separate license (the rest of Neo stays Apache-2.0). Skip this extra if you only need the plugins and the CLI with direct provider SDKs.
 
-### Start the car-server daemon, then Neo
+### Inbound: host Neo as an A2A endpoint
 
 ```bash
 # 1. Start the CAR daemon (default ws://127.0.0.1:9100)
@@ -233,7 +239,35 @@ car-server
 neo serve
 ```
 
-`neo serve` boots a single `CarRuntime`, registers Neo as the `neo.process` tool with its full schema (`src/neo/car_tool_schema.py`), installs the Python `tools.execute` handler, and binds the A2A HTTP listener. It blocks until `SIGINT`/`SIGTERM`.
+`neo serve` boots a `CarRuntime`, registers Neo as the `neo.process` tool with its full schema (`src/neo/car_tool_schema.py`), installs the Python `tools.execute` handler, and binds the A2A HTTP listener. It blocks until `SIGINT`/`SIGTERM`.
+
+### Outbound: use CAR as Neo's inference layer
+
+```bash
+# Switch Neo's default provider
+neo --config set --config-key provider --config-value car
+
+# Let CAR's adaptive router pick the backend per call (recommended)
+neo --config set --config-key model --config-value ""
+
+# Or pin a specific model — local or remote
+neo --config set --config-key model --config-value qwen3-32b
+neo --config set --config-key model --config-value gpt-5
+```
+
+The CAR daemon must be running (`car-server` / `python -m car_runtime.server`). From Python:
+
+```python
+from neo.adapters import create_adapter
+adapter = create_adapter("car")                                    # router-picked
+adapter = create_adapter("car", model="qwen3-32b")                 # pin local
+adapter = create_adapter(
+    "car",
+    intent_hint={"task": "code", "prefer_local": True},            # hint the router
+)
+```
+
+`IntentHint` (`task`, `prefer_local`, `prefer_fast`, `require: ModelCapability[]`) is how you express *what you need* without pinning a model ID — CAR threads it through every infer surface.
 
 ### Discover what's installed
 
@@ -245,14 +279,15 @@ neo car status
 neo --version
 ```
 
-If the CLI/daemon are present but the Python bindings aren't, Neo reports that state cleanly and keeps `neo serve` on the explicit `[car]` path. CAR install options live at [Parslee-ai/car-releases](https://github.com/Parslee-ai/car-releases).
+If the CLI/daemon are present but the Python bindings aren't, Neo reports that state cleanly. CAR install options live at [Parslee-ai/car-releases](https://github.com/Parslee-ai/car-releases).
 
-### Why use the CAR surface
+### Why use the CAR surfaces
 
-- **Real inference path** — calling agents see Neo as a tool with a typed JSON schema, not a subprocess
-- **One runtime per host** — session state, tool registry, and (eventually) memgine partition stay consistent across A2A calls
-- **A2A v1.0 standard** — interoperates with any compliant orchestrator
-- **Memory is shared** — Neo's `~/.neo/facts/` and per-project indexes are the same whether you invoke via CLI, plugin, or `neo serve`
+- **Real inference path both ways** — inbound, callers see Neo as a typed A2A tool; outbound, Neo gets local-first inference with automatic remote fallback through one provider-agnostic protocol
+- **One runtime per host** — session state, tool registry, policies, and the eventlog stay consistent across A2A inbound and inference outbound in the same process
+- **Local-first inference, free fallback** — Qwen3 / Gemma 4 on-device via Candle + MLX; remote OpenAI / Anthropic / Google when the router decides the task needs it
+- **Policies enforced in Rust** — deny rules and capability requirements run before any side-effecting call
+- **Memory is shared across all surfaces** — `~/.neo/facts/` and per-project indexes are the same whether you invoke via CLI, plugin, `neo serve`, or CAR inference
 
 
 ## Claude Code Plugin
@@ -909,6 +944,21 @@ Default model: `gemini-2.0-flash`. Uses the `google-genai` SDK.
 from neo.adapters import OllamaAdapter
 adapter = OllamaAdapter(model="llama2")
 ```
+
+### CAR (Common Agent Runtime)
+
+```python
+from neo.adapters import CarAdapter
+# model=None lets CAR's adaptive router pick local (Candle/MLX) vs remote per call
+adapter = CarAdapter()
+# pin a specific backend if you need to:
+adapter = CarAdapter(model="qwen3-32b")
+# or hint the router without pinning:
+adapter = CarAdapter(intent_hint={"task": "code", "prefer_local": True})
+```
+
+Requires the `[car]` extra (`pip install neo-reasoner[car]`) and a running `car-server`. See [Run as an Agent (CAR / A2A)](#run-as-an-agent-car--a2a) for the full setup.
+
 
 ## Extending Neo
 

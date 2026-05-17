@@ -689,6 +689,110 @@ class ClaudeCodeAdapter(LMAdapter):
 # Adapter Factory
 # ============================================================================
 
+# ============================================================================
+# CAR (Common Agent Runtime) Adapter — routes inference through car-server's
+# unified inference layer (local Candle/MLX + remote OpenAI/Anthropic/Google
+# behind one provider-agnostic protocol with Rust-enforced policies, adaptive
+# routing, semantic conversation compaction, and deterministic replay).
+# ============================================================================
+
+
+class CarAdapter(LMAdapter):
+    """Route Neo's outbound inference through CAR's unified inference layer.
+
+    With ``model=None`` (default), CAR's adaptive ``route_model`` picks local
+    vs. remote per call using the supplied ``intent_hint``. Pin a backend by
+    passing e.g. ``model='gpt-5'`` or ``model='qwen3-32b'``.
+
+    Reuses the process-wide ``CarRuntime`` singleton in ``neo.car_inference``,
+    so a single ``neo serve`` host and an outbound ``CarAdapter`` in the same
+    process share state, policies, and the eventlog.
+    """
+
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        intent_hint: Optional[dict] = None,
+        runtime: Optional[object] = None,
+    ):
+        self.model = model
+        self.intent_hint = dict(intent_hint) if intent_hint else None
+        if runtime is None:
+            from neo.car_inference import get_runtime
+            runtime = get_runtime()
+        self._rt = runtime
+
+    @staticmethod
+    def _messages_to_prompt(messages) -> str:
+        """Flatten a chat-style message list into a single prompt.
+
+        CAR's ``infer_tracked`` takes a string. Future: switch to a chat API
+        if/when ``car_runtime`` exposes one and we want to leverage CAR's
+        automatic conversation compaction.
+        """
+        if isinstance(messages, str):
+            return messages
+        parts = []
+        for m in messages:
+            if isinstance(m, dict):
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                parts.append(f"{role}: {content}")
+            else:
+                parts.append(str(m))
+        return "\n\n".join(parts)
+
+    def generate(
+        self,
+        messages,
+        stop: Optional[list] = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> str:
+        prompt = self._messages_to_prompt(messages)
+
+        kwargs: dict = {"max_tokens": int(max_tokens)}
+        # CAR honors temperature when the underlying backend supports it.
+        if temperature is not None:
+            kwargs["temperature"] = float(temperature)
+        if self.model:
+            kwargs["model"] = self.model
+        if self.intent_hint:
+            kwargs["intent_hint"] = self.intent_hint
+
+        result_raw = self._rt.infer_tracked(prompt, **kwargs)
+        try:
+            result = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
+        except (ValueError, TypeError):
+            # CAR violated its contract; surface the raw value as the text so
+            # downstream parsers see something rather than crashing.
+            return str(result_raw)
+
+        try:
+            from neo.memory.metrics import record as metrics_record
+            usage = result.get("usage") or {}
+            input_tokens = int(usage.get("input_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
+            cached = int(usage.get("cache_read_input_tokens") or 0)
+            cache_hit_rate = (cached / input_tokens) if input_tokens > 0 else 0.0
+            metrics_record(
+                "lm_call",
+                provider="car",
+                model=result.get("model") or self.model or "router",
+                input_tokens=input_tokens,
+                cache_read_input_tokens=cached,
+                output_tokens=output_tokens,
+                cache_hit_rate=round(cache_hit_rate, 4),
+            )
+        except Exception:
+            pass  # Metrics are never load-bearing.
+
+        return result.get("text", "")
+
+    def name(self) -> str:
+        return f"car/{self.model or 'router'}"
+
+
 def create_adapter(
     provider: str,
     model: Optional[str] = None,
@@ -698,7 +802,8 @@ def create_adapter(
     Factory function to create appropriate adapter.
 
     Args:
-        provider: One of "openai", "anthropic", "google", "azure", "local", "ollama", "claude-code"
+        provider: One of "openai", "anthropic", "google", "azure", "local",
+                  "ollama", "claude-code", "car"
         model: Model name (optional, uses provider default)
         **kwargs: Additional provider-specific arguments
 
@@ -721,8 +826,14 @@ def create_adapter(
         return OllamaAdapter(model=model or "llama2", **kwargs)
     elif provider == "claude-code":
         return ClaudeCodeAdapter(model=model or "claude-sonnet-4-5-20250929", **kwargs)
+    elif provider == "car":
+        # CarAdapter ignores api_key/base_url — CAR's router owns provider
+        # selection. Strip them so callers can pass NeoConfig values uniformly.
+        kwargs.pop("api_key", None)
+        kwargs.pop("base_url", None)
+        return CarAdapter(model=model, **kwargs)
     else:
         raise ValueError(
             f"Unknown provider: {provider}. "
-            f"Supported: openai, anthropic, google, azure, local, ollama, claude-code"
+            f"Supported: openai, anthropic, google, azure, local, ollama, claude-code, car"
         )
