@@ -52,6 +52,11 @@
   2 peer episodes from the same session.
 - Local storage: per-scope JSON files in `~/.neo/facts/` with inline embeddings. Fine
   while any single scope file stays under ~10k facts; revisit the backend past that.
+- Context assembly four-layer model + `ContextAssembler` token-budget enforcement are
+  adapted from Parslee's [StateBench](https://github.com/parslee-ai/statebench) and its
+  **memgine** budget engine. Changes to layer ordering, the 2/3 constraint cap, or the
+  inline `(changed from: X)` annotation should preserve the validated 95.8%
+  decision-accuracy contract — see `docs/solutions/token-budget-enforcement.md`.
 - Observability: retrieve / add_fact / lm_call / overseer_tick events land in
   `~/.neo/metrics.jsonl` (disable with `NEO_METRICS=off`). Sessions and watermarks live
   in `~/.neo/sessions/`.
