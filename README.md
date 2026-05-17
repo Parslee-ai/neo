@@ -11,9 +11,10 @@
 - **Code-First Generation**: No diff parsing failures
 - **Local Storage**: Privacy-first JSON storage in ~/.neo/facts/ directory
 - **Model-Agnostic**: Works with any LM provider
-- **Available as a [Claude Code Plugin](#claude-code-plugin)**: Integrates seamlessly with Anthropic's Claude models and CLI.
-
-![Claude Code Plugin Banner: Background is an illustration of a terminal or console.](https://ik.imagekit.io/xvpgfijuw/parslee/bannerFor__Claude-Code.webp)
+- **Three integration surfaces** — each on equal footing:
+  - **[Run as an Agent (CAR / A2A)](#run-as-an-agent-car--a2a)** — host Neo as an Agent2Agent v1.0 endpoint other agents (or orchestrators) can call directly. Real inference path, not a CLI wrapper.
+  - **[Claude Code Plugin](#claude-code-plugin)** — six slash commands + a specialized agent inside Anthropic's Claude Code CLI.
+  - **[Codex Plugin](#codex-plugin)** — same six skills, packaged for OpenAI Codex CLI.
 
 [![PyPI version](https://img.shields.io/pypi/v/neo-reasoner.svg)](https://pypi.org/project/neo-reasoner/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/neo-reasoner.svg)](https://pypi.org/project/neo-reasoner/)
@@ -32,10 +33,10 @@ Neo is **_the missing context layer_** for AI Code Assistants.  It learns from e
 - [Design Philosophy](#design-philosophy)
 - [How It Works](#how-it-works)
 - [Quick Start](#quick-start)
+- [Run as an Agent (CAR / A2A)](#run-as-an-agent-car--a2a)
 - [Claude Code Plugin](#claude-code-plugin)
 - [Codex Plugin](#codex-plugin)
 - [Works Alongside Your AI Tools](#works-alongside-your-ai-tools)
-  - [Quick Examples](#quick-examples)
 - [Installation](#installation)
   - [From PyPI (Recommended)](#from-pypi-recommended)
   - [From Source (Development)](#from-source-development)
@@ -207,68 +208,114 @@ neo --version
 **See [QUICKSTART.md](QUICKSTART.md) for 5-minute setup guide**
 
 
+## Run as an Agent (CAR / A2A)
+
+Neo can run as a first-class **Agent2Agent v1.0** endpoint via Parslee's **Common Agent Runtime (CAR)**. Once `neo serve` is up, other agents and orchestrators call Neo's `neo.process` tool over A2A — there's no CLI shell-out, no subprocess parsing, and no environment translation. This is the right surface when you want Neo's semantic memory + multi-agent reasoning available as **inference infrastructure** for other systems.
+
+### Install the CAR extras
+
+```bash
+# CAR-backed serving requires the car-runtime Python bindings
+pip install "neo-reasoner[car]"
+```
+
+`car-runtime` ships as a sealed binary under a separate license (the rest of Neo stays Apache-2.0). Skip this extra if you only need the plugins and CLI.
+
+### Start the car-server daemon, then Neo
+
+```bash
+# 1. Start the CAR daemon (default ws://127.0.0.1:9100)
+python -m car_runtime.server
+# or, if installed standalone:
+car-server
+
+# 2. In another terminal, host Neo as an A2A endpoint
+neo serve
+```
+
+`neo serve` boots a single `CarRuntime`, registers Neo as the `neo.process` tool with its full schema (`src/neo/car_tool_schema.py`), installs the Python `tools.execute` handler, and binds the A2A HTTP listener. It blocks until `SIGINT`/`SIGTERM`.
+
+### Discover what's installed
+
+```bash
+# Detects native CLI, car-server, Python bindings, and the default daemon port
+neo car status
+
+# Also surfaced in --version output
+neo --version
+```
+
+If the CLI/daemon are present but the Python bindings aren't, Neo reports that state cleanly and keeps `neo serve` on the explicit `[car]` path. CAR install options live at [Parslee-ai/car-releases](https://github.com/Parslee-ai/car-releases).
+
+### Why use the CAR surface
+
+- **Real inference path** — calling agents see Neo as a tool with a typed JSON schema, not a subprocess
+- **One runtime per host** — session state, tool registry, and (eventually) memgine partition stay consistent across A2A calls
+- **A2A v1.0 standard** — interoperates with any compliant orchestrator
+- **Memory is shared** — Neo's `~/.neo/facts/` and per-project indexes are the same whether you invoke via CLI, plugin, or `neo serve`
+
+
 ## Claude Code Plugin
 
-Neo is available as a **Claude Code plugin** with specialized agents and slash commands for seamless integration:
+Neo ships as a **Claude Code plugin** with a specialized agent and six slash commands. Anthropic's Claude Code CLI installs it from Parslee's plugin marketplace:
 
 ```bash
 # Add the marketplace
 /plugin marketplace add Parslee-ai/claude-code-plugins
 
-# Install Neo plugin
+# Install Neo
 /plugin install neo
 ```
 
-Once installed, you get:
-- **Neo Agent**: Specialized subagent for semantic reasoning (`Use the Neo agent to...`)
-- **Slash Commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
-- **Persistent Memory**: Neo learns from your codebase patterns over time
-- **Multi-Agent Reasoning**: Solver, Critic, and Verifier agents collaborate on solutions
+Once installed:
 
+- **Slash commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
+- **Specialized agent**: invoke with `Use the Neo agent to ...` for delegated semantic reasoning
+- **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Codex plugin
 
-### Quick Examples
+Examples:
 
 ```bash
-# Code review with semantic analysis
 /neo-review src/api/handlers.py
-
-# Get optimization suggestions
 /neo-optimize process_large_dataset function
-
-# Architectural guidance
 /neo-architect Should I use microservices or monolith?
-
-# Debug complex issues
 /neo-debug Race condition in task processor
 ```
+
+The plugin wraps the local `neo` CLI, so the binary must be installed first (`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set, or your provider of choice).
 
 Plugin sources live under [`.claude-plugin/`](.claude-plugin/) — `plugin.json` is the manifest, `agents/neo.md` defines the agent, and `commands/*.md` defines each slash command.
 
 
 ## Codex Plugin
 
-Neo also ships as a **Codex plugin** with the same six skills the Claude Code plugin exposes — packaged for [OpenAI Codex CLI](https://developers.openai.com/codex/plugins) instead of slash commands.
+Neo ships as a **Codex plugin** with the same six skills, packaged for [OpenAI Codex CLI](https://developers.openai.com/codex/plugins). Add the marketplace and install Neo from Codex's plugin directory:
 
 ```bash
-# Add Neo's local marketplace (works in any clone of this repo)
+# Add Parslee's hosted marketplace
 codex plugin marketplace add Parslee-ai/neo
 
-# Or, from a local checkout, point Codex at the in-tree marketplace:
+# Or, from a local checkout, point Codex at the in-tree marketplace
 codex plugin marketplace add ./
 ```
 
-Then open Codex's plugin directory and install **Neo** from the `Neo (local)` marketplace. Once installed, you get six skills:
+Once installed:
 
-- `$neo` — semantic reasoning over the current codebase
-- `$neo-review` — code review with semantic pattern matching
-- `$neo-optimize` — performance/algorithmic optimization analysis
-- `$neo-architect` — architectural guidance and design decisions
-- `$neo-debug` — help debugging intermittent or hard-to-reproduce issues
-- `$neo-pattern` — extract patterns from code or find pattern instances
+- **Skills**: `$neo`, `$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`
+- **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Claude Code plugin
 
-Skills wrap the local `neo` CLI, so you still need the binary installed (`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set). Neo's persistent semantic memory in `~/.neo/` is shared across both plugins — anything you teach Neo from Claude Code is available from Codex too, and vice versa.
+Examples:
 
-**See [plugins/neo/](plugins/neo/) for the manifest and skill sources**
+```bash
+$neo-review src/api/handlers.py
+$neo-optimize process_large_dataset function
+$neo-architect Should I use microservices or monolith?
+$neo-debug Race condition in task processor
+```
+
+The plugin wraps the local `neo` CLI, so the binary must be installed first (`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set, or your provider of choice). Anything you teach Neo from Codex is immediately available in the Claude Code plugin and the CAR endpoint, and vice versa — there is one fact store per host.
+
+Plugin sources live under [`plugins/neo/`](plugins/neo/) — see the manifest and skill definitions.
 
 
 ## Works Alongside Your AI Tools
@@ -474,21 +521,6 @@ neo memory prune --dry-run --max-invalid-age-days 14
 ```
 
 Use `prune` when a `~/.neo/facts/facts_project_*.json` file grows much larger than its 500-valid-fact cap — that gap is tombstone bloat from supersession. Defaults are conservative; raising `--max-invalid-age-days` is safe, lowering it past ~7 may evict tombstones still referenced by recent supersession chains.
-
-
-### CAR Runtime Discovery
-
-Neo detects local CAR installs across the native CLI, `car-server`, Python
-bindings, and the default daemon port:
-
-```bash
-neo car status
-neo --version
-```
-
-If the CLI/server are present but Python bindings are not, Neo reports that
-state and keeps `neo serve` on the explicit `[car]` path. CAR install options
-are documented at [Parslee-ai/car-releases](https://github.com/Parslee-ai/car-releases).
 
 
 ### Timeout Requirements
@@ -892,6 +924,10 @@ class CustomAdapter(LMAdapter):
 
 ## Key Features
 
+- **Three integration surfaces on equal footing**:
+  - **Run as an Agent (CAR / A2A)** — host Neo as an Agent2Agent v1.0 endpoint via `neo serve`; other agents call `neo.process` directly
+  - **Claude Code Plugin** — six slash commands + a specialized agent inside Claude Code
+  - **Codex Plugin** — the same six skills, packaged for OpenAI Codex CLI
 - **Fact-Based Memory**: Learns from every solution attempt using a scoped, supersession-based fact store
 - **Semantic Retrieval**: Vector search finds relevant facts via Jina Code embeddings
 - **Code-First Generation**: No diff parsing failures
