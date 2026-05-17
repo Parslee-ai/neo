@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 CONSTRAINT_FILES = [
     ("~/.claude/CLAUDE.md", FactScope.GLOBAL),
     ("{project}/CLAUDE.md", FactScope.PROJECT),
+    ("{project}/AGENTS.md", FactScope.PROJECT),
     ("{project}/agents.md", FactScope.PROJECT),
+    ("{project}/.github/AGENTS.md", FactScope.PROJECT),
     ("{project}/.cursor/rules", FactScope.PROJECT),
     ("{project}/.cursorrules", FactScope.PROJECT),
     ("{project}/.windsurfrules", FactScope.PROJECT),

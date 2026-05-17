@@ -8,8 +8,13 @@ These tests validate that bug #38 is fixed:
 
 import subprocess
 import sys
+import os
+from pathlib import Path
 
 import pytest
+
+
+REPO_SRC = str(Path(__file__).resolve().parents[1] / "src")
 
 
 def test_index_flag_imports_successfully():
@@ -43,6 +48,7 @@ def test_index_flag_basic_functionality(tmp_path):
         cwd=str(tmp_path),
         capture_output=True,
         text=True,
+        env={**os.environ, "PYTHONPATH": REPO_SRC},
         timeout=30,
     )
 

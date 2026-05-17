@@ -631,6 +631,15 @@ class TestInstallMethodDetection:
         # *first* when the path is in a pipx venv (even if also in a venv).
         assert _detect_install_method() == INSTALL_PIPX
 
+    def test_detects_editable_pipx_venv_from_prefix(self, monkeypatch):
+        """Editable pipx installs import neo from a checkout, not site-packages."""
+        fake_neo = MagicMock()
+        fake_neo.__file__ = "/Users/me/src/neo/src/neo/__init__.py"
+        monkeypatch.setitem(sys.modules, "neo", fake_neo)
+        monkeypatch.setattr(sys, "prefix", "/Users/me/.local/pipx/venvs/neo-reasoner")
+        monkeypatch.setattr(sys, "base_prefix", "/opt/homebrew")
+        assert _detect_install_method() == INSTALL_PIPX
+
     def test_detects_pip_venv(self, monkeypatch):
         fake = "/tmp/myproject/.venv/lib/python3.12/site-packages/neo/__init__.py"
         fake_neo = MagicMock()

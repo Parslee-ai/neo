@@ -1424,3 +1424,23 @@ class TestConstraintEmbeddings:
         constraints = [f for f in s._facts if f.kind == FactKind.CONSTRAINT]
         for c in constraints:
             assert c.embedding is not None, f"Constraint '{c.subject}' has no embedding"
+
+    def test_ingests_uppercase_agents_md(self, tmp_facts_dir, tmp_path, tmp_checksum_dir):
+        """AGENTS.md is the Codex-standard project instruction file."""
+        agents_md = tmp_path / "AGENTS.md"
+        agents_md.write_text("## Codex Rules\nRespect the project instructions.\n")
+
+        fake_emb = np.ones(768, dtype=np.float32)
+        with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
+             patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
+             patch.object(FactStore, "_maybe_migrate"), \
+             patch.object(FactStore, "_ingest_seed_facts"), \
+             patch.object(FactStore, "_ingest_community_feed"), \
+             patch.object(FactStore, "_ingest_claude_memory"), \
+             patch.object(FactStore, "_embed_text", return_value=fake_emb), \
+             patch("neo.memory.constraints.CHECKSUM_DIR", tmp_checksum_dir), \
+             patch("neo.memory.constraints.CHECKSUM_FILE", tmp_checksum_dir / "checksums.json"):
+            s = FactStore(codebase_root=str(tmp_path))
+
+        constraints = [f for f in s._facts if f.kind == FactKind.CONSTRAINT]
+        assert any(f.metadata.source_file == str(agents_md) for f in constraints)

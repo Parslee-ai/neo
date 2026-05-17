@@ -50,6 +50,11 @@ INSTALL_EXTERNAL = "external"  # PEP-668 / system Python; pip-upgrade is unsafe
 _BREW_PREFIXES = ("/opt/homebrew/", "/usr/local/Cellar/", "/home/linuxbrew/")
 
 
+def _path_is_pipx(path: str) -> bool:
+    """Return True when a path sits under pipx's managed venv directory."""
+    return "/pipx/venvs/" in path or "\\pipx\\venvs\\" in path
+
+
 def _brew_owns(formula: str) -> bool:
     """Return True if Homebrew has a formula with this name installed."""
     try:
@@ -72,15 +77,20 @@ def _detect_install_method() -> str:
     command — using pip on a brew install (or vice versa) leaves stale
     metadata behind and breaks future auto-updates.
     """
+    # pipx puts each app in its own venv under ~/.local/pipx/venvs/<app>/.
+    # Match POSIX and Windows separators. Check sys.prefix first because
+    # editable pipx installs import package code from the checkout, so
+    # neo.__file__ no longer lives inside the pipx venv.
+    if _path_is_pipx(str(Path(sys.prefix).resolve())):
+        return INSTALL_PIPX
+
     try:
         import neo  # local import to avoid circular concerns
         pkg_path = str(Path(neo.__file__).resolve())
     except Exception:
         return INSTALL_EXTERNAL
 
-    # pipx puts each app in its own venv under ~/.local/pipx/venvs/<app>/.
-    # Match POSIX and Windows separators.
-    if "/pipx/venvs/" in pkg_path or "\\pipx\\venvs\\" in pkg_path:
+    if _path_is_pipx(pkg_path):
         return INSTALL_PIPX
 
     # An isolated, non-pipx venv: sys.prefix diverges from base_prefix and

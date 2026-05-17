@@ -70,6 +70,8 @@ class OpenAIAdapter(LMAdapter):
             payload: dict = {
                 "model": self.model,
                 "input": messages,
+                "max_output_tokens": max_tokens,
+                "temperature": temperature,
             }
             if reasoning_effort is not None:
                 payload["reasoning"] = {"effort": reasoning_effort}

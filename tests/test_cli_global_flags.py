@@ -38,6 +38,7 @@ class TestCLIGlobalFlags:
             [sys.executable, "-m", "neo", "--version"],
             capture_output=True,
             text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
             timeout=30
         )
 
@@ -68,6 +69,7 @@ class TestCLIGlobalFlags:
             [sys.executable, "-m", "neo", "construct", "list"],
             capture_output=True,
             text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
             timeout=30
         )
 
@@ -120,16 +122,18 @@ class TestCLIGlobalFlags:
             [sys.executable, "-m", "neo", "construct", "--version"],
             capture_output=True,
             text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
             timeout=30
         )
 
         # Should exit successfully
         assert result.returncode == 0, f"Expected exit code 0, got {result.returncode}. stderr: {result.stderr}"
 
-        # Should output version info (neo X.Y.Z format or contains "version" keyword)
+        # Should output version info. Source-tree subprocesses may not have
+        # package metadata, in which case show_version prints "neo unknown".
         output = result.stdout + result.stderr
         output_lower = output.lower()
-        assert "neo 0." in output_lower or "version" in output_lower, \
+        assert "neo " in output_lower, \
             f"Expected version info in output, got: stdout={result.stdout}, stderr={result.stderr}"
 
         # Should not contain error messages
