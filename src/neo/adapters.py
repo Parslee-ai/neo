@@ -722,6 +722,13 @@ class CarAdapter(LMAdapter):
     via this API — the underlying backend's default is used.
     """
 
+    #: Default IntentHint sent to CAR when the caller doesn't supply one.
+    #: Neo's workload is overwhelmingly code reasoning (review, optimization,
+    #: debugging, generation), so we tell the router to pick a code-capable
+    #: model rather than a chat-tier one. CAR's task enum (per the binding's
+    #: error reporting): ``chat | classify | reasoning | code``.
+    DEFAULT_INTENT_HINT: dict = {"task": "code"}
+
     def __init__(
         self,
         model: Optional[str] = None,
@@ -729,7 +736,8 @@ class CarAdapter(LMAdapter):
         runtime: Optional[object] = None,
     ):
         self.model = model
-        self.intent_hint = dict(intent_hint) if intent_hint else None
+        # Caller-supplied intent wins; otherwise default to coding workload.
+        self.intent_hint = dict(intent_hint) if intent_hint else dict(self.DEFAULT_INTENT_HINT)
         if runtime is None:
             from neo.car_inference import get_runtime
             runtime = get_runtime()

@@ -259,15 +259,15 @@ The CAR daemon must be running (`car-server` / `python -m car_runtime.server`). 
 
 ```python
 from neo.adapters import create_adapter
-adapter = create_adapter("car")                                    # router-picked
-adapter = create_adapter("car", model="qwen3-32b")                 # pin local
+adapter = create_adapter("car")                                    # router picks a code-capable model
+adapter = create_adapter("car", model="Qwen3-4B")                  # pin a specific backend
 adapter = create_adapter(
     "car",
-    intent_hint={"task": "code", "prefer_local": True},            # hint the router
+    intent_hint={"task": "reasoning", "prefer_local": True},       # override the default
 )
 ```
 
-`IntentHint` (`task`, `prefer_local`, `prefer_fast`, `require: ModelCapability[]`) is how you express *what you need* without pinning a model ID — CAR threads it through every infer surface.
+**Default intent**: `CarAdapter` sends `intent_json={"task": "code"}` on every call unless you supply your own `intent_hint`. Neo's workload is overwhelmingly code reasoning (review, optimization, debugging, generation), so the router gets to pick a code-capable model rather than the chat default. CAR's task enum is `chat | classify | reasoning | code`. The rest of `IntentHint` (`prefer_local`, `prefer_fast`, `require: ModelCapability[]`) is how you express *what else you need* without pinning a model ID.
 
 ### Discover what's installed
 
@@ -949,12 +949,13 @@ adapter = OllamaAdapter(model="llama2")
 
 ```python
 from neo.adapters import CarAdapter
-# model=None lets CAR's adaptive router pick local (Candle/MLX) vs remote per call
+# Default: router-picked model with intent_json={"task": "code"} so the
+# router selects a code-capable backend rather than the chat default.
 adapter = CarAdapter()
 # pin a specific backend if you need to:
-adapter = CarAdapter(model="qwen3-32b")
-# or hint the router without pinning:
-adapter = CarAdapter(intent_hint={"task": "code", "prefer_local": True})
+adapter = CarAdapter(model="Qwen3-4B")
+# override the default intent (CAR task enum: chat | classify | reasoning | code):
+adapter = CarAdapter(intent_hint={"task": "reasoning", "prefer_local": True})
 ```
 
 Requires the `[car]` extra (`pip install neo-reasoner[car]`) and a running `car-server`. See [Run as an Agent (CAR / A2A)](#run-as-an-agent-car--a2a) for the full setup.
