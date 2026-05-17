@@ -672,7 +672,7 @@ Neo uses a **scoped, supersession-based fact store** with **Jina Code v2** embed
 5. **Hybrid Retrieval**: 0.7·dense (Jina) + 0.3·BM25. Half the result slots ranked by full `rank_score`, half by raw cosine — novel-but-relevant facts aren't crowded out by validated winners.
 6. **Triple-Trigger Consolidation**: REVIEW facts cluster into PATTERN / FAILURE archetypes when ANY of count-delta ≥10, elapsed ≥1h, or confidence-decile entropy >0.9 fires. Clusters of ≥3 get an NREM-style Hebbian confidence bump; non-curated facts decay 3% globally after each pass.
 7. **Dual-Buffer Probation**: New non-curated facts enter with a `probation` tag and a 3-day stale window (vs 7/14 normal); promoted automatically on `access_count ≥ 2` or `success_count > 0` — quietly evicts noise while keeping real signal.
-8. **Four-Layer Context**: Retrieved facts are organized into constraints, relevant knowledge, recent changes, and known unknowns. The four-layer state model and the token-budget enforcement in `memory/context.py` are both adapted from Parslee's [**StateBench**](https://github.com/parslee-ai/statebench) (a conformance bench for stateful agents) and its **memgine** budget engine. StateBench's measured 95.8% decision-accuracy result is what drove the move from a separate "Recently Changed" section to inline `(changed from: X)` annotations.
+8. **Four-Layer Context**: Retrieved facts are organized into constraints, relevant knowledge, recent changes, and known unknowns. The four-layer state model is from *Beyond Conversation: A State-Based Context Architecture for Enterprise AI Agents* (Liotta, 2025) — see [`papers/state-based-context-architecture.pdf`](papers/state-based-context-architecture.pdf). The token-budget enforcement in `memory/context.py` is ported from the engine described in *Memgine: A Deterministic Memory Engine for Stateful AI Agents* (Liotta, 2026) — see [`papers/memgine-deterministic-memory-engine.pdf`](papers/memgine-deterministic-memory-engine.pdf). Both are evaluated by [StateBench](https://github.com/parslee-ai/statebench); the 95.8% decision-accuracy result on the v1.0 development split is what drove Neo's move from a separate "Recently Changed" section to inline `(changed from: X)` annotations.
 
 ### Output Schemas
 
@@ -1084,12 +1084,20 @@ The 0.18 memory architecture lands deterministic techniques from a focused readi
     - Daemon-thread tick loop emitting `overseer_tick` events; loop detection via 5-identical-actions-in-a-row; LM-call cache-hit-rate tracking.
     - **Implementation**: `src/neo/overseer.py`, `src/neo/adapters.py:237`.
 
-**In-house benchmarks & engines (Parslee)**
+**In-house papers (Parslee)** — the foundational research behind Neo's context architecture
 
-- **StateBench** — [github.com/parslee-ai/statebench](https://github.com/parslee-ai/statebench) · [parslee-ai.github.io/statebench](https://parslee-ai.github.io/statebench/) — a conformance test for stateful agents that measures state correctness over time. Neo's four-layer context model (constraints / valid facts / invalidated facts / known unknowns) and its layer-ordering heuristic are adapted from StateBench's winning approach. The 95.8% decision-accuracy result on inline change annotations is the validation behind Neo's `(changed from: X)` formatting.
-  - **Implementation**: `src/neo/memory/context.py`, `src/neo/memory/models.py` `ContextResult`.
-- **memgine** — the layered-budget engine inside StateBench. Neo's `ContextAssembler.assemble()` token-budget enforcement (2/3 constraint cap, greedy first-fit accumulation with `at_least_one`, `Fact.size_hint()` heuristic) is a direct port — see `docs/solutions/token-budget-enforcement.md` for the full attribution and design notes.
-  - **Implementation**: `_accumulate_within_budget` in `src/neo/memory/context.py`; `Fact.size_hint()` in `src/neo/memory/models.py`.
+- **Beyond Conversation: A State-Based Context Architecture for Enterprise AI Agents**
+  *Liotta, 2025* | [PDF](papers/state-based-context-architecture.pdf)
+  - The theoretical foundations for the four-layer state model (constraints / valid facts / invalidated facts / known unknowns), supersession semantics, and the six classes of state failure (resurrection, hallucination, scope leak, stale reasoning, authority violation, temporal decay).
+  - **Implementation**: `src/neo/memory/context.py`, `ContextResult` in `src/neo/memory/models.py`.
+
+- **Memgine: A Deterministic Memory Engine for Stateful AI Agents**
+  *Liotta, 2026* | [PDF](papers/memgine-deterministic-memory-engine.pdf)
+  - The production engine implementing the full specification: query-relevance sorting, engine-level access control, adaptive inline repair, layered token-budget enforcement (2/3 constraint cap, greedy first-fit accumulation with `at_least_one`, `Fact.size_hint()` heuristic). Achieves 95.8% decision accuracy on the StateBench v1.0 development split with GPT-5.2 (97.3% with Opus 4.6).
+  - **Implementation**: `_accumulate_within_budget` in `src/neo/memory/context.py`; `Fact.size_hint()` in `src/neo/memory/models.py`; design notes in `docs/solutions/token-budget-enforcement.md`.
+
+- **StateBench** — [github.com/parslee-ai/statebench](https://github.com/parslee-ai/statebench) · [parslee-ai.github.io/statebench](https://parslee-ai.github.io/statebench/)
+  - The conformance test suite that evaluates the two papers above. PyPI / HuggingFace Dataset / Space. Reference baselines (`state_based`, `rolling_summary`, `fact_extraction_with_supersession`, etc.) on the v1.0 test split set the bar Neo's port is measured against.
 
 **Background reading (in [`papers/`](papers/) but not directly cited in code)**
 
