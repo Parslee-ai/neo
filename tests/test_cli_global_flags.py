@@ -15,6 +15,8 @@ import subprocess
 import sys
 import pytest
 
+from neo.cli import _adapter_kwargs_for_config
+
 
 class TestCLIGlobalFlags:
     """Test CLI global flags work correctly at entry point."""
@@ -158,6 +160,66 @@ class TestCLIGlobalFlags:
             f"Expected replay summary in output, got: stdout={result.stdout}, stderr={result.stderr}"
         assert "attributeerror" not in output_lower, f"Unexpected AttributeError in output: {output}"
         assert "traceback" not in output_lower, f"Unexpected traceback in output: {output}"
+
+    def test_no_scan_dry_run_does_not_require_api_key(self):
+        """
+        `--dry-run --no-scan` should exit before adapter initialization.
+        """
+        env = {
+            **os.environ,
+            "PYTHONPATH": "src",
+            "NEO_SKIP_UPDATE_CHECK": "1",
+        }
+        for key in ("NEO_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY"):
+            env.pop(key, None)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "neo", "--dry-run", "--no-scan", "test prompt"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+        assert result.returncode == 0, f"Expected exit code 0, got {result.returncode}. stderr: {result.stderr}"
+        output = result.stdout + result.stderr
+        assert "DRY RUN" in output
+        assert "OpenAI API key required" not in output
+
+    def test_memory_prune_dry_run_works(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "neo", "memory", "prune", "--dry-run"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
+            timeout=30,
+        )
+
+        assert result.returncode == 0, f"Expected exit code 0, got {result.returncode}. stderr: {result.stderr}"
+        output = result.stdout + result.stderr
+        assert "memory dry run" in output.lower()
+        assert "traceback" not in output.lower()
+
+
+def test_adapter_kwargs_passes_base_url_to_ollama():
+    class Config:
+        provider = "ollama"
+        api_key = "ignored"
+        base_url = "http://localhost:11434"
+
+    assert _adapter_kwargs_for_config(Config()) == {"base_url": "http://localhost:11434"}
+
+
+def test_adapter_kwargs_maps_azure_base_url_to_endpoint():
+    class Config:
+        provider = "azure"
+        api_key = "azure-key"
+        base_url = "https://example.openai.azure.com"
+
+    assert _adapter_kwargs_for_config(Config()) == {
+        "api_key": "azure-key",
+        "endpoint": "https://example.openai.azure.com",
+    }
 
 
 if __name__ == "__main__":

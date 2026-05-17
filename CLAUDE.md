@@ -32,7 +32,9 @@
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
     `outcomes.py`) and 50/project (`MAX_INDEPENDENT_FACTS` in `store.py`).
   - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` run on every
-    cold start (`store.py:190-192`).
+    cold start (`store.py:190-192`). For on-demand compaction of tombstone bloat in a
+    specific project's fact file, use `neo memory prune [--all] [--dry-run]`
+    (`subcommands.py:_compact_fact_file`).
 - Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`, ~`store.py:806-900`):
   ACCEPTED/MODIFIED/UNVERIFIED act on the linked original fact when present —
   confidence +0.2 / −0.2 / +0.1 (all ±arch_mod), and bump `success_count` (except

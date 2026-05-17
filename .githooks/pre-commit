@@ -4,10 +4,16 @@
 
 set -e
 
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [ -x ".venv/bin/python" ]; then
+  PYTHON_BIN=".venv/bin/python"
+fi
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}src"
+
 echo "Running ruff lint..."
-python3 -m ruff check src/ tests/
+"$PYTHON_BIN" -m ruff check src/ tests/
 
 echo "Running tests..."
-python3 -m pytest tests/ -q --tb=line -x
+"$PYTHON_BIN" -m pytest tests/ -q --tb=line -x
 
 echo "All checks passed."

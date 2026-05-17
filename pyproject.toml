@@ -34,6 +34,9 @@ dependencies = [
     "fastembed>=0.3.0",
     "faiss-cpu>=1.7.0",
     "jsonschema>=4.0.0",
+    # OpenAI is the default provider, so the base install must be runnable
+    # after setting OPENAI_API_KEY.
+    "openai>=1.0.0",
     # tree-sitter is required: empty-catch detection, multi-language
     # god-file metrics, language_parser semantic chunking, and edge
     # extraction all depend on it. Pinned to the 0.x line of

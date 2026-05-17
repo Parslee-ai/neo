@@ -119,6 +119,20 @@ def parse_args():
         args.command = 'serve'
         return args
 
+    # Detect if 'car' subcommand is being used
+    if len(sys.argv) > 1 and sys.argv[1] == 'car':
+        p = argparse.ArgumentParser(
+            prog="neo car",
+            description="Inspect local CAR runtime availability",
+            parents=[global_parser],
+        )
+        subparsers = p.add_subparsers(dest='action', help='CAR actions')
+        subparsers.add_parser('status', help='Show detected CAR CLI/server/Python binding state')
+        args = p.parse_args(sys.argv[2:])
+        args.command = 'car'
+        args.car_action = args.action
+        return args
+
     # Detect if 'construct' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'construct':
         # Parse construct subcommand with proper sub-subparsers
@@ -174,6 +188,20 @@ def parse_args():
             help='Also inspect legacy session_*.json fallback files (may replay already-processed old sessions)',
         )
         replay_p.add_argument('--limit', type=int, help='Limit number of projects when using --all')
+
+        prune_p = subparsers.add_parser(
+            'prune',
+            help='Compact fact files by dropping old invalid tombstones',
+        )
+        prune_p.add_argument('--all', action='store_true', help='Compact all local fact files')
+        prune_p.add_argument('--dry-run', action='store_true', help='Show what would be removed without mutating memory')
+        prune_p.add_argument('--limit', type=int, help='Limit number of fact files when using --all')
+        prune_p.add_argument(
+            '--max-invalid-age-days',
+            type=int,
+            default=30,
+            help='Drop invalid facts last accessed at least this many days ago (default: 30)',
+        )
 
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
@@ -325,6 +353,20 @@ def _configure_logging(args) -> None:
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
 
+def _adapter_kwargs_for_config(config) -> dict:
+    """Build provider-specific adapter kwargs from config."""
+    provider = config.provider.lower()
+    adapter_kwargs = {}
+    if provider in ("openai", "anthropic", "google", "azure", "local", "claude-code"):
+        adapter_kwargs["api_key"] = config.api_key
+    if config.base_url:
+        if provider in ("openai", "local", "ollama", "claude-code"):
+            adapter_kwargs["base_url"] = config.base_url
+        elif provider == "azure":
+            adapter_kwargs["endpoint"] = config.base_url
+    return adapter_kwargs
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # Parse arguments
@@ -447,6 +489,11 @@ def main():
     if hasattr(args, 'command') and args.command == 'serve':
         from neo.subcommands import handle_serve
         sys.exit(handle_serve(args))
+
+    # Handle CAR discovery subcommand
+    if hasattr(args, 'command') and args.command == 'car':
+        from neo.subcommands import handle_car
+        sys.exit(handle_car(args))
 
     # Handle construct subcommand
     if hasattr(args, 'command') and args.command == 'construct':
@@ -626,6 +673,14 @@ def main():
                 print(f"\nPrompt: {prompt[:200]}...\n", file=sys.stderr)
                 sys.exit(0)
 
+        if args.dry_run:
+            print("\n=== DRY RUN: Context that would be sent ===\n", file=sys.stderr)
+            for cf in neo_input.context_files:
+                content = cf.content or ""
+                print(f"  {cf.path} - {len(content.encode('utf-8'))} bytes", file=sys.stderr)
+            print(f"\nPrompt: {prompt[:200]}...\n", file=sys.stderr)
+            sys.exit(0)
+
     # Initialize adapter from environment
     # NO STUBS OR FALLBACKS - require real configuration
     from neo.adapters import create_adapter
@@ -645,7 +700,7 @@ def main():
         adapter = create_adapter(
             provider=config.provider,
             model=config.model,
-            api_key=config.api_key
+            **_adapter_kwargs_for_config(config),
         )
     except Exception as e:
         error_output = {

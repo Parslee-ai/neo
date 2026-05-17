@@ -113,6 +113,11 @@ def show_version(codebase_root: Optional[str] = None):
     print(f"neo {version}")
     print(f"Provider: {config.provider} | Model: {config.model}")
     print(f"Storage: {storage_info}")
+    try:
+        from neo.car_discovery import discover_car
+        print(f"CAR: {discover_car().summary()}")
+    except Exception:
+        pass
     print(f"Stage: {stage} | Memory: {level:.1%}")
     print(f"{bar}")
     print(f"{total_entries} patterns | {avg_confidence:.2f} avg confidence")
@@ -228,11 +233,112 @@ def _linked_feedback_projects(*, include_fallback: bool = False) -> list[tuple[s
     return [(pid, root_ts[0]) for pid, root_ts in sorted(projects.items(), key=lambda item: item[1][1], reverse=True)]
 
 
+def _compact_fact_file(path: Path, *, max_invalid_age_days: int = 30, dry_run: bool = False) -> dict:
+    """Drop old invalid facts from one scoped fact JSON file."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        return {"status": "error", "path": str(path), "error": str(exc)}
+
+    facts = data.get("facts", [])
+    if not isinstance(facts, list):
+        return {"status": "error", "path": str(path), "error": "facts is not a list"}
+
+    now = time.time()
+    cutoff = max(0, max_invalid_age_days) * 86400
+    kept = []
+    removed = 0
+    for fact in facts:
+        if not isinstance(fact, dict):
+            kept.append(fact)
+            continue
+        is_valid = fact.get("is_valid", True)
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        last_accessed = metadata.get("last_accessed") or metadata.get("created_at") or 0
+        try:
+            age = now - float(last_accessed)
+        except (TypeError, ValueError):
+            age = 0
+        if not is_valid and age >= cutoff:
+            removed += 1
+            continue
+        kept.append(fact)
+
+    if removed and not dry_run:
+        updated = dict(data)
+        updated["facts"] = kept
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(updated, indent=2))
+        tmp.replace(path)
+
+    return {
+        "status": "ok",
+        "path": str(path),
+        "total": len(facts),
+        "removed": removed,
+        "remaining": len(kept),
+    }
+
+
+def _fact_files_for_prune(*, all_files: bool, cwd: Optional[str] = None) -> list[Path]:
+    """Return fact JSON files to compact."""
+    facts_dir = Path.home() / ".neo" / "facts"
+    if all_files:
+        return sorted(facts_dir.glob("facts_*.json"))
+
+    from neo.memory.scope import detect_org_and_project
+
+    root = cwd or os.getcwd()
+    org_id, project_id = detect_org_and_project(root)
+    files = [facts_dir / "facts_global.json"]
+    if org_id != "unknown":
+        files.append(facts_dir / f"facts_org_{org_id}.json")
+    if project_id:
+        files.append(facts_dir / f"facts_project_{project_id}.json")
+    return [p for p in files if p.exists()]
+
+
 def handle_memory(args):
     """Memory maintenance subcommands."""
     action = getattr(args, "memory_action", None)
+    if action == "prune":
+        files = _fact_files_for_prune(
+            all_files=getattr(args, "all", False),
+            cwd=getattr(args, "cwd", None),
+        )
+        limit = getattr(args, "limit", None)
+        if limit is not None:
+            files = files[:limit]
+
+        totals = {"files": 0, "removed": 0, "errors": 0}
+        for path in files:
+            totals["files"] += 1
+            stats = _compact_fact_file(
+                path,
+                max_invalid_age_days=getattr(args, "max_invalid_age_days", 30),
+                dry_run=getattr(args, "dry_run", False),
+            )
+            if stats.get("status") == "error":
+                totals["errors"] += 1
+                print(f"[Neo] prune error {path}: {stats.get('error')}", file=sys.stderr)
+                continue
+            removed = int(stats.get("removed", 0))
+            totals["removed"] += removed
+            if removed or getattr(args, "verbose", False):
+                mode = "would remove" if getattr(args, "dry_run", False) else "removed"
+                print(f"[Neo] {mode} {removed} old invalid fact(s) from {path.name}")
+
+        mode = "dry run" if getattr(args, "dry_run", False) else "prune"
+        print(
+            f"[Neo] memory {mode}: {totals['removed']} old invalid fact(s) "
+            f"across {totals['files']} file(s)"
+        )
+        if totals["errors"]:
+            print(f"[Neo] {totals['errors']} file(s) failed", file=sys.stderr)
+        return
+
     if action != "replay-feedback":
-        print("Usage: neo memory replay-feedback [--all] [--dry-run] [--limit N]")
+        print("Usage: neo memory {replay-feedback|prune} [--all] [--dry-run] [--limit N]")
         return
 
     from neo.config import NeoConfig
@@ -661,6 +767,34 @@ def handle_serve(args) -> int:
     )
 
 
+def handle_car(args) -> int:
+    """Handle `neo car` discovery commands."""
+    action = getattr(args, "car_action", None)
+    if action not in ("status", None):
+        print("Usage: neo car status", file=sys.stderr)
+        return 1
+
+    from neo.car_discovery import discover_car
+
+    info = discover_car()
+    print(f"CAR: {info.summary()}")
+    if info.cli_path:
+        print(f"  cli: {info.cli_path}")
+        if info.cli_version:
+            print(f"  version: {info.cli_version}")
+    else:
+        print("  cli: not found")
+    print(f"  server: {info.server_path or 'not found'}")
+    print(f"  python binding: {info.python_binding or 'not found'}")
+    print(f"  daemon: {'running' if info.daemon_running else 'not detected'} ({info.daemon_url})")
+    if info.available and not info.has_python_runtime:
+        print(
+            "  note: CLI/server detected. Install neo-reasoner[car] or car-runtime "
+            "in this Python environment to enable CAR-native `neo serve`."
+        )
+    return 0
+
+
 def handle_construct(args):
     """Handle construct subcommand operations."""
     from neo.construct import ConstructIndex
@@ -970,7 +1104,12 @@ def handle_config(args):
     from neo.config import NeoConfig, store_api_key_in_keychain
 
     VALID_PROVIDERS = ['openai', 'anthropic', 'google', 'azure', 'ollama', 'local', 'claude-code']
-    EXPOSED_FIELDS = ['provider', 'model', 'api_key', 'base_url', 'auto_install_updates']
+    VALID_MEMORY_BACKENDS = ['fact_store', 'legacy']
+    EXPOSED_FIELDS = [
+        'provider', 'model', 'api_key', 'base_url',
+        'memory_backend', 'auto_install_updates', 'constraint_auto_scan',
+        'reasoning_effort_cap',
+    ]
 
     def mask_secret(value: str) -> str:
         """Mask API keys and secrets for display."""
@@ -1026,6 +1165,9 @@ def handle_config(args):
         if args.config_key == 'provider' and args.config_value not in VALID_PROVIDERS:
             print(f"Error: Invalid provider. Valid providers: {', '.join(VALID_PROVIDERS)}", file=sys.stderr)
             sys.exit(1)
+        if args.config_key == 'memory_backend' and args.config_value not in VALID_MEMORY_BACKENDS:
+            print(f"Error: Invalid memory backend. Valid values: {', '.join(VALID_MEMORY_BACKENDS)}", file=sys.stderr)
+            sys.exit(1)
 
         if args.config_key == 'api_key' and not args.config_value:
             import getpass
@@ -1040,13 +1182,20 @@ def handle_config(args):
             value = args.config_value
 
         # Convert boolean values
-        if args.config_key == 'auto_install_updates':
+        if args.config_key in ('auto_install_updates', 'constraint_auto_scan'):
             if str(value).lower() in ('true', '1', 'yes', 'on'):
                 value = True
             elif str(value).lower() in ('false', '0', 'no', 'off'):
                 value = False
             else:
                 print("Error: Invalid boolean value. Use: true/false, 1/0, yes/no, on/off", file=sys.stderr)
+                sys.exit(1)
+        elif args.config_key == 'reasoning_effort_cap':
+            from neo.reasoning_effort import validate_effort
+            try:
+                value = validate_effort(None if str(value).lower() in ('none', 'null', '') else str(value))
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(1)
 
         # Set the value

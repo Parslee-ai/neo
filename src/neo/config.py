@@ -174,13 +174,18 @@ class NeoConfig:
         if base_url := os.environ.get("NEO_BASE_URL"):
             config.base_url = base_url
 
-        # API keys
-        config.api_key = (
-            os.environ.get("NEO_API_KEY") or
-            os.environ.get("OPENAI_API_KEY") or
-            os.environ.get("ANTHROPIC_API_KEY") or
-            os.environ.get("GOOGLE_API_KEY")
-        )
+        # API keys. NEO_API_KEY is the explicit generic override; otherwise
+        # choose the provider-specific key for the selected provider only.
+        provider_key_env = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "google": "GOOGLE_API_KEY",
+            "azure": "AZURE_OPENAI_API_KEY",
+        }
+        provider_key = provider_key_env.get(config.provider.lower())
+        config.api_key = os.environ.get("NEO_API_KEY")
+        if config.api_key is None and provider_key:
+            config.api_key = os.environ.get(provider_key)
 
         # Generation settings
         if temp := os.environ.get("NEO_TEMPERATURE"):

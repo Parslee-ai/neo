@@ -57,9 +57,15 @@ def run_server(
     try:
         import car_runtime as cr
     except ImportError:
+        try:
+            from neo.car_discovery import discover_car
+            discovered = discover_car().summary()
+        except Exception:
+            discovered = "not checked"
         print(
             "car-runtime not installed. Install with:\n"
             "    pip install 'neo-reasoner[car]'\n"
+            f"Detected local CAR: {discovered}\n"
             "And start the daemon before launching `neo serve`:\n"
             "    python -m car_runtime.server &",
             file=sys.stderr,
@@ -105,12 +111,13 @@ def run_server(
             if engine is not None:
                 return engine
             from neo.adapters import create_adapter
+            from neo.cli import _adapter_kwargs_for_config
             from neo.engine import NeoEngine
 
             adapter = create_adapter(
                 provider=config.provider,
                 model=config.model,
-                api_key=config.api_key,
+                **_adapter_kwargs_for_config(config),
             )
             engine = NeoEngine(
                 lm_adapter=adapter,

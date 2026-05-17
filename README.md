@@ -192,7 +192,7 @@ Privacy:
 pip install neo-reasoner
 
 # Or install with specific LM provider
-pip install neo-reasoner[openai]     # For GPT (recommended)
+pip install neo-reasoner[openai]     # For GPT (same provider as the default)
 pip install neo-reasoner[anthropic]  # For Claude
 pip install neo-reasoner[google]     # For Gemini
 pip install neo-reasoner[all]        # All providers
@@ -350,7 +350,8 @@ pipx upgrade-all                    # Update all pipx packages
 
 #### Fully Automatic Updates
 
-Enable automatic installation of updates in the background:
+Automatic update installation is enabled by default for pipx and virtualenv
+installs. You can set it explicitly with:
 
 ```bash
 # Enable auto-install (persisted in ~/.neo/config.json)
@@ -361,7 +362,7 @@ export NEO_AUTO_INSTALL_UPDATES=1
 ```
 
 When enabled, Neo will:
-- Check for updates once every 24 hours
+- Check for updates once every hour using a stale-while-revalidate cache
 - Automatically download and install new versions in the background
 - Notify you when updates complete
 - Log all auto-update activity to `~/.neo/auto_update.log`
@@ -381,7 +382,9 @@ $ neo "your query"
 
 #### Update Notifications (Default)
 
-By default, Neo checks for updates once every 24 hours and displays a notification when a new version is available. This check happens in the background and will not interrupt your workflow.
+By default, Neo checks for updates once every hour and displays a notification
+when a new version is available. This check happens in the background and will
+not interrupt your workflow.
 
 To disable update checks entirely:
 ```bash
@@ -446,9 +449,46 @@ neo --index
 # Incrementally refresh the index after meaningful changes (re-embeds only changed files)
 neo --update
 
+# Preview the assembled context without making an LLM call
+neo --dry-run "your query"
+
 # Check version and memory stats
 neo --version
+
+# Inspect detected local CAR runtime surfaces
+neo car status
 ```
+
+
+### Memory Maintenance
+
+```bash
+# Compact fact files by dropping old invalid tombstones (default: > 30 days since last access)
+neo memory prune
+
+# Across every local project Neo has touched
+neo memory prune --all
+
+# Preview without writing
+neo memory prune --dry-run --max-invalid-age-days 14
+```
+
+Use `prune` when a `~/.neo/facts/facts_project_*.json` file grows much larger than its 500-valid-fact cap — that gap is tombstone bloat from supersession. Defaults are conservative; raising `--max-invalid-age-days` is safe, lowering it past ~7 may evict tombstones still referenced by recent supersession chains.
+
+
+### CAR Runtime Discovery
+
+Neo detects local CAR installs across the native CLI, `car-server`, Python
+bindings, and the default daemon port:
+
+```bash
+neo car status
+neo --version
+```
+
+If the CLI/server are present but Python bindings are not, Neo reports that
+state and keeps `neo serve` on the explicit `[car]` path. CAR install options
+are documented at [Parslee-ai/car-releases](https://github.com/Parslee-ai/car-releases).
 
 
 ### Timeout Requirements
@@ -730,8 +770,10 @@ neo --config reset
 - `memory_backend` - Memory backend: "fact_store" (default) or "legacy"
 - `auto_install_updates` - Automatically install updates in background (true/false)
 - `constraint_auto_scan` - Auto-scan CLAUDE.md for constraints (true/false, default: true)
+- `reasoning_effort_cap` - Optional cap for OpenAI gpt-5 reasoning effort
 
-Configuration is stored in `~/.neo/config.json` and takes precedence over environment variables.
+Configuration is stored in `~/.neo/config.json`. Environment variables override
+stored config values for the current process.
 
 ### Secure API Key Storage
 
@@ -773,6 +815,17 @@ export NEO_SKIP_UPDATE_CHECK=1                    # disable update checks entire
 export NEO_LOG_LEVEL=INFO                         # DEBUG/INFO/WARNING/ERROR
 export NEO_TEMPERATURE=0.7                        # generation temperature
 export NEO_MAX_TOKENS=4096                        # per-call max output tokens
+```
+
+### Install Sanity
+
+If you have multiple local installs, make sure the `neo` command and your test
+interpreter import the same package:
+
+```bash
+which neo
+neo --version
+python3 -c "import neo; print(neo.__file__)"
 ```
 
 **Observability**
@@ -1003,4 +1056,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
-

@@ -32,6 +32,28 @@ def test_load_uses_keychain_when_config_has_no_api_key(tmp_path, monkeypatch):
     assert loaded.api_key == "keychain-key"
 
 
+def test_env_api_key_matches_selected_provider(monkeypatch):
+    monkeypatch.setenv("NEO_PROVIDER", "anthropic")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.delenv("NEO_API_KEY", raising=False)
+
+    loaded = NeoConfig.from_env()
+
+    assert loaded.provider == "anthropic"
+    assert loaded.api_key == "anthropic-key"
+
+
+def test_neo_api_key_overrides_provider_specific_key(monkeypatch):
+    monkeypatch.setenv("NEO_PROVIDER", "anthropic")
+    monkeypatch.setenv("NEO_API_KEY", "generic-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+
+    loaded = NeoConfig.from_env()
+
+    assert loaded.api_key == "generic-key"
+
+
 def test_save_does_not_write_plaintext_api_key_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("NEO_ALLOW_PLAINTEXT_API_KEY", raising=False)
     path = tmp_path / "config.json"
