@@ -52,18 +52,19 @@ fastembed >= 0.3.0
 faiss-cpu >= 1.7.0
 jsonschema >= 4.0.0
 pyyaml >= 6.0
+openai >= 1.0.0
 tree-sitter >= 0.23, < 0.26
 tree-sitter-language-pack >= 0.13.0, < 1.0
 ```
 
-Tree-sitter is required (not optional) — empty-catch detection, god-file metrics, multi-language semantic chunking, and edge extraction all depend on it. See [`docs/tree-sitter-setup.md`](docs/tree-sitter-setup.md) for the full grammar list.
+- **OpenAI is the default provider**, so its SDK is now a core dependency — the base install is runnable as soon as you set `OPENAI_API_KEY`. The `[openai]` extra still exists for clarity but is redundant.
+- **Tree-sitter** is required (not optional) — empty-catch detection, god-file metrics, multi-language semantic chunking, and edge extraction all depend on it. See [`docs/tree-sitter-setup.md`](docs/tree-sitter-setup.md) for the full grammar list.
 
-### Optional: LM Provider SDKs
+### Optional: Additional LM Provider SDKs
 
-Choose your language model provider:
+OpenAI is included in the base install. Add others as needed:
 
 ```bash
-pip install openai                  # GPT models (recommended)
 pip install anthropic               # Claude
 pip install google-genai            # Gemini (requires Python 3.10+)
 pip install requests                # Ollama (usually already installed)

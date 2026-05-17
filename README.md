@@ -463,14 +463,17 @@ Core dependencies are automatically installed via `pyproject.toml`:
 - fastembed >= 0.3.0
 - faiss-cpu >= 1.7.0
 - jsonschema >= 4.0.0
+- pyyaml >= 6.0
+- openai >= 1.0.0  *(default provider; base install is runnable with just `OPENAI_API_KEY`)*
+- tree-sitter >= 0.23, < 0.26
+- tree-sitter-language-pack >= 0.13.0, < 1.0
 
 
-### Optional: LM Provider
+### Optional: Additional LM Providers
 
-Choose your language model provider:
+OpenAI is bundled in the base install. Add others as needed:
 
 ```bash
-pip install openai                  # GPT models (recommended)
 pip install anthropic               # Claude
 pip install google-genai>=0.2.0     # Gemini (requires Python 3.10+)
 pip install requests                # Ollama
@@ -802,6 +805,7 @@ neo --config reset
 - `memory_backend` - Memory backend: "fact_store" (default) or "legacy"
 - `auto_install_updates` - Automatically install updates in background (true/false)
 - `constraint_auto_scan` - Auto-scan CLAUDE.md for constraints (true/false, default: true)
+- `log_level` - Logging level: DEBUG, INFO, WARNING, or ERROR
 - `reasoning_effort_cap` - Optional cap for OpenAI gpt-5 reasoning effort
 
 Configuration is stored in `~/.neo/config.json`. Environment variables override
@@ -831,7 +835,7 @@ export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 export GOOGLE_API_KEY=...
 
-# Neo-generic (provider-specific keys take precedence)
+# Neo-generic override (takes precedence over provider-specific keys)
 export NEO_PROVIDER=openai
 export NEO_MODEL=gpt-5.5
 export NEO_API_KEY=sk-...
