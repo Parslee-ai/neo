@@ -1,5 +1,45 @@
 # Changelog
 
+## [Unreleased]
+
+CAR becomes a peer integration target alongside Claude Code and Codex; one OpenAI default-config regression fixed; docs realigned to what the code actually does.
+
+### Added
+
+- **CarAdapter** — route Neo's outbound inference through CAR's unified inference layer. With `model=None` (default), CAR's adaptive `route_model` picks local backends (Candle + MLX for Qwen3, Gemma 4) or remote providers (OpenAI, Anthropic, Google) per call. Pin via `model="gpt-5.3-codex"` etc. Activate with `neo --config set --config-key provider --config-value car` or env `NEO_PROVIDER=car`. Default `intent_hint={"task":"code"}` so the router knows it's serving code work; this is also Neo's local workaround for [Parslee-ai/car-releases#52](https://github.com/Parslee-ai/car-releases/issues/52), where `route_model` defaults are cost-biased rather than quality-biased for code prompts.
+- **`car_inference.get_runtime()` singleton** — process-wide `CarRuntime` shared between the inbound A2A host (`neo serve`) and the outbound `CarAdapter`. Same state, same policies, same eventlog, single auth handshake. `car_host.run_server()` pulls from the singleton instead of constructing its own.
+- **AGENTS.md ecosystem** — added Neo's own AGENTS.md (mirror of CLAUDE.md) and auto-ingestion of `{project}/AGENTS.md` / `{project}/.github/AGENTS.md` in `memory/constraints.py`. Codex-spec tools now see the same project rules as Claude Code.
+- **`neo memory prune` subcommand** — compacts a project's facts file by dropping old invalid tombstones (default: >30 days since last access). Supports `--all`, `--dry-run`, `--limit`, `--max-invalid-age-days`.
+- **`neo --dry-run "query"`** — print the assembled context without making the LLM call. Useful for debugging context-gatherer behavior.
+- **OpenAIAdapter `/v1/responses` passes `max_output_tokens` and `reasoning.effort`** so gpt-5*/o-series generation knobs from NeoConfig (and engine memory-driven effort selection) actually take effect.
+- **Construct library bundled into the wheel** as `neo/construct_library` via `[tool.hatch.build.targets.wheel.force-include]`. `neo construct list` now works for pip-installed users; was dev-tree only.
+
+### Changed (migration)
+
+- **`openai>=1.0.0` and `pyyaml>=6.0` are now core dependencies, not extras.** OpenAI is the default provider, so the base install is runnable on `OPENAI_API_KEY` alone. The `[openai]` extra still exists but is redundant; pinning workflows that install only with `[anthropic]` to avoid OpenAI dependencies should switch to a separate venv.
+- **Provider env-var selection is now provider-matched, not first-found.** Previously `NeoConfig.load()` picked whichever provider env var was set first (so `OPENAI_API_KEY` was used even when `provider=anthropic`). Now it picks the env var that matches `config.provider` (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, or `AZURE_OPENAI_API_KEY`), with `NEO_API_KEY` as the explicit cross-provider override. Setups that relied on the old leak-through behavior must set the correct env var for their active provider.
+
+### Fixed
+
+- **OpenAIAdapter regression: `temperature` rejected by gpt-5*/o-series on `/v1/responses`** (introduced in `ad8718e`, fixed in `aa52ca0`). The hardening commit added `"temperature": temperature` unconditionally to the responses payload. gpt-5/codex/o-series reject it with `Unsupported parameter: 'temperature' is not supported with this model` — so default config (`provider=openai`, `model=gpt-5.5`) was broken on first call. Adapter still accepts the kwarg for `LMAdapter` ABC compat but no longer forwards it for these model families.
+- **`neo --version` no longer eager-initializes FactStore.** Was paying the full embedding-pipeline cost (Jina model load + index build) just to read fact counts. Now `eager_init=False`.
+- **`pipx` editable installs were misclassified as `INSTALL_EXTERNAL`** so auto-update silently no-op'd. `update_checker._detect_install_method()` now checks `sys.prefix` against the pipx venv path first.
+- **`FileStorage.load()` backs up corrupt JSON before re-raising.** `JSONDecodeError` is handled separately from `PermissionError`/`IOError`: corrupt files trigger `_backup_corrupt_file()` so the original isn't silently destroyed by a subsequent save.
+
+### Docs
+
+- **README, QUICKSTART, INSTALL, and CONTRIBUTING restructured** so CAR, Claude Code, and Codex are documented symmetrically. CAR is the lead surface (`## Run as an Agent (CAR / A2A)` before the plugin sections); inbound (`neo serve`) and outbound (`provider=car`) directions both covered with Python and CLI examples; `intent_hint` knobs and `task=code` default documented in the LM Adapters CAR subsection.
+- **`docs/tree-sitter-setup.md` rewrite**: migrated to `tree-sitter-language-pack` from the deprecated `tree-sitter-languages`; dropped the obsolete Python 3.13 exclusion; added Ruby/PHP/Swift/Kotlin to the supported list; fixed `MAX_CHUNK_LENGTH = 2000` chars (previously claimed `>100KB`); added the `code_smells._ERROR_SWALLOW_DETECTORS` registration step.
+- **README Research & References rewritten** to match what's actually implemented. Previously cited five papers (Self-Planning, AdaCoder, As-Needed Decomposition, Multi-Agents Survey, Liu PG-TD) with "Implementation" claims that have zero code references. Now lists the 11 papers from the 0.18 memory architecture wave that ARE wired into code, with file-anchored citations. Wrong CodeSim paper (Xu 2023 vs the implemented Hou 2025) corrected; ReasoningBank moved to "Historical influences" since only the deprecated `persistent_reasoning.py` uses it. StateBench and memgine cited explicitly (was a one-word parenthetical).
+- **CLAUDE.md memory hygiene rewritten with correct outcome deltas** (ACCEPTED +0.2 / MODIFIED −0.2 / UNVERIFIED +0.1, all ±arch_mod), the full `rank_score` formula including `effectiveness_f`, the triple-trigger consolidation gate, and two footgun warnings (new `OutcomeType` requires updating both `outcomes.py` and `store.detect_implicit_feedback`; `rank_score` is shared between FactStore and ContextAssembler). CLAUDE.md and AGENTS.md are now kept in sync as a deliberate invariant.
+
+### Internal
+
+- **CarAdapter test coverage**: 23 unit/integration tests in `tests/test_car_adapter.py` — 15 mocked (always run), 4 live integration gated on `car_inference.is_available()` (skipped if `car-runtime` not installed), 2 negative-case for runtime failure propagation, 2 wiring. Covers chat-message vs string-prompt paths, default vs explicit `intent_hint`, real-schema metrics (`model_used`/`prompt_tokens`/`completion_tokens`/`latency_ms`/`trace_id`), error propagation (ConnectionError, RuntimeError), bad model id, oversized prompt, and the singleton-shared-with-car_host identity invariant.
+- **CarAdapter schema validated against `car-runtime 0.15.1`.** The first mocked-only release caught zero schema bugs by accident; running against the live daemon exposed three drift categories (`intent_hint`→`intent_json` JSON string; `temperature`/`stop` rejected; `model`/`input_tokens`/`output_tokens`/`cache_read_input_tokens` → `model_used`/`prompt_tokens`/`completion_tokens`/no-such-field). All fixed; FakeRuntime now mirrors the real shape.
+- **Upstream bugs encountered while wiring CAR integration**: [Parslee-ai/car-releases#50](https://github.com/Parslee-ai/car-releases/issues/50) (classify mis-routes — CLOSED), [#51](https://github.com/Parslee-ai/car-releases/issues/51) (stale v0.8 reference in `open_session` error — OPEN), [#52](https://github.com/Parslee-ai/car-releases/issues/52) (router cost-biased for code prompts — OPEN; worked around in CarAdapter via `task=code` default).
+
+
 ## [0.18.1] - 2026-05-16
 
 ### Fixed
