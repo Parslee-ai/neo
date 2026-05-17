@@ -269,6 +269,8 @@ adapter = create_adapter(
 
 **Default intent**: `CarAdapter` sends `intent_json={"task": "code"}` on every call unless you supply your own `intent_hint`. Neo's workload is overwhelmingly code reasoning (review, optimization, debugging, generation), so the router gets to pick a code-capable model rather than the chat default. CAR's task enum is `chat | classify | reasoning | code`. The rest of `IntentHint` (`prefer_local`, `prefer_fast`, `require: ModelCapability[]`) is how you express *what else you need* without pinning a model ID.
 
+> **Known limitation upstream:** CAR's `route_model` currently scores prompts as "simple" by heuristic length and picks the cheap chat-tier model (e.g. `gpt-4.1-mini`) even when models like `gpt-5.3-codex` and `o3` are registered and ranked as fallbacks. Tracked at [Parslee-ai/car-releases#52](https://github.com/Parslee-ai/car-releases/issues/52). The `task=code` default is Neo's local workaround — substantive prompts do escalate; trivial ones don't.
+
 ### Discover what's installed
 
 ```bash

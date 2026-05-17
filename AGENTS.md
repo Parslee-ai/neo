@@ -60,4 +60,13 @@
 - Observability: retrieve / add_fact / lm_call / overseer_tick events land in
   `~/.neo/metrics.jsonl` (disable with `NEO_METRICS=off`). Sessions and watermarks live
   in `~/.neo/sessions/`.
+- Debugging: `neo --dry-run "your query"` assembles the full context (file selection,
+  fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
+  the LM, then exits without making the LLM call. Faster iteration on context-gatherer
+  and retrieval changes than waiting for an inference round trip.
+- CarAdapter defaults `intent_hint={"task":"code"}` so CAR's router picks a code-capable
+  model rather than the chat default. This is the local workaround for
+  [Parslee-ai/car-releases#52](https://github.com/Parslee-ai/car-releases/issues/52)
+  (`route_model` is cost-biased for "simple" prompts and ranks `gpt-5.3-codex`/`o3`
+  behind `gpt-4.1-mini`). If that upstream lands, revisit the default.
 - When creating a pull request, always use the PR template included in the repo.
