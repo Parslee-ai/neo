@@ -865,70 +865,84 @@ pytest --cov=neo
 
 ## Research & References
 
-Neo's architecture is grounded in peer-reviewed research on code generation, semantic memory, and multi-agent reasoning.
+The 0.18 memory architecture lands deterministic techniques from a focused reading of recent work on long-horizon agent memory and code generation. Citations below are anchored to the file where the technique is actually implemented — the full PDFs are checked into [`papers/`](papers/) for reproducibility.
 
 ### Academic Papers
 
-**Semantic Memory & Failure Learning:**
+**Memory architecture & lifecycle**
 
-1. **ReasoningBank: Systematic Failure Learning and Semantic Anchor Embedding**
-   *Chen et al., 2025* | [arXiv:2509.25140](https://arxiv.org/abs/2509.25140)
-   - Phase 2: Semantic anchor embedding (pattern+context, not full reasoning)
-   - Phase 3: Failure root cause extraction with contrastive learning
-   - Phase 4: Self-contrast consolidation (archetypal vs spurious patterns)
-   - Phase 5: Strategy evolution tracking (procedural/adaptive/compositional)
-   - **Implementation**: Neo's persistent memory system with failure signatures
+1. **SCM Sleep Memory: Sleep-Consolidation in Continual Memory**
+   *Paper [2604.20943](https://arxiv.org/abs/2604.20943)*
+   - 4-D ValueTagger composite (novelty, validation, task, repetition); adaptive forgetting threshold; NREM Hebbian strengthening + global downscale; triple-trigger consolidation gate.
+   - **Implementation**: `src/neo/memory/value_score.py`, `store.synthesize_reviews`.
 
-**Code Generation & Planning:**
+2. **Memory Systems Survey (1)**
+   *Paper [2603.07670](https://arxiv.org/abs/2603.07670)*
+   - Provenance taxonomy (`STRUCTURAL > OBSERVED > INFERRED`); dual-buffer / probation consolidation; Layer-1/2/3 observability split.
+   - **Implementation**: `src/neo/memory/models.py:42`, `store.py` (probation tag), `memory/metrics.py`.
 
-2. **Planning with Large Language Models for Code Generation**
-   *Liu et al., ICLR 2023* | [Paper](https://openreview.net/forum?id=Lr8cOOtYbfL)
-   - Planning-guided test-driven decoding (PG-TD)
-   - Step-level preconditions and exit criteria
-   - **Implementation**: Neo's PlanStep schema with preconditions/exit_criteria fields
+3. **Memory Survey 2 — Zep / AriGraph bi-temporal pattern**
+   *Paper [2512.13564](https://arxiv.org/abs/2512.13564) §5.2.2*
+   - Bi-temporal stamps (`event_time` / `event_time_end` / `ingest_time`); supersession via soft-delete.
+   - **Implementation**: `src/neo/memory/models.py:241`.
 
-3. **Self-Planning Code Generation with Large Language Models**
-   *Zhang et al., 2023* | [arXiv:2303.06689](https://arxiv.org/abs/2303.06689)
-   - Two-phase plan-then-generate workflow
-   - +7% improvement on HumanEval-X Pass@1
-   - **Implementation**: Neo's planning phase before code generation
+4. **Trajectory Memory — Canonical-signature dedup**
+   *Paper [2603.10600](https://arxiv.org/abs/2603.10600) §7*
+   - Entity abstraction + verb-synonym folding + context strip as a pre-write dedup signature.
+   - **Implementation**: `src/neo/memory/generalize.py`.
 
-4. **AdaCoder: Adaptive Planning and Multi-Agent Framework for Function-Level Code Generation**
-   *Huang et al., 2025* | [arXiv:2407.13433](https://arxiv.org/abs/2407.13433)
-   - Task decomposition with planning, generation, and testing agents
-   - Explicit risk assessment per step
-   - **Implementation**: Neo's estimated_risk and verifier_checks fields
+5. **Memori — Hybrid dense+BM25 retrieval**
+   *Paper [2603.19935](https://arxiv.org/abs/2603.19935) §3.3*
+   - Sparse BM25 channel (k1=1.5, b=0.75) min-max-normalized and weighted with the dense channel at 0.7/0.3.
+   - **Implementation**: `src/neo/memory/bm25.py` (sparse channel), `store._fuse_dense_sparse` (0.7/0.3 fusion).
 
-**Multi-Agent Reasoning:**
+6. **MemMachine — Query-shape routing & nucleus episode expansion**
+   *Paper [2604.04853](https://arxiv.org/abs/2604.04853) §4.6, §5.3, §8.4.1*
+   - DIRECT / CHAIN / SPLIT prompt classification with per-branch retrieval; episode-peer expansion at retrieval time; k=20–30 sweet spot.
+   - **Implementation**: `src/neo/memory/query_routing.py`, `store.py` nucleus expansion.
 
-5. **MapCoder: Multi-Agent Code Generation for Competitive Programming**
-   *Islam et al., 2024* | [arXiv:2405.11403](https://arxiv.org/abs/2405.11403)
-   [GitHub](https://github.com/Md-Ashraful-Pramanik/MapCoder)
-   - Solver-Critic-Verifier agent collaboration
-   - Step-level verification and critique
-   - **Implementation**: Neo's verifier_checks and multi-phase reasoning
+7. **LessonL — Effectiveness multiplier on reuse outcomes**
+   *Paper [2505.23946](https://arxiv.org/abs/2505.23946)*
+   - Per-fact `c/n` effectiveness as a success-bonus multiplier; half-by-rank / half-by-cosine slot allocation (Algorithm 1).
+   - **Implementation**: `src/neo/memory/models.py:130, 233`; `store.retrieve_relevant`.
 
-**Retrieval & Similarity:**
+8. **Ebbinghaus Recall — Spaced-repetition decay for retrieval**
+   *Hou et al., paper [2404.00573](https://arxiv.org/abs/2404.00573)*
+   - Recall-probability transform `p_n(t) = (1 − exp(−r·exp(−t/g_n))) / (1 − e⁻¹)` applied to similarity scores for fluid facts.
+   - **Implementation**: `src/neo/math_utils.py:40`, `models.rank_score`.
 
-6. **CodeSim: Effective Semantic Similarity Metrics for Code**
-   *Xu et al., 2023* | [Paper](https://dl.acm.org/doi/10.1145/3611643.3616367)
-   - Code-specific similarity metrics for retrieval
-   - Step-scoped vs global retrieval tradeoffs
-   - **Implementation**: Neo's retrieval_keys for per-step memory access
+9. **Episodic Memory — Five-property episodic context**
+   *Paper [2502.06975](https://arxiv.org/abs/2502.06975) Table 1*
+   - `{when, where, why, with_whom}` instance-specific event context.
+   - **Implementation**: `src/neo/memory/models.py:320` `EpisodeContext`.
 
-**Agent Architectures:**
+10. **Multiple Memory Systems — Retrieval / context unit split**
+    *Paper [2508.15294](https://arxiv.org/abs/2508.15294) §3*
+    - Embed concise keywords (`retrieval_text`); inject full narrative (`context_text`) — same fact, two surfaces.
+    - **Implementation**: `src/neo/memory/models.py:373`.
 
-7. **As-Needed Decomposition and Planning with Language Models**
-   *Yao et al., NAACL 2024* | [arXiv:2311.05772](https://arxiv.org/abs/2311.05772)
-   - Selective planning (seed → expand when blocked)
-   - Avoids over-planning on simple tasks
-   - **Implementation**: Neo's expanded flag and incremental planning design
+**Engine & multi-agent reasoning**
 
-8. **Large Language Model-Based Multi-Agents: A Survey of Progress and Challenges**
-   *Wang et al., 2024* | [arXiv:2402.01680](https://arxiv.org/abs/2402.01680)
-   - Task decomposition, plan selection, and reflection as standard components
-   - Multi-agent coordination patterns
-   - **Implementation**: Neo's architectural foundations
+11. **MapCoder — Solver–Critic–Verifier multi-agent collaboration**
+    *Islam et al., paper [2405.11403](https://arxiv.org/abs/2405.11403)* | [GitHub](https://github.com/Md-Ashraful-Pramanik/MapCoder)
+    - Per-step confidence, multi-plan iteration scaffolding.
+    - **Implementation**: `PlanStep.confidence` in `src/neo/models.py`.
+
+12. **CodeSim — MODIFY / NO_MODIFY decision token**
+    *Hou et al., paper [2502.05664](https://arxiv.org/abs/2502.05664)*
+    - Simulator emits an explicit "no modification needed" token; planner uses it as an override on the agreement-of-outputs heuristic. (Distinct from the 2023 ACM CodeSim paper of the same name.)
+    - **Implementation**: `src/neo/engine.py:427`.
+
+13. **SICA — Asynchronous structured-output watchdog & cache-hit observability**
+    *Paper [2504.15228](https://arxiv.org/abs/2504.15228) §A.2, Table 1*
+    - Daemon-thread tick loop emitting `overseer_tick` events; loop detection via 5-identical-actions-in-a-row; LM-call cache-hit-rate tracking.
+    - **Implementation**: `src/neo/overseer.py`, `src/neo/adapters.py:237`.
+
+**Background reading (in [`papers/`](papers/) but not directly cited in code)**
+
+The following papers shaped the design vocabulary but aren't wired into a specific implementation today: 2506.18902 (Jina v4 — Neo currently uses Jina v2), 2508.21290 (Jina Code Embeddings), 2509.17489 (MapCoder-Lite), 2511.20857 (Evo-Memory).
+
+**Historical influences** (cited in legacy modules under deprecation): ReasoningBank ([2509.25140](https://arxiv.org/abs/2509.25140)) informed the original `src/neo/persistent_reasoning.py`; the 0.18 fact store supersedes it.
 
 ### Technologies & Libraries
 
@@ -974,7 +988,7 @@ If you use Neo in academic research, please cite:
   author={Parslee AI},
   year={2025},
   url={https://github.com/Parslee-ai/neo},
-  note={Built on ReasoningBank (Chen et al., 2025), MapCoder (Islam et al., 2024), and CodeSim (Xu et al., 2023)}
+  note={Memory architecture draws on SCM Sleep Memory (2604.20943), MemMachine (2604.04853), LessonL (2505.23946), and the bi-temporal/Ebbinghaus/dual-buffer techniques cataloged in the README's Research \& References section}
 }
 ```
 
