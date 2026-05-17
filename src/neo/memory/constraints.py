@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from neo.memory.io_utils import atomic_write_json
 from neo.memory.models import Fact, FactKind, FactMetadata, FactScope
 
 logger = logging.getLogger(__name__)
@@ -166,5 +167,4 @@ class ConstraintIngester:
 
     def _save_checksums(self) -> None:
         """Save checksums to disk."""
-        CHECKSUM_DIR.mkdir(parents=True, exist_ok=True)
-        CHECKSUM_FILE.write_text(json.dumps(self._checksums, indent=2))
+        atomic_write_json(CHECKSUM_FILE, self._checksums, indent=2)

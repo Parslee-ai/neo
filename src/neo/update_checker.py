@@ -210,15 +210,23 @@ def _compare_versions(current: str, latest: str) -> bool:
 
     try:
         from packaging import version
-        return version.parse(latest) > version.parse(current)
-    except (ImportError, version.InvalidVersion):
-        # Fallback: parse as tuples for proper comparison
-        def parse_version(v):
-            return tuple(int(x) for x in v.split('.') if x.isdigit())
+    except ImportError:
+        version = None
+
+    if version is not None:
         try:
-            return parse_version(latest) > parse_version(current)
-        except (ValueError, TypeError):
-            return False  # Can't compare, assume no update
+            return version.parse(latest) > version.parse(current)
+        except version.InvalidVersion:
+            return False
+
+    # Fallback: parse as tuples for proper comparison
+    def parse_version(v):
+        return tuple(int(x) for x in v.split('.') if x.isdigit())
+
+    try:
+        return parse_version(latest) > parse_version(current)
+    except (ValueError, TypeError):
+        return False  # Can't compare, assume no update
 
 
 def _refresh_cache_sync(current_version: str) -> None:

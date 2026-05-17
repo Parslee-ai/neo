@@ -262,6 +262,25 @@ class TestConstructIndex:
         empty = index.list_patterns(domain='nonexistent')
         assert len(empty) == 0
 
+    def test_construct_index_finds_packaged_pattern_library(self, tmp_path):
+        """PyPI wheels ship patterns under neo/construct_library."""
+        package_root = tmp_path / "neo"
+        library = package_root / "construct_library"
+        (library / "caching").mkdir(parents=True)
+        (library / "caching" / "cache-aside.md").write_text(VALID_PATTERN_CONTENT)
+
+        fake_construct_py = package_root / "construct.py"
+        fake_construct_py.write_text("# placeholder")
+
+        with patch("neo.construct.Path.cwd", return_value=tmp_path / "project"), \
+             patch("neo.construct.__file__", str(fake_construct_py)):
+            index = ConstructIndex()
+
+        assert index.construct_root == library
+        patterns = index.list_patterns()
+        assert len(patterns) == 1
+        assert patterns[0].pattern_id == "caching/cache-aside"
+
     def test_construct_show_missing_pattern(self, temp_construct_dir):
         """Test showing a pattern that doesn't exist."""
         index = ConstructIndex(construct_root=temp_construct_dir)
@@ -505,6 +524,7 @@ class TestIndexFreshness:
             # Build initial index
             result = index.build_index(force_rebuild=True)
             assert result['status'] == 'success'
+            assert list((temp_construct_dir / '.index').glob('*.tmp')) == []
 
             # Wait to ensure different mtime
             time.sleep(0.1)
@@ -545,4 +565,3 @@ class TestIndexFreshness:
             # Should skip because index is fresh and no files modified
             assert result['status'] == 'skipped'
             assert result['reason'] == 'index_fresh'
-

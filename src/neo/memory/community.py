@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from neo.memory.io_utils import atomic_write_json
 from neo.memory.models import Fact, FactKind, FactMetadata, FactScope
 
 logger = logging.getLogger(__name__)
@@ -166,10 +167,9 @@ class CommunityFeedIngester:
             return None
 
     def _write_cache(self, data: dict) -> None:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache = {"fetched_at": time.time(), "data": data}
         try:
-            CACHE_FILE.write_text(json.dumps(cache))
+            atomic_write_json(CACHE_FILE, cache)
         except OSError as e:
             logger.debug(f"Failed to write community feed cache: {e}")
 
@@ -182,5 +182,4 @@ class CommunityFeedIngester:
         return {}
 
     def _save_checksums(self) -> None:
-        CHECKSUM_DIR.mkdir(parents=True, exist_ok=True)
-        CHECKSUM_FILE.write_text(json.dumps(self._checksums, indent=2))
+        atomic_write_json(CHECKSUM_FILE, self._checksums, indent=2)

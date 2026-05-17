@@ -240,6 +240,25 @@ class TestPersistence:
         assert len(found) == 1
         assert found[0].body == "Important content"
 
+    def test_corrupt_fact_file_is_backed_up_before_empty_load(self, tmp_facts_dir, tmp_path):
+        corrupt_path = tmp_facts_dir / "facts_global.json"
+        corrupt_path.write_text('{"facts": [')
+
+        with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
+             patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
+             patch.object(FactStore, "_ingest_constraints"), \
+             patch.object(FactStore, "_ingest_seed_facts"), \
+             patch.object(FactStore, "_ingest_community_feed"), \
+             patch.object(FactStore, "_ingest_claude_memory"), \
+             patch.object(FactStore, "_maybe_migrate"), \
+             patch("neo.memory.store.FASTEMBED_AVAILABLE", False):
+            store = FactStore(codebase_root=str(tmp_path), eager_init=False)
+
+        backups = list(tmp_facts_dir.glob("facts_global.json.corrupt-*"))
+        assert store.entries == []
+        assert len(backups) == 1
+        assert backups[0].read_text() == '{"facts": ['
+
     def test_scoped_files_created(self, store):
         store.add_fact(subject="Global", body="G", scope=FactScope.GLOBAL)
         store.add_fact(subject="Project", body="P", scope=FactScope.PROJECT)

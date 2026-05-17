@@ -21,6 +21,8 @@ Design philosophy:
 import hashlib
 import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -217,6 +219,7 @@ class ProjectIndex:
             logger.error(f"Failed to load project index: {e}")
             # Reset to empty state
             self.chunks = []
+            self.edges = []
             self.snapshot = None
             self.faiss_index = None
 
@@ -232,15 +235,10 @@ class ProjectIndex:
             self.snapshot.last_updated = time.time()
             self.snapshot.total_chunks = len(self.chunks)
 
-            # Atomic write: write to temp, then rename
-            # Snapshot
-            snapshot_tmp = self.snapshot_path.with_suffix('.tmp')
-            with open(snapshot_tmp, 'w') as f:
-                json.dump(self.snapshot.__dict__, f, indent=2)
-            snapshot_tmp.rename(self.snapshot_path)
+            # Atomic write: write to unique temp files, then replace.
+            self._atomic_write_json(self.snapshot_path, self.snapshot.__dict__)
 
             # Chunks
-            chunks_tmp = self.chunks_path.with_suffix('.tmp')
             chunks_data = []
             for chunk in self.chunks:
                 chunk_dict = {
@@ -258,27 +256,39 @@ class ProjectIndex:
                 }
                 chunks_data.append(chunk_dict)
 
-            with open(chunks_tmp, 'w') as f:
-                json.dump(chunks_data, f, indent=2)
-            chunks_tmp.rename(self.chunks_path)
+            self._atomic_write_json(self.chunks_path, chunks_data)
 
             # Edges
             if self.edges:
-                edges_tmp = self.edges_path.with_suffix('.tmp')
-                with open(edges_tmp, 'w') as f:
-                    json.dump(self.edges, f, indent=2)
-                edges_tmp.rename(self.edges_path)
+                self._atomic_write_json(self.edges_path, self.edges)
 
             # FAISS index
             if FAISS_AVAILABLE and self.faiss_index:
-                faiss_tmp = self.faiss_path.with_suffix('.tmp')
-                faiss.write_index(self.faiss_index, str(faiss_tmp))
-                faiss_tmp.rename(self.faiss_path)
+                fd, tmp_name = tempfile.mkstemp(dir=self.faiss_path.parent, suffix=".tmp")
+                os.close(fd)
+                try:
+                    faiss.write_index(self.faiss_index, tmp_name)
+                    os.replace(tmp_name, self.faiss_path)
+                except BaseException:
+                    os.unlink(tmp_name)
+                    raise
 
             logger.info(f"Saved project index: {len(self.chunks)} chunks, {len(self.edges)} edges")
 
         except Exception as e:
             logger.error(f"Failed to save project index: {e}")
+            raise
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: Any) -> None:
+        """Write JSON via a unique same-directory temp file."""
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_name, path)
+        except BaseException:
+            os.unlink(tmp_name)
             raise
 
     def build_index(self, file_patterns: List[str] = None, languages: List[str] = None, max_files: int = 100):
@@ -297,7 +307,7 @@ class ProjectIndex:
             except ImportError as e:
                 raise RuntimeError(
                     "Tree-sitter is required for indexing. "
-                    "Install with: pip install neo[tree-sitter]"
+                    "Install with: pip install neo-reasoner"
                 ) from e
 
         # Auto-generate file patterns from languages if specified

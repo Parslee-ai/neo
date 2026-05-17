@@ -7,6 +7,8 @@ Patterns are stored as markdown files with structured metadata.
 
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -125,6 +127,11 @@ class PatternReader:
             parts = file_path.parts
             if 'construct' in parts:
                 idx = parts.index('construct')
+                domain = parts[idx + 1] if idx + 1 < len(parts) else ""
+                filename = file_path.stem
+                pattern_id = f"{domain}/{filename}"
+            elif 'construct_library' in parts:
+                idx = parts.index('construct_library')
                 domain = parts[idx + 1] if idx + 1 < len(parts) else ""
                 filename = file_path.stem
                 pattern_id = f"{domain}/{filename}"
@@ -279,6 +286,8 @@ class ConstructIndex:
                 self.construct_root = cwd / 'construct'
             elif (cwd.parent / 'construct').exists():
                 self.construct_root = cwd.parent / 'construct'
+            elif (Path(__file__).parent / 'construct_library').exists():
+                self.construct_root = Path(__file__).parent / 'construct_library'
             else:
                 # Fall back to ~/.neo/construct for testing
                 self.construct_root = Path.home() / '.neo' / 'construct'
@@ -416,12 +425,19 @@ class ConstructIndex:
         index = faiss.IndexFlatL2(self.embedding_dim)
         index.add(embeddings_array)
 
-        # Save index and metadata
-        faiss.write_index(index, str(self.index_path))
+        # Save index and metadata via unique temp files to avoid partial writes.
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=self.index_path.parent, suffix=".tmp")
+        os.close(fd)
+        try:
+            faiss.write_index(index, tmp_name)
+            os.replace(tmp_name, self.index_path)
+        except BaseException:
+            os.unlink(tmp_name)
+            raise
 
         metadata = [p.to_dict() for p in patterns]
-        with open(self.metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        self._atomic_write_json(self.metadata_path, metadata)
 
         elapsed = time.time() - start_time
 
@@ -473,6 +489,18 @@ class ConstructIndex:
         except Exception as e:
             logger.error(f"Failed to load index: {e}")
             return False
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: object) -> None:
+        """Write JSON via a unique same-directory temp file."""
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_name, path)
+        except BaseException:
+            os.unlink(tmp_name)
+            raise
 
     def search(self, query: str, top_k: int = 5) -> list[tuple[PatternSchema, float]]:
         """

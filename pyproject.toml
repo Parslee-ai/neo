@@ -34,6 +34,7 @@ dependencies = [
     "fastembed>=0.3.0",
     "faiss-cpu>=1.7.0",
     "jsonschema>=4.0.0",
+    "pyyaml>=6.0",
     # OpenAI is the default provider, so the base install must be runnable
     # after setting OPENAI_API_KEY.
     "openai>=1.0.0",
@@ -85,6 +86,9 @@ Changelog = "https://github.com/Parslee-ai/neo/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/neo"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"construct" = "neo/construct_library"
 
 [tool.hatch.build.targets.sdist]
 exclude = [

@@ -11,6 +11,7 @@ import json
 import logging
 from pathlib import Path
 
+from neo.memory.io_utils import atomic_write_json
 from neo.memory.models import Fact, FactKind, FactMetadata, FactScope
 
 logger = logging.getLogger(__name__)
@@ -124,5 +125,4 @@ class SeedIngester:
         return {}
 
     def _save_checksums(self) -> None:
-        CHECKSUM_DIR.mkdir(parents=True, exist_ok=True)
-        CHECKSUM_FILE.write_text(json.dumps(self._checksums, indent=2))
+        atomic_write_json(CHECKSUM_FILE, self._checksums, indent=2)

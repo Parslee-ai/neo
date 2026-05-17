@@ -175,6 +175,8 @@ def test_index_persistence(temp_repo):
     assert neo_dir.exists()
     assert (neo_dir / 'index.json').exists()
     assert (neo_dir / 'chunks.json').exists()
+    assert not (neo_dir / 'index.tmp').exists()
+    assert not (neo_dir / 'chunks.tmp').exists()
 
 
 def test_semantic_retrieval(temp_repo):

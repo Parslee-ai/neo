@@ -441,7 +441,7 @@ ENVIRONMENT VARIABLES:
     GOOGLE_API_KEY       Google API key
     NEO_PROVIDER         LLM provider (openai|anthropic|google|ollama)
     NEO_MODEL            Model name
-    NEO_API_KEY          Generic API key (provider-specific keys take precedence)
+    NEO_API_KEY          Generic API key override (takes precedence)
 
 EXAMPLES:
     # Simple query
@@ -1108,7 +1108,7 @@ def handle_config(args):
     EXPOSED_FIELDS = [
         'provider', 'model', 'api_key', 'base_url',
         'memory_backend', 'auto_install_updates', 'constraint_auto_scan',
-        'reasoning_effort_cap',
+        'log_level', 'reasoning_effort_cap',
     ]
 
     def mask_secret(value: str) -> str:
@@ -1168,6 +1168,11 @@ def handle_config(args):
         if args.config_key == 'memory_backend' and args.config_value not in VALID_MEMORY_BACKENDS:
             print(f"Error: Invalid memory backend. Valid values: {', '.join(VALID_MEMORY_BACKENDS)}", file=sys.stderr)
             sys.exit(1)
+        if args.config_key == 'log_level':
+            value_upper = str(args.config_value).upper() if args.config_value else ""
+            if value_upper not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+                print("Error: Invalid log level. Use: DEBUG, INFO, WARNING, ERROR", file=sys.stderr)
+                sys.exit(1)
 
         if args.config_key == 'api_key' and not args.config_value:
             import getpass
@@ -1197,15 +1202,23 @@ def handle_config(args):
             except ValueError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(1)
+        elif args.config_key == 'log_level':
+            value = str(value).upper()
 
         # Set the value
         if args.config_key == 'api_key':
-            try:
-                store_api_key_in_keychain(config.provider, str(value))
-            except Exception as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                sys.exit(1)
-            value = None
+            if os.environ.get("NEO_ALLOW_PLAINTEXT_API_KEY"):
+                config.api_key = str(value)
+                config.save()
+                print("\u2713 Stored api_key in config.json (plaintext enabled)")
+                return
+            else:
+                try:
+                    store_api_key_in_keychain(config.provider, str(value))
+                except Exception as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    sys.exit(1)
+                value = None
         else:
             setattr(config, args.config_key, value)
         config.save()

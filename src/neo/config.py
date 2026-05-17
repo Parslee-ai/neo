@@ -3,15 +3,18 @@ Configuration management for Neo.
 """
 
 import json
+import logging
 import os
 import platform
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 
 KEYCHAIN_SERVICE_PREFIX = "neo-reasoner"
+logger = logging.getLogger(__name__)
 
 
 def _keychain_service(provider: str) -> str:
@@ -142,8 +145,12 @@ class NeoConfig:
         if not path.exists():
             return cls()
 
-        with open(path) as f:
-            data = json.load(f)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"Failed to load config from {path}: {exc}; using defaults")
+            return cls()
 
         # Filter out fields that no longer exist (backward compatibility)
         import inspect
@@ -231,12 +238,42 @@ class NeoConfig:
             config = cls.from_file(str(default_path))
         else:
             config = cls()
+        original_provider = config.provider
 
-        # Override with environment variables
+        # Override with environment variables. Check env var presence rather
+        # than comparing against class defaults: users must be able to
+        # explicitly reset a saved config back to a default value, e.g.
+        # NEO_PROVIDER=openai over a saved provider=anthropic.
         env_config = cls.from_env()
-        for key, value in env_config.__dict__.items():
-            if value is not None and value != getattr(cls(), key):
-                setattr(config, key, value)
+        env_overrides = {
+            "NEO_PROVIDER": "provider",
+            "NEO_MODEL": "model",
+            "NEO_BASE_URL": "base_url",
+            "NEO_TEMPERATURE": "default_temperature",
+            "NEO_MAX_TOKENS": "default_max_tokens",
+            "NEO_EXEMPLAR_DIR": "exemplar_dir",
+            "NEO_AUTO_INSTALL_UPDATES": "auto_install_updates",
+            "NEO_LOG_LEVEL": "log_level",
+            "NEO_REASONING_EFFORT": "reasoning_effort_cap",
+        }
+        for env_name, field_name in env_overrides.items():
+            if env_name in os.environ:
+                setattr(config, field_name, getattr(env_config, field_name))
+
+        provider_key_env = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "google": "GOOGLE_API_KEY",
+            "azure": "AZURE_OPENAI_API_KEY",
+        }.get(config.provider.lower())
+        if "NEO_API_KEY" in os.environ or (
+            provider_key_env is not None and provider_key_env in os.environ
+        ):
+            config.api_key = env_config.api_key
+        elif config.provider != original_provider:
+            # A provider override must not reuse a plaintext key saved for the
+            # previous provider. Fall through to provider-specific Keychain.
+            config.api_key = None
 
         if not config.api_key:
             config.api_key = load_api_key_from_keychain(config.provider)
@@ -270,5 +307,11 @@ class NeoConfig:
         if self.auto_install_updates is False:
             exposed_fields['_auto_update_explicit'] = True
 
-        with open(path, "w") as f:
-            json.dump(exposed_fields, f, indent=2)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(exposed_fields, f, indent=2)
+            os.replace(tmp_name, path)
+        except BaseException:
+            os.unlink(tmp_name)
+            raise

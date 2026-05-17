@@ -9,6 +9,7 @@ and supersession chains.
 import hashlib
 import json
 import logging
+import shutil
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -23,6 +24,7 @@ from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
+from neo.memory.io_utils import atomic_write_json
 from neo.memory.metrics import record as metrics_record, time_block
 from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
@@ -1381,9 +1383,23 @@ class FactStore:
             with open(path) as fh:
                 data = json.load(fh)
             return [Fact.from_dict(d) for d in data.get("facts", [])]
-        except (json.JSONDecodeError, OSError) as e:
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to load facts from {path}: {e}")
+            self._backup_corrupt_file(path)
+            return []
+        except OSError as e:
             logger.error(f"Failed to load facts from {path}: {e}")
             return []
+
+    @staticmethod
+    def _backup_corrupt_file(path: Path) -> None:
+        """Preserve a corrupt fact file before future saves replace it."""
+        backup = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
+        try:
+            shutil.copy2(path, backup)
+            logger.warning(f"Backed up corrupt fact file to {backup}")
+        except OSError as backup_error:
+            logger.warning(f"Failed to back up corrupt fact file {path}: {backup_error}")
 
     # ------------------------------------------------------------------ #
     # Supersession
@@ -2097,10 +2113,10 @@ class FactStore:
             return
         watermark_path = self._project_path.parent / f"synthesis_watermark_{self.project_id}.json"
         try:
-            watermark_path.write_text(json.dumps({
+            atomic_write_json(watermark_path, {
                 "review_count": count,
                 "updated_at": time.time(),
-            }))
+            })
         except OSError as e:
             logger.debug(f"Failed to save synthesis watermark: {e}")
 

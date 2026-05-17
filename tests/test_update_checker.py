@@ -10,6 +10,7 @@ Tests cover:
 5. Timeout handling
 """
 
+import builtins
 import json
 import sys
 import tempfile
@@ -91,6 +92,19 @@ class TestCompareVersions:
             assert _compare_versions("1.0.0", "1.0.0a1") is False
         except ImportError:
             pytest.skip("packaging module not available for pre-release version tests")
+
+    def test_fallback_when_packaging_missing(self):
+        """Tuple fallback should work when optional packaging is unavailable."""
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "packaging" or name.startswith("packaging."):
+                raise ImportError("no packaging")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            assert _compare_versions("0.9.0", "0.10.0") is True
+            assert _compare_versions("0.10.0", "0.9.0") is False
 
 
 class TestCacheExpiry:

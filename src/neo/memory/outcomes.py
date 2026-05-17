@@ -14,11 +14,14 @@ import enum
 import json
 import logging
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from neo.memory.io_utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -272,8 +275,7 @@ class OutcomeTracker:
         )
 
         try:
-            with open(self._session_path, "w") as f:
-                json.dump(asdict(session), f, indent=2)
+            atomic_write_json(self._session_path, asdict(session), indent=2)
 
             # Also append to session log so we don't lose prior sessions
             log_path = self._session_log_path
@@ -419,9 +421,23 @@ class OutcomeTracker:
             with open(self._session_path) as f:
                 data = json.load(f)
             return SessionRecord(**data)
-        except (json.JSONDecodeError, OSError, TypeError) as e:
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to load previous session: {e}")
+            self._backup_corrupt_file(self._session_path)
+            return None
+        except (OSError, TypeError) as e:
             logger.warning(f"Failed to load previous session: {e}")
             return None
+
+    @staticmethod
+    def _backup_corrupt_file(path: Path) -> None:
+        """Preserve a corrupt session file before later writes replace it."""
+        backup = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
+        try:
+            shutil.copy2(path, backup)
+            logger.warning(f"Backed up corrupt session file to {backup}")
+        except OSError as backup_error:
+            logger.warning(f"Failed to back up corrupt session file {path}: {backup_error}")
 
     def _load_unprocessed_sessions(self, *, include_fallback: bool = True) -> list[SessionRecord]:
         """Load all unprocessed sessions from the session log.
@@ -975,10 +991,10 @@ class OutcomeTracker:
         if not watermark_path:
             return
         try:
-            watermark_path.write_text(json.dumps({
+            atomic_write_json(watermark_path, {
                 "last_commit_hash": commit_hash,
                 "updated_at": time.time(),
-            }))
+            })
         except OSError as e:
             logger.debug(f"Failed to save watermark: {e}")
 

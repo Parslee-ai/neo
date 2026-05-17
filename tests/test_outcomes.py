@@ -75,6 +75,9 @@ class TestSaveAndLoadSession:
         with open(tracker._session_path, "w") as f:
             f.write("not valid json")
         assert tracker._load_previous_session() is None
+        backups = list(tracker._session_path.parent.glob(f"{tracker._session_path.name}.corrupt-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "not valid json"
 
     def test_missing_session_returns_none(self, tracker):
         assert tracker._load_previous_session() is None

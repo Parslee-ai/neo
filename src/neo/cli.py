@@ -624,7 +624,8 @@ def main():
             working_directory=working_dir,
             safe_read_paths=[working_dir],
         )
-        _print_neo_greeting(prompt, working_dir)
+        if not args.dry_run:
+            _print_neo_greeting(prompt, working_dir)
 
         # Gather context from working directory unless --no-scan
         if not args.no_scan:
