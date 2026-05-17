@@ -233,6 +233,14 @@ def test_singleton_shared_across_adapter_instances():
     assert a._rt is b._rt is fake
 
 
+@pytest.mark.skipif(
+    not car_inference.is_available(),
+    reason=(
+        "car_runtime not installed — car_host.run_server() early-returns at "
+        "its top-level `import car_runtime as cr` before reaching the singleton "
+        "acquisition path, so the identity assertion can't be exercised."
+    ),
+)
 def test_car_host_uses_runtime_singleton_not_direct_constructor():
     """car_host.run_server must reuse the process-wide CarRuntime singleton
     so an inbound `neo serve` host and an outbound CarAdapter in the same
