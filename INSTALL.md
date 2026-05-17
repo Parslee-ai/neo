@@ -17,7 +17,7 @@ neo --version
 ```
 
 This automatically installs:
-- Core dependencies (numpy, scikit-learn, datasketch, fastembed, faiss-cpu, jsonschema)
+- Core dependencies (numpy, scikit-learn, datasketch, fastembed, faiss-cpu, jsonschema, pyyaml, tree-sitter)
 - Neo CLI command (`neo`)
 
 ### Alternative: Using pyproject.toml
@@ -27,9 +27,13 @@ This automatically installs:
 pip install -e .[anthropic]  # Include Anthropic SDK
 pip install -e .[openai]     # Include OpenAI SDK
 pip install -e .[google]     # Include Google SDK
+pip install -e .[ollama]     # Include Ollama HTTP client (requests)
 pip install -e .[all]        # All LM providers
+pip install -e .[car]        # Common Agent Runtime bindings (for `neo serve` A2A endpoint)
 pip install -e .[dev]        # Development tools
 ```
+
+> **Note on `[car]`**: `car-runtime` ships as a sealed binary under a separate license — the rest of Neo stays Apache-2.0. The default install path does not pull it in. See [Integration Surfaces](#integration-surfaces) below for `neo serve` setup.
 
 ## Requirements
 
@@ -47,7 +51,12 @@ datasketch >= 1.6.0
 fastembed >= 0.3.0
 faiss-cpu >= 1.7.0
 jsonschema >= 4.0.0
+pyyaml >= 6.0
+tree-sitter >= 0.23, < 0.26
+tree-sitter-language-pack >= 0.13.0, < 1.0
 ```
+
+Tree-sitter is required (not optional) — empty-catch detection, god-file metrics, multi-language semantic chunking, and edge extraction all depend on it. See [`docs/tree-sitter-setup.md`](docs/tree-sitter-setup.md) for the full grammar list.
 
 ### Optional: LM Provider SDKs
 
@@ -78,6 +87,57 @@ export GOOGLE_API_KEY=...
 ```
 
 Add to `~/.bashrc` or `~/.zshrc` for persistence.
+
+## Integration Surfaces
+
+Neo can be reached from three first-class surfaces. Pick whichever fits how you work — they share `~/.neo/facts/` so memory built up via one surface is visible to all three.
+
+### Run as an Agent (CAR / A2A)
+
+For orchestrators and other agents that speak [Agent2Agent v1.0](https://github.com/Parslee-ai/car-releases), Neo can host itself as a CAR-backed A2A endpoint.
+
+```bash
+# 1. Install the [car] extras (sealed binary under a separate license)
+pip install -e .[car]
+
+# 2. Start the CAR daemon (default ws://127.0.0.1:9100)
+python -m car_runtime.server &
+# or, if installed standalone:
+car-server &
+
+# 3. Host Neo as the neo.process A2A tool
+neo serve
+```
+
+Verify discovery:
+
+```bash
+neo car status   # native CLI, car-server, Python bindings, default port
+```
+
+See the README's [Run as an Agent (CAR / A2A)](README.md#run-as-an-agent-car--a2a) section for protocol details and tool schema.
+
+### Claude Code Plugin
+
+Installs from Parslee's plugin marketplace inside Claude Code:
+
+```bash
+/plugin marketplace add Parslee-ai/claude-code-plugins
+/plugin install neo
+```
+
+Requires the `neo` CLI installed and an API key set per the steps above.
+
+### Codex Plugin
+
+Installs from Parslee's marketplace inside OpenAI Codex CLI:
+
+```bash
+codex plugin marketplace add Parslee-ai/neo
+# then install "Neo" from Codex's plugin directory
+```
+
+Requires the `neo` CLI installed and an API key set per the steps above.
 
 ## Verification
 
