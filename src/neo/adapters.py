@@ -71,8 +71,10 @@ class OpenAIAdapter(LMAdapter):
                 "model": self.model,
                 "input": messages,
                 "max_output_tokens": max_tokens,
-                "temperature": temperature,
             }
+            # gpt-5* and codex models reject `temperature` on /v1/responses
+            # with a 400 ("Unsupported parameter"). Their reasoning behavior
+            # is steered by `reasoning.effort` instead. Don't include it.
             if reasoning_effort is not None:
                 payload["reasoning"] = {"effort": reasoning_effort}
 
@@ -768,10 +770,14 @@ class CarAdapter(LMAdapter):
         stop: Optional[list] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
-        # ``temperature`` is accepted for LMAdapter compatibility but CAR's
-        # infer_tracked does not expose it as a kwarg — backend default wins.
-        # ``stop`` likewise has no equivalent in the current CAR API surface.
+        # ``temperature``, ``stop``, ``reasoning_effort`` are accepted for
+        # LMAdapter ABC compatibility. CAR's infer_tracked does not expose
+        # them as kwargs — backend defaults win. Future: translate
+        # reasoning_effort∈{"high","xhigh"} to intent_hint["require"]=
+        # ["reasoning"] so CAR's router escalates accordingly (see
+        # github.com/Parslee-ai/car-releases/issues/52).
         kwargs: dict = {"max_tokens": int(max_tokens)}
         if self.model:
             kwargs["model"] = self.model
