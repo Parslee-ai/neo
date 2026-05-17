@@ -247,6 +247,82 @@ def test_metrics_emit_is_best_effort():
 # adapter and the binding (signatures, kwarg names, response field names).
 # ----------------------------------------------------------------------------
 
+def test_runtime_connection_error_propagates_uncaught(monkeypatch):
+    """Daemon-down failures must surface, not be swallowed.
+
+    If CAR's WebSocket connection drops or the daemon isn't running, the
+    runtime raises a connection error. CarAdapter must NOT silently return
+    empty text — operators need the failure visible so the engine can
+    fall back or fail loudly.
+    """
+    class BrokenRuntime:
+        def infer_tracked(self, prompt, **kwargs):
+            raise ConnectionError("car-server unreachable at ws://127.0.0.1:9100")
+
+    adapter = CarAdapter(runtime=BrokenRuntime())
+    with pytest.raises(ConnectionError, match="car-server unreachable"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
+def test_runtime_runtime_error_propagates_uncaught(monkeypatch):
+    """CAR's `rpc infer: -32xxx` errors (model not found, auth, backend
+    rejection) come up as RuntimeError. They must surface to the caller."""
+    class BrokenRuntime:
+        def infer_tracked(self, prompt, **kwargs):
+            raise RuntimeError("rpc infer: -32603 model not found: bogus-model")
+
+    adapter = CarAdapter(model="bogus-model", runtime=BrokenRuntime())
+    with pytest.raises(RuntimeError, match="model not found"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.skipif(not car_inference.is_available(), reason="car_runtime not installed")
+def test_live_bad_model_raises_actionable_error(monkeypatch):
+    """Pinning a model CAR doesn't know about must raise a clear error
+    (not silently succeed against a fallback)."""
+    import os
+    import pwd
+    monkeypatch.setenv("HOME", pwd.getpwuid(os.getuid()).pw_dir)
+    car_inference.reset_for_testing()
+
+    adapter = CarAdapter(model="nonexistent-model-id-xyz")
+    with pytest.raises(RuntimeError) as exc_info:
+        adapter.generate([{"role": "user", "content": "hi"}], max_tokens=8)
+    # The exact message comes from car-server, but it must mention the model
+    # so operators can diagnose. We don't pin the wording — just require
+    # the failed model id appears somewhere in the message.
+    assert "nonexistent-model-id-xyz" in str(exc_info.value)
+
+
+@pytest.mark.skipif(not car_inference.is_available(), reason="car_runtime not installed")
+def test_live_oversized_prompt_does_not_crash_adapter(monkeypatch):
+    """Adapter must not crash on a large prompt. CAR may compact, route to
+    a high-context model, or return an error — any of those is fine as
+    long as the adapter doesn't blow up before delivering the result."""
+    import os
+    import pwd
+    monkeypatch.setenv("HOME", pwd.getpwuid(os.getuid()).pw_dir)
+    car_inference.reset_for_testing()
+
+    # ~64KB prompt — well below any reasonable model context limit but
+    # large enough to exercise the JSON serialization + transport path.
+    big_prompt = "Repeat after me: OK.\n\n" + ("def f(): pass\n" * 3000)
+    adapter = CarAdapter()
+    try:
+        text = adapter.generate(
+            [{"role": "user", "content": big_prompt}],
+            max_tokens=8,
+        )
+        # If it succeeded, text is a string (possibly empty).
+        assert isinstance(text, str)
+    except RuntimeError as e:
+        # If CAR rejected it (e.g., context overflow on the selected
+        # backend), the error must be readable — not a crash.
+        assert "rpc" in str(e).lower() or "context" in str(e).lower() or "token" in str(e).lower(), (
+            f"oversized-prompt error should be a parseable CAR rpc error, got: {e}"
+        )
+
+
 @pytest.mark.skipif(not car_inference.is_available(), reason="car_runtime not installed")
 def test_real_round_trip_against_live_daemon(monkeypatch):
     """End-to-end smoke against a real CarRuntime + live car-server.
