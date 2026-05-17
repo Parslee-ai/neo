@@ -242,7 +242,7 @@ Once installed, you get:
 /neo-debug Race condition in task processor
 ```
 
-**See [.claude-plugin/README.md](.claude-plugin/README.md) for full plugin documentation**
+Plugin sources live under [`.claude-plugin/`](.claude-plugin/) — `plugin.json` is the manifest, `agents/neo.md` defines the agent, and `commands/*.md` defines each slash command.
 
 
 ## Codex Plugin
@@ -650,7 +650,7 @@ After each Neo run, the next invocation diffs your repo against the suggestions 
 
 | Outcome     | Trigger                                                                  | Effect                                                                              |
 |-------------|--------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
-| ACCEPTED    | Diff overlap ≥ 0.8 (or > 0.3 when Neo emitted no diff)                   | linked fact conf +0.2 ± arch_mod, success_count +1, effectiveness "better"          |
+| ACCEPTED    | Code-block overlap ≥ 0.8 (modern path) or unified-diff overlap > 0.3 (legacy path) | linked fact conf +0.2 ± arch_mod, success_count +1, effectiveness "better"          |
 | MODIFIED    | User changed the file differently                                        | linked fact conf −0.2 ± arch_mod (floored at 0.1) + new REVIEW at conf 0.4          |
 | UNVERIFIED  | File touched but suggestion had no diff to compare                       | linked fact conf +0.1 ± arch_mod, success_count +1 (no REVIEW)                      |
 | INDEPENDENT | File touched, never suggested by Neo                                     | new REVIEW at conf 0.2; capped 5/session, 50/project                                |
@@ -771,6 +771,8 @@ export NEO_REASONING_EFFORT=high                  # cap auto-effort selection
 export NEO_AUTO_INSTALL_UPDATES=1                 # auto-install background updates
 export NEO_SKIP_UPDATE_CHECK=1                    # disable update checks entirely
 export NEO_LOG_LEVEL=INFO                         # DEBUG/INFO/WARNING/ERROR
+export NEO_TEMPERATURE=0.7                        # generation temperature
+export NEO_MAX_TOKENS=4096                        # per-call max output tokens
 ```
 
 **Observability**
@@ -779,7 +781,7 @@ export NEO_LOG_LEVEL=INFO                         # DEBUG/INFO/WARNING/ERROR
 export NEO_METRICS=off                            # disable ~/.neo/metrics.jsonl writes
 ```
 
-Neo writes structured per-operation events (retrieve / add_fact / lm_call / overseer_tick) to `~/.neo/metrics.jsonl`, per-session manifests + JSONL logs to `~/.neo/sessions/`, and raw LM payloads to `~/.neo/lm_logs/` when `NEO_LOG_LEVEL=DEBUG`.
+Neo writes structured per-operation events (retrieve / add_fact / lm_call / overseer_tick) to `~/.neo/metrics.jsonl` and per-session manifests + JSONL outcome logs to `~/.neo/sessions/`.
 
 ## LM Adapters
 

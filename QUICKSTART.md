@@ -94,7 +94,7 @@ Then use slash commands:
 - **Full Documentation**: See [README.md](README.md)
 - **Installation Guide**: See [INSTALL.md](INSTALL.md)
 - **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Plugin Guide**: See [.claude-plugin/README.md](.claude-plugin/README.md)
+- **Plugin Sources**: [`.claude-plugin/`](.claude-plugin/) (manifest, agent, slash commands)
 
 ## Common Issues
 
