@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.19.0] - 2026-05-17
 
 CAR becomes a peer integration target alongside Claude Code and Codex; one OpenAI default-config regression fixed; docs realigned to what the code actually does.
 
