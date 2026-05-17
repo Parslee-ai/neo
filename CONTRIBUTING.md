@@ -77,29 +77,36 @@ mypy src/
 neo/
 ├── src/
 │   └── neo/              # Main package
-│       ├── cli.py                # CLI entry point
-│       ├── config.py             # Configuration management
-│       ├── adapters.py           # LM provider adapters
-│       ├── memory/               # Fact-based memory system
-│       │   ├── models.py         #   Fact, FactKind, FactScope models
-│       │   ├── store.py          #   FactStore implementation
-│       │   ├── scope.py          #   Scoping (global/org/project)
-│       │   ├── context.py        #   Four-layer context assembly
-│       │   ├── constraints.py    #   CLAUDE.md constraint ingestion
-│       │   └── migration.py      #   Legacy → fact store migration
-│       ├── index/                # Tree-sitter code indexing
-│       ├── prompt/               # Prompt enhancement system
-│       ├── context_gatherer.py   # Context collection
-│       ├── construct.py          # The Construct pattern library
-│       ├── persistent_reasoning.py  # Legacy memory (deprecated)
-│       └── ...                   # Other modules
-├── tests/
-│   ├── test_neo.py               # Core tests
-│   ├── test_integration.py       # Integration tests
-│   └── ...                       # Other test files
-├── construct/                    # Curated design pattern library
-├── .claude-plugin/               # Claude Code plugin
-└── pyproject.toml                # Package configuration
+│       ├── cli.py                  # CLI entry point + argparse surface
+│       ├── config.py               # Configuration management (incl. Keychain)
+│       ├── subcommands.py          # `neo memory`, `neo car`, version handler
+│       ├── adapters.py             # LM provider adapters
+│       ├── engine.py               # MapCoder/CodeSim orchestration
+│       ├── memory/                 # Fact-based memory system
+│       │   ├── models.py           #   Fact, FactKind, FactScope, rank_score
+│       │   ├── store.py            #   FactStore + supersession + synthesis
+│       │   ├── context.py          #   Four-layer context assembly (memgine-ported)
+│       │   ├── outcomes.py         #   Feedback-loop classification
+│       │   ├── bm25.py             #   Sparse channel for hybrid retrieval
+│       │   ├── query_routing.py    #   CHAIN/SPLIT shape classifier
+│       │   ├── value_score.py      #   SCM 4-D ValueTagger
+│       │   ├── generalize.py       #   Canonical-signature dedup
+│       │   ├── constraints.py      #   CLAUDE.md / AGENTS.md ingestion
+│       │   └── migration.py        #   Legacy → fact store migration
+│       ├── index/                  # Tree-sitter project index (per-repo FAISS)
+│       ├── prompt/                 # Prompt enhancement system
+│       ├── context_gatherer.py     # File-selection signals
+│       ├── construct.py            # The Construct pattern library
+│       ├── car_host.py             # `neo serve` A2A host (CAR surface)
+│       ├── car_discovery.py        # Local CAR install detection
+│       ├── car_tool_schema.py      # neo.process A2A tool schema
+│       └── persistent_reasoning.py # Legacy memory (deprecated)
+├── tests/                          # Pytest suite
+├── construct/                      # Curated design pattern library
+├── .claude-plugin/                 # Claude Code plugin sources (manifest, agent, slash commands)
+├── plugins/neo/                    # Codex plugin sources (manifest, skills)
+├── .agents/                        # Portable skill packages (shared release commands)
+└── pyproject.toml                  # Package configuration
 ```
 
 ## Contributing Guidelines
@@ -132,6 +139,25 @@ neo/
    - Provide multiple fallback strategies
    - Handle edge cases gracefully
    - Test with various LM outputs
+
+4. **New Claude Code Slash Command** (`.claude-plugin/commands/`)
+   - Add `<name>.md` defining the command's intent and arguments
+   - Update `.claude-plugin/plugin.json` so the marketplace surfaces it
+   - Mirror the command's purpose in the **Codex skill** below (same six skills are exposed in both plugins)
+   - Document it in the README's Claude Code Plugin section
+
+5. **New Codex Skill** (`plugins/neo/`)
+   - Add a SKILL file under the appropriate subdirectory
+   - Register it in the plugin's manifest
+   - Mirror it as a Claude Code slash command (see #4) — the two plugin surfaces are kept symmetric on purpose
+   - Document it in the README's Codex Plugin section
+
+6. **New CAR / A2A Tool** (`src/neo/car_host.py` + `car_tool_schema.py`)
+   - Define the tool schema in `car_tool_schema.py` (mirrors the typed JSON contract other agents see over A2A)
+   - Register the handler in `car_host.py` alongside `neo.process`
+   - Add a smoke test in `tests/test_car_host_smoke.py` and schema test in `tests/test_car_tool_schema.py`
+   - Bump the version note in the README's CAR section if the schema surface changes
+   - Coordinate with the `car-runtime` release if the change requires daemon-side support
 
 ### Contributing Patterns to The Construct
 
@@ -277,8 +303,11 @@ See existing patterns for reference:
 ### Documentation
 
 - Update `README.md` for user-facing changes
-- Update `INSTALL.md` for setup changes
-- Update `.claude-plugin/README.md` for plugin changes
+- Update `QUICKSTART.md` if the 5-minute setup flow changes
+- Update `INSTALL.md` for setup changes (extras, dependencies, integration surfaces)
+- Update `CLAUDE.md` and `AGENTS.md` together — they are kept identical so Claude Code and AGENTS.md-spec tools (Codex, etc.) see the same project rules
+- When touching plugin sources, update the relevant plugin manifest and keep the **Claude Code** (`.claude-plugin/`) and **Codex** (`plugins/neo/`) surfaces in sync — the same six commands are exposed on both
+- When touching CAR (`src/neo/car_*.py`), document any schema or behavior change in the README's "Run as an Agent (CAR / A2A)" section
 - Add docstrings to new functions
 
 ## Pull Request Process
