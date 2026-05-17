@@ -57,54 +57,61 @@ class OpenAIAdapter(LMAdapter):
         reasoning_effort: Optional[str] = None,
     ) -> str:
         """Generate response using OpenAI API."""
-        # gpt-5* and codex models use /v1/responses endpoint
-        if "codex" in self.model.lower() or "gpt-5" in self.model.lower():
-            import httpx
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            base_url = self.base_url or "https://api.openai.com"
-            url = f"{base_url}/v1/responses"
+        from neo.memory.metrics import capture_lm_call_failure
+        with capture_lm_call_failure(
+            provider="openai",
+            model=self.model,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        ):
+            # gpt-5* and codex models use /v1/responses endpoint
+            if "codex" in self.model.lower() or "gpt-5" in self.model.lower():
+                import httpx
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
+                base_url = self.base_url or "https://api.openai.com"
+                url = f"{base_url}/v1/responses"
 
-            payload: dict = {
-                "model": self.model,
-                "input": messages,
-                "max_output_tokens": max_tokens,
-            }
-            # gpt-5* and codex models reject `temperature` on /v1/responses
-            # with a 400 ("Unsupported parameter"). Their reasoning behavior
-            # is steered by `reasoning.effort` instead. Don't include it.
-            if reasoning_effort is not None:
-                payload["reasoning"] = {"effort": reasoning_effort}
+                payload: dict = {
+                    "model": self.model,
+                    "input": messages,
+                    "max_output_tokens": max_tokens,
+                }
+                # gpt-5* and codex models reject `temperature` on /v1/responses
+                # with a 400 ("Unsupported parameter"). Their reasoning behavior
+                # is steered by `reasoning.effort` instead. Don't include it.
+                if reasoning_effort is not None:
+                    payload["reasoning"] = {"effort": reasoning_effort}
 
-            response = httpx.post(url, headers=headers, json=payload, timeout=600.0)  # 10 minutes for complex queries
-            if response.status_code != 200:
-                raise ValueError(f"API error {response.status_code}: {response.text}")
-            data = response.json()
-            self._emit_usage_metric(data.get("usage", {}))
+                response = httpx.post(url, headers=headers, json=payload, timeout=600.0)  # 10 minutes for complex queries
+                if response.status_code != 200:
+                    raise ValueError(f"API error {response.status_code}: {response.text}")
+                data = response.json()
+                self._emit_usage_metric(data.get("usage", {}))
 
-            # Extract text from output array
-            output = data.get("output", [])
-            for item in output:
-                if item.get("type") == "message" and item.get("status") == "completed":
-                    content = item.get("content", [])
-                    for c in content:
-                        if c.get("type") == "output_text":
-                            return c.get("text", "")
+                # Extract text from output array
+                output = data.get("output", [])
+                for item in output:
+                    if item.get("type") == "message" and item.get("status") == "completed":
+                        content = item.get("content", [])
+                        for c in content:
+                            if c.get("type") == "output_text":
+                                return c.get("text", "")
 
-            raise ValueError(f"No completed message in response: {data}")
-        else:
-            # Standard chat completions for other models
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-            )
-            self._emit_usage_metric(getattr(response, "usage", None))
-            return response.choices[0].message.content
+                raise ValueError(f"No completed message in response: {data}")
+            else:
+                # Standard chat completions for other models
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stop=stop,
+                )
+                self._emit_usage_metric(getattr(response, "usage", None))
+                return response.choices[0].message.content
 
     def _emit_usage_metric(self, usage: object) -> None:
         """Record per-call token usage to metrics.jsonl.
@@ -163,6 +170,7 @@ class OpenAIAdapter(LMAdapter):
                 "lm_call",
                 provider="openai",
                 model=self.model,
+                status="success",
                 input_tokens=input_tokens,
                 cache_read_input_tokens=cached,
                 output_tokens=output_tokens,
@@ -229,9 +237,16 @@ class AnthropicAdapter(LMAdapter):
         if stop:
             kwargs["stop_sequences"] = stop
 
-        response = self.client.messages.create(**kwargs)
-        self._emit_usage_metric(response)
-        return response.content[0].text
+        from neo.memory.metrics import capture_lm_call_failure
+        with capture_lm_call_failure(
+            provider="anthropic",
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ):
+            response = self.client.messages.create(**kwargs)
+            self._emit_usage_metric(response)
+            return response.content[0].text
 
     def _emit_usage_metric(self, response: object) -> None:
         """Record per-call token usage to metrics.jsonl.
@@ -259,6 +274,7 @@ class AnthropicAdapter(LMAdapter):
                 "lm_call",
                 provider="anthropic",
                 model=self.model,
+                status="success",
                 input_tokens=input_tokens,
                 cache_read_input_tokens=cache_read,
                 cache_creation_input_tokens=cache_creation,
@@ -788,19 +804,32 @@ class CarAdapter(LMAdapter):
         # Prefer structured messages so CAR can apply its conversation
         # compaction and chat-template handling. Fall back to a flattened
         # prompt when the caller passed a bare string.
-        if isinstance(messages, str):
-            result_raw = self._rt.infer_tracked(messages, **kwargs)
-        elif isinstance(messages, list):
-            kwargs["messages_json"] = json.dumps(messages)
-            # Prompt arg is still required by infer_tracked; pass the first
-            # user message (or an empty string) — messages_json takes priority.
-            first_user = next(
-                (m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"),
-                "",
-            )
-            result_raw = self._rt.infer_tracked(first_user, **kwargs)
-        else:
-            result_raw = self._rt.infer_tracked(str(messages), **kwargs)
+        from neo.memory.metrics import capture_lm_call_failure
+        input_shape = (
+            "string" if isinstance(messages, str)
+            else "messages_list" if isinstance(messages, list)
+            else type(messages).__name__
+        )
+        with capture_lm_call_failure(
+            provider="car",
+            model=self.model or "router",
+            input_shape=input_shape,
+            max_tokens=int(max_tokens),
+            intent_task=(self.intent_hint or {}).get("task") if self.intent_hint else None,
+        ):
+            if isinstance(messages, str):
+                result_raw = self._rt.infer_tracked(messages, **kwargs)
+            elif isinstance(messages, list):
+                kwargs["messages_json"] = json.dumps(messages)
+                # Prompt arg is still required by infer_tracked; pass the first
+                # user message (or an empty string) — messages_json takes priority.
+                first_user = next(
+                    (m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+                    "",
+                )
+                result_raw = self._rt.infer_tracked(first_user, **kwargs)
+            else:
+                result_raw = self._rt.infer_tracked(str(messages), **kwargs)
 
         try:
             result = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
@@ -818,6 +847,7 @@ class CarAdapter(LMAdapter):
                 "lm_call",
                 provider="car",
                 model=result.get("model_used") or self.model or "router",
+                status="success",
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
                 context_window=int(usage.get("context_window") or 0),
