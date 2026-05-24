@@ -203,6 +203,17 @@ def parse_args():
             help='Drop invalid facts last accessed at least this many days ago (default: 30)',
         )
 
+        observer_p = subparsers.add_parser(
+            'observer',
+            help='Run REVIEW→PATTERN/FAILURE synthesis in a background process',
+        )
+        observer_p.add_argument(
+            'observer_action',
+            choices=('start', 'stop', 'status', 'kick'),
+            help='start: spawn; stop: SIGTERM; status: show PID/last cycle; kick: SIGUSR1 force cycle',
+        )
+        observer_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
+
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
         args.memory_action = args.action

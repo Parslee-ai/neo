@@ -73,6 +73,15 @@
   Changes to layer ordering, the 2/3 constraint cap, or the inline `(changed from: X)`
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
+- Async synthesis observer (`memory.observer`): a per-project background process
+  that runs `synthesize_reviews` on a wall-clock cadence, decoupled from the
+  request path. *Additive* — the inline triple-trigger gate keeps firing too;
+  the observer just makes synthesis more frequent. Lifecycle:
+  `neo memory observer {start|stop|status|kick}`. PID/log/last-analysis live in
+  `~/.neo/sessions/<project_id>/.observer.*`. Tunables:
+  `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
+  (default 60), `NEO_OBSERVER_IDLE_SECONDS` (default 1800 — observer self-exits
+  if metrics.jsonl stays idle that long after a startup grace window).
 - Observability: retrieve / add_fact / lm_call / overseer_tick events land in
   `~/.neo/metrics.jsonl`. Gated by `NEO_PROFILE`:
   `off` (no emit), `minimal` (lm_call only), `standard` (default, all events),

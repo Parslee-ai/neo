@@ -298,9 +298,54 @@ def _fact_files_for_prune(*, all_files: bool, cwd: Optional[str] = None) -> list
     return [p for p in files if p.exists()]
 
 
+def _handle_observer(args) -> None:
+    from neo.memory.observer import (
+        kick_observer,
+        observer_status,
+        start_observer,
+        stop_observer,
+    )
+
+    sub = getattr(args, "observer_action", None)
+    cwd = getattr(args, "cwd", None) or os.getcwd()
+
+    if sub == "start":
+        result = start_observer(cwd)
+    elif sub == "stop":
+        result = stop_observer(cwd)
+    elif sub == "kick":
+        result = kick_observer(cwd)
+    elif sub == "status":
+        result = observer_status(cwd)
+    else:
+        print("Usage: neo memory observer {start|stop|status|kick} [--cwd PATH]")
+        return
+
+    if result.get("status") == "error":
+        print(f"[Neo] observer error: {result.get('message')}", file=sys.stderr)
+        return
+
+    parts = [f"[Neo] observer {sub}: {result.get('status')}"]
+    if result.get("pid"):
+        parts.append(f"pid={result['pid']}")
+    if result.get("project_id"):
+        parts.append(f"project={result['project_id'][:8]}")
+    last = result.get("last_analysis_epoch")
+    if last:
+        import datetime as _dt
+        age = _dt.timedelta(seconds=int(time.time() - last))
+        parts.append(f"last_cycle={age} ago")
+    if result.get("log_file"):
+        parts.append(f"log={result['log_file']}")
+    print(" ".join(parts))
+
+
 def handle_memory(args):
     """Memory maintenance subcommands."""
     action = getattr(args, "memory_action", None)
+    if action == "observer":
+        _handle_observer(args)
+        return
     if action == "prune":
         files = _fact_files_for_prune(
             all_files=getattr(args, "all", False),
@@ -338,7 +383,7 @@ def handle_memory(args):
         return
 
     if action != "replay-feedback":
-        print("Usage: neo memory {replay-feedback|prune} [--all] [--dry-run] [--limit N]")
+        print("Usage: neo memory {replay-feedback|prune|observer} ...")
         return
 
     from neo.config import NeoConfig
