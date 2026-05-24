@@ -52,6 +52,11 @@
   2 peer episodes from the same session.
 - Local storage: per-scope JSON files in `~/.neo/facts/` with inline embeddings. Fine
   while any single scope file stays under ~10k facts; revisit the backend past that.
+  `project_id` is `SHA256[:16]` of the **normalized git remote URL** (`scope._compute_project_id`)
+  so the same repo on different clones / worktrees / machines hashes to the same ID.
+  Falls back to a path hash for repos without a remote. Legacy path-hashed fact and
+  watermark files are renamed in place on `FactStore` init
+  (`store._migrate_legacy_project_id_files`).
 - Context assembly four-layer model is from *Beyond Conversation: A State-Based Context
   Architecture for Enterprise AI Agents* (Liotta, 2025); the `ContextAssembler` token-budget
   enforcement is ported from *Memgine: A Deterministic Memory Engine for Stateful AI Agents*

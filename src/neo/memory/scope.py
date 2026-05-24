@@ -99,11 +99,66 @@ def _parse_org_from_url(url: str) -> str:
     return "unknown"
 
 
-def _compute_project_id(codebase_root: Optional[str] = None) -> str:
-    """Compute stable project ID from codebase root path.
+def _normalize_remote_url(url: str) -> str:
+    """Normalize a git remote URL so the same repo on different clones hashes
+    to the same project ID.
 
-    Uses SHA256[:16] of the resolved absolute path, consistent with
-    the existing PersistentReasoningMemory approach.
+    - Strips embedded credentials (e.g. `https://token@github.com/...`)
+    - Strips scheme (`https://`, `git://`, `ssh://`)
+    - Converts SSH `host:org/repo` form to `host/org/repo`
+    - Strips `.git` suffix and trailing slashes
+    - Lowercases network hosts (paths stay case-sensitive)
+
+    Returns "" if the input is empty.
+    """
+    if not url:
+        return ""
+
+    url = url.strip()
+
+    is_network = False
+    if "://" in url and not url.startswith("file://"):
+        is_network = True
+    elif re.match(r"^[^@/:]+@[^:]+:", url):  # git@host:org/repo
+        is_network = True
+
+    url = re.sub(r"://[^@]+@", "://", url)
+    url = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", url)
+    url = re.sub(r"^([^@/:]+)@([^:/]+):", r"\2/", url)
+    url = re.sub(r"\.git/?$", "", url)
+    url = url.rstrip("/")
+
+    if is_network:
+        # Lowercase only the host portion, leave path alone (GitHub paths
+        # are case-insensitive in practice but other forges aren't).
+        parts = url.split("/", 1)
+        parts[0] = parts[0].lower()
+        url = "/".join(parts)
+
+    return url
+
+
+def _compute_legacy_project_id(codebase_root: Optional[str] = None) -> str:
+    """Path-only project ID — the format used before git-remote hashing.
+
+    Kept so the FactStore can find and migrate fact files written under the
+    old scheme.
+    """
+    if not codebase_root:
+        return ""
+    resolved = str(Path(codebase_root).resolve())
+    return hashlib.sha256(resolved.encode()).hexdigest()[:16]
+
+
+def _compute_project_id(codebase_root: Optional[str] = None) -> str:
+    """Compute stable project ID, preferring the git remote URL hash.
+
+    Priority:
+      1. SHA256[:16] of the normalized `git remote get-url origin`
+         — portable across machines/clones/worktrees of the same repo
+      2. SHA256[:16] of the resolved absolute path
+         — fallback for repos without a remote, or non-git directories
+      3. "" if no codebase_root provided
     """
     if not codebase_root:
         logger.warning(
@@ -111,5 +166,9 @@ def _compute_project_id(codebase_root: Optional[str] = None) -> str:
             "Session saves and outcome detection will be disabled."
         )
         return ""
-    resolved = str(Path(codebase_root).resolve())
-    return hashlib.sha256(resolved.encode()).hexdigest()[:16]
+
+    normalized_remote = _normalize_remote_url(_get_git_remote_url(codebase_root))
+    if normalized_remote:
+        return hashlib.sha256(normalized_remote.encode()).hexdigest()[:16]
+
+    return _compute_legacy_project_id(codebase_root)

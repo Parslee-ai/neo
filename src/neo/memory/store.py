@@ -40,7 +40,7 @@ from neo.memory.models import (
     update_recall,
 )
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
-from neo.memory.scope import detect_org_and_project
+from neo.memory.scope import _compute_legacy_project_id, detect_org_and_project
 from neo.pattern_extraction import extract_pattern_from_correction, get_library
 
 logger = logging.getLogger(__name__)
@@ -136,6 +136,12 @@ class FactStore:
         self._global_path = FACTS_DIR / "facts_global.json"
         self._org_path = FACTS_DIR / f"facts_org_{self.org_id}.json" if self.org_id != "unknown" else None
         self._project_path = FACTS_DIR / f"facts_project_{self.project_id}.json" if self.project_id else None
+
+        # Rename fact + watermark files written under the pre-remote-hash
+        # project ID. Runs once per project; no-op when the legacy ID equals
+        # the current ID (e.g. repos without a remote) or when no legacy
+        # file exists.
+        self._migrate_legacy_project_id_files(codebase_root)
 
         # All facts in memory
         self._facts: list[Fact] = []
@@ -2123,6 +2129,40 @@ class FactStore:
     # ------------------------------------------------------------------ #
     # Migration
     # ------------------------------------------------------------------ #
+
+    def _migrate_legacy_project_id_files(self, codebase_root: Optional[str]) -> None:
+        """Rename fact + watermark files keyed by the legacy (path-only)
+        project ID to the new (git-remote-hashed) project ID.
+
+        No-op when there's no remote (legacy id equals current id) or when
+        no legacy file exists. Runs before `load()` so the rename is
+        transparent to callers.
+        """
+        if not self.project_id:
+            return
+        legacy_id = _compute_legacy_project_id(codebase_root)
+        if not legacy_id or legacy_id == self.project_id:
+            return
+
+        legacy_facts = FACTS_DIR / f"facts_project_{legacy_id}.json"
+        new_facts = FACTS_DIR / f"facts_project_{self.project_id}.json"
+        if legacy_facts.exists() and not new_facts.exists():
+            try:
+                legacy_facts.rename(new_facts)
+                logger.info(
+                    f"Migrated project facts {legacy_id[:8]} → {self.project_id[:8]} "
+                    "(now keyed by git remote URL)"
+                )
+            except OSError as e:
+                logger.warning(f"Legacy fact-file rename failed (non-fatal): {e}")
+
+        legacy_wm = FACTS_DIR / f"synthesis_watermark_{legacy_id}.json"
+        new_wm = FACTS_DIR / f"synthesis_watermark_{self.project_id}.json"
+        if legacy_wm.exists() and not new_wm.exists():
+            try:
+                legacy_wm.rename(new_wm)
+            except OSError as e:
+                logger.debug(f"Legacy watermark rename failed (non-fatal): {e}")
 
     def _maybe_migrate(self) -> None:
         """Migrate from old PersistentReasoningMemory format if needed.

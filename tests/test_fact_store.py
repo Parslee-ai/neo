@@ -1060,6 +1060,113 @@ class TestSynthesizeReviews:
         assert count == 0
 
 
+class TestLegacyProjectIdMigration:
+    """Verifies that fact + watermark files written under the pre-remote-hash
+    project ID get renamed to the new (git-remote-hashed) ID on FactStore init.
+    """
+
+    def test_renames_legacy_fact_and_watermark_files(self, tmp_facts_dir, tmp_path):
+        """Legacy path-hashed files should be moved to the remote-hashed key."""
+        from contextlib import ExitStack
+
+        from neo.memory.scope import _compute_legacy_project_id
+
+        # Codebase root is a fake path; what matters is that the mocked git
+        # remote yields a remote-hashed ID distinct from the path-hashed one.
+        codebase_root = str(tmp_path / "fake-repo")
+        (tmp_path / "fake-repo").mkdir()
+        remote_url = "git@github.com:parslee-ai/neo.git"
+
+        legacy_id = _compute_legacy_project_id(codebase_root)
+        # Pre-populate the legacy fact + watermark files
+        legacy_facts = tmp_facts_dir / f"facts_project_{legacy_id}.json"
+        legacy_facts.write_text('{"facts": [], "version": 1}')
+        legacy_wm = tmp_facts_dir / f"synthesis_watermark_{legacy_id}.json"
+        legacy_wm.write_text('{"watermark": 0}')
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("neo.memory.store.FACTS_DIR", tmp_facts_dir))
+            stack.enter_context(patch("neo.memory.scope._get_git_remote_url",
+                                     return_value=remote_url))
+            stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
+            stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
+            stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
+            stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
+            stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
+            stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
+
+            store = FactStore(codebase_root=codebase_root, eager_init=True)
+
+        # New (remote-hashed) ID must differ from the legacy one
+        assert store.project_id != legacy_id
+        # Legacy files moved to new ID
+        assert not legacy_facts.exists()
+        assert not legacy_wm.exists()
+        assert (tmp_facts_dir / f"facts_project_{store.project_id}.json").exists()
+        assert (tmp_facts_dir / f"synthesis_watermark_{store.project_id}.json").exists()
+
+    def test_no_op_when_no_remote(self, tmp_facts_dir, tmp_path):
+        """Without a remote, legacy ID == new ID, so nothing should be renamed."""
+        from contextlib import ExitStack
+
+        codebase_root = str(tmp_path / "no-remote")
+        (tmp_path / "no-remote").mkdir()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("neo.memory.store.FACTS_DIR", tmp_facts_dir))
+            stack.enter_context(patch("neo.memory.scope._get_git_remote_url",
+                                     return_value=""))
+            stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
+            stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
+            stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
+            stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
+            stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
+            stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
+
+            store = FactStore(codebase_root=codebase_root, eager_init=True)
+
+        from neo.memory.scope import _compute_legacy_project_id
+        assert store.project_id == _compute_legacy_project_id(codebase_root)
+
+    def test_does_not_clobber_new_file(self, tmp_facts_dir, tmp_path):
+        """If both legacy and new files exist, leave the new one alone."""
+        from contextlib import ExitStack
+
+        from neo.memory.scope import _compute_legacy_project_id
+
+        codebase_root = str(tmp_path / "repo")
+        (tmp_path / "repo").mkdir()
+        remote_url = "git@github.com:parslee-ai/neo.git"
+
+        legacy_id = _compute_legacy_project_id(codebase_root)
+        legacy_facts = tmp_facts_dir / f"facts_project_{legacy_id}.json"
+        legacy_facts.write_text('{"legacy": true}')
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("neo.memory.store.FACTS_DIR", tmp_facts_dir))
+            stack.enter_context(patch("neo.memory.scope._get_git_remote_url",
+                                     return_value=remote_url))
+            stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
+            stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
+            stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
+            stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
+            stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
+            stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
+
+            # Pre-create the new fact file so the migration must not overwrite it
+            from neo.memory.scope import _compute_project_id
+            new_id = _compute_project_id(codebase_root)
+            new_facts = tmp_facts_dir / f"facts_project_{new_id}.json"
+            new_facts.write_text('{"new": true}')
+
+            store = FactStore(codebase_root=codebase_root, eager_init=True)
+
+        # New file untouched, legacy file left in place
+        assert legacy_facts.exists()
+        assert legacy_facts.read_text() == '{"legacy": true}'
+        assert new_facts.read_text() == '{"new": true}'
+
+
 class TestPruneStaleFacts:
     """Tests for quality pruning of stale unvalidated facts."""
 
