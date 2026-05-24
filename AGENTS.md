@@ -77,22 +77,19 @@
   that runs `synthesize_reviews` on a wall-clock cadence, decoupled from the
   request path. *Additive* — the inline triple-trigger gate keeps firing too;
   the observer just makes synthesis more frequent. **Hard dep**: car-runtime
-  ≥ 0.16.1 (for the `agents_*` lifecycle API) and a running `car-server`
-  daemon — CAR's supervisor owns the spawn / restart-on-failure / log
-  redirection / clean SIGTERM shutdown. Spec persisted to `~/.car/agents.json`
-  (`auto_start: true` so it comes back on daemon boot); logs land at
-  `~/.car/logs/neo-observer-<id8>.{stdout,stderr}.log`. Lifecycle:
-  `neo memory observer {start|stop|status|kick}` — `kick` maps to
-  `agents_restart` since CAR has no signal-passthrough primitive.
-  Tunables: `NEO_OBSERVER_INTERVAL_SECONDS` (default 300),
-  `NEO_OBSERVER_COOLDOWN` (default 60, per-process).
-  **Known broken** on machines where CarHost.app is running:
-  `car-runtime 0.16.x`'s module-level `agents_upsert` is still in-process
-  and collides with the running supervisor's manifest lock — see
-  [Parslee-ai/car-releases#54](https://github.com/Parslee-ai/car-releases/issues/54).
-  The unit tests pass because they mock `car_runtime`; do not interpret
-  green CI as "observer works". Revisit once #54 lands a wheel that
-  routes `agents_*` over WS.
+  ≥ 0.17.0 and a running `car-server` daemon — CAR's supervisor owns the
+  spawn / restart-on-failure / log redirection / clean SIGTERM shutdown.
+  Spec persisted to `~/.car/agents.json` (`auto_start: true` so it comes back
+  on daemon boot); logs land at `~/.car/logs/neo-observer-<id8>.{stdout,stderr}.log`.
+  Lifecycle: `neo memory observer {start|stop|status|kick}` — `kick` maps to
+  `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
+  CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |
+  `errored`) so restart-loops are diagnosable. Tunables:
+  `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
+  (default 60, per-process). **Footgun**: the interpreter path (`sys.executable`)
+  must not live under a world-writable directory (`/tmp`, `/private/tmp`,
+  `/var/tmp`, `/dev/shm`) — the CAR daemon rejects such commands as a
+  security measure. Use a venv under `$HOME` or a system install.
 - Observability: retrieve / add_fact / lm_call / overseer_tick events land in
   `~/.neo/metrics.jsonl`. Gated by `NEO_PROFILE`:
   `off` (no emit), `minimal` (lm_call only), `standard` (default, all events),

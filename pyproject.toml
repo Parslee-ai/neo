@@ -61,13 +61,15 @@ ollama = ["requests>=2.31.0"]
 # Requires the car-server daemon (`python -m car_runtime.server`)
 # running locally; see INSTALL.md.
 #
-# Minimum is 0.16.1: that's where the `agents_*` lifecycle API
-# landed (the surface `neo.memory.observer` builds on). Earlier
-# versions still work for `CarAdapter`-only use, but
-# `neo memory observer start` will reject them with an actionable
-# error.
+# Minimum is 0.17.0: 0.16.x has the `agents_*` API but the PyO3
+# binding still tries to acquire the supervisor manifest lock
+# in-process, which collides with a running CarHost.app/car-server
+# (Parslee-ai/car-releases#54). 0.17.0 routes those calls through
+# the daemon's WS handlers when the lock is held. Earlier versions
+# still work for `CarAdapter`-only use, but `neo memory observer
+# start` will reject them with an actionable error.
 car = [
-    "car-runtime>=0.16.1",
+    "car-runtime>=0.17.0",
 ]
 all = [
     "anthropic>=0.21.0",

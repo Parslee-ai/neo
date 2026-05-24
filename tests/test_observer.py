@@ -153,7 +153,7 @@ class TestStartObserver:
         from neo.memory.observer import _agent_id
         aid = _agent_id(fake_project_id)
         fake_car.agents_list.return_value = json.dumps(
-            [{"id": aid, "pid": 1234, "running": True}]
+            [{"id": aid, "pid": 1234, "status": "running"}]
         )
 
         from neo.memory.observer import start_observer
@@ -176,7 +176,7 @@ class TestStopObserver:
         from neo.memory.observer import _agent_id
         aid = _agent_id(fake_project_id)
         fake_car.agents_list.return_value = json.dumps(
-            [{"id": aid, "pid": 9001, "running": True}]
+            [{"id": aid, "pid": 9001, "status": "running"}]
         )
         fake_car.agents_stop.return_value = json.dumps({"id": aid, "pid": 9001})
 
@@ -184,6 +184,18 @@ class TestStopObserver:
         result = stop_observer("/some/path")
         assert result["status"] == "stopped"
         fake_car.agents_stop.assert_called_once_with(aid)
+
+    def test_stop_when_already_stopped(self, fake_project_id, fake_car):
+        """Spec exists but `status` says stopped — should NOT call agents_stop."""
+        from neo.memory.observer import _agent_id
+        aid = _agent_id(fake_project_id)
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": aid, "pid": None, "status": "stopped"}]
+        )
+        from neo.memory.observer import stop_observer
+        result = stop_observer("/some/path")
+        assert result["status"] == "not_running"
+        fake_car.agents_stop.assert_not_called()
 
 
 class TestKickObserver:
@@ -198,7 +210,7 @@ class TestKickObserver:
         from neo.memory.observer import _agent_id
         aid = _agent_id(fake_project_id)
         fake_car.agents_list.return_value = json.dumps(
-            [{"id": aid, "pid": 1, "running": True}]
+            [{"id": aid, "pid": 1, "status": "running"}]
         )
         fake_car.agents_restart.return_value = json.dumps({"id": aid, "pid": 2})
 
@@ -220,7 +232,7 @@ class TestObserverStatus:
         from neo.memory.observer import _agent_id
         aid = _agent_id(fake_project_id)
         fake_car.agents_list.return_value = json.dumps([{
-            "id": aid, "pid": 12345, "running": True, "restart_count": 2,
+            "id": aid, "pid": 12345, "status": "running", "restart_count": 2,
         }])
         from neo.memory.observer import observer_status
         result = observer_status("/some/path")
@@ -232,11 +244,27 @@ class TestObserverStatus:
         from neo.memory.observer import _agent_id
         aid = _agent_id(fake_project_id)
         fake_car.agents_list.return_value = json.dumps(
-            [{"id": aid, "pid": 0, "running": False, "restart_count": 0}]
+            [{"id": aid, "pid": None, "status": "stopped", "restart_count": 0,
+              "last_exit_code": 0}]
         )
         from neo.memory.observer import observer_status
         result = observer_status("/some/path")
+        # We now surface CAR's raw status verbatim (running|stopped|backoff|...)
         assert result["status"] == "stopped"
+        assert result["pid"] is None
+
+    def test_status_when_in_backoff(self, fake_project_id, fake_car):
+        """`backoff` is a valid CAR status — restart-loop diagnosis."""
+        from neo.memory.observer import _agent_id
+        aid = _agent_id(fake_project_id)
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": aid, "pid": None, "status": "backoff", "restart_count": 7,
+              "last_exit_code": 1}]
+        )
+        from neo.memory.observer import observer_status
+        result = observer_status("/some/path")
+        assert result["status"] == "backoff"
+        assert result["restart_count"] == 7
 
 
 class TestObserverCycleUnit:

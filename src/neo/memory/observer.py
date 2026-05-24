@@ -50,9 +50,11 @@ logger = logging.getLogger(__name__)
 
 
 _CAR_REQUIRED_MSG = (
-    "Observer requires car-runtime >= 0.16.1 (introduces the agents_* "
-    "lifecycle API). Install: `pip install neo[car]`, then ensure "
-    "car-server is running (or set CAR_AUTOSTART=1)."
+    "Observer requires car-runtime >= 0.17.0 (where the agents_* "
+    "calls route to the running car-server daemon instead of "
+    "colliding with its supervisor lock — see Parslee-ai/car-releases#54). "
+    "Install: `pip install neo[car]`, then ensure car-server is running "
+    "(CarHost.app or `python -m car_runtime.server`)."
 )
 
 
@@ -270,7 +272,7 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
                 "message": f"agents_upsert failed: {e}"}
 
     existing = _find_managed_agent(car, aid)
-    if existing and existing.get("running"):
+    if existing and existing.get("status") == "running":
         return {"status": "already_running", "project_id": project_id,
                 "agent_id": aid, "pid": existing.get("pid"),
                 "message": f"observer pid {existing.get('pid')}"}
@@ -309,9 +311,10 @@ def stop_observer(codebase_root: Optional[str] = None) -> dict:
     if not existing:
         return {"status": "not_running", "project_id": project_id, "agent_id": aid,
                 "message": "no managed agent registered"}
-    if not existing.get("running"):
+    if existing.get("status") != "running":
         return {"status": "not_running", "project_id": project_id, "agent_id": aid,
-                "pid": existing.get("pid"), "message": "agent already stopped"}
+                "pid": existing.get("pid"),
+                "message": f"agent {existing.get('status', 'unknown')}"}
 
     try:
         managed_json = car.agents_stop(aid)
@@ -376,19 +379,25 @@ def observer_status(codebase_root: Optional[str] = None) -> dict:
         return {"status": "not_running", "project_id": project_id, "agent_id": aid,
                 "message": "no managed agent registered"}
 
-    running = bool(existing.get("running"))
+    # CAR's `status` field is one of: stopped | starting | running |
+    # backoff | errored — we surface it directly so operators can tell
+    # restart-loop ("backoff") apart from a clean stop.
+    car_status = existing.get("status", "unknown")
+    is_running = car_status == "running"
     return {
-        "status": "running" if running else "stopped",
+        "status": car_status,
         "project_id": project_id,
         "agent_id": aid,
-        "pid": existing.get("pid") if running else None,
+        "pid": existing.get("pid") if is_running else None,
         "restart_count": existing.get("restart_count", 0),
+        "last_exit_code": existing.get("last_exit_code"),
         "log_file": f"~/.car/logs/{aid}.stdout.log",
         "message": (
             f"observer pid {existing.get('pid')} "
             f"(restarts={existing.get('restart_count', 0)})"
-            if running
-            else f"agent registered but stopped (last pid {existing.get('pid')})"
+            if is_running
+            else f"agent {car_status} (last pid {existing.get('pid')}, "
+                 f"last exit {existing.get('last_exit_code')})"
         ),
     }
 
