@@ -1,29 +1,27 @@
-"""Tests for the async synthesis observer (neo.memory.observer).
+"""Tests for the CAR-supervised async synthesis observer.
 
-Lifecycle smoke tests use a stubbed daemon process so we don't actually
-fork a Python interpreter under pytest. The Observer class itself is
-exercised directly with monkeypatched sleeps.
+Lifecycle tests stub a fake ``car_runtime`` module with just the
+``agents_*`` functions we depend on, so the tests don't require
+car-server to be running or the car-runtime wheel to be installed.
+
+The Observer class itself (the daemon body) is exercised directly.
 """
 
 from __future__ import annotations
 
+import json
 import os
-import signal
+import sys
 import time
-from pathlib import Path
-from unittest.mock import patch
+import types
+from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _isolated_home(monkeypatch, tmp_path):
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    return tmp_path
-
-
 @pytest.fixture
-def project_id(monkeypatch):
+def fake_project_id(monkeypatch):
     """Pin the project_id so tests don't depend on the host's git remote."""
     fixed = "test1234abcdef00"
     monkeypatch.setattr(
@@ -33,105 +31,219 @@ def project_id(monkeypatch):
     return fixed
 
 
-def test_pid_helpers(project_id, _isolated_home):
-    from neo.memory.observer import _pid_file, _read_pid, _sessions_dir
-
-    assert _read_pid(project_id) is None
-    _sessions_dir(project_id).mkdir(parents=True, exist_ok=True)
-    _pid_file(project_id).write_text("12345")
-    assert _read_pid(project_id) == 12345
-
-
-def test_pid_alive_for_current_process():
-    from neo.memory.observer import _pid_alive
-    assert _pid_alive(os.getpid()) is True
-
-
-def test_pid_alive_for_dead_pid():
-    from neo.memory.observer import _pid_alive
-    # PID 1 is always init/launchd — alive. Use an arbitrarily large PID
-    # that is overwhelmingly likely to be dead.
-    assert _pid_alive(2**31 - 1) is False
+@pytest.fixture
+def fake_car(monkeypatch):
+    """Inject a fake car_runtime module with stubbable agents_* methods."""
+    car = types.SimpleNamespace(
+        agents_upsert=MagicMock(return_value="{}"),
+        agents_start=MagicMock(),
+        agents_stop=MagicMock(),
+        agents_restart=MagicMock(),
+        agents_list=MagicMock(return_value="[]"),
+        # Sentinel attr that _require_car_runtime checks for to gate
+        # the version requirement.
+        __spec__=None,
+    )
+    monkeypatch.setitem(sys.modules, "car_runtime", car)
+    return car
 
 
-def test_observer_config_defaults(monkeypatch):
-    monkeypatch.delenv("NEO_OBSERVER_INTERVAL_SECONDS", raising=False)
-    monkeypatch.delenv("NEO_OBSERVER_COOLDOWN", raising=False)
-    monkeypatch.delenv("NEO_OBSERVER_IDLE_SECONDS", raising=False)
-    from neo.memory.observer import ObserverConfig
-    cfg = ObserverConfig.from_env()
-    assert cfg.interval_seconds == 300.0
-    assert cfg.cooldown_seconds == 60.0
-    assert cfg.idle_seconds == 1800.0
+class TestRequireCarRuntime:
+    def test_missing_module_raises_actionable_error(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "car_runtime", None)
+        from neo.memory.observer import _require_car_runtime
+        with pytest.raises(RuntimeError, match="car-runtime"):
+            _require_car_runtime()
+
+    def test_too_old_module_raises_actionable_error(self, monkeypatch):
+        # No agents_upsert attr → pre-0.16 install.
+        old = types.SimpleNamespace(infer=lambda *a, **kw: None)
+        monkeypatch.setitem(sys.modules, "car_runtime", old)
+        from neo.memory.observer import _require_car_runtime
+        with pytest.raises(RuntimeError, match="agents_\\*"):
+            _require_car_runtime()
 
 
-def test_observer_config_env_overrides(monkeypatch):
-    monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "10")
-    monkeypatch.setenv("NEO_OBSERVER_COOLDOWN", "2")
-    monkeypatch.setenv("NEO_OBSERVER_IDLE_SECONDS", "60")
-    from neo.memory.observer import ObserverConfig
-    cfg = ObserverConfig.from_env()
-    assert cfg.interval_seconds == 10.0
-    assert cfg.cooldown_seconds == 2.0
-    assert cfg.idle_seconds == 60.0
+class TestSpecBuilding:
+    def test_spec_uses_current_python(self, fake_project_id):
+        from neo.memory.observer import _build_spec
+        spec = _build_spec(fake_project_id, "/repo/root")
+        assert spec["command"] == sys.executable
+        assert spec["args"] == ["-m", "neo.memory.observer", "--daemon",
+                                "--cwd", "/repo/root"]
+        assert spec["cwd"] == "/repo/root"
+        assert spec["restart"] == "on_failure"
+        assert spec["auto_start"] is True
+
+    def test_spec_id_is_filename_safe(self, fake_project_id):
+        from neo.memory.observer import _agent_id, _build_spec
+        spec = _build_spec(fake_project_id, "/r")
+        # Filename-safe: alphanumerics + hyphens only
+        assert spec["id"] == _agent_id(fake_project_id)
+        for ch in spec["id"]:
+            assert ch.isalnum() or ch in "-_"
+
+    def test_spec_forwards_only_neo_env(self, fake_project_id, monkeypatch):
+        monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "30")
+        monkeypatch.setenv("NEO_PROFILE", "minimal")
+        monkeypatch.setenv("USER_SECRET", "hunter2")
+        from neo.memory.observer import _build_spec
+        spec = _build_spec(fake_project_id, "/r")
+        assert spec["env"]["NEO_OBSERVER_INTERVAL_SECONDS"] == "30"
+        assert spec["env"]["NEO_PROFILE"] == "minimal"
+        assert "USER_SECRET" not in spec["env"]
 
 
-def test_observer_config_rejects_garbage(monkeypatch):
-    monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "not-a-number")
-    monkeypatch.setenv("NEO_OBSERVER_COOLDOWN", "-5")  # non-positive
-    from neo.memory.observer import ObserverConfig
-    cfg = ObserverConfig.from_env()
-    assert cfg.interval_seconds == 300.0  # falls back to default
-    assert cfg.cooldown_seconds == 60.0
+class TestObserverConfig:
+    def test_defaults(self, monkeypatch):
+        for k in ("NEO_OBSERVER_INTERVAL_SECONDS", "NEO_OBSERVER_COOLDOWN"):
+            monkeypatch.delenv(k, raising=False)
+        from neo.memory.observer import ObserverConfig
+        cfg = ObserverConfig.from_env()
+        assert cfg.interval_seconds == 300.0
+        assert cfg.cooldown_seconds == 60.0
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "15")
+        monkeypatch.setenv("NEO_OBSERVER_COOLDOWN", "3")
+        from neo.memory.observer import ObserverConfig
+        cfg = ObserverConfig.from_env()
+        assert cfg.interval_seconds == 15.0
+        assert cfg.cooldown_seconds == 3.0
+
+    def test_rejects_garbage(self, monkeypatch):
+        monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "junk")
+        monkeypatch.setenv("NEO_OBSERVER_COOLDOWN", "-5")
+        from neo.memory.observer import ObserverConfig
+        cfg = ObserverConfig.from_env()
+        assert cfg.interval_seconds == 300.0
+        assert cfg.cooldown_seconds == 60.0
 
 
-class TestObserverStatus:
-    """status() before any observer is running."""
+class TestStartObserver:
+    def test_start_with_no_project_id_returns_error(self, fake_car, monkeypatch):
+        monkeypatch.setattr(
+            "neo.memory.observer.detect_org_and_project",
+            lambda _root: ("unknown", ""),
+        )
+        from neo.memory.observer import start_observer
+        result = start_observer("/nowhere")
+        assert result["status"] == "error"
+        # Did NOT touch CAR if project_id resolution failed
+        fake_car.agents_upsert.assert_not_called()
 
-    def test_status_when_no_observer(self, project_id):
-        from neo.memory.observer import observer_status
-        result = observer_status("/some/path")
-        assert result["status"] == "not_running"
-        assert result["pid"] is None
+    def test_start_calls_upsert_then_start(self, fake_project_id, fake_car):
+        fake_car.agents_list.return_value = "[]"
+        fake_car.agents_start.return_value = json.dumps({"id": "x", "pid": 9001})
 
-    def test_status_when_pid_file_stale(self, project_id, _isolated_home):
-        from neo.memory.observer import _pid_file, _sessions_dir, observer_status
+        from neo.memory.observer import start_observer
+        result = start_observer("/some/path")
 
-        _sessions_dir(project_id).mkdir(parents=True, exist_ok=True)
-        _pid_file(project_id).write_text(str(2**31 - 1))  # dead PID
+        assert result["status"] == "started"
+        assert result["pid"] == 9001
+        fake_car.agents_upsert.assert_called_once()
+        fake_car.agents_start.assert_called_once()
+        # The spec passed to agents_upsert must be valid JSON with our fields
+        spec_arg = fake_car.agents_upsert.call_args[0][0]
+        spec = json.loads(spec_arg)
+        assert spec["id"].startswith("neo-observer-")
+        assert spec["restart"] == "on_failure"
 
-        result = observer_status("/some/path")
-        assert result["status"] == "stale"
+    def test_start_when_already_running(self, fake_project_id, fake_car):
+        from neo.memory.observer import _agent_id
+        aid = _agent_id(fake_project_id)
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": aid, "pid": 1234, "running": True}]
+        )
+
+        from neo.memory.observer import start_observer
+        result = start_observer("/some/path")
+        assert result["status"] == "already_running"
+        assert result["pid"] == 1234
+        # Spec gets upserted (idempotent); but start is NOT called when already running
+        fake_car.agents_start.assert_not_called()
 
 
-class TestObserverStopAndKick:
-    def test_stop_when_not_running(self, project_id):
+class TestStopObserver:
+    def test_stop_when_not_registered(self, fake_project_id, fake_car):
+        fake_car.agents_list.return_value = "[]"
         from neo.memory.observer import stop_observer
         result = stop_observer("/some/path")
         assert result["status"] == "not_running"
+        fake_car.agents_stop.assert_not_called()
 
-    def test_kick_when_not_running(self, project_id):
+    def test_stop_when_running(self, fake_project_id, fake_car):
+        from neo.memory.observer import _agent_id
+        aid = _agent_id(fake_project_id)
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": aid, "pid": 9001, "running": True}]
+        )
+        fake_car.agents_stop.return_value = json.dumps({"id": aid, "pid": 9001})
+
+        from neo.memory.observer import stop_observer
+        result = stop_observer("/some/path")
+        assert result["status"] == "stopped"
+        fake_car.agents_stop.assert_called_once_with(aid)
+
+
+class TestKickObserver:
+    def test_kick_when_not_registered(self, fake_project_id, fake_car):
+        fake_car.agents_list.return_value = "[]"
         from neo.memory.observer import kick_observer
         result = kick_observer("/some/path")
         assert result["status"] == "not_running"
+        fake_car.agents_restart.assert_not_called()
 
-    def test_stop_clears_stale_pid_file(self, project_id, _isolated_home):
-        from neo.memory.observer import _pid_file, _sessions_dir, stop_observer
+    def test_kick_maps_to_restart(self, fake_project_id, fake_car):
+        from neo.memory.observer import _agent_id
+        aid = _agent_id(fake_project_id)
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": aid, "pid": 1, "running": True}]
+        )
+        fake_car.agents_restart.return_value = json.dumps({"id": aid, "pid": 2})
 
-        _sessions_dir(project_id).mkdir(parents=True, exist_ok=True)
-        _pid_file(project_id).write_text(str(2**31 - 1))
+        from neo.memory.observer import kick_observer
+        result = kick_observer("/some/path")
+        assert result["status"] == "kicked"
+        assert result["pid"] == 2
+        fake_car.agents_restart.assert_called_once_with(aid)
 
-        result = stop_observer("/some/path")
+
+class TestObserverStatus:
+    def test_status_when_not_registered(self, fake_project_id, fake_car):
+        fake_car.agents_list.return_value = "[]"
+        from neo.memory.observer import observer_status
+        result = observer_status("/some/path")
         assert result["status"] == "not_running"
-        assert not _pid_file(project_id).exists()
+
+    def test_status_when_running(self, fake_project_id, fake_car):
+        from neo.memory.observer import _agent_id
+        aid = _agent_id(fake_project_id)
+        fake_car.agents_list.return_value = json.dumps([{
+            "id": aid, "pid": 12345, "running": True, "restart_count": 2,
+        }])
+        from neo.memory.observer import observer_status
+        result = observer_status("/some/path")
+        assert result["status"] == "running"
+        assert result["pid"] == 12345
+        assert result["restart_count"] == 2
+
+    def test_status_when_registered_but_stopped(self, fake_project_id, fake_car):
+        from neo.memory.observer import _agent_id
+        aid = _agent_id(fake_project_id)
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": aid, "pid": 0, "running": False, "restart_count": 0}]
+        )
+        from neo.memory.observer import observer_status
+        result = observer_status("/some/path")
+        assert result["status"] == "stopped"
 
 
 class TestObserverCycleUnit:
     """Drive Observer._cycle directly — no daemon, no signals."""
 
-    def test_cycle_calls_synthesize_reviews(self, project_id, _isolated_home, monkeypatch):
+    def test_cycle_calls_synthesize_reviews(self, fake_project_id, monkeypatch):
         from neo.memory.observer import Observer
-
         observer = Observer(codebase_root="/some/path")
 
         call_count = {"n": 0}
@@ -152,13 +264,9 @@ class TestObserverCycleUnit:
 
         assert call_count["n"] == 1
         assert observer._last_analysis_epoch > 0
-        # last_analysis file written
-        from neo.memory.observer import _last_analysis_file
-        assert _last_analysis_file(project_id).exists()
 
-    def test_cycle_swallows_errors(self, project_id, _isolated_home, monkeypatch):
+    def test_cycle_swallows_errors(self, fake_project_id, monkeypatch):
         from neo.memory.observer import Observer
-
         observer = Observer(codebase_root="/some/path")
 
         class _BrokenStore:
@@ -166,14 +274,12 @@ class TestObserverCycleUnit:
                 raise RuntimeError("boom")
 
         monkeypatch.setattr("neo.memory.store.FactStore", _BrokenStore)
-        # Should not raise
-        observer._cycle()
+        observer._cycle()  # must not raise
 
 
-class TestCooldownAndIdle:
-    def test_cooldown_blocks_until_elapsed(self, project_id, _isolated_home):
+class TestCooldown:
+    def test_cooldown_blocks_until_elapsed(self, fake_project_id):
         from neo.memory.observer import Observer, ObserverConfig
-
         observer = Observer(
             codebase_root="/some/path",
             config=ObserverConfig(cooldown_seconds=10.0),
@@ -184,77 +290,9 @@ class TestCooldownAndIdle:
         observer._last_analysis_epoch = time.time() - 11
         assert observer._cooldown_ok() is True
 
-    def test_idle_returns_false_when_no_metrics_file(self, project_id, _isolated_home):
+    def test_first_run_passes_cooldown(self, fake_project_id):
+        """``_last_analysis_epoch`` starts at 0, so the first call should
+        always be allowed."""
         from neo.memory.observer import Observer
         observer = Observer(codebase_root="/some/path")
-        assert observer._idle_too_long() is False
-
-    def test_idle_returns_true_when_metrics_file_stale(
-        self, project_id, _isolated_home,
-    ):
-        from neo.memory.observer import Observer, ObserverConfig, _metrics_file
-
-        observer = Observer(
-            codebase_root="/some/path",
-            config=ObserverConfig(idle_seconds=10.0),
-        )
-        # Backdate the observer's _start_time too, since _idle_too_long uses
-        # max(mtime, start_time) so a newly-started observer gets a grace
-        # window even against a stale file.
-        observer._start_time = time.time() - 100
-
-        mf = _metrics_file()
-        mf.parent.mkdir(parents=True, exist_ok=True)
-        mf.write_text("{}\n")
-        old = time.time() - 100
-        os.utime(mf, (old, old))
-
-        assert observer._idle_too_long() is True
-
-    def test_idle_returns_false_during_startup_grace_window(
-        self, project_id, _isolated_home,
-    ):
-        """A freshly-started observer must not self-exit on a stale metrics file."""
-        from neo.memory.observer import Observer, ObserverConfig, _metrics_file
-
-        observer = Observer(
-            codebase_root="/some/path",
-            config=ObserverConfig(idle_seconds=10.0),
-        )
-
-        mf = _metrics_file()
-        mf.parent.mkdir(parents=True, exist_ok=True)
-        mf.write_text("{}\n")
-        old = time.time() - 9999
-        os.utime(mf, (old, old))
-
-        # _start_time is now() so the reference is now → not idle yet
-        assert observer._idle_too_long() is False
-
-
-class TestStartObserverGuards:
-    def test_start_returns_error_without_project_id(self, monkeypatch):
-        monkeypatch.setattr(
-            "neo.memory.observer.detect_org_and_project",
-            lambda _root: ("unknown", ""),
-        )
-        from neo.memory.observer import start_observer
-        result = start_observer("/nowhere")
-        assert result["status"] == "error"
-
-    def test_start_returns_already_running_when_pid_alive(
-        self, project_id, _isolated_home,
-    ):
-        from neo.memory.observer import (
-            _pid_file,
-            _sessions_dir,
-            start_observer,
-        )
-
-        _sessions_dir(project_id).mkdir(parents=True, exist_ok=True)
-        # Use OUR own PID — guaranteed alive
-        _pid_file(project_id).write_text(str(os.getpid()))
-
-        result = start_observer("/some/path")
-        assert result["status"] == "already_running"
-        assert result["pid"] == os.getpid()
+        assert observer._cooldown_ok() is True

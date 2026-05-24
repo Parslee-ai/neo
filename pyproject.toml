@@ -53,13 +53,21 @@ openai = ["openai>=1.0.0"]
 google = ["google-genai>=0.2.0"]
 ollama = ["requests>=2.31.0"]
 # Optional CAR (Common Agent Runtime) backend. Enables `neo serve`,
-# which hosts Neo as an Agent2Agent v1.0 endpoint via car-server.
+# which hosts Neo as an Agent2Agent v1.0 endpoint via car-server,
+# and `neo memory observer`, which runs synthesis under CAR's agent
+# supervisor.
 # Kept optional so the default install path stays pure Apache-2.0 —
 # car-runtime ships as a sealed binary under a separate license.
 # Requires the car-server daemon (`python -m car_runtime.server`)
 # running locally; see INSTALL.md.
+#
+# Minimum is 0.16.1: that's where the `agents_*` lifecycle API
+# landed (the surface `neo.memory.observer` builds on). Earlier
+# versions still work for `CarAdapter`-only use, but
+# `neo memory observer start` will reject them with an actionable
+# error.
 car = [
-    "car-runtime>=0.9.0",
+    "car-runtime>=0.16.1",
 ]
 all = [
     "anthropic>=0.21.0",

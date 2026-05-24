@@ -4,6 +4,18 @@ Proposal for moving REVIEW→PATTERN/FAILURE synthesis off the hot path, modeled
 after ECC's `continuous-learning-v2` observer
 (`affaan-m/ECC:skills/continuous-learning-v2/`).
 
+> **As-built note (post-v0.19):** the first cut of this proposal rolled its own
+> daemon (`subprocess.Popen` + PID file + SIGUSR1 kick + idle-exit). That
+> implementation was replaced before any release with a port to CAR's
+> `agents_*` lifecycle API (car-runtime ≥ 0.16.1). The motivation, ECC
+> reference points, and design rationale below remain accurate; the
+> "Process model" section's plumbing is **superseded** — CAR's supervisor
+> owns spawn, restart-on-failure, log redirection, and clean shutdown.
+> `~/.car/agents.json` is the persisted spec; `~/.car/logs/neo-observer-<id8>.{stdout,stderr}.log`
+> is where output lands. `kick` maps to `agents_restart` since CAR has no
+> signal-passthrough primitive. See `src/neo/memory/observer.py` for the
+> current shape.
+
 ## Status quo
 
 Synthesis runs inline in `memory/store.py:1722-1765` under a triple-trigger gate

@@ -76,12 +76,16 @@
 - Async synthesis observer (`memory.observer`): a per-project background process
   that runs `synthesize_reviews` on a wall-clock cadence, decoupled from the
   request path. *Additive* — the inline triple-trigger gate keeps firing too;
-  the observer just makes synthesis more frequent. Lifecycle:
-  `neo memory observer {start|stop|status|kick}`. PID/log/last-analysis live in
-  `~/.neo/sessions/<project_id>/.observer.*`. Tunables:
-  `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
-  (default 60), `NEO_OBSERVER_IDLE_SECONDS` (default 1800 — observer self-exits
-  if metrics.jsonl stays idle that long after a startup grace window).
+  the observer just makes synthesis more frequent. **Hard dep**: car-runtime
+  ≥ 0.16.1 (for the `agents_*` lifecycle API) and a running `car-server`
+  daemon — CAR's supervisor owns the spawn / restart-on-failure / log
+  redirection / clean SIGTERM shutdown. Spec persisted to `~/.car/agents.json`
+  (`auto_start: true` so it comes back on daemon boot); logs land at
+  `~/.car/logs/neo-observer-<id8>.{stdout,stderr}.log`. Lifecycle:
+  `neo memory observer {start|stop|status|kick}` — `kick` maps to
+  `agents_restart` since CAR has no signal-passthrough primitive.
+  Tunables: `NEO_OBSERVER_INTERVAL_SECONDS` (default 300),
+  `NEO_OBSERVER_COOLDOWN` (default 60, per-process).
 - Observability: retrieve / add_fact / lm_call / overseer_tick events land in
   `~/.neo/metrics.jsonl`. Gated by `NEO_PROFILE`:
   `off` (no emit), `minimal` (lm_call only), `standard` (default, all events),

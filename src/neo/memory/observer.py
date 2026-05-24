@@ -1,44 +1,41 @@
-"""Async out-of-band synthesis observer.
+"""Async out-of-band synthesis observer, supervised by car-server.
 
-A long-lived background process that runs REVIEW→PATTERN/FAILURE synthesis
-on a wall-clock cadence, decoupled from the request path. Modeled after
-ECC's continuous-learning-v2 observer (skills/continuous-learning-v2/
-agents/observer-loop.sh).
+A per-project background process that runs REVIEW→PATTERN/FAILURE
+synthesis on a wall-clock cadence. Lifecycle is owned by CAR's
+agent supervisor:
 
-The observer is *additive* to the inline triple-trigger gate in
-``FactStore.synthesize_reviews``: both paths call the same entry point, the
-gate inside ``synthesize_reviews`` is idempotent (watermark-protected), and
-running the observer just makes synthesis fire more often than the inline
-gate alone would. Operators who want only out-of-band synthesis can lift
-``synthesize_reviews``'s gate in a follow-up.
+  - ``agents_upsert`` registers the spec under ``~/.car/agents.json``
+  - ``agents_start`` spawns the child
+    (``python -m neo.memory.observer --daemon --cwd <root>``)
+  - Supervisor handles restart-on-failure, clean SIGTERM shutdown, log
+    redirection to ``~/.car/logs/<id>.{stdout,stderr}.log``, and auto-
+    start at daemon boot when ``auto_start=True``.
 
-Lifecycle:
-    neo memory observer start    # spawn, write PID, write log
-    neo memory observer status   # PID liveness + last-analysis epoch
-    neo memory observer kick     # SIGUSR1 — force an early cycle (cooldown applies)
-    neo memory observer stop     # SIGTERM
+Hard dependency on ``car-runtime>=0.16.1`` (when the ``agents_*``
+lifecycle API landed). The car-server daemon must be running; the
+CAR bindings will auto-spawn it via ``CAR_AUTOSTART`` if reachable
+on the default ``ws://127.0.0.1:9100``.
 
-Per-project state lives under ``~/.neo/sessions/<project_id>/``:
-    .observer.pid          — PID of the running observer
-    .observer.log          — appended log lines
-    .observer.last_analysis — epoch of last successful synthesis call
+Tunables (env, read by the daemon child):
 
-Tunables (env):
     NEO_OBSERVER_INTERVAL_SECONDS  — wake cadence (default 300)
-    NEO_OBSERVER_COOLDOWN          — min seconds between analyses (default 60)
-    NEO_OBSERVER_IDLE_SECONDS      — exit if no metrics activity for this long (default 1800)
+    NEO_OBSERVER_COOLDOWN          — min seconds between analyses
+                                     (default 60). With CAR-managed
+                                     lifecycle there's no SIGUSR1
+                                     kick; the cooldown still bounds
+                                     the rate at which restarts re-
+                                     trigger synthesis.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 from neo.memory.scope import detect_org_and_project
@@ -46,49 +43,86 @@ from neo.memory.scope import detect_org_and_project
 logger = logging.getLogger(__name__)
 
 
-def _sessions_dir(project_id: str) -> Path:
-    """Project-scoped state directory. Created on demand by start_observer."""
-    return Path.home() / ".neo" / "sessions" / project_id
+# ---------------------------------------------------------------------------
+# CAR runtime adapter (lazy-imported so non-observer neo commands work
+# without the car-runtime dependency installed)
+# ---------------------------------------------------------------------------
 
 
-def _pid_file(project_id: str) -> Path:
-    return _sessions_dir(project_id) / ".observer.pid"
+_CAR_REQUIRED_MSG = (
+    "Observer requires car-runtime >= 0.16.1 (introduces the agents_* "
+    "lifecycle API). Install: `pip install neo[car]`, then ensure "
+    "car-server is running (or set CAR_AUTOSTART=1)."
+)
 
 
-def _log_file(project_id: str) -> Path:
-    return _sessions_dir(project_id) / ".observer.log"
+def _require_car_runtime():
+    """Import car_runtime and verify it has the agent-supervisor API.
 
-
-def _last_analysis_file(project_id: str) -> Path:
-    return _sessions_dir(project_id) / ".observer.last_analysis"
-
-
-def _metrics_file() -> Path:
-    return Path.home() / ".neo" / "metrics.jsonl"
-
-
-def _read_pid(project_id: str) -> Optional[int]:
-    pf = _pid_file(project_id)
-    if not pf.exists():
-        return None
+    Raises ``RuntimeError`` with an actionable message when missing or
+    too old, instead of a cryptic ImportError/AttributeError at the
+    call site.
+    """
     try:
-        return int(pf.read_text().strip())
-    except (ValueError, OSError):
-        return None
+        import car_runtime
+    except ImportError as e:
+        raise RuntimeError(_CAR_REQUIRED_MSG) from e
 
+    if not hasattr(car_runtime, "agents_upsert"):
+        raise RuntimeError(_CAR_REQUIRED_MSG)
 
-def _pid_alive(pid: int) -> bool:
-    """``kill -0`` semantics: signal 0 raises if PID is dead."""
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
-        return False
-    return True
+    return car_runtime
 
 
 def _resolve_project_id(codebase_root: Optional[str]) -> str:
     _, project_id = detect_org_and_project(codebase_root or os.getcwd())
     return project_id
+
+
+def _agent_id(project_id: str) -> str:
+    """Filename-safe ID for the supervisor. Short prefix keeps logs
+    grep-able when multiple projects are active."""
+    return f"neo-observer-{project_id[:12]}"
+
+
+def _build_spec(project_id: str, codebase_root: str) -> dict:
+    """Spec for ``agents_upsert``. ``command`` must be an absolute
+    interpreter path per the CAR contract; ``args`` invokes our daemon
+    module.
+
+    Picks ``sys.executable`` so the supervisor uses the *same* Python
+    that neo itself is running on — important when the user installed
+    neo in a virtualenv.
+    """
+    return {
+        "id": _agent_id(project_id),
+        "name": f"Neo observer ({project_id[:8]})",
+        "command": sys.executable,
+        "args": ["-m", "neo.memory.observer", "--daemon", "--cwd", codebase_root],
+        "cwd": codebase_root,
+        "env": {
+            # Forward only the knobs the daemon body honors. Don't dump
+            # the parent's full env into the manifest — that bloats
+            # ~/.car/agents.json and exposes secrets to other readers.
+            k: os.environ[k]
+            for k in (
+                "NEO_OBSERVER_INTERVAL_SECONDS",
+                "NEO_OBSERVER_COOLDOWN",
+                "NEO_PROFILE",
+                "NEO_METRICS",
+            )
+            if k in os.environ
+        },
+        "restart": "on_failure",
+        "max_restarts": 10,
+        "backoff_secs": 5,
+        "auto_start": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Observer body — runs in the supervised child process
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -97,7 +131,6 @@ class ObserverConfig:
 
     interval_seconds: float = 300.0
     cooldown_seconds: float = 60.0
-    idle_seconds: float = 1800.0
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -114,12 +147,17 @@ class ObserverConfig:
         return cls(
             interval_seconds=_read("NEO_OBSERVER_INTERVAL_SECONDS", 300.0),
             cooldown_seconds=_read("NEO_OBSERVER_COOLDOWN", 60.0),
-            idle_seconds=_read("NEO_OBSERVER_IDLE_SECONDS", 1800.0),
         )
 
 
 class Observer:
-    """Per-project synthesis loop. One instance per running process."""
+    """Synthesis loop. One instance per supervised child process.
+
+    Process lifecycle (spawn, restart, stop) is owned by CAR's
+    supervisor. This class only owns the in-process loop: wake on
+    interval, run synthesis, sleep. Receives SIGTERM from the
+    supervisor on stop and exits cleanly.
+    """
 
     def __init__(self, codebase_root: str, config: Optional[ObserverConfig] = None):
         self.codebase_root = codebase_root
@@ -130,172 +168,130 @@ class Observer:
                 "Cannot run observer without a resolvable project_id "
                 "(no codebase_root and no git repo in cwd)"
             )
-        self._sessions = _sessions_dir(self.project_id)
-        self._sessions.mkdir(parents=True, exist_ok=True)
         self._stop = False
-        self._kick = False
         self._last_analysis_epoch = 0.0
-        self._start_time = time.time()
 
     def run(self) -> None:
-        """Main loop. Returns when SIGTERM/SIGINT received or idle-timeout hits."""
+        """Main loop. Returns when SIGTERM/SIGINT received."""
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
-        signal.signal(signal.SIGUSR1, self._handle_kick)
 
-        self._log(f"observer started pid={os.getpid()} project={self.project_id[:8]}")
-        _pid_file(self.project_id).write_text(str(os.getpid()))
+        print(
+            f"neo observer started pid={os.getpid()} project={self.project_id[:8]}",
+            flush=True,
+        )
 
-        try:
-            while not self._stop:
-                if self._idle_too_long():
-                    self._log("idle timeout — exiting")
-                    break
+        while not self._stop:
+            if self._cooldown_ok():
+                self._cycle()
+            # Sleep in 1-second slices so SIGTERM is responsive without
+            # leaving the supervisor waiting through a full interval.
+            slept = 0.0
+            while slept < self.config.interval_seconds and not self._stop:
+                time.sleep(1.0)
+                slept += 1.0
 
-                if self._cooldown_ok():
-                    self._cycle()
-
-                # Sleep in 1-second slices so SIGUSR1 / SIGTERM are responsive.
-                slept = 0.0
-                while slept < self.config.interval_seconds and not self._stop:
-                    if self._kick:
-                        self._kick = False
-                        self._log("kick received — running cycle")
-                        if self._cooldown_ok():
-                            self._cycle()
-                        else:
-                            self._log("kick suppressed by cooldown")
-                    time.sleep(1.0)
-                    slept += 1.0
-        finally:
-            try:
-                _pid_file(self.project_id).unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._log("observer stopped")
+        print(f"neo observer stopped pid={os.getpid()}", flush=True)
 
     def _handle_stop(self, _signum: int, _frame) -> None:
         self._stop = True
-
-    def _handle_kick(self, _signum: int, _frame) -> None:
-        self._kick = True
 
     def _cooldown_ok(self) -> bool:
         elapsed = time.time() - self._last_analysis_epoch
         return elapsed >= self.config.cooldown_seconds
 
-    def _idle_too_long(self) -> bool:
-        """Exit if metrics.jsonl hasn't been touched in ``idle_seconds``.
-
-        Treats a missing metrics file as "not idle" — neo just hasn't run
-        anything yet on this machine, but might in a moment. The reference
-        time is ``max(mtime, _start_time)``: an observer launched against a
-        stale metrics file gets a full ``idle_seconds`` grace window to see
-        activity before exiting, rather than self-exiting on iteration 1.
-        """
-        mf = _metrics_file()
-        if not mf.exists():
-            return False
-        try:
-            mtime = mf.stat().st_mtime
-        except OSError:
-            return False
-        reference = max(mtime, self._start_time)
-        return (time.time() - reference) > self.config.idle_seconds
-
     def _cycle(self) -> None:
-        """One synthesis pass. Errors are caught and logged — never propagate."""
+        """One synthesis pass. Errors are caught and logged — never
+        propagate, so a bad cycle doesn't cause the supervisor to
+        restart-loop us into a backoff hell."""
         try:
-            # Lazy import — `Observer` is a daemon entrypoint, and we want
-            # the heavy FactStore import to happen inside the child process
-            # so `start_observer` returns fast.
+            # Lazy import — FactStore pulls fastembed/numpy/etc.; defer
+            # so a malformed --cwd reports cleanly before paying that
+            # import cost.
             from neo.memory.store import FactStore
 
             store = FactStore(codebase_root=self.codebase_root, eager_init=False)
             store.initialize()
             count = store.synthesize_reviews()
             self._last_analysis_epoch = time.time()
-            _last_analysis_file(self.project_id).write_text(str(self._last_analysis_epoch))
-            self._log(f"cycle ok: {count} synthesized facts")
-        except Exception as e:  # never let one bad cycle kill the loop
-            self._log(f"cycle error: {type(e).__name__}: {e}")
-
-    def _log(self, message: str) -> None:
-        try:
-            with _log_file(self.project_id).open("a") as f:
-                f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {message}\n")
-        except OSError:
-            pass
+            print(
+                f"neo observer cycle ok: {count} synthesized facts",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"neo observer cycle error: {type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 # ---------------------------------------------------------------------------
-# Public lifecycle API (called from subcommands.py)
+# Public lifecycle API — delegates to CAR's supervisor
 # ---------------------------------------------------------------------------
+
+
+def _find_managed_agent(car, agent_id: str) -> Optional[dict]:
+    """Return the ManagedAgent dict for ``agent_id`` or None."""
+    try:
+        managed_json = car.agents_list()
+        managed = json.loads(managed_json)
+    except (json.JSONDecodeError, Exception) as e:
+        logger.debug("agents_list failed: %s", e)
+        return None
+    for m in managed:
+        if m.get("id") == agent_id:
+            return m
+    return None
 
 
 def start_observer(codebase_root: Optional[str] = None) -> dict:
-    """Spawn a detached observer process for the resolved project.
+    """Register the spec and start the supervised child.
 
-    Returns a status dict: ``{"status": "started"|"already_running"|"error",
-    "pid": int|None, "project_id": str, "message": str}``. The parent process
-    returns immediately — the daemon does its own logging.
+    Returns: ``{"status": "started"|"already_running"|"error", ...}``.
     """
     project_id = _resolve_project_id(codebase_root)
     if not project_id:
-        return {"status": "error", "pid": None, "project_id": "",
+        return {"status": "error", "project_id": "",
                 "message": "No project_id (run from a git repo or pass --cwd)"}
 
-    existing = _read_pid(project_id)
-    if existing and _pid_alive(existing):
-        return {"status": "already_running", "pid": existing,
-                "project_id": project_id, "message": f"observer pid {existing}"}
-
-    if existing:
-        _pid_file(project_id).unlink(missing_ok=True)
-
-    _sessions_dir(project_id).mkdir(parents=True, exist_ok=True)
-    log_path = _log_file(project_id)
-    log_path.touch(exist_ok=True)
-
-    # Re-exec ourselves into the hidden daemon entrypoint. `start_new_session`
-    # detaches the child from the parent's controlling terminal so closing the
-    # shell doesn't kill it.
-    env = os.environ.copy()
-    cmd = [sys.executable, "-m", "neo.memory.observer", "--daemon",
-           "--cwd", codebase_root or os.getcwd()]
     try:
-        with log_path.open("a") as log_fp:
-            proc = subprocess.Popen(  # noqa: S603 — argv is constructed, not shell
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log_fp,
-                stderr=log_fp,
-                start_new_session=True,
-                env=env,
-                close_fds=True,
-            )
-    except OSError as e:
-        return {"status": "error", "pid": None, "project_id": project_id,
-                "message": f"spawn failed: {e}"}
+        car = _require_car_runtime()
+    except RuntimeError as e:
+        return {"status": "error", "project_id": project_id, "message": str(e)}
 
-    # Give the child a moment to write its PID file. Bounded poll, not sleep,
-    # so we fail fast if the child died on start.
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        if _read_pid(project_id):
-            break
-        if proc.poll() is not None:
-            return {"status": "error", "pid": None, "project_id": project_id,
-                    "message": f"daemon exited immediately (code {proc.returncode})"}
-        time.sleep(0.05)
+    aid = _agent_id(project_id)
+    spec = _build_spec(project_id, codebase_root or os.getcwd())
 
-    pid = _read_pid(project_id)
-    if not pid:
-        return {"status": "error", "pid": None, "project_id": project_id,
-                "message": "daemon did not write PID file within 3s"}
+    try:
+        car.agents_upsert(json.dumps(spec))
+    except Exception as e:
+        return {"status": "error", "project_id": project_id,
+                "message": f"agents_upsert failed: {e}"}
 
-    return {"status": "started", "pid": pid, "project_id": project_id,
-            "message": f"observer pid {pid}, log {log_path}"}
+    existing = _find_managed_agent(car, aid)
+    if existing and existing.get("running"):
+        return {"status": "already_running", "project_id": project_id,
+                "agent_id": aid, "pid": existing.get("pid"),
+                "message": f"observer pid {existing.get('pid')}"}
+
+    try:
+        managed_json = car.agents_start(aid)
+        managed = json.loads(managed_json)
+    except Exception as e:
+        return {"status": "error", "project_id": project_id,
+                "message": f"agents_start failed: {e}"}
+
+    return {
+        "status": "started",
+        "project_id": project_id,
+        "agent_id": aid,
+        "pid": managed.get("pid"),
+        "message": (
+            f"observer pid {managed.get('pid')}, "
+            f"log ~/.car/logs/{aid}.stdout.log"
+        ),
+    }
 
 
 def stop_observer(codebase_root: Optional[str] = None) -> dict:
@@ -303,42 +299,65 @@ def stop_observer(codebase_root: Optional[str] = None) -> dict:
     if not project_id:
         return {"status": "error", "message": "No project_id"}
 
-    pid = _read_pid(project_id)
-    if not pid:
-        return {"status": "not_running", "pid": None, "project_id": project_id,
-                "message": "no PID file"}
-    if not _pid_alive(pid):
-        _pid_file(project_id).unlink(missing_ok=True)
-        return {"status": "not_running", "pid": pid, "project_id": project_id,
-                "message": "stale PID file removed"}
+    try:
+        car = _require_car_runtime()
+    except RuntimeError as e:
+        return {"status": "error", "project_id": project_id, "message": str(e)}
+
+    aid = _agent_id(project_id)
+    existing = _find_managed_agent(car, aid)
+    if not existing:
+        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+                "message": "no managed agent registered"}
+    if not existing.get("running"):
+        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+                "pid": existing.get("pid"), "message": "agent already stopped"}
 
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as e:
-        return {"status": "error", "pid": pid, "project_id": project_id,
-                "message": f"SIGTERM failed: {e}"}
-    return {"status": "stopped", "pid": pid, "project_id": project_id,
-            "message": f"SIGTERM sent to pid {pid}"}
+        managed_json = car.agents_stop(aid)
+        managed = json.loads(managed_json)
+    except Exception as e:
+        return {"status": "error", "project_id": project_id,
+                "message": f"agents_stop failed: {e}"}
+
+    return {"status": "stopped", "project_id": project_id, "agent_id": aid,
+            "pid": managed.get("pid"),
+            "message": f"SIGTERM sent to pid {managed.get('pid')}"}
 
 
 def kick_observer(codebase_root: Optional[str] = None) -> dict:
-    """Send SIGUSR1 to force an early cycle (still subject to cooldown)."""
+    """Force an early cycle by restarting the child.
+
+    CAR's supervisor has no SIGUSR1 / signal-passthrough primitive, so
+    kick maps to ``agents_restart`` — stop, then start. The new
+    process runs its first cycle immediately (modulo cooldown, which
+    is per-process and so resets on restart).
+    """
     project_id = _resolve_project_id(codebase_root)
     if not project_id:
         return {"status": "error", "message": "No project_id"}
 
-    pid = _read_pid(project_id)
-    if not pid or not _pid_alive(pid):
-        return {"status": "not_running", "pid": None, "project_id": project_id,
-                "message": "no running observer"}
+    try:
+        car = _require_car_runtime()
+    except RuntimeError as e:
+        return {"status": "error", "project_id": project_id, "message": str(e)}
+
+    aid = _agent_id(project_id)
+    existing = _find_managed_agent(car, aid)
+    if not existing:
+        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+                "message": "no managed agent registered"}
 
     try:
-        os.kill(pid, signal.SIGUSR1)
-    except OSError as e:
-        return {"status": "error", "pid": pid, "project_id": project_id,
-                "message": f"SIGUSR1 failed: {e}"}
-    return {"status": "kicked", "pid": pid, "project_id": project_id,
-            "message": f"SIGUSR1 sent to pid {pid}"}
+        managed_json = car.agents_restart(aid)
+        managed = json.loads(managed_json)
+    except Exception as e:
+        return {"status": "error", "project_id": project_id,
+                "message": f"agents_restart failed: {e}"}
+
+    return {"status": "kicked", "project_id": project_id, "agent_id": aid,
+            "pid": managed.get("pid"),
+            "message": f"restarted as pid {managed.get('pid')}"}
 
 
 def observer_status(codebase_root: Optional[str] = None) -> dict:
@@ -346,34 +365,37 @@ def observer_status(codebase_root: Optional[str] = None) -> dict:
     if not project_id:
         return {"status": "error", "message": "No project_id"}
 
-    pid = _read_pid(project_id)
-    if not pid:
-        return {"status": "not_running", "pid": None, "project_id": project_id,
-                "message": "no PID file"}
-    if not _pid_alive(pid):
-        return {"status": "stale", "pid": pid, "project_id": project_id,
-                "message": "PID file references dead process"}
+    try:
+        car = _require_car_runtime()
+    except RuntimeError as e:
+        return {"status": "error", "project_id": project_id, "message": str(e)}
 
-    last_analysis_path = _last_analysis_file(project_id)
-    last_analysis: Optional[float] = None
-    if last_analysis_path.exists():
-        try:
-            last_analysis = float(last_analysis_path.read_text().strip())
-        except (ValueError, OSError):
-            pass
+    aid = _agent_id(project_id)
+    existing = _find_managed_agent(car, aid)
+    if not existing:
+        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+                "message": "no managed agent registered"}
 
+    running = bool(existing.get("running"))
     return {
-        "status": "running",
-        "pid": pid,
+        "status": "running" if running else "stopped",
         "project_id": project_id,
-        "log_file": str(_log_file(project_id)),
-        "last_analysis_epoch": last_analysis,
-        "message": f"observer pid {pid}",
+        "agent_id": aid,
+        "pid": existing.get("pid") if running else None,
+        "restart_count": existing.get("restart_count", 0),
+        "log_file": f"~/.car/logs/{aid}.stdout.log",
+        "message": (
+            f"observer pid {existing.get('pid')} "
+            f"(restarts={existing.get('restart_count', 0)})"
+            if running
+            else f"agent registered but stopped (last pid {existing.get('pid')})"
+        ),
     }
 
 
 # ---------------------------------------------------------------------------
 # Daemon entrypoint — `python -m neo.memory.observer --daemon --cwd <path>`
+# Invoked by CAR's supervisor via the spec from ``_build_spec``.
 # ---------------------------------------------------------------------------
 
 

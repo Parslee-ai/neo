@@ -326,15 +326,15 @@ def _handle_observer(args) -> None:
         return
 
     parts = [f"[Neo] observer {sub}: {result.get('status')}"]
+    if result.get("agent_id"):
+        parts.append(f"id={result['agent_id']}")
     if result.get("pid"):
         parts.append(f"pid={result['pid']}")
     if result.get("project_id"):
         parts.append(f"project={result['project_id'][:8]}")
-    last = result.get("last_analysis_epoch")
-    if last:
-        import datetime as _dt
-        age = _dt.timedelta(seconds=int(time.time() - last))
-        parts.append(f"last_cycle={age} ago")
+    rc = result.get("restart_count")
+    if rc is not None and rc > 0:
+        parts.append(f"restarts={rc}")
     if result.get("log_file"):
         parts.append(f"log={result['log_file']}")
     print(" ".join(parts))
