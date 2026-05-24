@@ -86,6 +86,13 @@
   `agents_restart` since CAR has no signal-passthrough primitive.
   Tunables: `NEO_OBSERVER_INTERVAL_SECONDS` (default 300),
   `NEO_OBSERVER_COOLDOWN` (default 60, per-process).
+  **Known broken** on machines where CarHost.app is running:
+  `car-runtime 0.16.x`'s module-level `agents_upsert` is still in-process
+  and collides with the running supervisor's manifest lock — see
+  [Parslee-ai/car-releases#54](https://github.com/Parslee-ai/car-releases/issues/54).
+  The unit tests pass because they mock `car_runtime`; do not interpret
+  green CI as "observer works". Revisit once #54 lands a wheel that
+  routes `agents_*` over WS.
 - Observability: retrieve / add_fact / lm_call / overseer_tick events land in
   `~/.neo/metrics.jsonl`. Gated by `NEO_PROFILE`:
   `off` (no emit), `minimal` (lm_call only), `standard` (default, all events),
