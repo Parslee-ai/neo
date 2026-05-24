@@ -331,7 +331,12 @@ class FactStore:
         )
         return fact
 
-    def retrieve_relevant(self, query: str, k: int = 30) -> list[Fact]:
+    def retrieve_relevant(
+        self,
+        query: str,
+        k: int = 30,
+        domain: Optional[str] = None,
+    ) -> list[Fact]:
         """Retrieve the most relevant valid facts for a query.
 
         Pipeline:
@@ -346,17 +351,21 @@ class FactStore:
 
         At Neo's max scope of ~850 valid facts, all of this is in the
         single-millisecond range — no ANN index needed.
+
+        If ``domain`` is given, only facts whose ``Fact.domain`` matches
+        exactly are considered. See ``SUGGESTED_DOMAINS`` for the
+        recommended vocabulary.
         """
         shape, sub_queries = _decompose_query(query)
         if shape is QueryShape.DIRECT or len(sub_queries) <= 1:
-            return self._retrieve_single(query, k)
+            return self._retrieve_single(query, k, domain=domain)
 
         # Multi-hop / multi-entity: per-branch retrieve, merge, dedup,
         # then take top-k by best per-fact rank_score across branches.
         per_branch_k = max(5, k // max(1, len(sub_queries)))
         merged: dict[str, tuple[Fact, float]] = {}
         for sq in sub_queries:
-            for fact in self._retrieve_single(sq, per_branch_k):
+            for fact in self._retrieve_single(sq, per_branch_k, domain=domain):
                 prev = merged.get(fact.id)
                 if prev is None or fact.metadata.confidence > prev[1]:
                     merged[fact.id] = (fact, fact.metadata.confidence)
@@ -422,7 +431,9 @@ class FactStore:
                 added += 1
         return expanded
 
-    def _retrieve_single(self, query: str, k: int) -> list[Fact]:
+    def _retrieve_single(
+        self, query: str, k: int, *, domain: Optional[str] = None
+    ) -> list[Fact]:
         """Single-pass retrieval — what retrieve_relevant used to be.
 
         Split out so query-routing can call us per sub-query without
@@ -432,6 +443,8 @@ class FactStore:
             query_embedding = self._embed_text(query)
 
             valid_facts = [f for f in self._facts if f.is_valid and f.kind != FactKind.CONSTRAINT]
+            if domain is not None:
+                valid_facts = [f for f in valid_facts if f.domain == domain]
             if not valid_facts:
                 metrics_record(
                     "retrieve",

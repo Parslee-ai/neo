@@ -124,6 +124,23 @@ class TestFact:
         assert fact.superseded_by is None
         assert fact.depends_on == []
         assert fact.tags == []
+        assert fact.domain is None
+
+    def test_domain_roundtrip(self):
+        fact = Fact(subject="prefer pytest", body="...", domain="testing")
+        restored = Fact.from_dict(fact.to_dict())
+        assert restored.domain == "testing"
+
+    def test_domain_missing_in_legacy_dict(self):
+        """Facts written before the field existed deserialize with domain=None."""
+        d = {"subject": "old", "kind": "pattern", "scope": "project"}
+        fact = Fact.from_dict(d)
+        assert fact.domain is None
+
+    def test_domain_accepts_arbitrary_string(self):
+        """SUGGESTED_DOMAINS is recommended, not enforced."""
+        fact = Fact(domain="ml-pipelines")
+        assert fact.domain == "ml-pipelines"
 
 
 class TestContextResult:

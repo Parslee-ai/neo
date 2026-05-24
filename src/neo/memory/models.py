@@ -210,6 +210,26 @@ class FactScope(Enum):
     SESSION = "session"   # Current session only (ephemeral)
 
 
+# Suggested vocabulary for `Fact.domain` — orthogonal to `FactKind`.
+# Domain answers "what *area* is this fact about?" (code-style, testing, …);
+# kind answers "what *kind* of knowledge is it?" (PATTERN, FAILURE, …).
+#
+# Open set: callers may write any string. The constant exists so retrieval
+# filters and synthesis prompts have a stable list to choose from. Modeled
+# after ECC's continuous-learning-v2 `domain` taxonomy.
+SUGGESTED_DOMAINS = frozenset({
+    "code-style",      # naming, formatting, idioms
+    "testing",         # test layout, mocking policy, fixtures
+    "git",             # branching, commit conventions, PRs
+    "debugging",       # diagnostic patterns, common-cause heuristics
+    "workflow",        # tool-use sequences, command preferences
+    "security",        # input validation, secrets, sandboxing
+    "file-patterns",   # directory layout, naming conventions
+    "architecture",    # cross-cutting design decisions
+    "performance",     # hot paths, perf-sensitive code
+})
+
+
 @dataclass
 class FactMetadata:
     """Metadata attached to a fact."""
@@ -356,6 +376,7 @@ class Fact:
     body: str = ""                 # Full content
     kind: FactKind = FactKind.PATTERN
     scope: FactScope = FactScope.PROJECT
+    domain: Optional[str] = None   # Free-form area tag; see SUGGESTED_DOMAINS
     org_id: str = ""               # From git remote (e.g., "parslee-ai")
     project_id: str = ""           # SHA256[:16] of codebase root
     is_valid: bool = True          # True until superseded
@@ -406,6 +427,7 @@ class Fact:
             "body": self.body,
             "kind": self.kind.value,
             "scope": self.scope.value,
+            "domain": self.domain,
             "org_id": self.org_id,
             "project_id": self.project_id,
             "is_valid": self.is_valid,
@@ -438,6 +460,7 @@ class Fact:
             body=data.get("body", ""),
             kind=FactKind(data.get("kind", "pattern")),
             scope=FactScope(data.get("scope", "project")),
+            domain=data.get("domain"),
             org_id=data.get("org_id", ""),
             project_id=data.get("project_id", ""),
             is_valid=data.get("is_valid", True),

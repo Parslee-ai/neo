@@ -218,6 +218,53 @@ class TestRetrieveRelevant:
         store.retrieve_relevant("test", k=1)
         assert fact.metadata.access_count == 1
 
+    def test_domain_filter_excludes_other_domains(self, store):
+        store._facts.append(Fact(
+            subject="Testing fact",
+            body="Use pytest",
+            domain="testing",
+            metadata=FactMetadata(confidence=0.8),
+        ))
+        store._facts.append(Fact(
+            subject="Style fact",
+            body="Snake case",
+            domain="code-style",
+            metadata=FactMetadata(confidence=0.8),
+        ))
+        results = store.retrieve_relevant("anything", k=10, domain="testing")
+        assert len(results) == 1
+        assert results[0].subject == "Testing fact"
+
+    def test_domain_filter_none_returns_all(self, store):
+        store._facts.append(Fact(
+            subject="A", body="b", domain="testing",
+            metadata=FactMetadata(confidence=0.8),
+        ))
+        store._facts.append(Fact(
+            subject="B", body="b", domain="code-style",
+            metadata=FactMetadata(confidence=0.8),
+        ))
+        store._facts.append(Fact(
+            subject="C", body="b", domain=None,
+            metadata=FactMetadata(confidence=0.8),
+        ))
+        results = store.retrieve_relevant("anything", k=10)
+        assert len(results) == 3
+
+    def test_domain_filter_excludes_unset_domain(self, store):
+        """Facts with domain=None must NOT match a specific domain filter."""
+        store._facts.append(Fact(
+            subject="Untagged", body="b", domain=None,
+            metadata=FactMetadata(confidence=0.8),
+        ))
+        store._facts.append(Fact(
+            subject="Tagged", body="b", domain="testing",
+            metadata=FactMetadata(confidence=0.8),
+        ))
+        results = store.retrieve_relevant("anything", k=10, domain="testing")
+        assert len(results) == 1
+        assert results[0].subject == "Tagged"
+
 
 class TestPersistence:
     def test_save_load_roundtrip(self, store):
