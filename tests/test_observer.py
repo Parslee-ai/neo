@@ -10,12 +10,10 @@ The Observer class itself (the daemon body) is exercised directly.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 import types
-from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

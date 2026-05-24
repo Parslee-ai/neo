@@ -1206,7 +1206,9 @@ class TestLegacyProjectIdMigration:
             new_facts = tmp_facts_dir / f"facts_project_{new_id}.json"
             new_facts.write_text('{"new": true}')
 
-            store = FactStore(codebase_root=codebase_root, eager_init=True)
+            # Construct for its side effect (migration check); the assertions
+            # below verify the on-disk state, not the store object.
+            FactStore(codebase_root=codebase_root, eager_init=True)
 
         # New file untouched, legacy file left in place
         assert legacy_facts.exists()
