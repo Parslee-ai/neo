@@ -6,9 +6,20 @@ Append-only JSONL log of retrieval and write events, used to track Layer 2
 (paper 2603.07670 §7). No analysis here — just structured emit; downstream
 tools (or future Layer-2 evaluators) consume the log.
 
-Disabled by setting NEO_METRICS=off (or 0/false/no). Writes are best-effort:
-any I/O failure is logged at debug-level and swallowed so retrieval is never
-blocked by metrics emission.
+Gated by ``NEO_PROFILE``:
+
+  - ``off``      — emit nothing (kill switch)
+  - ``minimal``  — emit only high-signal events (currently ``lm_call``);
+                   right for production deployments that only care about
+                   model-call observability.
+  - ``standard`` — emit everything (default)
+  - ``strict``   — emit everything plus reserved verbose events
+                   (currently identical to ``standard``).
+
+``NEO_METRICS=off`` (or ``0``/``false``/``no``) remains a hard kill-switch
+that overrides ``NEO_PROFILE``, so existing kill-the-emit scripts keep
+working. Writes are best-effort: any I/O failure is logged at debug-level
+and swallowed so retrieval is never blocked by metrics emission.
 
 ## lm_call event convention
 
@@ -39,10 +50,53 @@ logger = logging.getLogger(__name__)
 
 _DISABLED_VALUES = frozenset({"off", "0", "false", "no"})
 
+PROFILE_OFF = "off"
+PROFILE_MINIMAL = "minimal"
+PROFILE_STANDARD = "standard"
+PROFILE_STRICT = "strict"
+VALID_PROFILES = frozenset({PROFILE_OFF, PROFILE_MINIMAL, PROFILE_STANDARD, PROFILE_STRICT})
+
+# Events that emit under the "minimal" profile. Everything else requires
+# "standard" or higher. Keep this short — the point of "minimal" is to give
+# operators an LM-call audit trail without the per-retrieval volume.
+_MINIMAL_EVENTS = frozenset({"lm_call"})
+
+
+def _profile() -> str:
+    """Resolve the active profile.
+
+    ``NEO_METRICS=off`` is a hard kill-switch and overrides ``NEO_PROFILE``;
+    otherwise ``NEO_PROFILE`` decides (default ``standard``). Unknown profile
+    values fall back to ``standard`` after a debug-level log.
+    """
+    metrics_value = os.getenv("NEO_METRICS", "").strip().lower()
+    if metrics_value in _DISABLED_VALUES:
+        return PROFILE_OFF
+
+    profile = os.getenv("NEO_PROFILE", PROFILE_STANDARD).strip().lower()
+    if profile not in VALID_PROFILES:
+        logger.debug("Unknown NEO_PROFILE=%r, falling back to %s", profile, PROFILE_STANDARD)
+        return PROFILE_STANDARD
+    return profile
+
+
+def _should_emit(event: str) -> bool:
+    """Whether ``event`` passes the current profile filter."""
+    profile = _profile()
+    if profile == PROFILE_OFF:
+        return False
+    if profile == PROFILE_MINIMAL:
+        return event in _MINIMAL_EVENTS
+    return True  # standard, strict
+
 
 def _enabled() -> bool:
-    value = os.getenv("NEO_METRICS", "on").strip().lower()
-    return value not in _DISABLED_VALUES
+    """Legacy entry point — true unless profile == off.
+
+    Kept so callers that just want to know "are we emitting anything?"
+    (without naming a specific event) still work after the profile migration.
+    """
+    return _profile() != PROFILE_OFF
 
 
 def _metrics_path() -> Path:
@@ -62,7 +116,7 @@ def record(event: str, **fields: Any) -> None:
     Every record also gets a millisecond-precision ``ts``. All other fields
     pass through unmodified — callers decide what's useful per event type.
     """
-    if not _enabled():
+    if not _should_emit(event):
         return
     try:
         path = _metrics_path()

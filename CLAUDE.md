@@ -74,8 +74,11 @@
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
 - Observability: retrieve / add_fact / lm_call / overseer_tick events land in
-  `~/.neo/metrics.jsonl` (disable with `NEO_METRICS=off`). Sessions and watermarks live
-  in `~/.neo/sessions/`.
+  `~/.neo/metrics.jsonl`. Gated by `NEO_PROFILE`:
+  `off` (no emit), `minimal` (lm_call only), `standard` (default, all events),
+  `strict` (reserved for future verbose events; currently == standard).
+  `NEO_METRICS=off` is a legacy hard kill-switch that overrides `NEO_PROFILE`.
+  Sessions and watermarks live in `~/.neo/sessions/`.
 - Debugging: `neo --dry-run "your query"` assembles the full context (file selection,
   fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
   the LM, then exits without making the LLM call. Faster iteration on context-gatherer
