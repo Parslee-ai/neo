@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.20.1] - 2026-05-25
+
+### Fixed
+
+- **A2UI memory inspector surface rendered as "(no root component)"** in CarHost.app despite the daemon-side dataModel populating correctly. Root cause: A2UI v0.9's `CreateSurface` wire schema (`car-a2ui/src/lib.rs:120`) only carries `surfaceId` + catalog metadata — `components` and `dataModel` are silently dropped by serde (extra-fields-ignored). The agent-docs cookbook example shows them inside `createSurface`; the wire format doesn't actually accept that. `SurfaceManager.ensure_surface` now emits three envelopes in order: `createSurface` (surfaceId only) → `updateComponents` (the tree) → `updateDataModel` (initial state). For existing surfaces left empty by 0.20.0, re-emits ONLY `updateComponents` on reconnect — heals the tree without wiping live observer/memory state. Live-confirmed against CarHost.app: 17 components, correct root, observer + memory dataModel intact.
+
 ## [0.20.0] - 2026-05-24
 
 Neo gains a long-lived presence: an out-of-band synthesis observer supervised by CAR's agent runtime, a live A2UI memory inspector that exposes both observer cycles and FactStore state to any conformant renderer, plus quieter foundational work on project-ID stability, metrics ergonomics, and a new fact-domain taxonomy.
