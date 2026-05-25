@@ -77,18 +77,24 @@ class TestInitialEnvelopes:
 
     def test_updateComponents_has_full_component_tree(self):
         from neo.a2ui import _initial_envelopes
-        envs = _initial_envelopes("neo-x", "x")
+        envs = _initial_envelopes("neo-x", "Parslee-ai/neo")
         uc = envs[1]["updateComponents"]
         assert uc["surfaceId"] == "neo-x"
         comp_ids = [c["id"] for c in uc["components"]]
         assert "root" in comp_ids
         assert "obs-status" in comp_ids
-        assert "mem-total" in comp_ids
-        assert "btn-kick" in comp_ids
+        assert "mem-headline" in comp_ids
+        assert "btn-run-now" in comp_ids
+        assert "btn-pause" in comp_ids
+        # Header components: quote, title, version line, stage line.
+        # No "says" — that was the redundant copy of the observer-tab
+        # state; the header now mirrors `neo --version`.
+        for cid in ("hdr-quote", "hdr-title", "hdr-version", "hdr-stage"):
+            assert cid in comp_ids, f"header must include {cid}"
 
     def test_updateDataModel_seeds_full_value_tree(self):
         from neo.a2ui import _initial_envelopes
-        envs = _initial_envelopes("neo-fcbc43ed0a20", "fcbc43ed0a20b8b8")
+        envs = _initial_envelopes("neo-fcbc43ed0a20", "Parslee-ai/neo")
         udm = envs[2]["updateDataModel"]
         assert udm["surfaceId"] == "neo-fcbc43ed0a20"
         # No "path" — whole-value replace, per the Rust UpdateDataModel
@@ -97,7 +103,11 @@ class TestInitialEnvelopes:
         dm = udm["value"]
         assert "observer" in dm
         assert "memory" in dm
-        assert "fcbc43ed" in dm["header"]["title"]
+        # Header carries the human-readable repo name, NOT a SHA hash.
+        # `neo --version`-shaped fields: quote, title, version, stage.
+        assert dm["header"]["title"] == "Parslee-ai/neo"
+        for key in ("quote", "version", "stage"):
+            assert key in dm["header"], f"header.{key} missing"
 
     def test_uses_only_basic_catalog_components(self):
         """Component types must be in BASIC_CATALOG_V0_9. Otherwise
@@ -110,8 +120,37 @@ class TestInitialEnvelopes:
             "FilePicker",
         }
         for c in _components_tree():
-            if "component" in c:  # tabs children dicts have no 'component'
-                assert c["component"] in allowed, f"unknown component: {c['component']}"
+            assert c["component"] in allowed, f"unknown component: {c['component']}"
+
+    def test_badge_uses_text_field_not_label(self):
+        """Regression: Badge's visible value is on `text`, not `label`
+        (`A2uiRenderer.swift:675`). Mislabeling produces an empty pill —
+        the renderer reads `obj["text"]` and falls back to "" silently."""
+        from neo.a2ui import _components_tree
+        badge = next(c for c in _components_tree() if c["component"] == "Badge")
+        assert "text" in badge, "Badge must use `text` field"
+        assert "label" not in badge, (
+            "Badge does NOT accept `label` (renderer ignores it; renders empty)"
+        )
+
+    def test_tabs_uses_parallel_arrays(self):
+        """Tabs schema (per renderer contract) takes two parallel
+        arrays: `tabs: [{id, label}]` for tab metadata, `children:
+        [contentId]` for the content component ids in matching order.
+        NOT a single `children` of nested tab-descriptor objects —
+        that shape leaves the tab bar empty (the renderer pulls labels
+        from `tabs[i].label` and the rendered content from
+        `surface.component(children[i])`)."""
+        from neo.a2ui import _components_tree
+        tabs = next(c for c in _components_tree() if c["component"] == "Tabs")
+        assert isinstance(tabs.get("tabs"), list)
+        assert all(isinstance(t, dict) and "id" in t and "label" in t
+                   for t in tabs["tabs"]), "every tab entry needs {id, label}"
+        assert isinstance(tabs.get("children"), list)
+        assert all(isinstance(child, str) for child in tabs["children"]), \
+            "Tabs children must be plain component-id strings, not nested objects"
+        assert len(tabs["tabs"]) == len(tabs["children"]), \
+            "tabs[] and children[] must be same length (parallel arrays)"
 
 
 class TestUpdatePathEnvelope:
@@ -136,95 +175,206 @@ class TestObserverStateSnapshot:
     def test_no_cycles_yet(self):
         from neo.a2ui import observer_state_snapshot
         s = observer_state_snapshot(
-            pid=123, project_id="abcdef1234567890",
-            last_cycle_epoch=None, last_cycle_count=None,
-            cycles_total=0, recent_cycles=[],
+            interval_seconds=300, last_cycle_epoch=None,
+            last_cycle_count=None, cycles_total=0,
         )
-        assert s["status"] == "running"
-        assert s["last_cycle_text"] == "no cycles yet"
-        assert "pid 123" in s["header_text"]
-        assert s["recent_cycles"] == []
+        assert s["status_label"] == "Active"
+        assert s["last_check"] == "No checks yet"
+        assert "Checks every 5 minutes" in s["cadence"]
+        assert "0 checks" in s["cadence"]
 
-    def test_includes_recent_cycle_summary(self):
-        import time
+    def test_cadence_is_user_readable(self):
         from neo.a2ui import observer_state_snapshot
-        now = time.time() - 65  # 1m5s ago
         s = observer_state_snapshot(
-            pid=123, project_id="abcdef1234567890",
-            last_cycle_epoch=now, last_cycle_count=3,
-            cycles_total=5, recent_cycles=[{"text": "x"}],
+            interval_seconds=300, last_cycle_epoch=None,
+            last_cycle_count=None, cycles_total=1,
         )
-        assert "3 synthesized" in s["last_cycle_text"]
-        assert "5 cycles" in s["header_text"]
+        # Pluralization correctness — "1 check" (singular) but
+        # "5 minutes" (plural).
+        assert "1 check this session" in s["cadence"]
+        assert "minutes" in s["cadence"]
 
-    def test_recent_cycles_capped(self):
-        """RECENT_CYCLES_MAX = 20; longer histories should be trimmed."""
-        from neo.a2ui import RECENT_CYCLES_MAX, observer_state_snapshot
-        history = [{"text": f"cycle-{i}"} for i in range(50)]
+    def test_last_check_with_patterns_found(self):
+        import time as _t
+        from neo.a2ui import observer_state_snapshot
         s = observer_state_snapshot(
-            pid=1, project_id="x", last_cycle_epoch=None,
-            last_cycle_count=None, cycles_total=50, recent_cycles=history,
+            interval_seconds=300, last_cycle_epoch=_t.time() - 60,
+            last_cycle_count=3, cycles_total=2,
         )
-        assert len(s["recent_cycles"]) == RECENT_CYCLES_MAX
-        # Tail kept, not head — most recent at the end.
-        assert s["recent_cycles"][-1]["text"] == "cycle-49"
+        assert "distilled 3 new patterns" in s["last_check"]
+        # Time stamp not a relative offset (which would go stale).
+        assert "Last check at " in s["last_check"]
+
+    def test_last_check_singular_pattern(self):
+        import time as _t
+        from neo.a2ui import observer_state_snapshot
+        s = observer_state_snapshot(
+            interval_seconds=300, last_cycle_epoch=_t.time(),
+            last_cycle_count=1, cycles_total=1,
+        )
+        assert "1 new pattern" in s["last_check"]
+        assert "patterns" not in s["last_check"], "should be singular"
+
+    def test_status_label_flips_to_recovering_on_error(self):
+        from neo.a2ui import observer_state_snapshot
+        s = observer_state_snapshot(
+            interval_seconds=300, last_cycle_epoch=12345.0,
+            last_cycle_count=None, last_cycle_error="ValueError",
+            cycles_total=1,
+        )
+        assert s["status_label"] == "Recovering"
+        assert "ValueError" in s["last_check"]
 
 
 class TestMemoryStateSnapshot:
     def test_empty_store(self):
         from neo.a2ui import memory_state_snapshot
-        fake = MagicMock(_facts=[])
-        s = memory_state_snapshot(fake)
-        assert "0 valid facts" in s["total_text"]
-        assert s["by_kind_text"] == "by kind: —"
-        assert s["by_scope_text"] == "by scope: —"
-        assert "0 fact" in s["probation_text"]
+        s = memory_state_snapshot(MagicMock(_facts=[]), "Parslee-ai/neo")
+        assert s["headline"] == "0 facts about Parslee-ai/neo"
+        # Each primary kind line still renders even at 0 so the UI
+        # doesn't collapse the breakdown.
+        assert s["patterns"].startswith("0 patterns")
+        assert s["reviews"].startswith("0 reviews")
+        assert s["constraints"].startswith("0 constraints")
+        assert "All facts validated" in s["probation"]
 
-    def test_counts_valid_only(self):
+    def test_describes_each_kind_in_plain_english(self):
+        from neo.a2ui import memory_state_snapshot
+        f = MagicMock(is_valid=True, tags=[],
+                      kind=MagicMock(value="pattern"),
+                      scope=MagicMock(value="project"))
+        s = memory_state_snapshot(MagicMock(_facts=[f]), "x/y")
+        # Plain-English description after the em-dash.
+        assert "stable techniques" in s["patterns"]
+
+    def test_counts_valid_only_pluralizes_kinds(self):
         from neo.a2ui import memory_state_snapshot
         facts = []
-        for i in range(3):
-            f = MagicMock()
-            f.is_valid = True
-            f.kind = MagicMock(value="pattern")
-            f.scope = MagicMock(value="project")
-            f.tags = []
+        for _ in range(3):
+            f = MagicMock(is_valid=True, tags=[],
+                          kind=MagicMock(value="review"),
+                          scope=MagicMock(value="project"))
             facts.append(f)
-        invalid = MagicMock()
-        invalid.is_valid = False
-        invalid.kind = MagicMock(value="pattern")
-        invalid.scope = MagicMock(value="project")
-        invalid.tags = []
-        facts.append(invalid)
+        # Invalid fact must NOT be counted.
+        bad = MagicMock(is_valid=False, tags=[],
+                        kind=MagicMock(value="review"),
+                        scope=MagicMock(value="project"))
+        facts.append(bad)
+        s = memory_state_snapshot(MagicMock(_facts=facts), "x/y")
+        assert s["headline"] == "3 facts about x/y"
+        # Pluralization: review → reviews
+        assert s["reviews"].startswith("3 reviews")
 
-        fake = MagicMock(_facts=facts)
-        s = memory_state_snapshot(fake)
-        assert "3 valid facts" in s["total_text"]
-        assert "pattern=3" in s["by_kind_text"]
-        assert "project=3" in s["by_scope_text"]
-
-    def test_probation_tag_counted(self):
+    def test_probation_count_singular_plural(self):
         from neo.a2ui import memory_state_snapshot
-        f1 = MagicMock(is_valid=True, kind=MagicMock(value="review"),
-                       scope=MagicMock(value="project"), tags=["probation"])
-        f2 = MagicMock(is_valid=True, kind=MagicMock(value="pattern"),
-                       scope=MagicMock(value="project"), tags=[])
-        s = memory_state_snapshot(MagicMock(_facts=[f1, f2]))
-        assert "1 fact" in s["probation_text"]
+        f = MagicMock(is_valid=True, tags=["probation"],
+                      kind=MagicMock(value="review"),
+                      scope=MagicMock(value="project"))
+        s = memory_state_snapshot(MagicMock(_facts=[f]), "x/y")
+        assert s["probation"].startswith("1 fact ")
+        # Plural with 2:
+        s2 = memory_state_snapshot(MagicMock(_facts=[f, f]), "x/y")
+        assert s2["probation"].startswith("2 facts ")
+
+    def test_scope_breakdown_is_human_readable(self):
+        from neo.a2ui import memory_state_snapshot
+        proj = MagicMock(is_valid=True, tags=[],
+                         kind=MagicMock(value="pattern"),
+                         scope=MagicMock(value="project"))
+        glob = MagicMock(is_valid=True, tags=[],
+                         kind=MagicMock(value="pattern"),
+                         scope=MagicMock(value="global"))
+        s = memory_state_snapshot(MagicMock(_facts=[proj, glob]), "x/y")
+        assert "specific to this project" in s["scope"]
+        assert "global knowledge" in s["scope"]
 
 
-class TestHumanizeSeconds:
-    def test_seconds(self):
-        from neo.a2ui import _humanize_seconds
-        assert _humanize_seconds(45) == "45s"
+class TestVersionStateSnapshot:
+    """The header card mirrors `neo --version`: personality quote,
+    learning stage, fact count, avg confidence. These tests pin the
+    same stage thresholds + shape as ``subcommands.show_version``
+    (a regression here means the CLI banner and the inspector header
+    will disagree about what Neo is doing).
+    """
 
-    def test_minutes(self):
-        from neo.a2ui import _humanize_seconds
-        assert _humanize_seconds(90) == "1m30s"
+    def test_stage_mapping_matches_show_version(self):
+        from neo.a2ui import _stage_for_memory_level
+        assert _stage_for_memory_level(0.0) == (1, "Sleeper")
+        assert _stage_for_memory_level(0.19) == (1, "Sleeper")
+        assert _stage_for_memory_level(0.2) == (2, "Glitch")
+        assert _stage_for_memory_level(0.4) == (3, "Unplugged")
+        assert _stage_for_memory_level(0.6) == (4, "Training")
+        assert _stage_for_memory_level(0.8) == (5, "The One")
+        assert _stage_for_memory_level(1.0) == (5, "The One")
 
-    def test_hours(self):
-        from neo.a2ui import _humanize_seconds
-        assert _humanize_seconds(3700) == "1h1m"
+    def test_snapshot_has_quote_and_stage(self):
+        from neo.a2ui import version_state_snapshot
+        store = MagicMock(_facts=[], memory_level=lambda: 0.0)
+        s = version_state_snapshot(store)
+        assert "quote" in s
+        assert s["quote"].startswith('"') and s["quote"].endswith('"')
+        assert "Stage:" in s["stage"]
+        assert "Memory" in s["stage"]
+
+    def test_stage_line_includes_pattern_count_and_confidence(self):
+        from neo.a2ui import version_state_snapshot
+        # Build 3 valid facts with confidences 0.6, 0.7, 0.8
+        facts = []
+        for conf in (0.6, 0.7, 0.8):
+            md = MagicMock()
+            md.confidence = conf
+            f = MagicMock(is_valid=True, metadata=md)
+            facts.append(f)
+        store = MagicMock(_facts=facts, memory_level=lambda: 0.3)
+        s = version_state_snapshot(store)
+        # 3 patterns (plural), stage = Glitch (0.3 → 0.2-0.4 range),
+        # avg confidence = 0.70.
+        assert "3 patterns" in s["stage"]
+        assert "Glitch" in s["stage"]
+        assert "0.70 avg confidence" in s["stage"]
+        assert "Memory 30.0%" in s["stage"]
+
+    def test_singular_pattern_pluralization(self):
+        from neo.a2ui import version_state_snapshot
+        md = MagicMock()
+        md.confidence = 0.5
+        f = MagicMock(is_valid=True, metadata=md)
+        store = MagicMock(_facts=[f], memory_level=lambda: 0.0)
+        s = version_state_snapshot(store)
+        assert "1 pattern" in s["stage"]
+        # "1 patterns" would be a grammar fail — never present.
+        assert "1 patterns" not in s["stage"]
+
+    def test_memory_level_failure_doesnt_break_snapshot(self):
+        """If FactStore.memory_level() raises (e.g. mid-init), the
+        snapshot should still come back with a sensible default."""
+        from neo.a2ui import version_state_snapshot
+        def boom():
+            raise RuntimeError("not ready")
+        store = MagicMock(_facts=[], memory_level=boom)
+        s = version_state_snapshot(store)
+        # 0.0 → Sleeper. Snapshot resilient.
+        assert "Sleeper" in s["stage"]
+
+
+class TestRepoDisplayName:
+    def test_falls_back_to_basename_when_no_remote(self, monkeypatch):
+        monkeypatch.setattr("neo.memory.scope._get_git_remote_url", lambda *_: "")
+        monkeypatch.setattr("neo.memory.scope._detect_org", lambda *_: "unknown")
+        from neo.a2ui import _repo_display_name
+        assert _repo_display_name("/home/user/projects/myrepo") == "myrepo"
+
+    def test_uses_org_and_repo_from_https_remote(self, monkeypatch):
+        monkeypatch.setattr(
+            "neo.memory.scope._get_git_remote_url",
+            lambda *_: "https://github.com/Parslee-ai/neo.git",
+        )
+        from neo.a2ui import _repo_display_name
+        assert _repo_display_name("/some/path") == "Parslee-ai/neo"
+
+    def test_handles_no_codebase_root(self):
+        from neo.a2ui import _repo_display_name
+        assert _repo_display_name(None) == "this project"
 
 
 # ---------------------------------------------------------------------------

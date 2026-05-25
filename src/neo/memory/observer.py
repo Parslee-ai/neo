@@ -255,6 +255,7 @@ class Observer:
             self._last_analysis_epoch = time.time()
             self._cycles_total += 1
             self._last_cycle_count = count
+            self._last_cycle_error = None
             self._recent_cycles.append({
                 "timestamp": self._last_analysis_epoch,
                 "text": (
@@ -271,6 +272,7 @@ class Observer:
             )
         except Exception as e:
             self._last_cycle_count = None
+            self._last_cycle_error = type(e).__name__
             self._recent_cycles.append({
                 "timestamp": time.time(),
                 "text": f"{time.strftime('%H:%M:%S')} · ERROR {type(e).__name__}",
@@ -282,11 +284,21 @@ class Observer:
             )
 
     def _build_store_snapshot(self, store) -> Optional[dict]:
-        """Extract memory-tab state from a FactStore. Wrapped so an
-        unexpected schema change can't blow up the cycle's main path."""
+        """Extract memory-tab + header-stage state from a FactStore.
+
+        Wrapped so an unexpected schema change can't blow up the
+        cycle's main path. Returns a {"memory": ..., "header": ...}
+        dict that the post-cycle push splits into the two updateDataModel
+        envelopes.
+        """
         try:
-            from neo.a2ui import memory_state_snapshot
-            return memory_state_snapshot(store)
+            from neo.a2ui import memory_state_snapshot, version_state_snapshot
+            repo_display = getattr(self._surface, "repo_display", "this project") \
+                if self._surface else "this project"
+            return {
+                "memory": memory_state_snapshot(store, repo_display),
+                "header": version_state_snapshot(store),
+            }
         except Exception as e:  # noqa: BLE001
             logger.debug("memory snapshot extraction failed: %s", e)
             return None
@@ -310,6 +322,7 @@ class Observer:
 
         self._surface = SurfaceManager(
             self.project_id,
+            codebase_root=self.codebase_root,
             action_handlers={
                 "kick": self._on_kick_action,
                 "stop": self._on_stop_action,
@@ -334,17 +347,24 @@ class Observer:
             return
         try:
             from neo.a2ui import observer_state_snapshot
+            last_count = getattr(self, "_last_cycle_count", None)
+            last_error = getattr(self, "_last_cycle_error", None)
             obs = observer_state_snapshot(
-                pid=os.getpid(),
-                project_id=self.project_id,
+                interval_seconds=self.config.interval_seconds,
                 last_cycle_epoch=self._last_analysis_epoch or None,
-                last_cycle_count=getattr(self, "_last_cycle_count", None),
+                last_cycle_count=last_count,
+                last_cycle_error=last_error,
                 cycles_total=self._cycles_total,
-                recent_cycles=self._recent_cycles,
             )
             await self._surface.push_observer_state(obs)
             if self._last_store_snapshot is not None:
-                await self._surface.push_memory_state(self._last_store_snapshot)
+                # snapshot is {"memory": ..., "header": ...} — push the
+                # memory subtree and the header's dynamic fields.
+                snap = self._last_store_snapshot
+                if "memory" in snap:
+                    await self._surface.push_memory_state(snap["memory"])
+                if "header" in snap:
+                    await self._surface.push_header_state(snap["header"])
         except Exception as e:  # noqa: BLE001
             logger.debug("a2ui push after cycle failed: %s", e)
 
