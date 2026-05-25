@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.20.0] - 2026-05-24
+
+Neo gains a long-lived presence: an out-of-band synthesis observer supervised by CAR's agent runtime, a live A2UI memory inspector that exposes both observer cycles and FactStore state to any conformant renderer, plus quieter foundational work on project-ID stability, metrics ergonomics, and a new fact-domain taxonomy.
+
+### Added
+
+- **Async synthesis observer (`neo memory observer {start|stop|status|kick}`)** — a per-project background process that runs `synthesize_reviews` on a wall-clock cadence (default 5 min), decoupled from the request path. **Additive**: the inline triple-trigger gate keeps firing too; the observer just makes synthesis more frequent. Lifecycle is owned by CAR's agent supervisor (car-runtime ≥ 0.17.0): spawn, restart-on-failure, log redirection to `~/.car/logs/`, clean SIGTERM shutdown, and auto-start at daemon boot via the persisted spec in `~/.car/agents.json`. Tunables: `NEO_OBSERVER_INTERVAL_SECONDS`, `NEO_OBSERVER_COOLDOWN`. Status surfaces CAR's raw state (`running | stopped | starting | backoff | errored`) so restart-loops are diagnosable. Hard footgun: the interpreter must not live under a world-writable directory (`/tmp`, `/private/tmp`, `/var/tmp`, `/dev/shm`) — the CAR daemon rejects such commands for security.
+- **A2UI memory inspector surface (`neo.a2ui`)** — a per-project A2UI v0.9 surface (`neo-<project_id8>`) registered with the running `car-server` daemon so any conformant renderer (CarHost.app, future webviews) can inspect Neo's state live. Two tabs: **Observer** (status badge, pid, last cycle, recent cycles list, Kick/Stop buttons) and **Memory** (valid fact count, by kind, by scope, probation count). Both populate from the same `FactStore` load the observer's synthesis cycle already does — zero hot-path cost. Kick/Stop buttons emit `a2ui.action` notifications which the observer dispatches to `kick_observer` / `stop_observer`, closing the loop with CAR's supervisor. Activation: auto when `127.0.0.1:9100` is reachable; silent no-op otherwise.
+- **`Fact.domain` taxonomy** — optional free-form area tag orthogonal to `FactKind`. `memory.models.SUGGESTED_DOMAINS` (`code-style`, `testing`, `git`, `debugging`, `workflow`, `security`, `file-patterns`, `architecture`, `performance`) is the recommended vocabulary; any string is valid. `retrieve_relevant(..., domain=...)` filters by exact match; `domain=None` returns all facts including unset ones; a specific filter excludes domain-unset facts.
+- **`NEO_PROFILE` metrics gating** (`off | minimal | standard | strict`) replaces the single-knob `NEO_METRICS=off`. `minimal` emits only `lm_call` (audit trail without per-retrieval volume); `standard` emits everything (default, matches prior behavior); `strict` is reserved for future verbose events. `NEO_METRICS=off` remains a hard kill-switch that overrides `NEO_PROFILE`.
+
+### Changed
+
+- **`project_id` is now hashed from the normalized git remote URL** (`scope._compute_project_id`), not the codebase root path. The same repo on different clones / worktrees / machines now resolves to the same project ID. Falls back to a path hash when no remote is configured. Legacy path-hashed fact and watermark files in `~/.neo/facts/` are renamed in place on `FactStore` init (`store._migrate_legacy_project_id_files`) — transparent for upgrades.
+- **`car-runtime>=0.17.0`** is now the floor for the `[car]` extra (bumped from `>=0.9.0`). The observer's `agents_*` lifecycle calls require the WS-routing fix that landed in v0.17.0 ([Parslee-ai/car-releases#54](https://github.com/Parslee-ai/car-releases/issues/54)) — earlier car-runtime versions still work for `CarAdapter`-only use, but `neo memory observer start` will refuse them with an actionable error pointing at the upgrade path.
+
+### Fixed
+
+- **Observer's `agents_list` shape parsing** — the CAR `ManagedAgent` shape uses a `status` *string* (`running | stopped | starting | backoff | errored`), not a `running` *bool*. Initial port checked `existing.get("running")` which was always falsy — meaning `stop_observer` returned "not_running" before ever calling `agents_stop`, leaking the supervised child. Fixed; `observer_status` now surfaces CAR's raw status verbatim. Regression test added.
+- **`asyncio` missing from the observer module-scope import**. Surfaced only after the daemon spawn — caught by the live A2UI integration test, not unit tests.
+- **`a2ui.apply` envelope was wrapped** under `params={"envelope": …}` instead of being passed as the envelope directly, silently creating an empty surface. Wire-shape regression test added (`tests/test_a2ui.py::TestWireShape`).
+- **`pytest-asyncio` added to `[dev]` extra** — the new async a2ui tests failed in CI because the plugin was only in my local venv. Adds `pytest-asyncio>=0.21.0` to the manifest.
+- **`websockets>=12.0` added to `[car]` extra** — needed by `neo.a2ui.DaemonClient` to speak JSON-RPC over the daemon's WebSocket (the Python `car_runtime.a2ui_*` helpers are in-process only).
+
+### Docs
+
+- CLAUDE.md / AGENTS.md gain bullets for: project-ID hashing + migration, domain taxonomy, profile gating, observer (incl. tunables and the world-writable-command footgun), and the A2UI surface architecture (including why the in-process `car_runtime.a2ui_*` helpers don't suffice).
+- New `docs/solutions/async-observer.md` design proposal — borrows process-lifecycle ideas from ECC's `continuous-learning-v2` observer, ported onto CAR's `agents_*` supervisor. Includes an as-built note pointing readers at `src/neo/memory/observer.py`.
+
 ## [0.19.0] - 2026-05-17
 
 CAR becomes a peer integration target alongside Claude Code and Codex; one OpenAI default-config regression fixed; docs realigned to what the code actually does.
