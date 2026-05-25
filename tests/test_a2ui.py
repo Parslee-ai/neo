@@ -51,43 +51,67 @@ class TestDaemonReachable:
 # ---------------------------------------------------------------------------
 
 
-class TestInitialSurfaceEnvelope:
-    def test_envelope_shape(self):
-        from neo.a2ui import _initial_surface_envelope
-        env = _initial_surface_envelope("neo-test12345678", "test12345678abcd")
-        assert "createSurface" in env
-        cs = env["createSurface"]
-        assert cs["surfaceId"] == "neo-test12345678"
-        assert "components" in cs
-        assert "dataModel" in cs
+class TestInitialEnvelopes:
+    """A2UI v0.9 splits createSurface from components/dataModel — the
+    wire schema rejects them as fields on createSurface. ensure_surface
+    sends three envelopes in order; this group tests each.
+    """
+
+    def test_emits_three_envelopes_in_correct_order(self):
+        from neo.a2ui import _initial_envelopes
+        envs = _initial_envelopes("neo-test12345678", "test12345678abcd")
+        assert len(envs) == 3
+        kinds = [next(iter(e.keys())) for e in envs]
+        assert kinds == ["createSurface", "updateComponents", "updateDataModel"]
+
+    def test_createSurface_carries_only_surfaceId(self):
+        """Regression: serde silently drops unknown fields, so any
+        ``components``/``dataModel`` on createSurface would create an
+        empty surface that the renderer can't draw."""
+        from neo.a2ui import _initial_envelopes
+        envs = _initial_envelopes("neo-x", "x")
+        cs = envs[0]["createSurface"]
+        assert cs == {"surfaceId": "neo-x"}, (
+            f"createSurface must only carry surfaceId; got {cs}"
+        )
+
+    def test_updateComponents_has_full_component_tree(self):
+        from neo.a2ui import _initial_envelopes
+        envs = _initial_envelopes("neo-x", "x")
+        uc = envs[1]["updateComponents"]
+        assert uc["surfaceId"] == "neo-x"
+        comp_ids = [c["id"] for c in uc["components"]]
+        assert "root" in comp_ids
+        assert "obs-status" in comp_ids
+        assert "mem-total" in comp_ids
+        assert "btn-kick" in comp_ids
+
+    def test_updateDataModel_seeds_full_value_tree(self):
+        from neo.a2ui import _initial_envelopes
+        envs = _initial_envelopes("neo-fcbc43ed0a20", "fcbc43ed0a20b8b8")
+        udm = envs[2]["updateDataModel"]
+        assert udm["surfaceId"] == "neo-fcbc43ed0a20"
+        # No "path" — whole-value replace, per the Rust UpdateDataModel
+        # struct (`path: Option<String>`).
+        assert "path" not in udm
+        dm = udm["value"]
+        assert "observer" in dm
+        assert "memory" in dm
+        assert "fcbc43ed" in dm["header"]["title"]
 
     def test_uses_only_basic_catalog_components(self):
-        """Envelope should only reference components in BASIC_CATALOG_V0_9.
-
-        Otherwise non-CarHost renderers can't draw it."""
-        from neo.a2ui import _initial_surface_envelope
+        """Component types must be in BASIC_CATALOG_V0_9. Otherwise
+        non-CarHost renderers can't draw the surface."""
+        from neo.a2ui import _components_tree
         allowed = {
             "Column", "Row", "Card", "Divider", "Spacer", "Tabs", "Modal", "List",
             "Text", "Image", "File", "Badge",
             "Button", "TextField", "CheckBox", "ChoicePicker", "Select", "Slider",
             "FilePicker",
         }
-        env = _initial_surface_envelope("neo-x", "x")
-        for c in env["createSurface"]["components"]:
-            if "component" in c:  # tabs items are dicts without 'component'
+        for c in _components_tree():
+            if "component" in c:  # tabs children dicts have no 'component'
                 assert c["component"] in allowed, f"unknown component: {c['component']}"
-
-    def test_data_model_has_both_tabs(self):
-        from neo.a2ui import _initial_surface_envelope
-        env = _initial_surface_envelope("neo-x", "x")
-        dm = env["createSurface"]["dataModel"]
-        assert "observer" in dm
-        assert "memory" in dm
-
-    def test_header_title_includes_project_prefix(self):
-        from neo.a2ui import _initial_surface_envelope
-        env = _initial_surface_envelope("neo-fcbc43ed0a20", "fcbc43ed0a20b8b8")
-        assert "fcbc43ed" in env["createSurface"]["dataModel"]["header"]["title"]
 
 
 class TestUpdatePathEnvelope:
@@ -278,7 +302,12 @@ class TestSurfaceManagerConnect:
 
 class TestSurfaceManagerEnsureSurface:
     @pytest.mark.asyncio
-    async def test_creates_when_not_existing(self, fake_reachable, stub_client):
+    async def test_creates_emits_three_envelopes_in_order(
+        self, fake_reachable, stub_client,
+    ):
+        """Fresh surface: createSurface → updateComponents → updateDataModel.
+        Order matters — components reference dataModel paths that must
+        exist (or be created) by the time the renderer evaluates them."""
         from neo.a2ui import SurfaceManager
         stub_client.get_returns = None  # surface doesn't exist
 
@@ -286,14 +315,17 @@ class TestSurfaceManagerEnsureSurface:
         await mgr.connect()
         await mgr.ensure_surface()
 
-        methods = [c[0] for c in stub_client.calls]
-        assert "a2ui.get" in methods
-        # Followed by createSurface
-        apply_call = next(c for c in stub_client.calls if c[0] == "a2ui.apply")
-        assert "createSurface" in apply_call[1]
+        apply_envelopes = [c[1] for c in stub_client.calls if c[0] == "a2ui.apply"]
+        envelope_kinds = [next(iter(e.keys())) for e in apply_envelopes]
+        assert envelope_kinds == ["createSurface", "updateComponents", "updateDataModel"]
 
     @pytest.mark.asyncio
-    async def test_skips_create_when_existing(self, fake_reachable, stub_client):
+    async def test_existing_surface_repairs_components(
+        self, fake_reachable, stub_client,
+    ):
+        """Existing surface (e.g. left empty by pre-fix code): re-emit
+        updateComponents to heal the tree, but skip createSurface and
+        skip the initial dataModel seed so live state isn't wiped."""
         from neo.a2ui import SurfaceManager
         stub_client.get_returns = {"surfaceId": "neo-abc12345"}
 
@@ -301,11 +333,11 @@ class TestSurfaceManagerEnsureSurface:
         await mgr.connect()
         await mgr.ensure_surface()
 
-        # No createSurface envelope sent — only the .get probe.
-        assert not any(
-            "createSurface" in (c[1] or {})
-            for c in stub_client.calls if c[0] == "a2ui.apply"
-        )
+        apply_envelopes = [c[1] for c in stub_client.calls if c[0] == "a2ui.apply"]
+        kinds = [next(iter(e.keys())) for e in apply_envelopes]
+        assert "createSurface" not in kinds
+        assert "updateDataModel" not in kinds
+        assert kinds == ["updateComponents"]
 
 
 class TestSurfaceManagerPush:

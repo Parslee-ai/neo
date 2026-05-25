@@ -231,81 +231,115 @@ class DaemonClient:
 # ---------------------------------------------------------------------------
 
 
-def _initial_surface_envelope(surface_id: str, project_id: str) -> dict:
-    """The ``createSurface`` envelope — layout + initial data model.
+def _components_tree() -> list[dict]:
+    """Component layout for the surface.
 
-    Component tree uses only types in ``BASIC_CATALOG_V0_9`` so any
-    conformant renderer (CarHost.app, future webview) can draw it.
-    All mutable values are JSON-pointer-bound against ``dataModel``;
-    later updates call ``updateDataModel`` instead of re-emitting
-    components.
+    Carved out separately from the ``createSurface`` envelope because
+    A2UI v0.9's wire schema (``car-a2ui/src/lib.rs:120``) splits surface
+    creation from component population:
+
+      - ``createSurface`` carries *only* ``surfaceId`` + catalog metadata.
+        Any ``components`` / ``dataModel`` field on it is silently dropped
+        by serde during deserialization (extra-fields-ignored). The
+        agent-docs cookbook shows them in one envelope; the wire format
+        doesn't accept that. Surface gets created — empty — and the
+        renderer shows "(no root component)".
+
+      - ``updateComponents`` carries the component list. We emit it
+        right after ``createSurface``.
+
+      - ``updateDataModel`` (no ``path``, ``value=<full tree>``) seeds
+        the data model. Subsequent state pushes target specific paths.
+
+    All component names below are from ``BASIC_CATALOG_V0_9`` so any
+    conformant renderer can draw the surface.
     """
+    return [
+        {"id": "root", "component": "Column",
+         "children": ["header", "tabs"]},
+        {"id": "header", "component": "Card", "children": ["title"]},
+        {"id": "title", "component": "Text",
+         "text": {"path": "/header/title"}, "variant": "title"},
+        {"id": "tabs", "component": "Tabs", "children": [
+            {"id": "tab-observer", "label": "Observer",
+             "child": "observer-card"},
+            {"id": "tab-memory", "label": "Memory",
+             "child": "memory-card"},
+        ]},
+        # --- Observer tab --------------------------------------------
+        {"id": "observer-card", "component": "Card", "children": [
+            "obs-status", "obs-pid", "obs-last", "obs-recent",
+            "obs-actions",
+        ]},
+        {"id": "obs-status", "component": "Badge",
+         "label": {"path": "/observer/status"}},
+        {"id": "obs-pid", "component": "Text",
+         "text": {"path": "/observer/header_text"}, "variant": "subtitle"},
+        {"id": "obs-last", "component": "Text",
+         "text": {"path": "/observer/last_cycle_text"}},
+        {"id": "obs-recent", "component": "List",
+         "forEach": {"path": "/observer/recent_cycles"},
+         "itemTemplate": {"component": "Text",
+                          "text": {"path": "/text"}}},
+        {"id": "obs-actions", "component": "Row",
+         "children": ["btn-kick", "btn-stop"]},
+        {"id": "btn-kick", "component": "Button",
+         "label": "Kick", "action": "kick"},
+        {"id": "btn-stop", "component": "Button",
+         "label": "Stop", "action": "stop"},
+        # --- Memory tab ----------------------------------------------
+        {"id": "memory-card", "component": "Card", "children": [
+            "mem-total", "mem-by-kind", "mem-by-scope", "mem-probation",
+        ]},
+        {"id": "mem-total", "component": "Text",
+         "text": {"path": "/memory/total_text"}, "variant": "subtitle"},
+        {"id": "mem-by-kind", "component": "Text",
+         "text": {"path": "/memory/by_kind_text"}},
+        {"id": "mem-by-scope", "component": "Text",
+         "text": {"path": "/memory/by_scope_text"}},
+        {"id": "mem-probation", "component": "Text",
+         "text": {"path": "/memory/probation_text"}},
+    ]
+
+
+def _initial_data_model(project_id: str) -> dict:
+    """Seed data model. JSON-pointer paths under here are what
+    component bindings (``{"path": "/observer/status"}`` etc.) resolve
+    against; subsequent ``updateDataModel`` calls replace subtrees."""
     return {
-        "createSurface": {
-            "surfaceId": surface_id,
-            "components": [
-                {"id": "root", "component": "Column",
-                 "children": ["header", "tabs"]},
-                {"id": "header", "component": "Card", "children": ["title"]},
-                {"id": "title", "component": "Text",
-                 "text": {"path": "/header/title"}, "variant": "title"},
-                {"id": "tabs", "component": "Tabs", "children": [
-                    {"id": "tab-observer", "label": "Observer",
-                     "child": "observer-card"},
-                    {"id": "tab-memory", "label": "Memory",
-                     "child": "memory-card"},
-                ]},
-                # --- Observer tab --------------------------------------------
-                {"id": "observer-card", "component": "Card", "children": [
-                    "obs-status", "obs-pid", "obs-last", "obs-recent",
-                    "obs-actions",
-                ]},
-                {"id": "obs-status", "component": "Badge",
-                 "label": {"path": "/observer/status"}},
-                {"id": "obs-pid", "component": "Text",
-                 "text": {"path": "/observer/header_text"}, "variant": "subtitle"},
-                {"id": "obs-last", "component": "Text",
-                 "text": {"path": "/observer/last_cycle_text"}},
-                {"id": "obs-recent", "component": "List",
-                 "forEach": {"path": "/observer/recent_cycles"},
-                 "itemTemplate": {"component": "Text",
-                                  "text": {"path": "/text"}}},
-                {"id": "obs-actions", "component": "Row",
-                 "children": ["btn-kick", "btn-stop"]},
-                {"id": "btn-kick", "component": "Button",
-                 "label": "Kick", "action": "kick"},
-                {"id": "btn-stop", "component": "Button",
-                 "label": "Stop", "action": "stop"},
-                # --- Memory tab ----------------------------------------------
-                {"id": "memory-card", "component": "Card", "children": [
-                    "mem-total", "mem-by-kind", "mem-by-scope", "mem-probation",
-                ]},
-                {"id": "mem-total", "component": "Text",
-                 "text": {"path": "/memory/total_text"}, "variant": "subtitle"},
-                {"id": "mem-by-kind", "component": "Text",
-                 "text": {"path": "/memory/by_kind_text"}},
-                {"id": "mem-by-scope", "component": "Text",
-                 "text": {"path": "/memory/by_scope_text"}},
-                {"id": "mem-probation", "component": "Text",
-                 "text": {"path": "/memory/probation_text"}},
-            ],
-            "dataModel": {
-                "header": {"title": f"Neo · project {project_id[:8]}"},
-                "observer": {
-                    "status": "starting",
-                    "header_text": "—",
-                    "last_cycle_text": "no cycles yet",
-                    "recent_cycles": [],
-                },
-                "memory": {
-                    "total_text": "loading…",
-                    "by_kind_text": "—",
-                    "by_scope_text": "—",
-                    "probation_text": "—",
-                },
-            },
-        }
+        "header": {"title": f"Neo · project {project_id[:8]}"},
+        "observer": {
+            "status": "starting",
+            "header_text": "—",
+            "last_cycle_text": "no cycles yet",
+            "recent_cycles": [],
+        },
+        "memory": {
+            "total_text": "loading…",
+            "by_kind_text": "—",
+            "by_scope_text": "—",
+            "probation_text": "—",
+        },
     }
+
+
+def _initial_envelopes(surface_id: str, project_id: str) -> list[dict]:
+    """The three envelopes ``ensure_surface`` sends in order.
+
+    Split because A2UI v0.9's wire schema requires it — see
+    ``_components_tree`` for the long story.
+    """
+    return [
+        {"createSurface": {"surfaceId": surface_id}},
+        {"updateComponents": {
+            "surfaceId": surface_id,
+            "components": _components_tree(),
+        }},
+        {"updateDataModel": {
+            "surfaceId": surface_id,
+            "value": _initial_data_model(project_id),
+        }},
+    ]
 
 
 def _update_path_envelope(surface_id: str, path: str, value: Any) -> dict:
@@ -379,28 +413,41 @@ class SurfaceManager:
                 self._connected = False
 
     async def ensure_surface(self) -> None:
-        """Create the surface if it doesn't already exist on the daemon.
+        """Initialize the surface: createSurface → updateComponents →
+        updateDataModel. Three envelopes, in order, per the A2UI v0.9
+        wire schema (see ``_components_tree`` docstring).
 
-        Safe to call repeatedly — first call wins. If two processes race,
-        the second's ``createSurface`` will error and we treat it as
-        "already created" (no rethrow).
+        Always re-emits the component tree even when the surface
+        already exists. ``updateComponents`` replaces by id, so it's
+        idempotent — and it heals surfaces that were left empty by the
+        pre-fix code (one ``createSurface``-only envelope, components
+        silently dropped). The initial data model is only seeded when
+        the surface is brand new, so we don't wipe live observer/memory
+        state on reconnect.
         """
         if not self._connected:
             return
         try:
             existing = await self.client.a2ui_get(self.surface_id)
-            if existing:
-                return
         except Exception as e:  # noqa: BLE001
             logger.debug("a2ui_get probe failed: %s", e)
+            existing = None
 
-        try:
-            await self.client.a2ui_apply(
-                _initial_surface_envelope(self.surface_id, self.project_id)
-            )
-        except Exception as e:  # noqa: BLE001
-            # Race: another process beat us to it. Fine.
-            logger.debug("createSurface skipped (likely already exists): %s", e)
+        envelopes = _initial_envelopes(self.surface_id, self.project_id)
+        for env in envelopes:
+            # Skip createSurface when the surface already exists (the
+            # daemon would refuse it). Skip the initial-dataModel seed
+            # when reconnecting to an existing surface — caller has
+            # live state we mustn't clobber.
+            if existing and "createSurface" in env:
+                continue
+            if existing and "updateDataModel" in env:
+                continue
+            try:
+                await self.client.a2ui_apply(env)
+            except Exception as e:  # noqa: BLE001
+                kind = next(iter(env.keys()), "?")
+                logger.debug("a2ui %s failed: %s", kind, e)
 
     async def push_observer_state(self, state: dict) -> None:
         await self._push("/observer", state)
