@@ -70,6 +70,11 @@ ollama = ["requests>=2.31.0"]
 # start` will reject them with an actionable error.
 car = [
     "car-runtime>=0.17.0",
+    # JSON-RPC-over-WebSocket client for the A2UI surface
+    # (`neo.a2ui`). The Python `car_runtime.a2ui_*` helpers are
+    # in-process only; reaching the daemon's a2ui store — which is
+    # what renderers subscribe to — requires speaking WS directly.
+    "websockets>=12.0",
 ]
 all = [
     "anthropic>=0.21.0",

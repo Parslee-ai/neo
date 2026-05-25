@@ -29,6 +29,7 @@ Tunables (env, read by the daemon child):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -172,9 +173,30 @@ class Observer:
             )
         self._stop = False
         self._last_analysis_epoch = 0.0
+        self._cycles_total = 0
+        # Recent cycles for the A2UI Observer tab. List of
+        # ``{"timestamp": float, "text": "..."}`` capped client-side at
+        # RECENT_CYCLES_MAX.
+        self._recent_cycles: list[dict] = []
+        # Latest FactStore snapshot — used to update the A2UI Memory tab
+        # without paying a second load.
+        self._last_store_snapshot: Optional[dict] = None
+        # Surface manager (async). Created in run() since it needs an
+        # event loop.
+        self._surface = None
 
     def run(self) -> None:
-        """Main loop. Returns when SIGTERM/SIGINT received."""
+        """Main entry — switches to async so we can run a WS client for
+        A2UI alongside the synthesis loop. ``_cycle`` stays sync
+        (heavy I/O) and runs in the default executor."""
+        try:
+            asyncio.run(self._run_async())
+        except KeyboardInterrupt:
+            # asyncio.run already handles SIGINT cleanup; this just keeps
+            # the supervisor's exit-code expectations sane.
+            pass
+
+    async def _run_async(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
 
@@ -183,16 +205,27 @@ class Observer:
             flush=True,
         )
 
+        # Best-effort A2UI surface. Daemon may not be up; if not, we
+        # skip silently and the rest of the loop runs unchanged.
+        await self._init_surface()
+
+        loop = asyncio.get_event_loop()
         while not self._stop:
             if self._cooldown_ok():
-                self._cycle()
+                # _cycle is synchronous and does blocking I/O. Run in
+                # the executor so the WS recv loop keeps draining
+                # action notifications during a long synthesis pass.
+                await loop.run_in_executor(None, self._cycle)
+                await self._push_surface_after_cycle()
+
             # Sleep in 1-second slices so SIGTERM is responsive without
             # leaving the supervisor waiting through a full interval.
             slept = 0.0
             while slept < self.config.interval_seconds and not self._stop:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 slept += 1.0
 
+        await self._teardown_surface()
         print(f"neo observer stopped pid={os.getpid()}", flush=True)
 
     def _handle_stop(self, _signum: int, _frame) -> None:
@@ -205,7 +238,11 @@ class Observer:
     def _cycle(self) -> None:
         """One synthesis pass. Errors are caught and logged — never
         propagate, so a bad cycle doesn't cause the supervisor to
-        restart-loop us into a backoff hell."""
+        restart-loop us into a backoff hell.
+
+        Also stashes a FactStore snapshot on ``self`` so the post-cycle
+        A2UI push can update the Memory tab without re-loading.
+        """
         try:
             # Lazy import — FactStore pulls fastembed/numpy/etc.; defer
             # so a malformed --cwd reports cleanly before paying that
@@ -216,16 +253,119 @@ class Observer:
             store.initialize()
             count = store.synthesize_reviews()
             self._last_analysis_epoch = time.time()
+            self._cycles_total += 1
+            self._last_cycle_count = count
+            self._recent_cycles.append({
+                "timestamp": self._last_analysis_epoch,
+                "text": (
+                    f"{time.strftime('%H:%M:%S', time.localtime(self._last_analysis_epoch))} · "
+                    f"{count} synthesized"
+                ),
+            })
+            # Stash for the post-cycle Memory tab update. Keep the ref
+            # around for ~1 cycle; FactStore is GC'd otherwise.
+            self._last_store_snapshot = self._build_store_snapshot(store)
             print(
                 f"neo observer cycle ok: {count} synthesized facts",
                 flush=True,
             )
         except Exception as e:
+            self._last_cycle_count = None
+            self._recent_cycles.append({
+                "timestamp": time.time(),
+                "text": f"{time.strftime('%H:%M:%S')} · ERROR {type(e).__name__}",
+            })
             print(
                 f"neo observer cycle error: {type(e).__name__}: {e}",
                 file=sys.stderr,
                 flush=True,
             )
+
+    def _build_store_snapshot(self, store) -> Optional[dict]:
+        """Extract memory-tab state from a FactStore. Wrapped so an
+        unexpected schema change can't blow up the cycle's main path."""
+        try:
+            from neo.a2ui import memory_state_snapshot
+            return memory_state_snapshot(store)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("memory snapshot extraction failed: %s", e)
+            return None
+
+    # ------------------------------------------------------------------ #
+    # A2UI surface integration
+    # ------------------------------------------------------------------ #
+
+    async def _init_surface(self) -> None:
+        """Try to connect to car-server and register the surface.
+
+        On failure (daemon down, websockets pkg missing) we silently
+        stay disconnected — observer keeps doing its job. This is
+        observability, not load-bearing.
+        """
+        try:
+            from neo.a2ui import SurfaceManager
+        except ImportError as e:
+            logger.debug("a2ui module unavailable: %s", e)
+            return
+
+        self._surface = SurfaceManager(
+            self.project_id,
+            action_handlers={
+                "kick": self._on_kick_action,
+                "stop": self._on_stop_action,
+            },
+        )
+        try:
+            if await self._surface.connect():
+                await self._surface.ensure_surface()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("a2ui surface init failed: %s", e)
+            self._surface = None
+
+    async def _teardown_surface(self) -> None:
+        if self._surface:
+            try:
+                await self._surface.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _push_surface_after_cycle(self) -> None:
+        if not self._surface:
+            return
+        try:
+            from neo.a2ui import observer_state_snapshot
+            obs = observer_state_snapshot(
+                pid=os.getpid(),
+                project_id=self.project_id,
+                last_cycle_epoch=self._last_analysis_epoch or None,
+                last_cycle_count=getattr(self, "_last_cycle_count", None),
+                cycles_total=self._cycles_total,
+                recent_cycles=self._recent_cycles,
+            )
+            await self._surface.push_observer_state(obs)
+            if self._last_store_snapshot is not None:
+                await self._surface.push_memory_state(self._last_store_snapshot)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("a2ui push after cycle failed: %s", e)
+
+    async def _on_kick_action(self, _action: dict) -> None:
+        """A2UI `kick` button → restart self via CAR's supervisor.
+
+        ``kick_observer`` calls ``agents_restart``, which SIGTERMs the
+        current child and brings up a new one — exactly the behavior a
+        renderer-driven kick should produce.
+        """
+        try:
+            kick_observer(self.codebase_root)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("a2ui kick action failed: %s", e)
+
+    async def _on_stop_action(self, _action: dict) -> None:
+        """A2UI `stop` button → graceful SIGTERM via the supervisor."""
+        try:
+            stop_observer(self.codebase_root)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("a2ui stop action failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

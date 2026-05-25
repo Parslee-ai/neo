@@ -73,6 +73,21 @@
   Changes to layer ordering, the 2/3 constraint cap, or the inline `(changed from: X)`
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
+- A2UI memory inspector (`neo.a2ui`): a per-project A2UI v0.9 surface
+  (`neo-<project_id8>`) registered with the running `car-server` daemon so any
+  conformant renderer (CarHost.app, future webviews) can inspect neo's state
+  live. Two tabs: **Observer** (status badge, pid, last cycle, recent cycles
+  list, Kick/Stop buttons) and **Memory** (valid fact count, by kind, by scope,
+  probation count). Updates pushed by the observer process at the end of each
+  synthesis cycle — the same FactStore load powers both tabs, so the
+  inspector adds zero hot-path cost. Kick/Stop buttons emit `a2ui.action`
+  notifications which the observer dispatches to `kick_observer` /
+  `stop_observer` — closes the loop with CAR's supervisor. **Footgun**:
+  Python's `car_runtime.a2ui_*` helpers are in-process only; reaching the
+  daemon's shared store (which renderers subscribe to) requires speaking
+  JSON-RPC over its WebSocket. `neo.a2ui.DaemonClient` is that bridge.
+  Activation: auto when `127.0.0.1:9100` is reachable; silent no-op
+  otherwise. Adds `websockets>=12.0` to the `[car]` extra.
 - Async synthesis observer (`memory.observer`): a per-project background process
   that runs `synthesize_reviews` on a wall-clock cadence, decoupled from the
   request path. *Additive* — the inline triple-trigger gate keeps firing too;
