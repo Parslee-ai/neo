@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.20.2] - 2026-05-25
+
+### Fixed
+
+The A2UI memory inspector ships against a real CarHost.app renderer for the first time. Three wire-schema bugs (silent failures the unit tests couldn't see) and one UX pass.
+
+- **Tabs rendered empty** — A2UI v0.9's Tabs component takes **two parallel arrays** (`tabs: [{id, label}]` for metadata, `children: [contentId]` for content in matching order), per the renderer contract in `apps/car-a2ui-renderer/.../A2uiRenderer.swift:595`. The previous shape (a single `children` of nested tab-descriptor dicts) left the tab bar entirely blank — the renderer iterated nothing and showed no labels.
+- **Badge rendered as an empty pill** — Badge's visible value lives on `text`, not `label` (`A2uiRenderer.swift:675`). With `label`, the renderer read empty string and drew the capsule with no content. Also pinned a literal `tone` because the renderer reads `obj["tone"].asString` directly — `{path: …}` references don't resolve there.
+- **`List` with `forEach`/`itemTemplate` did nothing** — the v0.9 basic-catalog renderer maps `List` to `renderStack(.vertical)` (`A2uiRenderer.swift:465`); there's no template iteration. Dropped the dynamic recent-cycles list in favor of static stays-current Texts. A future surface revision can declare fixed slot Texts bound to indexed paths if a visible cycle log is desired.
+
+### Changed (UX)
+
+Inspector header redesigned to read like `neo --version` instead of supervisor jargon:
+
+- **Header now mirrors `neo --version`**: personality quote (from `config/beats/neo_matrix.yaml`, stage-appropriate), repo display name (e.g. `Parslee-ai/neo` from the normalized git remote — not the SHA), `neo X.Y.Z` line, and a learning-stage summary (`Stage: Glitch · Memory 30.4% · 117 patterns · 0.58 avg confidence`). The CLI banner and the inspector header now read the same stage info — `a2ui._STAGE_TABLE` is kept in lockstep with `subcommands.show_version`.
+- **Observer tab no longer redundant with the header** — dropped the "Idle, watching for patterns" status line that just restated the Observer card below it. Header stays summary-only; Observer card carries the operational detail (badge, last-check timestamp, cadence, action buttons).
+- **Button labels say what they do**: `Kick` → `Run now`, `Stop` → `Pause`. The wire action names (`kick`, `stop`) are unchanged so handlers don't need to rename — only the user-visible label flipped.
+- **Memory tab gains plain-English descriptions**: `50 patterns — stable techniques and conventions`, `58 reviews — recent observations being distilled into patterns`, `9 constraints — hard rules from project docs`. Pluralization handled (`1 pattern` vs `2 patterns`, `1 fact still being validated` vs `2 facts`). Scope line reads as `67 specific to this project · 50 from your global knowledge` instead of `project=67, global=50`.
+
 ## [0.20.1] - 2026-05-25
 
 ### Fixed
