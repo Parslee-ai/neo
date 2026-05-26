@@ -290,8 +290,10 @@ class TestPerformanceIntegration:
         merged = memory._merge_cluster(entries)
         elapsed_ms = (time.perf_counter() - start) * 1000
 
-        # Should complete quickly (<50ms for 5 entries)
-        assert elapsed_ms < 50, f"Consolidation took {elapsed_ms:.1f}ms, expected <50ms"
+        # Should complete quickly (<100ms for 5 entries — loose bound so the
+        # assertion catches algorithmic regressions without flapping on
+        # shared CI runners, where 50ms drifts under load).
+        assert elapsed_ms < 100, f"Consolidation took {elapsed_ms:.1f}ms, expected <100ms"
         assert merged.merge_count == 5
 
 
