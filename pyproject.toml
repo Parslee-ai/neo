@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neo-reasoner"
-version = "0.20.2"
+version = "0.20.3"
 description = "A self-improving code reasoning engine with persistent semantic memory"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -61,15 +61,22 @@ ollama = ["requests>=2.31.0"]
 # Requires the car-server daemon (`python -m car_runtime.server`)
 # running locally; see INSTALL.md.
 #
-# Minimum is 0.17.0: 0.16.x has the `agents_*` API but the PyO3
+# Minimum is 0.18.0: 0.16.x has the `agents_*` API but the PyO3
 # binding still tries to acquire the supervisor manifest lock
 # in-process, which collides with a running CarHost.app/car-server
 # (Parslee-ai/car-releases#54). 0.17.0 routes those calls through
-# the daemon's WS handlers when the lock is held. Earlier versions
-# still work for `CarAdapter`-only use, but `neo memory observer
-# start` will reject them with an actionable error.
+# the daemon's WS handlers when the lock is held. 0.18.0 fixes two
+# observer-reliability footguns that directly hit `neo memory
+# observer`: the supervisor no longer orphans a live child or storms
+# restarts on a `start` issued during `Backoff` (`spawn_supervision`
+# is now teardown-first + `kill_on_drop`, backoff is exponential),
+# and `last_exit_code` is cleared on successful (re)start so
+# `neo memory observer status` no longer shows a stale exit code
+# next to a healthy `running` agent. Earlier versions still work
+# for `CarAdapter`-only use, but `neo memory observer start` will
+# reject them with an actionable error.
 car = [
-    "car-runtime>=0.17.0",
+    "car-runtime>=0.18.0",
     # JSON-RPC-over-WebSocket client for the A2UI surface
     # (`neo.a2ui`). The Python `car_runtime.a2ui_*` helpers are
     # in-process only; reaching the daemon's a2ui store — which is
