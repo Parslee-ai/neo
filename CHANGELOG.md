@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.20.3] - 2026-05-26
+
+### Fixed
+
+Two observer crash modes and one upstream-pin bump — all aimed at the supervised observer surviving real-world macOS conditions.
+
+- **`asyncio.get_event_loop()` → `get_running_loop()` in the observer coroutine** (`memory/observer.py:212`). On Python 3.14 the deprecated call has been observed raising `NameError: name 'asyncio' is not defined` from inside the coroutine launched by `asyncio.run(self._run_async())`, even though `asyncio` is imported at module scope and the same name resolves fine in `run()` a few lines up. `get_running_loop()` is the canonical API inside a running coroutine, dodges the deprecation, and stops the supervisor from chewing through `max_restarts: 10` on every restart.
+- **fastembed cache pinned to `~/.cache/neo/fastembed/`** (`memory/store.py`). The default cache lives under `$TMPDIR/fastembed_cache/`, which on macOS is `/var/folders/<...>/T/` — periodically swept by the OS. After a sweep the in-cache manifest still points at a (now-deleted) `model.onnx` and `TextEmbedding(...)` raises `ONNXRuntimeError ... NO_SUCHFILE`, leaving FactStore silently running without embeddings until a human noticed. The new path survives reboots and tmp sweeps; on `NO_SUCHFILE` / missing-`model.onnx` the loader nukes the stale snapshot dir and retries once, so any future eviction self-heals.
+
+### Changed
+
+- **`car-runtime` pin bumped to `>=0.18.0`** for two upstream supervisor-reliability fixes that directly hit `neo memory observer`: `spawn_supervision` is now teardown-first with `kill_on_drop`, so a `start` issued during `Backoff` can no longer leave an orphaned child holding the agent's port; and restart backoff is exponential (base → ×2, capped at 60s) instead of flat, so a crash loop can no longer burn through `max_restarts` in under a minute. `last_exit_code` is also now cleared on successful (re)start, so `neo memory observer status` won't show a stale `1` next to a healthy `running` agent. No neo code changes required — the pin captures the upstream wins for new installs.
+
 ## [0.20.2] - 2026-05-25
 
 ### Fixed
