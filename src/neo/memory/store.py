@@ -100,6 +100,16 @@ except ImportError:
 
 FACTS_DIR = Path.home() / ".neo" / "facts"
 
+# Persistent location for the fastembed ONNX cache. fastembed defaults
+# to `$TMPDIR/fastembed_cache/` which on macOS lives under
+# `/var/folders/<...>/T/` — periodically purged by the OS. After a
+# purge, fastembed's local manifest still points at the (now-missing)
+# `model.onnx` and `TextEmbedding(...)` blows up with
+# `ONNXRuntimeError ... NO_SUCHFILE`. Pinning the cache under
+# `~/.cache/neo/` keeps the model around across reboots and macOS tmp
+# sweeps.
+FASTEMBED_CACHE_DIR = Path.home() / ".cache" / "neo" / "fastembed"
+
 
 class FactStore:
     """Scoped fact store with supersession-based knowledge management.
@@ -206,12 +216,44 @@ class FactStore:
         if self._embedder_initialized:
             return
         self._embedder_initialized = True
-        if FASTEMBED_AVAILABLE:
-            try:
-                self._embedder = TextEmbedding(model_name="jinaai/jina-embeddings-v2-base-code")
-                logger.info("FactStore: Jina Code v2 embeddings initialized")
-            except Exception as e:
-                logger.warning(f"FactStore: Failed to initialize embedder: {e}")
+        if not FASTEMBED_AVAILABLE:
+            return
+        FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            self._embedder = TextEmbedding(
+                model_name="jinaai/jina-embeddings-v2-base-code",
+                cache_dir=str(FASTEMBED_CACHE_DIR),
+            )
+            logger.info("FactStore: Jina Code v2 embeddings initialized")
+        except Exception as e:
+            # Recover from a stale local cache: if fastembed's
+            # manifest points at a missing `model.onnx` (typical
+            # after a `$TMPDIR` sweep on macOS), nuke the
+            # snapshot dir and let fastembed re-download. Only
+            # retry once — a second failure means something else
+            # is wrong (network, disk, transient ONNX init bug).
+            msg = str(e)
+            if "NO_SUCHFILE" in msg or "model.onnx" in msg:
+                logger.warning(
+                    "FactStore: embedder cache appears stale "
+                    "(%s); clearing and re-downloading", e
+                )
+                shutil.rmtree(FASTEMBED_CACHE_DIR, ignore_errors=True)
+                FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                try:
+                    self._embedder = TextEmbedding(
+                        model_name="jinaai/jina-embeddings-v2-base-code",
+                        cache_dir=str(FASTEMBED_CACHE_DIR),
+                    )
+                    logger.info("FactStore: embedder re-downloaded successfully")
+                    return
+                except Exception as e2:
+                    logger.warning(
+                        "FactStore: Failed to initialize embedder "
+                        "after cache reset: %s", e2
+                    )
+                    return
+            logger.warning(f"FactStore: Failed to initialize embedder: {e}")
 
     # ------------------------------------------------------------------ #
     # Public API

@@ -209,7 +209,13 @@ class Observer:
         # skip silently and the rest of the loop runs unchanged.
         await self._init_surface()
 
-        loop = asyncio.get_event_loop()
+        # `get_running_loop()` (not `get_event_loop()`) is the
+        # canonical API inside a coroutine — the latter is deprecated
+        # since Python 3.10 and on 3.14 tracebacks have surfaced
+        # `NameError: name 'asyncio' is not defined` here on supervisor
+        # restarts. Switching avoids both the deprecation warning and
+        # the observed crash.
+        loop = asyncio.get_running_loop()
         while not self._stop:
             if self._cooldown_ok():
                 # _cycle is synchronous and does blocking I/O. Run in
