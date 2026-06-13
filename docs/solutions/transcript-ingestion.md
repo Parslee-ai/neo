@@ -208,10 +208,21 @@ Concern: `_cycle`'s synthesis already runs in a blocking `run_in_executor` to ke
 the WS loop draining; adding LM extract+verify could lengthen the tick and move LM
 calls (timeouts/rate limits) into the supervised path that does zero today. But
 *pre-building* a second supervised lifecycle for an unmeasured cost is
-over-engineering. Revised plan: run ingest **inside the existing `_cycle`, behind
-the existing executor, with a hard per-cycle episode budget** (e.g. N episodes per
-pass), and emit the tick duration. Split into a separate cycle ONLY if the tick is
-measured to stall WS responsiveness. Start simple; measure; split if proven.
+over-engineering. As built: ingest runs **inside the existing `_cycle`, after
+synthesis, behind the existing executor**, with tick-duration logging. Split into a
+separate cycle ONLY if the tick is measured to stall WS responsiveness.
+
+**Critical bound (added in review):** an episode *count* budget does not bound
+*time* — with up to ~32 serial LM calls and a 600s adapter timeout, a hung
+provider could park the executor thread and stonewall SIGTERM (the supervisor only
+re-checks `_stop` between executor calls). So ingest is bounded by BOTH
+`NEO_OBSERVER_INGEST_BUDGET` (episodes, default 8) AND
+`NEO_OBSERVER_INGEST_DEADLINE` (wall-clock, default 120s), plus a `should_stop`
+check that honors SIGTERM. These stop *dispatching new* episodes; an in-flight
+call still runs to its own timeout, so worst case collapses from N×timeout to ~1.
+The backlog drains on the next cycle via the watermark. Ingest is isolated in its
+own try/except (runs after synthesis is durable) and surfaces failures in the cycle
+record, not just stderr.
 
 ### Watermark — atomic-after-write, per-episode (corrected from v1)
 
@@ -260,6 +271,24 @@ Emit `transcript_ingest` events (`spans_found`, `facts_extracted`,
 high-quality, deduped, retrievable PATTERN/FAILURE lessons that get surfaced and
 earn ACCEPTED outcomes — not raw fact count. (Synthesis-clustering is explicitly
 no longer the success metric; Phase 0 retired it.)
+
+## Phase 1 validation results (2026-06-13)
+
+End-to-end on 25 real substantive episodes via gpt-5.5, isolated store:
+
+- **Enrichment:** 41 lessons admitted → 40 valid (1 collapsed by the existing
+  0.85 supersession). Kinds: 27 pattern / 13 failure. Domains populated and
+  queryable (debugging, workflow, testing, architecture, file-patterns, …).
+- **Idempotency:** re-run reported 0 new / 0 processed / 0 LM calls — the
+  per-episode watermark works.
+- **No flood:** 40 ≪ the 500 project cap.
+- **Quality (sampled):** genuinely transferable lessons ("verify behavior, not
+  installs", "pipx injected deps don't auto-upgrade", "pause a background writer
+  before editing its store", "read before editing"). High signal.
+- **Confidence:** max 0.65 — one fact lifted above the 0.6 birth-cap by
+  supersession carry-forward (corroboration); benign and expected.
+
+Gate passed → cleared to wire into the live observer.
 
 ## Risks
 
