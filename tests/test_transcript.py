@@ -7,6 +7,7 @@ import pytest
 from neo.memory.models import FactKind, FactScope
 from neo.memory.transcript import (
     CarSource,
+    CodexSource,
     Episode,
     TranscriptIngester,
     _parse_json,
@@ -476,3 +477,131 @@ def test_car_source_skips_bad_and_missing(tmp_path):
 def test_default_sources_include_car(temp_store):
     ing = TranscriptIngester(store=temp_store, lm_adapter=_StubAdapter([]), codebase_root="/x")
     assert {s.name for s in ing.sources} >= {"claude-code", "car"}
+
+
+# --------------------------------------------------------------------------
+# Codex source adapter
+# --------------------------------------------------------------------------
+
+def _write_rollout(path, cwd, sid, records):
+    lines = [{"timestamp": "t0", "type": "session_meta", "payload": {"id": sid, "cwd": cwd}}]
+    lines += records
+    path.write_text("\n".join(json.dumps(r) for r in lines), encoding="utf-8")
+
+
+def _ev(pt, **payload):
+    return {"timestamp": "t", "type": "event_msg", "payload": {"type": pt, **payload}}
+
+
+def _ri(pt, **payload):
+    return {"timestamp": "t", "type": "response_item", "payload": {"type": pt, **payload}}
+
+
+def test_codex_source_parses_rollout(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-1.jsonl", cwd="/work/proj", sid="sess1", records=[
+        _ev("user_message", message="fix the failing build"),
+        _ev("agent_message", message="tracing the build failure"),
+        _ri("function_call", name="exec_command", arguments="{}"),
+        _ev("exec_command_end", exit_code=1, stderr="compile error: missing symbol"),
+    ])
+    src = CodexSource(codebase_root="/work/proj", sessions_dir=sdir)
+    assert src.name == "codex" and src.scope == FactScope.PROJECT
+    eps = src.collect_episodes()
+    assert len(eps) == 1
+    ep = eps[0]
+    assert ep.ask == "fix the failing build"
+    assert ep.assistant_text == ["tracing the build failure"]
+    assert ep.tools == ["exec_command"]
+    assert ep.errors == ["compile error: missing symbol"]
+    assert ep.anchor_uuid.startswith("sess1:")
+
+
+def test_codex_source_filters_by_cwd(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-other.jsonl", cwd="/some/other/repo", sid="s",
+                   records=[_ev("user_message", message="not my project")])
+    _write_rollout(sdir / "rollout-sub.jsonl", cwd="/work/proj/subdir", sid="s2",
+                   records=[_ev("user_message", message="within the repo"),
+                            _ev("agent_message", message="ok")])
+    eps = CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes()
+    assert len(eps) == 1 and eps[0].ask == "within the repo"  # only the in-repo cwd
+
+
+def test_codex_source_multiple_user_messages(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-m.jsonl", cwd="/work/proj", sid="s", records=[
+        _ev("user_message", message="first ask"),
+        _ev("agent_message", message="a1"),
+        _ev("user_message", message="second ask"),
+        _ev("agent_message", message="a2"),
+    ])
+    eps = CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes()
+    assert [e.ask for e in eps] == ["first ask", "second ask"]
+    assert eps[0].anchor_uuid != eps[1].anchor_uuid
+
+
+def test_codex_source_skips_synthetic_user_message(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-s.jsonl", cwd="/work/proj", sid="s", records=[
+        _ev("user_message", message="<task-notification>x</task-notification>"),
+        _ev("user_message", message="a real ask"),
+        _ev("agent_message", message="ok"),
+    ])
+    eps = CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes()
+    assert len(eps) == 1 and eps[0].ask == "a real ask"
+
+
+def test_codex_source_no_root_or_missing_dir(tmp_path):
+    assert CodexSource(codebase_root=None, sessions_dir=tmp_path).collect_episodes() == []
+    assert CodexSource(codebase_root="/x", sessions_dir=tmp_path / "nope").collect_episodes() == []
+
+
+def test_default_sources_include_codex(temp_store):
+    ing = TranscriptIngester(store=temp_store, lm_adapter=_StubAdapter([]), codebase_root="/x")
+    assert {s.name for s in ing.sources} >= {"claude-code", "codex", "car"}
+
+
+def test_codex_source_captures_function_call_output_errors(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-e.jsonl", cwd="/work/proj", sid="s", records=[
+        _ev("user_message", message="run the migration"),
+        _ri("function_call", name="exec_command"),
+        _ri("function_call_output", output="Process exited with code 1\nsed: no such file"),
+        _ri("function_call", name="exec_command"),
+        _ri("function_call_output", output="Process exited with code 0\nOutput:\nok"),  # success: ignored
+    ])
+    eps = CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes()
+    assert len(eps) == 1
+    assert len(eps[0].errors) == 1 and "code 1" in eps[0].errors[0]  # only the failure
+
+
+def test_codex_source_captures_timeout_and_patch_failure(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-t.jsonl", cwd="/work/proj", sid="s", records=[
+        _ev("user_message", message="apply the patch"),
+        _ri("function_call_output", output="command timed out after 120015 milliseconds"),
+        _ev("patch_apply_end", success=False, stderr="hunk failed to apply"),
+    ])
+    eps = CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes()
+    assert len(eps) == 1
+    joined = " ".join(eps[0].errors)
+    assert "timed out" in joined and "hunk failed" in joined
+
+
+def test_codex_source_skips_agent_history_wrapper(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-w.jsonl", cwd="/work/proj", sid="s", records=[
+        _ev("user_message", message="The following is the Codex agent history whose request action you are assessing..."),
+        _ev("user_message", message="a genuine ask"),
+        _ev("agent_message", message="ok"),
+    ])
+    eps = CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes()
+    assert len(eps) == 1 and eps[0].ask == "a genuine ask"

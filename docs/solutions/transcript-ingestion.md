@@ -15,6 +15,17 @@ tool-agnostic; only *parsing* is tool-specific. So each tool is a
 and the ingester iterates a list of them:
 
 - **`ClaudeCodeSource`** (scope PROJECT) — `~/.claude/projects/{path}/*.jsonl`.
+- **`CodexSource`** (scope PROJECT) — `~/.codex/sessions/**/rollout-*.jsonl`.
+  Codex records `session_meta.cwd`, so rollouts ARE project-attributable
+  (unlike CAR) → project-scoped, filtered to rollouts whose cwd is within
+  `codebase_root` (cheap first-line read). Episodes anchor on
+  `event_msg/user_message`; assistant text from `agent_message`; tools from
+  `response_item/function_call`. **Errors** come from
+  `response_item/function_call_output` (`exited with code N` / `timed out`) —
+  verified the only error channel in 73% of sessions and all 6 of this repo's
+  rollouts — plus `patch_apply_end` failures, with `exec_command_end` kept for
+  older rollouts. Codex's synthetic "agent history" review-wrapper is filtered
+  out of `user_message`. Append-only, so `(session_id, msg_idx)` is the anchor.
 - **`CarSource`** (scope GLOBAL) — `~/.car/sessions/*.json` task conversations.
   CAR is cross-agent / not repo-bound, hence global scope. One session = one
   episode (no per-message ids → session id is the watermark anchor). Guards:
@@ -24,7 +35,12 @@ and the ingester iterates a list of them:
   sessions — 311 raw → 37 unique). CAR **journals** (`~/.car/journals`) are
   intentionally NOT a source: thin action-lifecycle audit logs whose
   rejection/violation records carry empty `data` — nothing extractable.
-- Codex / others: drop in as new adapters yielding the same `Episode`.
+- **Cursor: deferred** — not installed, so there is no real transcript schema to
+  build and verify against. Building a parser from a guessed schema is the
+  anti-pattern that bit both the Claude Code (synthetic-string) and CAR
+  (journals-vs-sessions) adapters; the Cursor adapter will be built when Cursor
+  is installed and has real transcripts on disk.
+- Other tools: drop in as new adapters yielding the same `Episode`.
 
 Watermarks are namespaced per `(source, scope-suffix)` so sources never collide;
 project sources key on `project_id`, global sources on the literal `global`. The
@@ -45,6 +61,14 @@ sessions → 37 episodes (finished + ask-dedup) → **3 admitted**, all GLOBAL (
 pattern, 1 failure); the verify gate **rejected 34/37** toy episodes. Re-run: 0
 new (idempotent). Confirms the quality wall holds on a low-signal source and that
 scope/watermark threading is correct. Claude Code source unchanged from #97.
+
+**Codex validation (2026-06-13):** CodexSource on the 6 real `~/git/neo` rollouts
+— 44 episodes → **77 admitted**, all PROJECT (34 failure, 43 pattern; domains
+spanning workflow/debugging/architecture/testing/security/git). Re-run: 0 new
+(idempotent). The 34 failures confirm the `function_call_output` error channel
+fix — the original `exec_command_end`-only capture would have found ~zero (those
+rollouts emit none). Codex is the highest-signal source: project-scoped real
+engineering work.
 
 ## Problem
 
