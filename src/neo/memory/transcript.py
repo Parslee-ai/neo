@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from neo.memory.io_utils import atomic_write_json
+from neo.memory.metrics import record as metrics_record
 from neo.memory.models import FactKind, FactScope, Provenance
 from neo.memory.outcomes import SESSIONS_DIR
 
@@ -392,7 +394,9 @@ class TranscriptIngester:
 
     # -- incremental ingest with watermark -------------------------------
     def ingest(self, episodes: Optional[list[Episode]] = None,
-               max_episodes: Optional[int] = None) -> dict:
+               max_episodes: Optional[int] = None,
+               max_seconds: Optional[float] = None,
+               should_stop: Optional[Callable[[], bool]] = None) -> dict:
         """Ingest not-yet-consumed episodes, advancing the watermark per episode.
 
         Idempotent: an episode's ``anchor_uuid`` is recorded as consumed only
@@ -400,6 +404,13 @@ class TranscriptIngester:
         mid-episode simply reprocesses it (dedup absorbs any partial). The
         watermark is keyed by project, not by transcript path, so it survives
         worktrees/clones that share the same git remote.
+
+        ``max_episodes`` caps episode count; ``max_seconds`` caps wall time and
+        ``should_stop`` caps on an external signal (SIGTERM). Both bounds stop
+        *dispatching new* episodes — an LM call already in flight runs to its own
+        timeout — which collapses a hung pass from N×(call timeout) to ~1, and
+        keeps the supervised observer responsive to shutdown. The watermark
+        drains the remaining backlog on the next cycle.
         """
         if episodes is None:
             episodes = collect_episodes(self.codebase_root)
@@ -407,13 +418,20 @@ class TranscriptIngester:
         new = [e for e in episodes if e.anchor_uuid not in consumed]
         stats = {"episodes_total": len(episodes), "episodes_new": len(new),
                  "episodes_processed": 0, "facts_admitted": 0}
+        start = time.monotonic()
         for ep in new:
             if max_episodes is not None and stats["episodes_processed"] >= max_episodes:
+                break
+            if max_seconds is not None and (time.monotonic() - start) >= max_seconds:
+                break
+            if should_stop is not None and should_stop():
                 break
             stats["facts_admitted"] += self.ingest_episode(ep)
             consumed.add(ep.anchor_uuid)
             self._persist_consumed(consumed)   # advance only after facts are durable
             stats["episodes_processed"] += 1
+        if stats["episodes_processed"]:
+            metrics_record("transcript_ingest", **stats)
         return stats
 
     def _watermark_path(self) -> Optional[Path]:

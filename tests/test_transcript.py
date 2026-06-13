@@ -326,3 +326,18 @@ def test_watermark_persisted(temp_store, tmp_path, monkeypatch):
     ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
     ing.ingest(episodes=[_ep("e1", "ask one")])
     assert ing._load_consumed() == {"e1"}
+
+
+def test_ingest_respects_stop_and_deadline(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    ad = _StubAdapter([_LESSON], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
+    eps = [_ep(f"e{i}", f"ask {i}") for i in range(5)]
+
+    # should_stop fires immediately -> nothing dispatched
+    s = ing.ingest(episodes=eps, should_stop=lambda: True)
+    assert s["episodes_processed"] == 0 and len(ad.calls) == 0
+
+    # max_seconds=0 -> deadline already passed before the first episode
+    s = ing.ingest(episodes=eps, max_seconds=0)
+    assert s["episodes_processed"] == 0 and len(ad.calls) == 0

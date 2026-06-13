@@ -136,6 +136,14 @@ class ObserverConfig:
 
     interval_seconds: float = 300.0
     cooldown_seconds: float = 60.0
+    # Max transcript episodes mined per cycle. Bounds LM calls; the backlog
+    # drains across cycles. 0 disables transcript ingestion.
+    ingest_budget: int = 8
+    # Wall-clock cap on the mining pass. Stops dispatching new episodes past
+    # this (an in-flight LM call still runs to its own timeout) so a hung
+    # provider can't park the cycle and stonewall SIGTERM. Kept well under the
+    # interval so a slow pass doesn't swallow the wake cadence.
+    ingest_deadline_seconds: float = 120.0
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -149,9 +157,21 @@ class ObserverConfig:
             except ValueError:
                 return default
 
+        def _read_int(name: str, default: int) -> int:
+            raw = os.getenv(name, "").strip()
+            if not raw:
+                return default
+            try:
+                v = int(raw)
+                return v if v >= 0 else default
+            except ValueError:
+                return default
+
         return cls(
             interval_seconds=_read("NEO_OBSERVER_INTERVAL_SECONDS", 300.0),
             cooldown_seconds=_read("NEO_OBSERVER_COOLDOWN", 60.0),
+            ingest_budget=_read_int("NEO_OBSERVER_INGEST_BUDGET", 8),
+            ingest_deadline_seconds=_read("NEO_OBSERVER_INGEST_DEADLINE", 120.0),
         )
 
 
@@ -183,6 +203,9 @@ class Observer:
         # Latest FactStore snapshot — used to update the A2UI Memory tab
         # without paying a second load.
         self._last_store_snapshot: Optional[dict] = None
+        # Name of the last transcript-ingest exception (or None), surfaced in
+        # the cycle record so a failing LM key isn't invisible.
+        self._last_ingest_error: Optional[str] = None
         # Surface manager (async). Created in run() since it needs an
         # event loop.
         self._surface = None
@@ -257,9 +280,20 @@ class Observer:
             # import cost.
             from neo.memory.store import FactStore
 
+            t0 = time.time()
             store = FactStore(codebase_root=self.codebase_root, eager_init=False)
             store.initialize()
             count = store.synthesize_reviews()
+            # Transcript mining MUST run AFTER synthesis: synthesis is then
+            # already durable, so an ingest/LM failure (isolated in its own
+            # guard) can never abort it. Both passes share this executor-run
+            # call (run_in_executor keeps the WS loop draining); tick is logged
+            # so we can tell if it stalls and needs splitting into a separate
+            # cycle. Do not reorder.
+            ingested = self._ingest_transcripts(store)
+            tick = time.time() - t0
+            mined = (f"{ingested} mined" if not self._last_ingest_error
+                     else f"ingest ERROR {self._last_ingest_error}")
             self._last_analysis_epoch = time.time()
             self._cycles_total += 1
             self._last_cycle_count = count
@@ -268,14 +302,14 @@ class Observer:
                 "timestamp": self._last_analysis_epoch,
                 "text": (
                     f"{time.strftime('%H:%M:%S', time.localtime(self._last_analysis_epoch))} · "
-                    f"{count} synthesized"
+                    f"{count} synthesized, {mined}"
                 ),
             })
             # Stash for the post-cycle Memory tab update. Keep the ref
             # around for ~1 cycle; FactStore is GC'd otherwise.
             self._last_store_snapshot = self._build_store_snapshot(store)
             print(
-                f"neo observer cycle ok: {count} synthesized facts",
+                f"neo observer cycle ok: {count} synthesized, {mined} ({tick:.1f}s)",
                 flush=True,
             )
         except Exception as e:
@@ -290,6 +324,44 @@ class Observer:
                 file=sys.stderr,
                 flush=True,
             )
+
+    def _ingest_transcripts(self, store) -> int:
+        """Mine Claude Code transcripts for lessons, bounded by the per-cycle
+        episode budget AND a wall-clock deadline. Isolated in its own
+        try/except so an LM or transcript failure never aborts the synthesis
+        cycle (which has already completed). Returns facts admitted; records a
+        failure marker in ``self._last_ingest_error`` so a silently-failing LM
+        key is visible in the cycle record, not just stderr.
+        """
+        self._last_ingest_error = None
+        if self.config.ingest_budget <= 0:
+            return 0
+        try:
+            from neo.adapters import create_adapter
+            from neo.config import NeoConfig
+            from neo.memory.transcript import TranscriptIngester
+
+            cfg = NeoConfig.load()
+            adapter = create_adapter(
+                cfg.provider, cfg.model, api_key=cfg.api_key, base_url=cfg.base_url
+            )
+            ingester = TranscriptIngester(
+                store=store, lm_adapter=adapter, codebase_root=self.codebase_root
+            )
+            stats = ingester.ingest(
+                max_episodes=self.config.ingest_budget,
+                max_seconds=self.config.ingest_deadline_seconds,
+                should_stop=lambda: self._stop,  # honor SIGTERM between episodes
+            )
+            return int(stats.get("facts_admitted", 0))
+        except Exception as e:
+            self._last_ingest_error = type(e).__name__
+            print(
+                f"neo observer transcript ingest error: {type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 0
 
     def _build_store_snapshot(self, store) -> Optional[dict]:
         """Extract memory-tab + header-stage state from a FactStore.
