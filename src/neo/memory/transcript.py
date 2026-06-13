@@ -27,7 +27,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator, Optional, Protocol
 
 from neo.memory.io_utils import atomic_write_json
 from neo.memory.metrics import record as metrics_record
@@ -305,6 +305,120 @@ def _normalize_ws(s: str) -> str:
     return " ".join(s.split())
 
 
+# ---------------------------------------------------------------------------
+# Source adapters — one per AI tool. Each yields the common Episode shape so the
+# extract→verify→admit pipeline and per-source watermark are reused unchanged.
+# ---------------------------------------------------------------------------
+
+
+class TranscriptSource(Protocol):
+    """A tool whose transcripts neo mines.
+
+    ``name`` namespaces the watermark; ``scope`` is the FactScope for facts
+    derived from this source (PROJECT for repo-bound tools, GLOBAL for
+    cross-agent tools that aren't tied to one repo).
+    """
+
+    name: str
+    scope: FactScope
+
+    def collect_episodes(self) -> list[Episode]:
+        ...
+
+
+class ClaudeCodeSource:
+    """Claude Code session transcripts for one project."""
+
+    name = "claude-code"
+    scope = FactScope.PROJECT
+
+    def __init__(self, codebase_root: Optional[str]):
+        self.codebase_root = codebase_root
+
+    def collect_episodes(self) -> list[Episode]:
+        return collect_episodes(self.codebase_root)
+
+
+CAR_SESSIONS_DIR = Path.home() / ".car" / "sessions"
+
+
+class CarSource:
+    """CAR agent session transcripts (``~/.car/sessions/*.json``).
+
+    CAR sessions are ``{id, task, messages:[{role, content}], ...}`` task
+    conversations. They are cross-agent and not bound to a git repo, so derived
+    facts are GLOBAL-scoped. Each session maps to one episode — there are no
+    per-message ids, so the session id is the watermark anchor. (The sibling
+    ``~/.car/journals`` are thin action-lifecycle audit logs with no extractable
+    content, so they are intentionally not a source.)
+    """
+
+    name = "car"
+    scope = FactScope.GLOBAL
+
+    def __init__(self, sessions_dir: Optional[Path] = None):
+        self._dir = sessions_dir or CAR_SESSIONS_DIR
+
+    def collect_episodes(self) -> list[Episode]:
+        if not self._dir.is_dir():
+            return []
+        episodes: list[Episode] = []
+        seen_asks: set[str] = set()
+        for fp in sorted(self._dir.glob("*.json")):
+            ep = self._session_to_episode(fp)
+            if ep is None:
+                continue
+            # CAR's multi-agent fan-out creates many sessions with identical
+            # tasks (e.g. dozens of "What is 6*7?"). Collapse by normalized ask
+            # so the toy-duplicate flood never reaches the (global, 200-cap) store.
+            sig = ep.ask.strip().lower()
+            if sig in seen_asks:
+                continue
+            seen_asks.add(sig)
+            episodes.append(ep)
+        return episodes
+
+    @staticmethod
+    def _session_to_episode(fp: Path) -> Optional[Episode]:
+        try:
+            d = json.loads(fp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(d, dict):
+            return None
+        # Only finished sessions are immutable. An in-flight session can gain
+        # turns across runs, and we watermark by session id — so mining it early
+        # would permanently skip the finished, substantive version. Skip until done.
+        if d.get("finished") is not True:
+            return None
+        sid = str(d.get("id") or fp.stem)
+        user_texts, asst_texts = [], []
+        for m in d.get("messages") or []:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if content is None:
+                continue  # skip empty messages rather than emit a literal "null"
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            if m.get("role") == "user":
+                user_texts.append(content)
+            elif m.get("role") == "assistant":
+                asst_texts.append(content)
+        # The first user message is the actual prompt; fall back to the task field.
+        ask = (user_texts[0] if user_texts else str(d.get("task") or "")).strip()
+        if not ask:
+            return None
+        return Episode(
+            session_id=sid,
+            anchor_uuid=sid,
+            last_uuid=sid,
+            timestamp=str(d.get("created_at") or ""),
+            ask=ask[:_MAX_ASK_CHARS],
+            assistant_text=asst_texts,
+        )
+
+
 class TranscriptIngester:
     """Extract verified, generalizable lessons from transcript episodes and
     admit them directly as PATTERN/FAILURE facts.
@@ -315,10 +429,16 @@ class TranscriptIngester:
     episode (provable evidence, not claimed).
     """
 
-    def __init__(self, store, lm_adapter, codebase_root: Optional[str] = None):
+    def __init__(self, store, lm_adapter, codebase_root: Optional[str] = None,
+                 sources: Optional[list] = None):
         self._store = store
         self._lm = lm_adapter
         self.codebase_root = codebase_root or getattr(store, "codebase_root", None)
+        # Default source set; add Codex/etc. here as adapters land.
+        self.sources = sources if sources is not None else [
+            ClaudeCodeSource(self.codebase_root),
+            CarSource(),
+        ]
 
     # -- Stage B ---------------------------------------------------------
     def extract_lessons(self, ep: Episode) -> list[dict]:
@@ -355,7 +475,7 @@ class TranscriptIngester:
         return bool(data and data.get("keep") is True)
 
     # -- admission -------------------------------------------------------
-    def admit(self, lesson: dict, ep: Episode):
+    def admit(self, lesson: dict, ep: Episode, scope: FactScope = FactScope.PROJECT):
         kind = FactKind.FAILURE if lesson.get("kind") == "failure" else FactKind.PATTERN
         try:
             raw_conf = float(lesson.get("confidence", 0.5) or 0.5)
@@ -369,7 +489,7 @@ class TranscriptIngester:
             subject=str(lesson.get("subject", ""))[:120],
             body=str(lesson.get("body", ""))[:_MAX_BODY_CHARS],
             kind=kind,
-            scope=FactScope.PROJECT,
+            scope=scope,
             confidence=confidence,
             source_prompt=ep.ask[:200],
             tags=[_TRANSCRIPT_TAG],
@@ -377,7 +497,7 @@ class TranscriptIngester:
             domain=domain,  # first-class field so retrieve_relevant(domain=...) matches
         )
 
-    def ingest_episode(self, ep: Episode) -> int:
+    def ingest_episode(self, ep: Episode, scope: FactScope = FactScope.PROJECT) -> int:
         """Full per-episode pipeline; returns number of facts admitted.
 
         ``store.add_fact`` saves to disk on each call, so an episode's facts
@@ -388,60 +508,77 @@ class TranscriptIngester:
         admitted = 0
         for lesson in self.extract_lessons(ep):
             if self.verify(lesson, ep):
-                self.admit(lesson, ep)
+                self.admit(lesson, ep, scope)
                 admitted += 1
         return admitted
 
-    # -- incremental ingest with watermark -------------------------------
-    def ingest(self, episodes: Optional[list[Episode]] = None,
-               max_episodes: Optional[int] = None,
+    # -- incremental ingest with per-source watermark --------------------
+    def ingest(self, max_episodes: Optional[int] = None,
                max_seconds: Optional[float] = None,
                should_stop: Optional[Callable[[], bool]] = None) -> dict:
-        """Ingest not-yet-consumed episodes, advancing the watermark per episode.
+        """Mine all configured sources, advancing each source's watermark per
+        episode.
 
-        Idempotent: an episode's ``anchor_uuid`` is recorded as consumed only
-        *after* its facts are durably written, so a re-run skips it and a crash
-        mid-episode simply reprocesses it (dedup absorbs any partial). The
-        watermark is keyed by project, not by transcript path, so it survives
-        worktrees/clones that share the same git remote.
+        Idempotent per source: an episode's ``anchor_uuid`` is recorded as
+        consumed only *after* its facts are durably written, so a re-run skips it
+        and a crash mid-episode simply reprocesses it (dedup absorbs any partial).
+        Watermarks are namespaced by source and (for project-scoped sources) by
+        project_id, so sources never collide and the key survives worktrees/clones
+        that share the same git remote.
 
-        ``max_episodes`` caps episode count; ``max_seconds`` caps wall time and
-        ``should_stop`` caps on an external signal (SIGTERM). Both bounds stop
-        *dispatching new* episodes — an LM call already in flight runs to its own
-        timeout — which collapses a hung pass from N×(call timeout) to ~1, and
-        keeps the supervised observer responsive to shutdown. The watermark
-        drains the remaining backlog on the next cycle.
+        ``max_episodes`` / ``max_seconds`` / ``should_stop`` are SHARED across all
+        sources (a single per-cycle budget). They stop *dispatching new* episodes
+        — an LM call already in flight runs to its own timeout — collapsing a hung
+        pass from N×(call timeout) to ~1 and keeping the supervised observer
+        responsive to shutdown. The watermark drains the remaining backlog next
+        cycle.
         """
-        if episodes is None:
-            episodes = collect_episodes(self.codebase_root)
-        consumed = self._load_consumed()
-        new = [e for e in episodes if e.anchor_uuid not in consumed]
-        stats = {"episodes_total": len(episodes), "episodes_new": len(new),
+        stats = {"episodes_total": 0, "episodes_new": 0,
                  "episodes_processed": 0, "facts_admitted": 0}
         start = time.monotonic()
-        for ep in new:
+
+        def stop_now() -> bool:
             if max_episodes is not None and stats["episodes_processed"] >= max_episodes:
-                break
+                return True
             if max_seconds is not None and (time.monotonic() - start) >= max_seconds:
+                return True
+            return bool(should_stop is not None and should_stop())
+
+        for source in self.sources:
+            if stop_now():
                 break
-            if should_stop is not None and should_stop():
-                break
-            stats["facts_admitted"] += self.ingest_episode(ep)
-            consumed.add(ep.anchor_uuid)
-            self._persist_consumed(consumed)   # advance only after facts are durable
-            stats["episodes_processed"] += 1
+            consumed = self._load_consumed(source)
+            try:
+                episodes = source.collect_episodes()
+            except Exception as e:  # one bad source must not sink the others
+                logger.warning("transcript: source %s collect failed: %s", source.name, e)
+                continue
+            new = [e for e in episodes if e.anchor_uuid not in consumed]
+            stats["episodes_total"] += len(episodes)
+            stats["episodes_new"] += len(new)
+            for ep in new:
+                if stop_now():
+                    break
+                stats["facts_admitted"] += self.ingest_episode(ep, source.scope)
+                consumed.add(ep.anchor_uuid)
+                self._persist_consumed(source, consumed)  # advance only after durable
+                stats["episodes_processed"] += 1
         if stats["episodes_processed"]:
             metrics_record("transcript_ingest", **stats)
         return stats
 
-    def _watermark_path(self) -> Optional[Path]:
-        pid = getattr(self._store, "project_id", None)
-        if not pid:
-            return None
-        return SESSIONS_DIR / f"transcript_watermark_{pid}.json"
+    def _watermark_path(self, source) -> Optional[Path]:
+        if source.scope == FactScope.PROJECT:
+            pid = getattr(self._store, "project_id", None)
+            if not pid:
+                return None
+            suffix = pid
+        else:
+            suffix = "global"
+        return SESSIONS_DIR / f"transcript_watermark_{source.name}_{suffix}.json"
 
-    def _load_consumed(self) -> set:
-        path = self._watermark_path()
+    def _load_consumed(self, source) -> set:
+        path = self._watermark_path(source)
         if not path or not path.exists():
             return set()
         try:
@@ -449,8 +586,8 @@ class TranscriptIngester:
         except (OSError, json.JSONDecodeError):
             return set()
 
-    def _persist_consumed(self, consumed: set) -> None:
-        path = self._watermark_path()
+    def _persist_consumed(self, source, consumed: set) -> None:
+        path = self._watermark_path(source)
         if not path:
             return
         try:

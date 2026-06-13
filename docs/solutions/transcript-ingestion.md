@@ -1,10 +1,50 @@
 # Transcript & journal ingestion — feeding synthesis from AI-tool artifacts
 
-**Status:** proposal v3 (2026-06-13). Phase 0 spike complete (results below).
-v1 → v2 corrected integration claims after @neo + @linus review; Phase 0 then
-**retired the clustering approach** and v3 pivots the Design to direct ingestion
-of verified lessons as PATTERN/FAILURE facts + cosine semantic dedup. This is the
-architecture being implemented.
+**Status:** v4 (2026-06-13). v3 shipped Claude Code ingestion (PR #97). v4
+generalizes to **multiple AI-tool sources** behind a `TranscriptSource` adapter
+interface and adds **CAR** as the second source. (History: v1→v2 corrected
+integration claims after @neo + @linus review; Phase 0 retired the clustering
+approach; v3 pivoted to direct PATTERN/FAILURE admission.)
+
+## Multi-source architecture (v4)
+
+The goal is to learn from **every AI coding tool**, not just Claude Code. The
+extract→verify→admit pipeline, probation, dedup, and watermark are all
+tool-agnostic; only *parsing* is tool-specific. So each tool is a
+`TranscriptSource` adapter (`name`, `scope`, `collect_episodes() -> [Episode]`)
+and the ingester iterates a list of them:
+
+- **`ClaudeCodeSource`** (scope PROJECT) — `~/.claude/projects/{path}/*.jsonl`.
+- **`CarSource`** (scope GLOBAL) — `~/.car/sessions/*.json` task conversations.
+  CAR is cross-agent / not repo-bound, hence global scope. One session = one
+  episode (no per-message ids → session id is the watermark anchor). Guards:
+  ingest only **finished** sessions (session files mutate across runs, so an
+  in-flight one would be permanently skipped once watermarked), and **dedup by
+  normalized ask** (CAR's multi-agent fan-out creates many identical-task
+  sessions — 311 raw → 37 unique). CAR **journals** (`~/.car/journals`) are
+  intentionally NOT a source: thin action-lifecycle audit logs whose
+  rejection/violation records carry empty `data` — nothing extractable.
+- Codex / others: drop in as new adapters yielding the same `Episode`.
+
+Watermarks are namespaced per `(source, scope-suffix)` so sources never collide;
+project sources key on `project_id`, global sources on the literal `global`. The
+per-cycle budget/deadline is **shared across all sources** (one bound per cycle);
+sources run in list order, so a deep first-source backlog can defer later sources
+for a few cycles until it drains (self-healing, not permanent starvation).
+
+**Caveat (today):** CAR's current corpus is ~100% stale toy/test tasks
+("What is 6\*7?", "Capital of France?"), so the verify gate rejects nearly all of
+it; the adapter pays off as CAR accrues real work. GLOBAL-scoped facts surface in
+*all* projects (that is what global scope means, and is the chosen behavior) — if
+toy-data spill becomes a problem before CAR has real data, the mitigation is to
+drop `CarSource` from the default `sources` list (one line) or add source-aware
+retrieval filtering.
+
+**v4 validation (2026-06-13):** CAR source end-to-end via gpt-5.5 — 311 raw
+sessions → 37 episodes (finished + ask-dedup) → **3 admitted**, all GLOBAL (2
+pattern, 1 failure); the verify gate **rejected 34/37** toy episodes. Re-run: 0
+new (idempotent). Confirms the quality wall holds on a low-signal source and that
+scope/watermark threading is correct. Claude Code source unchanged from #97.
 
 ## Problem
 
