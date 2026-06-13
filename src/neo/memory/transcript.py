@@ -339,6 +339,86 @@ class ClaudeCodeSource:
         return collect_episodes(self.codebase_root)
 
 
+CAR_SESSIONS_DIR = Path.home() / ".car" / "sessions"
+
+
+class CarSource:
+    """CAR agent session transcripts (``~/.car/sessions/*.json``).
+
+    CAR sessions are ``{id, task, messages:[{role, content}], ...}`` task
+    conversations. They are cross-agent and not bound to a git repo, so derived
+    facts are GLOBAL-scoped. Each session maps to one episode — there are no
+    per-message ids, so the session id is the watermark anchor. (The sibling
+    ``~/.car/journals`` are thin action-lifecycle audit logs with no extractable
+    content, so they are intentionally not a source.)
+    """
+
+    name = "car"
+    scope = FactScope.GLOBAL
+
+    def __init__(self, sessions_dir: Optional[Path] = None):
+        self._dir = sessions_dir or CAR_SESSIONS_DIR
+
+    def collect_episodes(self) -> list[Episode]:
+        if not self._dir.is_dir():
+            return []
+        episodes: list[Episode] = []
+        seen_asks: set[str] = set()
+        for fp in sorted(self._dir.glob("*.json")):
+            ep = self._session_to_episode(fp)
+            if ep is None:
+                continue
+            # CAR's multi-agent fan-out creates many sessions with identical
+            # tasks (e.g. dozens of "What is 6*7?"). Collapse by normalized ask
+            # so the toy-duplicate flood never reaches the (global, 200-cap) store.
+            sig = ep.ask.strip().lower()
+            if sig in seen_asks:
+                continue
+            seen_asks.add(sig)
+            episodes.append(ep)
+        return episodes
+
+    @staticmethod
+    def _session_to_episode(fp: Path) -> Optional[Episode]:
+        try:
+            d = json.loads(fp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(d, dict):
+            return None
+        # Only finished sessions are immutable. An in-flight session can gain
+        # turns across runs, and we watermark by session id — so mining it early
+        # would permanently skip the finished, substantive version. Skip until done.
+        if d.get("finished") is not True:
+            return None
+        sid = str(d.get("id") or fp.stem)
+        user_texts, asst_texts = [], []
+        for m in d.get("messages") or []:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if content is None:
+                continue  # skip empty messages rather than emit a literal "null"
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            if m.get("role") == "user":
+                user_texts.append(content)
+            elif m.get("role") == "assistant":
+                asst_texts.append(content)
+        # The first user message is the actual prompt; fall back to the task field.
+        ask = (user_texts[0] if user_texts else str(d.get("task") or "")).strip()
+        if not ask:
+            return None
+        return Episode(
+            session_id=sid,
+            anchor_uuid=sid,
+            last_uuid=sid,
+            timestamp=str(d.get("created_at") or ""),
+            ask=ask[:_MAX_ASK_CHARS],
+            assistant_text=asst_texts,
+        )
+
+
 class TranscriptIngester:
     """Extract verified, generalizable lessons from transcript episodes and
     admit them directly as PATTERN/FAILURE facts.
@@ -357,6 +437,7 @@ class TranscriptIngester:
         # Default source set; add Codex/etc. here as adapters land.
         self.sources = sources if sources is not None else [
             ClaudeCodeSource(self.codebase_root),
+            CarSource(),
         ]
 
     # -- Stage B ---------------------------------------------------------

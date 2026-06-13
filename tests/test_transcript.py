@@ -6,6 +6,7 @@ import pytest
 
 from neo.memory.models import FactKind, FactScope
 from neo.memory.transcript import (
+    CarSource,
     Episode,
     TranscriptIngester,
     _parse_json,
@@ -395,3 +396,83 @@ def test_shared_budget_across_sources(temp_store, tmp_path, monkeypatch):
     stats = ing.ingest(max_episodes=1)
     assert stats["episodes_processed"] == 1
     assert ing._load_consumed(s2) == set()  # second source never reached
+
+
+# --------------------------------------------------------------------------
+# CAR source adapter
+# --------------------------------------------------------------------------
+
+def _write_session(path, d):
+    path.write_text(json.dumps(d), encoding="utf-8")
+
+
+def test_car_source_parses_session(tmp_path):
+    sdir = tmp_path / "car_sessions"
+    sdir.mkdir()
+    _write_session(sdir / "abc.json", {
+        "id": "abc", "task": "do thing", "created_at": 123.0, "provider": "openai",
+        "finished": True,
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "fix the flaky test"},
+            {"role": "assistant", "content": "I retried and found the race"},
+        ],
+    })
+    src = CarSource(sessions_dir=sdir)
+    assert src.name == "car" and src.scope == FactScope.GLOBAL
+    eps = src.collect_episodes()
+    assert len(eps) == 1
+    ep = eps[0]
+    assert ep.ask == "fix the flaky test"          # first user msg, not the task field
+    assert ep.anchor_uuid == "abc"                 # session id = watermark anchor
+    assert ep.assistant_text == ["I retried and found the race"]
+    assert ep.is_substantive
+
+
+def test_car_source_falls_back_to_task(tmp_path):
+    sdir = tmp_path / "s"
+    sdir.mkdir()
+    _write_session(sdir / "x.json",
+                   {"id": "x", "task": "the task", "finished": True,
+                    "messages": [{"role": "assistant", "content": "did it"}]})
+    eps = CarSource(sessions_dir=sdir).collect_episodes()
+    assert len(eps) == 1 and eps[0].ask == "the task"
+
+
+def test_car_source_skips_unfinished_sessions(tmp_path):
+    sdir = tmp_path / "s"
+    sdir.mkdir()
+    _write_session(sdir / "live.json",
+                   {"id": "live", "task": "in progress", "finished": False,
+                    "messages": [{"role": "assistant", "content": "working"}]})
+    # no `finished` key at all -> also skipped (treated as in-flight)
+    _write_session(sdir / "nokey.json",
+                   {"id": "nokey", "task": "t",
+                    "messages": [{"role": "assistant", "content": "x"}]})
+    assert CarSource(sessions_dir=sdir).collect_episodes() == []
+
+
+def test_car_source_dedups_identical_asks(tmp_path):
+    sdir = tmp_path / "s"
+    sdir.mkdir()
+    for i in range(4):
+        _write_session(sdir / f"dup{i}.json",
+                       {"id": f"dup{i}", "task": "What is 6 * 7?", "finished": True,
+                        "messages": [{"role": "user", "content": "What is 6 * 7?"},
+                                     {"role": "assistant", "content": "42"}]})
+    eps = CarSource(sessions_dir=sdir).collect_episodes()
+    assert len(eps) == 1  # the fan-out duplicates collapse to one episode
+
+
+def test_car_source_skips_bad_and_missing(tmp_path):
+    sdir = tmp_path / "s"
+    sdir.mkdir()
+    (sdir / "bad.json").write_text("not json", encoding="utf-8")
+    _write_session(sdir / "noask.json", {"id": "e", "messages": []})  # no ask -> skipped
+    assert CarSource(sessions_dir=sdir).collect_episodes() == []
+    assert CarSource(sessions_dir=tmp_path / "nope").collect_episodes() == []
+
+
+def test_default_sources_include_car(temp_store):
+    ing = TranscriptIngester(store=temp_store, lm_adapter=_StubAdapter([]), codebase_root="/x")
+    assert {s.name for s in ing.sources} >= {"claude-code", "car"}
