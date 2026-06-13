@@ -1,8 +1,14 @@
-"""Tests for Claude Code transcript parsing (Stage A)."""
+"""Tests for Claude Code transcript parsing (Stage A) and ingestion (B/C)."""
 
 import json
 
+import pytest
+
+from neo.memory.models import FactKind
 from neo.memory.transcript import (
+    Episode,
+    TranscriptIngester,
+    _parse_json,
     build_episodes,
     collect_episodes,
     resolve_transcript_dir,
@@ -156,3 +162,118 @@ def test_malformed_lines_skipped(tmp_path):
 
 def test_collect_episodes_missing_dir():
     assert collect_episodes("/nonexistent/path/xyz") == []
+
+
+# --------------------------------------------------------------------------
+# Stage B/C: extraction + verify-at-admission
+# --------------------------------------------------------------------------
+
+class _StubAdapter:
+    """LM boundary stub: returns a canned extract payload, then verify verdicts."""
+
+    def __init__(self, lessons, keep=True):
+        self._lessons = {"lessons": lessons}
+        self._keep = keep
+        self.calls = []
+
+    def generate(self, messages, **kw):
+        prompt = messages[0]["content"]
+        self.calls.append(prompt)
+        if '"lessons"' in prompt:  # extraction prompt
+            return "preamble " + json.dumps(self._lessons) + " trailer"
+        return json.dumps({"keep": self._keep, "reason": "t"})  # verify prompt
+
+
+def _episode(ask="why did the test fail", asst="the venv was missing pytest-asyncio"):
+    return Episode(session_id="s1", anchor_uuid="u1", last_uuid="u2",
+                   timestamp="t", ask=ask, assistant_text=[asst], tools=["Bash"])
+
+
+def test_parse_json_tolerant():
+    assert _parse_json('{"keep": true}')["keep"] is True              # strict
+    assert _parse_json('preamble {"keep": true} trailer')["keep"] is True  # sliced
+    assert _parse_json('{"keep": true} note: see {x}')["keep"] is True     # brace in trailer
+    assert _parse_json("no json here") is None
+    assert _parse_json('[1, 2, 3]') is None                            # non-object
+    assert _parse_json("") is None
+
+
+def test_extract_lessons_parses_and_filters():
+    ad = _StubAdapter([
+        {"kind": "pattern", "subject": "verify env first", "body": "check the venv",
+         "evidence_span": "venv was missing"},
+        {"kind": "pattern", "subject": "no body", "body": ""},  # dropped
+    ])
+    ing = TranscriptIngester(store=None, lm_adapter=ad, codebase_root="/x")
+    lessons = ing.extract_lessons(_episode())
+    assert len(lessons) == 1 and lessons[0]["subject"] == "verify env first"
+
+
+def test_verify_rejects_non_verbatim_evidence():
+    ad = _StubAdapter([], keep=True)  # judge would keep, but evidence is bogus
+    ing = TranscriptIngester(store=None, lm_adapter=ad, codebase_root="/x")
+    lesson = {"subject": "x", "body": "y", "evidence_span": "this phrase is not in the episode"}
+    assert ing.verify(lesson, _episode()) is False
+    assert ad.calls == []  # short-circuits before calling the judge
+
+
+def test_verify_rejects_when_judge_rejects():
+    ad = _StubAdapter([], keep=False)
+    ing = TranscriptIngester(store=None, lm_adapter=ad, codebase_root="/x")
+    lesson = {"subject": "x", "body": "y", "evidence_span": "venv was missing pytest-asyncio"}
+    assert ing.verify(lesson, _episode()) is False
+
+
+def test_verify_accepts_with_verbatim_evidence_and_keep():
+    ad = _StubAdapter([], keep=True)
+    ing = TranscriptIngester(store=None, lm_adapter=ad, codebase_root="/x")
+    lesson = {"subject": "x", "body": "y", "evidence_span": "venv was missing pytest-asyncio"}
+    assert ing.verify(lesson, _episode()) is True
+
+
+@pytest.fixture
+def temp_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEO_METRICS", "off")
+    import neo.memory.store as store_mod
+    monkeypatch.setattr(store_mod, "FACTS_DIR", tmp_path / "facts")
+    return store_mod.FactStore(codebase_root="/tmp/proj_transcript_test", eager_init=False)
+
+
+def test_ingest_episode_admits_capped_pattern(temp_store):
+    ad = _StubAdapter([
+        {"kind": "pattern", "subject": "verify env first",
+         "body": "Stale virtualenvs cause spurious test failures; check the env before the code.",
+         "domain": "testing", "confidence": 0.95,  # should be capped to 0.6
+         "evidence_span": "venv was missing pytest-asyncio"},
+    ], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
+    n = ing.ingest_episode(_episode())
+    assert n == 1
+    facts = [f for f in temp_store._facts if f.is_valid]
+    assert len(facts) == 1
+    f = facts[0]
+    assert f.kind == FactKind.PATTERN
+    assert "transcript-derived" in f.tags
+    assert f.metadata.confidence <= 0.6
+    assert f.domain == "testing"          # domain lands on the first-class field, not tags
+    assert "testing" not in f.tags
+
+
+def test_admit_handles_non_numeric_confidence_and_bounds_body(temp_store):
+    ad = _StubAdapter([], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
+    lesson = {"kind": "pattern", "subject": "s", "body": "B" * 5000,
+              "confidence": "high", "domain": "other",
+              "evidence_span": "venv was missing pytest-asyncio"}
+    fact = ing.admit(lesson, _episode())
+    assert fact.metadata.confidence == 0.5          # non-numeric -> conservative default
+    assert len(fact.body) <= 600                     # bounded
+    assert fact.domain is None                       # "other" -> unset
+
+
+def test_ingest_skips_nonsubstantive(temp_store):
+    ad = _StubAdapter([{"kind": "pattern", "subject": "x", "body": "y"}])
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
+    ep = Episode(session_id="s", anchor_uuid="u", last_uuid="u", timestamp="t", ask="just asking")
+    assert ing.ingest_episode(ep) == 0
+    assert ad.calls == []  # no LM calls for a non-substantive episode

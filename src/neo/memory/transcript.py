@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
 
+from neo.memory.models import FactKind, FactScope, Provenance
+
 logger = logging.getLogger(__name__)
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -232,3 +234,164 @@ def collect_episodes(codebase_root: Optional[str]) -> list[Episode]:
     for fp in sorted(tdir.glob("*.jsonl")):
         episodes.extend(build_episodes(fp))
     return episodes
+
+
+# ---------------------------------------------------------------------------
+# Stage B/C: LM lesson extraction + verify-at-admission
+# ---------------------------------------------------------------------------
+
+# Bound downstream token usage per episode (parser leaves these unbounded).
+_MAX_ASST_CHARS = 2500
+_MAX_ERR_CHARS = 800
+# Lessons are "1-2 sentences"; bound the body so a runaway extraction can't bloat
+# the store or the embedding.
+_MAX_BODY_CHARS = 600
+
+# Transcript lessons are a single LM assertion grounded in observed behavior;
+# cap their initial confidence so they never out-rank corroborated facts.
+_MAX_LESSON_CONFIDENCE = 0.6
+_TRANSCRIPT_TAG = "transcript-derived"
+
+_EXTRACT_PROMPT = """You are mining a coding-assistant transcript for GENERALIZABLE engineering lessons that would help on FUTURE tasks in this or other codebases.
+
+Given one episode (a user request + what the assistant did, including any tool errors), extract 0 to 3 transferable lessons. A good lesson is a reusable rule, pattern, gotcha, or correction — NOT a restatement of what happened, NOT project-trivia (file paths, line numbers, one-off values).
+
+Return STRICT JSON: {"lessons":[{"kind":"pattern|failure","subject":"<=8 words","body":"1-2 sentences, generalizable","domain":"testing|debugging|git|architecture|performance|workflow|code-style|security|file-patterns|other","confidence":0.0-1.0,"evidence_span":"a SHORT verbatim quote (<=120 chars) copied EXACTLY from the episode text below that justifies the lesson"}]}
+If there is no transferable lesson, return {"lessons":[]}.
+
+EPISODE:
+USER ASK: <<ASK>>
+ASSISTANT DID: <<ASST>>
+TOOLS USED: <<TOOLS>>
+ERRORS: <<ERRS>>
+"""
+
+_VERIFY_PROMPT = """You are a skeptical reviewer guarding a long-term memory store. Default to REJECT unless the lesson is clearly worth keeping.
+
+Reject if the lesson is: a restatement of one episode rather than a transferable rule; project-trivia; vague; obvious boilerplate; or not actually supported by the evidence quote.
+
+LESSON: <<SUBJECT>> — <<BODY>>
+EVIDENCE QUOTE: <<EVIDENCE>>
+
+Return STRICT JSON: {"keep": true|false, "reason": "<=15 words"}
+"""
+
+
+def _parse_json(text: str) -> Optional[dict]:
+    """Parse the first JSON object from an LM response, tolerantly.
+
+    Uses ``raw_decode`` from the first ``{``, which parses one complete object
+    and ignores any surrounding prose — including trailing text that itself
+    contains braces (where a first-brace/last-brace slice would fail). Fails
+    closed (returns ``None``) rather than risk bad data.
+    """
+    if not text:
+        return None
+    start = text.find("{")
+    if start == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text, start)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _normalize_ws(s: str) -> str:
+    return " ".join(s.split())
+
+
+class TranscriptIngester:
+    """Extract verified, generalizable lessons from transcript episodes and
+    admit them directly as PATTERN/FAILURE facts.
+
+    Stage B (extract) and Stage C (verify) both call the configured LM
+    adapter. Admission is gated by two hard filters: the verifier must keep
+    the lesson, and its ``evidence_span`` must appear verbatim in the source
+    episode (provable evidence, not claimed).
+    """
+
+    def __init__(self, store, lm_adapter, codebase_root: Optional[str] = None):
+        self._store = store
+        self._lm = lm_adapter
+        self.codebase_root = codebase_root or getattr(store, "codebase_root", None)
+
+    # -- Stage B ---------------------------------------------------------
+    def extract_lessons(self, ep: Episode) -> list[dict]:
+        prompt = (
+            _EXTRACT_PROMPT
+            .replace("<<ASK>>", ep.ask)
+            .replace("<<ASST>>", (" ".join(ep.assistant_text)[:_MAX_ASST_CHARS]) or "(no text)")
+            .replace("<<TOOLS>>", ", ".join(dict.fromkeys(ep.tools)) or "(none)")
+            .replace("<<ERRS>>", (" | ".join(ep.errors)[:_MAX_ERR_CHARS]) or "(none)")
+        )
+        data = self._lm_json(prompt)
+        if not data:
+            return []
+        return [L for L in data.get("lessons", []) if isinstance(L, dict) and L.get("body")]
+
+    # -- Stage C ---------------------------------------------------------
+    def verify(self, lesson: dict, ep: Episode) -> bool:
+        """Two hard gates: verbatim evidence present, then adversarial judge."""
+        span = _normalize_ws(str(lesson.get("evidence_span", "")))
+        if not span:
+            return False
+        # Include tool names: the extract prompt shows them, so a lesson may
+        # legitimately cite one as evidence.
+        haystack = _normalize_ws(" ".join([ep.ask, *ep.assistant_text, *ep.errors, *ep.tools]))
+        if span not in haystack:
+            return False  # hallucinated / non-verbatim evidence
+        prompt = (
+            _VERIFY_PROMPT
+            .replace("<<SUBJECT>>", str(lesson.get("subject", "")))
+            .replace("<<BODY>>", str(lesson.get("body", "")))
+            .replace("<<EVIDENCE>>", span)
+        )
+        data = self._lm_json(prompt)
+        return bool(data and data.get("keep") is True)
+
+    # -- admission -------------------------------------------------------
+    def admit(self, lesson: dict, ep: Episode):
+        kind = FactKind.FAILURE if lesson.get("kind") == "failure" else FactKind.PATTERN
+        try:
+            raw_conf = float(lesson.get("confidence", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            raw_conf = 0.5  # non-numeric LM confidence ("high") -> conservative default
+        confidence = min(raw_conf, _MAX_LESSON_CONFIDENCE)
+        domain = lesson.get("domain") or ""
+        if domain == "other":
+            domain = ""
+        return self._store.add_fact(
+            subject=str(lesson.get("subject", ""))[:120],
+            body=str(lesson.get("body", ""))[:_MAX_BODY_CHARS],
+            kind=kind,
+            scope=FactScope.PROJECT,
+            confidence=confidence,
+            source_prompt=ep.ask[:200],
+            tags=[_TRANSCRIPT_TAG],
+            provenance=Provenance.INFERRED,  # LM generalization, no bonus over corroborated facts
+            domain=domain,  # first-class field so retrieve_relevant(domain=...) matches
+        )
+
+    def ingest_episode(self, ep: Episode) -> int:
+        """Full per-episode pipeline; returns number of facts admitted."""
+        if not ep.is_substantive:
+            return 0
+        admitted = 0
+        for lesson in self.extract_lessons(ep):
+            if self.verify(lesson, ep):
+                self.admit(lesson, ep)
+                admitted += 1
+        return admitted
+
+    def _lm_json(self, prompt: str) -> Optional[dict]:
+        try:
+            out = self._lm.generate(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.2,
+            )
+        except Exception as e:
+            logger.warning("transcript: LM call failed: %s", e)
+            return None
+        return _parse_json(out)

@@ -273,6 +273,7 @@ class FactStore:
         provenance: "str | Provenance" = Provenance.INFERRED,
         retrieval_text: Optional[str] = None,
         context_text: Optional[str] = None,
+        domain: str = "",
     ) -> Fact:
         """Add a new fact to the store.
 
@@ -326,6 +327,7 @@ class FactStore:
             depends_on=depends_on or [],
             retrieval_text=retrieval_text,
             context_text=context_text,
+            domain=domain or None,
         )
 
         # Pre-write dedup: filter -> canonicalize -> exact-match check.
