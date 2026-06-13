@@ -746,10 +746,15 @@ class CarAdapter(LMAdapter):
 
     #: Default IntentHint sent to CAR when the caller doesn't supply one.
     #: Neo's workload is overwhelmingly code reasoning (review, optimization,
-    #: debugging, generation), so we tell the router to pick a code-capable
-    #: model rather than a chat-tier one. CAR's task enum (per the binding's
-    #: error reporting): ``chat | classify | reasoning | code``.
-    DEFAULT_INTENT_HINT: dict = {"task": "code"}
+    #: debugging, generation), so we tell the router (a) it's a code task and
+    #: (b) ``prefer_quality`` — route to the most capable model, not the cheapest
+    #: or fastest. This is what lets neo rely on CAR's router WITHOUT pinning a
+    #: model version: the router picks the best available model (and, with CAR's
+    #: auto-discovery, newly-released ones) under the quality workload. Without
+    #: ``prefer_quality`` CAR's default profile is latency/cost-biased and
+    #: routes neo to mini models — a measured quality regression. CAR task enum:
+    #: ``chat | classify | reasoning | code``.
+    DEFAULT_INTENT_HINT: dict = {"task": "code", "prefer_quality": True}
 
     def __init__(
         self,
