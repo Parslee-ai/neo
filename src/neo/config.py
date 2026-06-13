@@ -96,12 +96,15 @@ class NeoConfig:
     base_url: Optional[str] = None  # For local/ollama
 
     # Inference routing.
+    #   "static" — always use the configured `provider` (never CAR). (default)
     #   "auto"   — prefer CAR's dynamic router when car-runtime is importable AND
     #              the daemon is reachable; fall back to the static provider above
     #              on absence or runtime failure. CAR is optional but used when
-    #              present. (default)
-    #   "static" — always use the configured `provider` (never CAR).
-    inference_mode: str = "auto"
+    #              present.
+    # Default is "static" (gpt-5.5) until a CAR release verifies the router's
+    # quality behavior — CAR's released router cost-biases to mini models, a
+    # measured regression. Flip to "auto" once a verified CAR build is deployed.
+    inference_mode: str = "static"
 
     # Generation settings
     default_temperature: float = 0.7

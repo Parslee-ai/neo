@@ -30,8 +30,9 @@ def _stub_create(monkeypatch):
 
 # --- config ---------------------------------------------------------------
 
-def test_inference_mode_default_is_auto():
-    assert NeoConfig().inference_mode == "auto"
+def test_inference_mode_default_is_static():
+    # Default stays static (gpt-5.5) until a CAR release verifies router quality.
+    assert NeoConfig().inference_mode == "static"
 
 
 def test_inference_mode_env_override(monkeypatch):
