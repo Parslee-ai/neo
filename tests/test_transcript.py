@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from neo.memory.models import FactKind
+from neo.memory.models import FactKind, FactScope
 from neo.memory.transcript import (
     Episode,
     TranscriptIngester,
@@ -13,6 +13,19 @@ from neo.memory.transcript import (
     collect_episodes,
     resolve_transcript_dir,
 )
+
+
+class _StaticSource:
+    """Test source yielding a fixed episode list."""
+
+    name = "test"
+    scope = FactScope.PROJECT
+
+    def __init__(self, episodes):
+        self._episodes = list(episodes)
+
+    def collect_episodes(self):
+        return list(self._episodes)
 
 
 def _write(path, records):
@@ -295,14 +308,14 @@ _LESSON = {"kind": "pattern", "subject": "verify env", "body": "Check the venv b
 def test_ingest_is_idempotent(temp_store, tmp_path, monkeypatch):
     monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
     ad = _StubAdapter([_LESSON], keep=True)
-    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
-    eps = [_ep("e1", "ask one"), _ep("e2", "ask two")]
+    src = _StaticSource([_ep("e1", "ask one"), _ep("e2", "ask two")])
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[src])
 
-    s1 = ing.ingest(episodes=eps)
+    s1 = ing.ingest()
     assert s1["episodes_new"] == 2 and s1["episodes_processed"] == 2 and s1["facts_admitted"] == 2
     calls_after_first = len(ad.calls)
 
-    s2 = ing.ingest(episodes=eps)  # re-run: everything already consumed
+    s2 = ing.ingest()  # re-run: everything already consumed
     assert s2["episodes_new"] == 0 and s2["episodes_processed"] == 0
     assert len(ad.calls) == calls_after_first  # zero new LM calls on re-run
 
@@ -310,34 +323,75 @@ def test_ingest_is_idempotent(temp_store, tmp_path, monkeypatch):
 def test_ingest_budget_resumes(temp_store, tmp_path, monkeypatch):
     monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
     ad = _StubAdapter([_LESSON], keep=True)
-    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
-    eps = [_ep(f"e{i}", f"ask {i}") for i in range(5)]
+    src = _StaticSource([_ep(f"e{i}", f"ask {i}") for i in range(5)])
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[src])
 
-    s1 = ing.ingest(episodes=eps, max_episodes=2)
+    s1 = ing.ingest(max_episodes=2)
     assert s1["episodes_new"] == 5 and s1["episodes_processed"] == 2  # budget honored
 
-    s2 = ing.ingest(episodes=eps, max_episodes=10)  # resumes the rest
+    s2 = ing.ingest(max_episodes=10)  # resumes the rest
     assert s2["episodes_new"] == 3 and s2["episodes_processed"] == 3
 
 
 def test_watermark_persisted(temp_store, tmp_path, monkeypatch):
     monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
     ad = _StubAdapter([_LESSON], keep=True)
-    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
-    ing.ingest(episodes=[_ep("e1", "ask one")])
-    assert ing._load_consumed() == {"e1"}
+    src = _StaticSource([_ep("e1", "ask one")])
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[src])
+    ing.ingest()
+    assert ing._load_consumed(src) == {"e1"}
 
 
 def test_ingest_respects_stop_and_deadline(temp_store, tmp_path, monkeypatch):
     monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
     ad = _StubAdapter([_LESSON], keep=True)
-    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
-    eps = [_ep(f"e{i}", f"ask {i}") for i in range(5)]
+    src = _StaticSource([_ep(f"e{i}", f"ask {i}") for i in range(5)])
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[src])
 
     # should_stop fires immediately -> nothing dispatched
-    s = ing.ingest(episodes=eps, should_stop=lambda: True)
+    s = ing.ingest(should_stop=lambda: True)
     assert s["episodes_processed"] == 0 and len(ad.calls) == 0
 
     # max_seconds=0 -> deadline already passed before the first episode
-    s = ing.ingest(episodes=eps, max_seconds=0)
+    s = ing.ingest(max_seconds=0)
     assert s["episodes_processed"] == 0 and len(ad.calls) == 0
+
+
+class _GlobalSource(_StaticSource):
+    name = "carlike"
+    scope = FactScope.GLOBAL
+
+
+def test_default_sources_include_claude_code(temp_store):
+    ing = TranscriptIngester(store=temp_store, lm_adapter=_StubAdapter([]), codebase_root="/x")
+    assert any(s.name == "claude-code" for s in ing.sources)
+
+
+def test_multiple_sources_independent_watermarks_and_scope(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    ad = _StubAdapter([_LESSON], keep=True)
+    s_proj = _StaticSource([_ep("p1", "project ask")])
+    s_glob = _GlobalSource([_ep("g1", "global ask")])
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[s_proj, s_glob])
+
+    stats = ing.ingest()
+    assert stats["episodes_processed"] == 2
+    # watermarks are namespaced per source — no collision
+    assert ing._load_consumed(s_proj) == {"p1"}
+    assert ing._load_consumed(s_glob) == {"g1"}
+    # facts admitted at each source's scope
+    scopes = {f.scope for f in temp_store._facts if f.is_valid}
+    assert FactScope.PROJECT in scopes
+    assert FactScope.GLOBAL in scopes
+
+
+def test_shared_budget_across_sources(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    ad = _StubAdapter([_LESSON], keep=True)
+    s1 = _StaticSource([_ep("a1", "ask"), _ep("a2", "ask")])
+    s2 = _GlobalSource([_ep("b1", "ask")])
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[s1, s2])
+    # budget of 1 is shared: only the first source's first episode is processed
+    stats = ing.ingest(max_episodes=1)
+    assert stats["episodes_processed"] == 1
+    assert ing._load_consumed(s2) == set()  # second source never reached
