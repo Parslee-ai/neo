@@ -15,7 +15,7 @@ import subprocess
 import sys
 import pytest
 
-from neo.cli import _adapter_kwargs_for_config
+from neo.adapters import _adapter_kwargs_for_config
 
 
 class TestCLIGlobalFlags:

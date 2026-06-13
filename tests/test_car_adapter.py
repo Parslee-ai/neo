@@ -93,17 +93,17 @@ def test_generate_returns_text_field_from_infer_tracked():
     # Default IntentHint should request the code task so the router
     # picks a code-capable model instead of the chat default.
     assert "intent_json" in kwargs
-    assert json.loads(kwargs["intent_json"]) == {"task": "code"}
+    assert json.loads(kwargs["intent_json"]) == {"task": "code", "prefer_quality": True}
 
 
 def test_default_intent_hint_is_code_task():
     """Neo's workload is code reasoning — the router should know."""
     rt = FakeRuntime()
     adapter = CarAdapter(runtime=rt)
-    assert adapter.intent_hint == {"task": "code"}
+    assert adapter.intent_hint == {"task": "code", "prefer_quality": True}
     adapter.generate("anything", max_tokens=8)
     _, kwargs = rt.calls[0]
-    assert json.loads(kwargs["intent_json"]) == {"task": "code"}
+    assert json.loads(kwargs["intent_json"]) == {"task": "code", "prefer_quality": True}
 
 
 def test_explicit_intent_hint_overrides_default():
@@ -130,7 +130,7 @@ def test_generate_string_prompt_skips_messages_json():
     assert prompt == "just a string prompt"
     assert "messages_json" not in kwargs
     # Default coding intent still applies on bare-string prompts.
-    assert json.loads(kwargs["intent_json"]) == {"task": "code"}
+    assert json.loads(kwargs["intent_json"]) == {"task": "code", "prefer_quality": True}
 
 
 def test_generate_pins_model_when_set():

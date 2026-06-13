@@ -4,8 +4,10 @@ LM Adapter implementations for OpenAI, Anthropic, and local models.
 
 import os
 import json
+import logging
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +19,8 @@ except ImportError:
     pass
 
 from neo.models import LMAdapter
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -742,10 +746,15 @@ class CarAdapter(LMAdapter):
 
     #: Default IntentHint sent to CAR when the caller doesn't supply one.
     #: Neo's workload is overwhelmingly code reasoning (review, optimization,
-    #: debugging, generation), so we tell the router to pick a code-capable
-    #: model rather than a chat-tier one. CAR's task enum (per the binding's
-    #: error reporting): ``chat | classify | reasoning | code``.
-    DEFAULT_INTENT_HINT: dict = {"task": "code"}
+    #: debugging, generation), so we tell the router (a) it's a code task and
+    #: (b) ``prefer_quality`` — route to the most capable model, not the cheapest
+    #: or fastest. This is what lets neo rely on CAR's router WITHOUT pinning a
+    #: model version: the router picks the best available model (and, with CAR's
+    #: auto-discovery, newly-released ones) under the quality workload. Without
+    #: ``prefer_quality`` CAR's default profile is latency/cost-biased and
+    #: routes neo to mini models — a measured quality regression. CAR task enum:
+    #: ``chat | classify | reasoning | code``.
+    DEFAULT_INTENT_HINT: dict = {"task": "code", "prefer_quality": True}
 
     def __init__(
         self,
@@ -908,3 +917,118 @@ def create_adapter(
             f"Unknown provider: {provider}. "
             f"Supported: openai, anthropic, google, azure, local, ollama, claude-code, car"
         )
+
+
+#: Seconds the breaker stays open after a CAR failure before half-opening to
+#: re-probe CAR. Bounds retry-storms while letting a long-lived process recover
+#: from a transient CAR outage instead of pinning to the fallback forever.
+_CAR_RETRY_COOLDOWN_S = 300.0
+
+
+class AutoAdapter(LMAdapter):
+    """CAR-first adapter: route through CAR's dynamic router, fall back to a
+    static adapter when a CAR call fails.
+
+    Constructed only when CAR is usable at build time (see ``resolve_adapter``),
+    so "CAR absent / daemon down at start" is handled there. This handles the
+    other half — CAR failing mid-process (daemon dies, a call errors): a failure
+    opens a circuit breaker for ``retry_cooldown`` seconds (no retry-storm),
+    after which it half-opens and re-probes CAR (so a transient outage doesn't
+    pin a long-lived observer/host to the fallback forever).
+
+    The fallback is built **lazily** via ``fallback_factory`` — so when CAR is
+    the only usable backend, a missing/invalid static-provider key never blocks
+    CAR (it's only constructed if CAR actually fails).
+
+    The breaker is intentionally lock-free: ``_disabled_until`` is a plain float
+    written from ``generate``. Concurrent callers may both see CAR up, both
+    fail, both push the cooldown — idempotent, no torn state — so car_host's
+    shared per-project adapter is safe without a mutex.
+    """
+
+    def __init__(self, car: LMAdapter, fallback_factory,
+                 retry_cooldown: float = _CAR_RETRY_COOLDOWN_S):
+        self._car = car
+        self._make_fallback = fallback_factory
+        self._fallback: Optional[LMAdapter] = None
+        self._retry_cooldown = retry_cooldown
+        self._disabled_until = 0.0  # monotonic deadline; <= now => CAR eligible
+
+    def _fallback_adapter(self) -> LMAdapter:
+        if self._fallback is None:
+            self._fallback = self._make_fallback()
+        return self._fallback
+
+    def generate(self, messages, stop=None, max_tokens: int = 4096,
+                 temperature: float = 0.7, reasoning_effort: Optional[str] = None) -> str:
+        if time.monotonic() >= self._disabled_until:
+            try:
+                return self._car.generate(
+                    messages, stop=stop, max_tokens=max_tokens,
+                    temperature=temperature, reasoning_effort=reasoning_effort,
+                )
+            except Exception as e:
+                self._disabled_until = time.monotonic() + self._retry_cooldown
+                logger.warning(
+                    "CAR inference failed (%s); using the static fallback for ~%.0fs: %s",
+                    type(e).__name__, self._retry_cooldown, e,
+                )
+        return self._fallback_adapter().generate(
+            messages, stop=stop, max_tokens=max_tokens,
+            temperature=temperature, reasoning_effort=reasoning_effort,
+        )
+
+    def name(self) -> str:
+        return f"auto({self._car.name()} -> static)"
+
+
+def _adapter_kwargs_for_config(config) -> dict:
+    """Build provider-specific adapter kwargs from config."""
+    provider = config.provider.lower()
+    adapter_kwargs = {}
+    if provider in ("openai", "anthropic", "google", "azure", "local", "claude-code"):
+        adapter_kwargs["api_key"] = config.api_key
+    if config.base_url:
+        if provider in ("openai", "local", "ollama", "claude-code"):
+            adapter_kwargs["base_url"] = config.base_url
+        elif provider == "azure":
+            adapter_kwargs["endpoint"] = config.base_url
+    return adapter_kwargs
+
+
+def resolve_adapter(config) -> LMAdapter:
+    """Build the inference adapter for a NeoConfig, honoring ``inference_mode``.
+
+    Default ("auto"): prefer CAR's dynamic router when car-runtime is importable
+    AND the daemon is reachable, falling back to the configured static provider
+    on absence or runtime failure. "static": always the configured provider.
+
+    CAR is therefore optional — neo works without it — but used when present.
+    The static adapter is built **lazily** (only when CAR is unavailable, or as
+    the fallback after a CAR failure) so that a CAR-only install with no static
+    provider key configured still works.
+    """
+    def build_static() -> LMAdapter:
+        return create_adapter(
+            config.provider,
+            config.model,
+            **_adapter_kwargs_for_config(config),
+        )
+
+    mode = str(getattr(config, "inference_mode", "auto") or "auto").strip().lower()
+    if mode not in ("auto", "static"):
+        logger.warning("unknown inference_mode %r; using 'auto'", mode)
+        mode = "auto"
+
+    if mode == "auto":
+        # CAR-first: only build the CAR adapter when CAR is genuinely usable, so
+        # we never pay an import/connect error just to fall back.
+        try:
+            from neo.a2ui import is_daemon_reachable
+            from neo.car_inference import is_available as car_available
+            if car_available() and is_daemon_reachable():
+                car = create_adapter("car", model=None)  # model=None -> CAR routes dynamically
+                return AutoAdapter(car, build_static)
+        except Exception as e:
+            logger.debug("CAR-first unavailable, using static provider: %s", e)
+    return build_static()
