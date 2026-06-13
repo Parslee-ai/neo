@@ -34,7 +34,8 @@
   - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` run on every
     cold start (`store.py:190-192`). For on-demand compaction of tombstone bloat in a
     specific project's fact file, use `neo memory prune [--all] [--dry-run]`
-    (`subcommands.py:_compact_fact_file`).
+    (`neo/subcommands.py:_compact_fact_file` — at the package root, not
+    under `memory/`).
 - Domain tags (`Fact.domain`, `memory.models.SUGGESTED_DOMAINS`): optional free-form
   area tag orthogonal to `FactKind` — `code-style`, `testing`, `git`, `debugging`,
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the
@@ -92,7 +93,7 @@
   that runs `synthesize_reviews` on a wall-clock cadence, decoupled from the
   request path. *Additive* — the inline triple-trigger gate keeps firing too;
   the observer just makes synthesis more frequent. **Hard dep**: car-runtime
-  ≥ 0.17.0 and a running `car-server` daemon — CAR's supervisor owns the
+  ≥ 0.18.0 and a running `car-server` daemon — CAR's supervisor owns the
   spawn / restart-on-failure / log redirection / clean SIGTERM shutdown.
   Spec persisted to `~/.car/agents.json` (`auto_start: true` so it comes back
   on daemon boot); logs land at `~/.car/logs/neo-observer-<id8>.{stdout,stderr}.log`.

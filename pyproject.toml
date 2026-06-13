@@ -76,7 +76,13 @@ ollama = ["requests>=2.31.0"]
 # for `CarAdapter`-only use, but `neo memory observer start` will
 # reject them with an actionable error.
 car = [
-    "car-runtime>=0.18.0",
+    # Upper-capped at the next major so `keep current` (a plain
+    # `pipx upgrade`) tracks latest within a compatible major rather
+    # than silently adopting a breaking rewrite of this sealed binary.
+    # NB: car-runtime is pre-1.0, so 0.x minor bumps can still carry
+    # breaking changes (see history above) — validate the observer
+    # after upgrading across a minor.
+    "car-runtime>=0.18.0,<1.0",
     # JSON-RPC-over-WebSocket client for the A2UI surface
     # (`neo.a2ui`). The Python `car_runtime.a2ui_*` helpers are
     # in-process only; reaching the daemon's a2ui store — which is
