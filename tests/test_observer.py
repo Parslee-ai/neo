@@ -100,6 +100,9 @@ class TestObserverConfig:
         cfg = ObserverConfig.from_env()
         assert cfg.interval_seconds == 300.0
         assert cfg.cooldown_seconds == 60.0
+        # Ingest bounds are committed constants, not env-toggleable.
+        assert cfg.ingest_budget == 8
+        assert cfg.ingest_deadline_seconds == 120.0
 
     def test_env_overrides(self, monkeypatch):
         monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "15")
@@ -116,6 +119,21 @@ class TestObserverConfig:
         cfg = ObserverConfig.from_env()
         assert cfg.interval_seconds == 300.0
         assert cfg.cooldown_seconds == 60.0
+
+    def test_zero_budget_is_defensive_noop(self):
+        # Not a feature toggle (budget is a committed constant) — just a guard
+        # so a 0 can't waste an adapter build.
+        from neo.memory.observer import Observer, ObserverConfig
+        obs = Observer(codebase_root="/tmp/x", config=ObserverConfig(ingest_budget=0))
+        assert obs._ingest_transcripts(store=None) == 0
+
+    def test_ingest_transcripts_swallows_errors(self, monkeypatch):
+        # Force an error inside the ingest path; the cycle must not crash.
+        from neo.memory.observer import Observer, ObserverConfig
+        monkeypatch.setattr("neo.config.NeoConfig.load",
+                            staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))))
+        obs = Observer(codebase_root="/tmp/x", config=ObserverConfig(ingest_budget=5))
+        assert obs._ingest_transcripts(store=None) == 0
 
 
 class TestStartObserver:
@@ -269,8 +287,11 @@ class TestObserverCycleUnit:
     """Drive Observer._cycle directly — no daemon, no signals."""
 
     def test_cycle_calls_synthesize_reviews(self, fake_project_id, monkeypatch):
-        from neo.memory.observer import Observer
-        observer = Observer(codebase_root="/some/path")
+        from neo.memory.observer import Observer, ObserverConfig
+        # ingest_budget=0 so this isolates synthesis (otherwise the real ingest
+        # path runs and only passes because it swallows its own failure).
+        observer = Observer(codebase_root="/some/path",
+                            config=ObserverConfig(ingest_budget=0))
 
         call_count = {"n": 0}
 
@@ -292,8 +313,9 @@ class TestObserverCycleUnit:
         assert observer._last_analysis_epoch > 0
 
     def test_cycle_swallows_errors(self, fake_project_id, monkeypatch):
-        from neo.memory.observer import Observer
-        observer = Observer(codebase_root="/some/path")
+        from neo.memory.observer import Observer, ObserverConfig
+        observer = Observer(codebase_root="/some/path",
+                            config=ObserverConfig(ingest_budget=0))
 
         class _BrokenStore:
             def __init__(self, **kwargs):
@@ -301,6 +323,57 @@ class TestObserverCycleUnit:
 
         monkeypatch.setattr("neo.memory.store.FactStore", _BrokenStore)
         observer._cycle()  # must not raise
+
+    def test_cycle_ingests_and_records(self, fake_project_id, monkeypatch, tmp_path):
+        """Positive end-to-end: ingest runs inside _cycle and admits a fact."""
+        import neo.memory.transcript as tr
+        from neo.memory.observer import Observer, ObserverConfig
+
+        monkeypatch.setattr(tr, "SESSIONS_DIR", tmp_path / "sessions")
+        admitted = []
+
+        class _FakeStore:
+            project_id = "testproj"
+
+            def __init__(self, **kwargs):
+                pass
+
+            def initialize(self):
+                pass
+
+            def synthesize_reviews(self):
+                return 0
+
+            def add_fact(self, **kw):
+                admitted.append(kw)
+                return object()
+
+        class _Cfg:
+            provider, model, api_key, base_url = "openai", "m", "k", None
+
+        class _Adapter:
+            def generate(self, messages, **kw):
+                p = messages[0]["content"]
+                if '"lessons"' in p:
+                    return ('{"lessons":[{"kind":"pattern","subject":"s","body":"b",'
+                            '"domain":"testing","evidence_span":"hello world"}]}')
+                return '{"keep": true}'
+
+        ep = tr.Episode(session_id="s", anchor_uuid="u1", last_uuid="u1", timestamp="t",
+                        ask="why", assistant_text=["hello world"], tools=[])
+
+        monkeypatch.setattr("neo.memory.store.FactStore", _FakeStore)
+        monkeypatch.setattr("neo.config.NeoConfig.load", staticmethod(lambda *a, **k: _Cfg()))
+        monkeypatch.setattr("neo.adapters.create_adapter", lambda *a, **k: _Adapter())
+        monkeypatch.setattr(tr, "collect_episodes", lambda root: [ep])
+
+        observer = Observer(codebase_root="/p", config=ObserverConfig(ingest_budget=5))
+        observer._cycle()
+
+        assert len(admitted) == 1                       # a lesson was admitted
+        assert admitted[0]["domain"] == "testing"
+        assert observer._last_ingest_error is None
+        assert "1 mined" in observer._recent_cycles[-1]["text"]
 
 
 class TestCooldown:
