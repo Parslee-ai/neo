@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -419,6 +420,156 @@ class CarSource:
         )
 
 
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+# Sanity ceiling only. Rollouts are parsed line-by-line (bounded memory), and
+# real working sessions legitimately reach hundreds of MB (inline command
+# output), so this is set high — it exists to skip a truly broken file, not to
+# drop real data. Logged, not silent.
+_CODEX_MAX_ROLLOUT_BYTES = 2 * 1024 * 1024 * 1024
+# Codex injects a synthetic "agent history" review wrapper as a user_message;
+# it is not a human ask and must not anchor an episode.
+_CODEX_SYNTHETIC_PREFIX = "The following is the Codex agent history"
+_CODEX_EXIT_RE = re.compile(r"exited with code (\d+)")
+
+
+def _codex_output_error(output: str) -> Optional[str]:
+    """Return a failure snippet from a function_call_output blob, else None.
+
+    Codex command results land in ``function_call_output.output`` as text like
+    ``Process exited with code 1\n...`` or ``command timed out after ...`` — the
+    only error channel in the modern rollout format. Success blobs say
+    ``exited with code 0`` and are ignored.
+    """
+    if not output:
+        return None
+    m = _CODEX_EXIT_RE.search(output)
+    failed = (m is not None and m.group(1) != "0") or "timed out" in output.lower()
+    return output.strip()[:300] if failed else None
+
+
+class CodexSource:
+    """Codex CLI session rollouts (``~/.codex/sessions/**/rollout-*.jsonl``).
+
+    Rollouts are ``{timestamp, type, payload}`` JSONL whose first record is a
+    ``session_meta`` carrying ``cwd``. Unlike CAR, that makes them
+    project-attributable, so this is PROJECT-scoped: only rollouts whose cwd is
+    within the current ``codebase_root`` are ingested. Conversation lives in
+    ``event_msg`` records (``user_message`` anchors an episode, ``agent_message``
+    is assistant text), tools in ``response_item`` ``function_call`` names, and
+    errors in ``exec_command_end`` with a non-zero ``exit_code``. Rollouts are
+    append-only, so ``(session_id, record-timestamp)`` is a stable watermark
+    anchor.
+    """
+
+    name = "codex"
+    scope = FactScope.PROJECT
+
+    def __init__(self, codebase_root: Optional[str], sessions_dir: Optional[Path] = None):
+        self.codebase_root = codebase_root
+        self._dir = sessions_dir or CODEX_SESSIONS_DIR
+
+    def collect_episodes(self) -> list[Episode]:
+        root = self.codebase_root
+        if not root or not self._dir.is_dir():
+            return []
+        episodes: list[Episode] = []
+        for fp in sorted(self._dir.glob("**/rollout-*.jsonl")):
+            if not self._cwd_within_root(fp, root):
+                continue
+            try:
+                if fp.stat().st_size > _CODEX_MAX_ROLLOUT_BYTES:
+                    logger.warning("transcript: skipping oversized codex rollout %s", fp.name)
+                    continue
+            except OSError:
+                continue
+            episodes.extend(self._rollout_to_episodes(fp))
+        return episodes
+
+    @staticmethod
+    def _cwd_within_root(fp: Path, root: str) -> bool:
+        """Cheap project filter: read only the first record (session_meta)."""
+        try:
+            with fp.open(encoding="utf-8") as f:
+                first = f.readline()
+            r = json.loads(first)
+        except (OSError, json.JSONDecodeError):
+            return False
+        if r.get("type") != "session_meta":
+            return False
+        cwd = (r.get("payload") or {}).get("cwd") or ""
+        return cwd == root or cwd.startswith(root.rstrip("/") + "/")
+
+    @staticmethod
+    def _rollout_to_episodes(fp: Path) -> list[Episode]:
+        episodes: list[Episode] = []
+        sid = fp.stem
+        msg_idx = 0  # monotonic per-session index keeps anchors unique even if
+        # two records share a timestamp; stable across runs (append-only order).
+        cur: Optional[Episode] = None
+        try:
+            handle = fp.open(encoding="utf-8")
+        except OSError:
+            return []
+        with handle as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = r.get("type")
+                p = r.get("payload")
+                if not isinstance(p, dict):
+                    continue
+                if t == "session_meta":
+                    sid = str(p.get("id") or sid)
+                elif t == "event_msg":
+                    pt = p.get("type")
+                    if pt == "user_message":
+                        msg = str(p.get("message") or "").strip()
+                        if msg and not _is_synthetic(msg) \
+                                and not msg.startswith(_CODEX_SYNTHETIC_PREFIX):
+                            if cur:
+                                episodes.append(cur)
+                            # (sid, msg_idx) is already unique + stable under the
+                            # append-only ordering; no timestamp needed.
+                            anchor = f"{sid}:{msg_idx}"
+                            msg_idx += 1
+                            cur = Episode(
+                                session_id=sid, anchor_uuid=anchor, last_uuid=anchor,
+                                timestamp=str(r.get("timestamp", "")),
+                                ask=msg[:_MAX_ASK_CHARS],
+                            )
+                    elif pt == "agent_message" and cur is not None:
+                        # Use agent_message (not response_item/message, role=assistant)
+                        # for assistant text — they are byte-identical duplicates;
+                        # reading both would double every assistant turn.
+                        m = str(p.get("message") or "").strip()
+                        if m:
+                            cur.assistant_text.append(m)
+                    elif pt == "exec_command_end" and cur is not None:
+                        # Older-format error channel; modern rollouts use
+                        # function_call_output below.
+                        if p.get("exit_code") not in (0, None):
+                            err = str(p.get("stderr") or "").strip()[:300] or f"exit {p.get('exit_code')}"
+                            cur.errors.append(err)
+                    elif pt == "patch_apply_end" and cur is not None:
+                        if p.get("success") is False:
+                            err = str(p.get("stderr") or "").strip()[:300] or "patch apply failed"
+                            cur.errors.append(err)
+                elif t == "response_item" and cur is not None:
+                    pt = p.get("type")
+                    if pt == "function_call" and p.get("name"):
+                        cur.tools.append(str(p["name"]))
+                    elif pt == "function_call_output":
+                        # The primary error channel in the modern rollout format.
+                        err = _codex_output_error(str(p.get("output") or ""))
+                        if err:
+                            cur.errors.append(err)
+        if cur:
+            episodes.append(cur)
+        return episodes
+
+
 class TranscriptIngester:
     """Extract verified, generalizable lessons from transcript episodes and
     admit them directly as PATTERN/FAILURE facts.
@@ -434,9 +585,10 @@ class TranscriptIngester:
         self._store = store
         self._lm = lm_adapter
         self.codebase_root = codebase_root or getattr(store, "codebase_root", None)
-        # Default source set; add Codex/etc. here as adapters land.
+        # Default source set; add new tool adapters here as they land.
         self.sources = sources if sources is not None else [
             ClaudeCodeSource(self.codebase_root),
+            CodexSource(self.codebase_root),
             CarSource(),
         ]
 
