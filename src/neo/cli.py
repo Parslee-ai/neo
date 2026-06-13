@@ -364,20 +364,6 @@ def _configure_logging(args) -> None:
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
 
-def _adapter_kwargs_for_config(config) -> dict:
-    """Build provider-specific adapter kwargs from config."""
-    provider = config.provider.lower()
-    adapter_kwargs = {}
-    if provider in ("openai", "anthropic", "google", "azure", "local", "claude-code"):
-        adapter_kwargs["api_key"] = config.api_key
-    if config.base_url:
-        if provider in ("openai", "local", "ollama", "claude-code"):
-            adapter_kwargs["base_url"] = config.base_url
-        elif provider == "azure":
-            adapter_kwargs["endpoint"] = config.base_url
-    return adapter_kwargs
-
-
 def main():
     """Main entry point for stdin/stdout interface."""
     # Parse arguments
@@ -695,7 +681,7 @@ def main():
 
     # Initialize adapter from environment
     # NO STUBS OR FALLBACKS - require real configuration
-    from neo.adapters import create_adapter
+    from neo.adapters import resolve_adapter
     from neo.config import NeoConfig
 
     try:
@@ -709,11 +695,7 @@ def main():
                 if cfg_level is not None:
                     logging.getLogger().setLevel(cfg_level)
 
-        adapter = create_adapter(
-            provider=config.provider,
-            model=config.model,
-            **_adapter_kwargs_for_config(config),
-        )
+        adapter = resolve_adapter(config)
     except Exception as e:
         error_output = {
             "error": f"Failed to initialize LM adapter: {e}",

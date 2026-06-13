@@ -119,15 +119,10 @@ def run_server(
             engine = engines.get(working_dir)
             if engine is not None:
                 return engine
-            from neo.adapters import create_adapter
-            from neo.cli import _adapter_kwargs_for_config
+            from neo.adapters import resolve_adapter
             from neo.engine import NeoEngine
 
-            adapter = create_adapter(
-                provider=config.provider,
-                model=config.model,
-                **_adapter_kwargs_for_config(config),
-            )
+            adapter = resolve_adapter(config)
             engine = NeoEngine(
                 lm_adapter=adapter,
                 codebase_root=working_dir,

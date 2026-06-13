@@ -324,14 +324,12 @@ class Observer:
         if self.config.ingest_budget <= 0:
             return 0
         try:
-            from neo.adapters import create_adapter
+            from neo.adapters import resolve_adapter
             from neo.config import NeoConfig
             from neo.memory.transcript import TranscriptIngester
 
             cfg = NeoConfig.load()
-            adapter = create_adapter(
-                cfg.provider, cfg.model, api_key=cfg.api_key, base_url=cfg.base_url
-            )
+            adapter = resolve_adapter(cfg)
             ingester = TranscriptIngester(
                 store=store, lm_adapter=adapter, codebase_root=self.codebase_root
             )

@@ -95,6 +95,14 @@ class NeoConfig:
     api_key: Optional[str] = None
     base_url: Optional[str] = None  # For local/ollama
 
+    # Inference routing.
+    #   "auto"   — prefer CAR's dynamic router when car-runtime is importable AND
+    #              the daemon is reachable; fall back to the static provider above
+    #              on absence or runtime failure. CAR is optional but used when
+    #              present. (default)
+    #   "static" — always use the configured `provider` (never CAR).
+    inference_mode: str = "auto"
+
     # Generation settings
     default_temperature: float = 0.7
     default_max_tokens: int = 4096
@@ -180,6 +188,8 @@ class NeoConfig:
             config.model = model
         if base_url := os.environ.get("NEO_BASE_URL"):
             config.base_url = base_url
+        if mode := os.environ.get("NEO_INFERENCE_MODE"):
+            config.inference_mode = mode
 
         # API keys. NEO_API_KEY is the explicit generic override; otherwise
         # choose the provider-specific key for the selected provider only.
@@ -249,6 +259,7 @@ class NeoConfig:
             "NEO_PROVIDER": "provider",
             "NEO_MODEL": "model",
             "NEO_BASE_URL": "base_url",
+            "NEO_INFERENCE_MODE": "inference_mode",
             "NEO_TEMPERATURE": "default_temperature",
             "NEO_MAX_TOKENS": "default_max_tokens",
             "NEO_EXEMPLAR_DIR": "exemplar_dir",
