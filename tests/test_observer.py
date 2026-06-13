@@ -94,39 +94,37 @@ class TestSpecBuilding:
 
 class TestObserverConfig:
     def test_defaults(self, monkeypatch):
-        for k in ("NEO_OBSERVER_INTERVAL_SECONDS", "NEO_OBSERVER_COOLDOWN",
-                  "NEO_OBSERVER_INGEST_BUDGET"):
+        for k in ("NEO_OBSERVER_INTERVAL_SECONDS", "NEO_OBSERVER_COOLDOWN"):
             monkeypatch.delenv(k, raising=False)
         from neo.memory.observer import ObserverConfig
         cfg = ObserverConfig.from_env()
         assert cfg.interval_seconds == 300.0
         assert cfg.cooldown_seconds == 60.0
+        # Ingest bounds are committed constants, not env-toggleable.
         assert cfg.ingest_budget == 8
+        assert cfg.ingest_deadline_seconds == 120.0
 
     def test_env_overrides(self, monkeypatch):
         monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "15")
         monkeypatch.setenv("NEO_OBSERVER_COOLDOWN", "3")
-        monkeypatch.setenv("NEO_OBSERVER_INGEST_BUDGET", "20")
         from neo.memory.observer import ObserverConfig
         cfg = ObserverConfig.from_env()
         assert cfg.interval_seconds == 15.0
         assert cfg.cooldown_seconds == 3.0
-        assert cfg.ingest_budget == 20
 
     def test_rejects_garbage(self, monkeypatch):
         monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "junk")
         monkeypatch.setenv("NEO_OBSERVER_COOLDOWN", "-5")
-        monkeypatch.setenv("NEO_OBSERVER_INGEST_BUDGET", "-1")
         from neo.memory.observer import ObserverConfig
         cfg = ObserverConfig.from_env()
         assert cfg.interval_seconds == 300.0
         assert cfg.cooldown_seconds == 60.0
-        assert cfg.ingest_budget == 8
 
-    def test_ingest_budget_zero_disables(self):
+    def test_zero_budget_is_defensive_noop(self):
+        # Not a feature toggle (budget is a committed constant) — just a guard
+        # so a 0 can't waste an adapter build.
         from neo.memory.observer import Observer, ObserverConfig
         obs = Observer(codebase_root="/tmp/x", config=ObserverConfig(ingest_budget=0))
-        # budget 0 -> no transcript work, no adapter built, returns 0
         assert obs._ingest_transcripts(store=None) == 0
 
     def test_ingest_transcripts_swallows_errors(self, monkeypatch):

@@ -215,14 +215,15 @@ separate cycle ONLY if the tick is measured to stall WS responsiveness.
 **Critical bound (added in review):** an episode *count* budget does not bound
 *time* — with up to ~32 serial LM calls and a 600s adapter timeout, a hung
 provider could park the executor thread and stonewall SIGTERM (the supervisor only
-re-checks `_stop` between executor calls). So ingest is bounded by BOTH
-`NEO_OBSERVER_INGEST_BUDGET` (episodes, default 8) AND
-`NEO_OBSERVER_INGEST_DEADLINE` (wall-clock, default 120s), plus a `should_stop`
-check that honors SIGTERM. These stop *dispatching new* episodes; an in-flight
-call still runs to its own timeout, so worst case collapses from N×timeout to ~1.
-The backlog drains on the next cycle via the watermark. Ingest is isolated in its
-own try/except (runs after synthesis is durable) and surfaces failures in the cycle
-record, not just stderr.
+re-checks `_stop` between executor calls). So ingest is bounded by BOTH a
+per-cycle episode budget (8) AND a wall-clock deadline (120s), plus a
+`should_stop` check that honors SIGTERM. These are **committed constants, not
+env toggles** — the feature is always on, no runtime flag to enable/disable it.
+The bounds stop *dispatching new* episodes; an in-flight call still runs to its
+own timeout, so worst case collapses from N×timeout to ~1. The backlog drains on
+the next cycle via the watermark. Ingest is isolated in its own try/except (runs
+after synthesis is durable) and surfaces failures in the cycle record, not just
+stderr.
 
 ### Watermark — atomic-after-write, per-episode (corrected from v1)
 

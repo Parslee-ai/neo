@@ -136,13 +136,12 @@ class ObserverConfig:
 
     interval_seconds: float = 300.0
     cooldown_seconds: float = 60.0
-    # Max transcript episodes mined per cycle. Bounds LM calls; the backlog
-    # drains across cycles. 0 disables transcript ingestion.
+    # Committed safety bounds for the per-cycle transcript-mining pass — not
+    # runtime toggles. ``ingest_budget`` caps episodes per cycle (the backlog
+    # drains across cycles); ``ingest_deadline_seconds`` caps wall time so a
+    # hung provider can't park the cycle and stonewall SIGTERM. Kept well under
+    # the interval so a slow pass doesn't swallow the wake cadence.
     ingest_budget: int = 8
-    # Wall-clock cap on the mining pass. Stops dispatching new episodes past
-    # this (an in-flight LM call still runs to its own timeout) so a hung
-    # provider can't park the cycle and stonewall SIGTERM. Kept well under the
-    # interval so a slow pass doesn't swallow the wake cadence.
     ingest_deadline_seconds: float = 120.0
 
     @classmethod
@@ -157,21 +156,9 @@ class ObserverConfig:
             except ValueError:
                 return default
 
-        def _read_int(name: str, default: int) -> int:
-            raw = os.getenv(name, "").strip()
-            if not raw:
-                return default
-            try:
-                v = int(raw)
-                return v if v >= 0 else default
-            except ValueError:
-                return default
-
         return cls(
             interval_seconds=_read("NEO_OBSERVER_INTERVAL_SECONDS", 300.0),
             cooldown_seconds=_read("NEO_OBSERVER_COOLDOWN", 60.0),
-            ingest_budget=_read_int("NEO_OBSERVER_INGEST_BUDGET", 8),
-            ingest_deadline_seconds=_read("NEO_OBSERVER_INGEST_DEADLINE", 120.0),
         )
 
 
