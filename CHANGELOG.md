@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.21.0] - 2026-06-13
+
+### Added
+
+neo now learns from the behavioral record of AI coding tools — not just git — and can route inference through CAR when configured to.
+
+- **Transcript learning (observer).** The synthesis observer was *starved*, not broken: on a real project, 92 diverse REVIEW facts produced 0 patterns because they don't cluster. A Phase 0 spike confirmed the fix isn't more clustering (diverse lessons don't cluster; the only clusters are paraphrase-dup artifacts) — it's richer ingestion. The observer now mines AI-tool session transcripts each cycle, extracts generalizable lessons via the configured LM, and admits the verified ones **directly as retrievable PATTERN/FAILURE facts** (no clustering step). Two hard admission gates: the cited `evidence_span` must appear **verbatim** in the source transcript, and an adversarial LM judge must keep the lesson. Lessons enter probationary at capped confidence (≤0.6) with `INFERRED` provenance, so they never out-rank corroborated facts and decay out if unhelpful. Bounded per cycle by an episode budget **and** a wall-clock deadline **and** a SIGTERM stop-check, so a hung provider can't stall the CAR-supervised process. (`memory/transcript.py`, `memory/observer.py`)
+- **Multi-source ingestion via a `TranscriptSource` adapter interface.** Each tool is a small parser yielding a common `Episode`; the extract→verify→admit pipeline, the existing cosine supersession dedup, and a per-source watermark are reused unchanged. Three live sources: **Claude Code** (`~/.claude/projects`, project-scoped), **Codex** (`~/.codex/sessions` rollouts — project-scoped by `cwd`, errors read from `function_call_output`), and **CAR** (`~/.car/sessions`, global-scoped, finished-only + ask-deduped). Watermarks are namespaced per `(source, scope)`; the shared per-cycle budget spans sources. Codex/Cursor/etc. are drop-in adapters.
+- **CAR-first inference mode** (`NeoConfig.inference_mode`, env `NEO_INFERENCE_MODE`). `"auto"` prefers CAR's dynamic router when `car-runtime` is importable **and** the daemon is reachable, falling back to the configured static provider on absence or runtime failure — via an `AutoAdapter` whose circuit breaker half-opens after a cooldown and whose static fallback is built lazily (so a CAR-only install with no static key still works). **Defaults to `"static"`** (the configured provider, e.g. gpt-5.5): CAR-first is a fully-built opt-in pending a CAR release that verifies the router's quality routing. (`adapters.py`, `config.py`)
+
+### Changed
+
+- **`add_fact` gains a `domain` parameter** threaded to `Fact.domain`, so transcript-derived lessons are matched by `retrieve_relevant(domain=...)` rather than lost in tags. (`memory/store.py`)
+- Observer `car-runtime` version references aligned to the `>=0.18.0` floor (the gate is capability-based; the numbers are documentation), and the project-doc `subcommands.py` path corrected to `neo/subcommands.py`.
+
 ## [0.20.3] - 2026-05-26
 
 ### Fixed
