@@ -11,8 +11,10 @@ agent supervisor:
     redirection to ``~/.car/logs/<id>.{stdout,stderr}.log``, and auto-
     start at daemon boot when ``auto_start=True``.
 
-Hard dependency on ``car-runtime>=0.16.1`` (when the ``agents_*``
-lifecycle API landed). The car-server daemon must be running; the
+Hard dependency on ``car-runtime>=0.18.0`` (the ``agents_*`` lifecycle
+API landed in 0.16.1, but earlier bindings grab the supervisor manifest
+lock in-process and collide with a running car-server — see
+Parslee-ai/car-releases#54). The car-server daemon must be running; the
 CAR bindings will auto-spawn it via ``CAR_AUTOSTART`` if reachable
 on the default ``ws://127.0.0.1:9100``.
 
@@ -51,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 _CAR_REQUIRED_MSG = (
-    "Observer requires car-runtime >= 0.17.0 (where the agents_* "
+    "Observer requires car-runtime >= 0.18.0 (where the agents_* "
     "calls route to the running car-server daemon instead of "
     "colliding with its supervisor lock — see Parslee-ai/car-releases#54). "
     "Install: `pip install neo[car]`, then ensure car-server is running "

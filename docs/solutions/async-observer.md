@@ -7,7 +7,8 @@ after ECC's `continuous-learning-v2` observer
 > **As-built note (post-v0.19):** the first cut of this proposal rolled its own
 > daemon (`subprocess.Popen` + PID file + SIGUSR1 kick + idle-exit). That
 > implementation was replaced before any release with a port to CAR's
-> `agents_*` lifecycle API (car-runtime ≥ 0.16.1). The motivation, ECC
+> `agents_*` lifecycle API (the API landed in car-runtime 0.16.1; the
+> hard dep is ≥ 0.18.0 — see car-releases#54). The motivation, ECC
 > reference points, and design rationale below remain accurate; the
 > "Process model" section's plumbing is **superseded** — CAR's supervisor
 > owns spawn, restart-on-failure, log redirection, and clean shutdown.
