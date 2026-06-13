@@ -28,7 +28,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
 
+from neo.memory.io_utils import atomic_write_json
 from neo.memory.models import FactKind, FactScope, Provenance
+from neo.memory.outcomes import SESSIONS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -374,7 +376,11 @@ class TranscriptIngester:
         )
 
     def ingest_episode(self, ep: Episode) -> int:
-        """Full per-episode pipeline; returns number of facts admitted."""
+        """Full per-episode pipeline; returns number of facts admitted.
+
+        ``store.add_fact`` saves to disk on each call, so an episode's facts
+        are durably written before ``ingest`` advances the watermark.
+        """
         if not ep.is_substantive:
             return 0
         admitted = 0
@@ -383,6 +389,57 @@ class TranscriptIngester:
                 self.admit(lesson, ep)
                 admitted += 1
         return admitted
+
+    # -- incremental ingest with watermark -------------------------------
+    def ingest(self, episodes: Optional[list[Episode]] = None,
+               max_episodes: Optional[int] = None) -> dict:
+        """Ingest not-yet-consumed episodes, advancing the watermark per episode.
+
+        Idempotent: an episode's ``anchor_uuid`` is recorded as consumed only
+        *after* its facts are durably written, so a re-run skips it and a crash
+        mid-episode simply reprocesses it (dedup absorbs any partial). The
+        watermark is keyed by project, not by transcript path, so it survives
+        worktrees/clones that share the same git remote.
+        """
+        if episodes is None:
+            episodes = collect_episodes(self.codebase_root)
+        consumed = self._load_consumed()
+        new = [e for e in episodes if e.anchor_uuid not in consumed]
+        stats = {"episodes_total": len(episodes), "episodes_new": len(new),
+                 "episodes_processed": 0, "facts_admitted": 0}
+        for ep in new:
+            if max_episodes is not None and stats["episodes_processed"] >= max_episodes:
+                break
+            stats["facts_admitted"] += self.ingest_episode(ep)
+            consumed.add(ep.anchor_uuid)
+            self._persist_consumed(consumed)   # advance only after facts are durable
+            stats["episodes_processed"] += 1
+        return stats
+
+    def _watermark_path(self) -> Optional[Path]:
+        pid = getattr(self._store, "project_id", None)
+        if not pid:
+            return None
+        return SESSIONS_DIR / f"transcript_watermark_{pid}.json"
+
+    def _load_consumed(self) -> set:
+        path = self._watermark_path()
+        if not path or not path.exists():
+            return set()
+        try:
+            return set(json.loads(path.read_text(encoding="utf-8")).get("consumed", []))
+        except (OSError, json.JSONDecodeError):
+            return set()
+
+    def _persist_consumed(self, consumed: set) -> None:
+        path = self._watermark_path()
+        if not path:
+            return
+        try:
+            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, {"consumed": sorted(consumed)})
+        except OSError as e:
+            logger.warning("transcript: failed to persist watermark: %s", e)
 
     def _lm_json(self, prompt: str) -> Optional[dict]:
         try:

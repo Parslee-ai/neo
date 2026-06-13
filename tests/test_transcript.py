@@ -277,3 +277,52 @@ def test_ingest_skips_nonsubstantive(temp_store):
     ep = Episode(session_id="s", anchor_uuid="u", last_uuid="u", timestamp="t", ask="just asking")
     assert ing.ingest_episode(ep) == 0
     assert ad.calls == []  # no LM calls for a non-substantive episode
+
+
+# --------------------------------------------------------------------------
+# Watermark / incremental ingest
+# --------------------------------------------------------------------------
+
+def _ep(uid, ask):
+    return Episode(session_id="s", anchor_uuid=uid, last_uuid=uid, timestamp="t",
+                   ask=ask, assistant_text=["the venv was missing pytest-asyncio"], tools=["Bash"])
+
+
+_LESSON = {"kind": "pattern", "subject": "verify env", "body": "Check the venv before the code.",
+           "domain": "testing", "evidence_span": "venv was missing pytest-asyncio"}
+
+
+def test_ingest_is_idempotent(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    ad = _StubAdapter([_LESSON], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
+    eps = [_ep("e1", "ask one"), _ep("e2", "ask two")]
+
+    s1 = ing.ingest(episodes=eps)
+    assert s1["episodes_new"] == 2 and s1["episodes_processed"] == 2 and s1["facts_admitted"] == 2
+    calls_after_first = len(ad.calls)
+
+    s2 = ing.ingest(episodes=eps)  # re-run: everything already consumed
+    assert s2["episodes_new"] == 0 and s2["episodes_processed"] == 0
+    assert len(ad.calls) == calls_after_first  # zero new LM calls on re-run
+
+
+def test_ingest_budget_resumes(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    ad = _StubAdapter([_LESSON], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
+    eps = [_ep(f"e{i}", f"ask {i}") for i in range(5)]
+
+    s1 = ing.ingest(episodes=eps, max_episodes=2)
+    assert s1["episodes_new"] == 5 and s1["episodes_processed"] == 2  # budget honored
+
+    s2 = ing.ingest(episodes=eps, max_episodes=10)  # resumes the rest
+    assert s2["episodes_new"] == 3 and s2["episodes_processed"] == 3
+
+
+def test_watermark_persisted(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    ad = _StubAdapter([_LESSON], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, codebase_root="/x")
+    ing.ingest(episodes=[_ep("e1", "ask one")])
+    assert ing._load_consumed() == {"e1"}
