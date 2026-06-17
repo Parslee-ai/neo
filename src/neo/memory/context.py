@@ -197,7 +197,10 @@ class ContextAssembler:
                     f"- **{fact.subject}** ({fact.kind.value}, confidence={conf:.2f}): "
                     f"{_body_for_context(fact, 200)}"
                 )
-                # Inline change annotation
+                # Inline change annotation. The `in old_lookup` guard is
+                # load-bearing, not a style choice: purge_dead_facts reclaims
+                # cold superseded tombstones, so a live fact's `supersedes` may
+                # dangle. Membership-test, never a bare subscript.
                 if fact.supersedes and fact.supersedes in old_lookup:
                     old = old_lookup[fact.supersedes]
                     line += f" (changed from: {_body_for_context(old, 80)})"

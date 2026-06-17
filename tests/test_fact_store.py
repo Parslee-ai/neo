@@ -631,11 +631,32 @@ class TestPurgeDeadFacts:
         assert store.purge_dead_facts() == 0
         assert len(store._facts) == 2
 
-    def test_keeps_invalid_without_valid_successor(self, store):
-        """Invalid facts whose chain doesn't resolve to a valid fact should be kept."""
+    def test_purges_cold_eviction_orphan(self, store):
+        """Eviction orphans (invalid, no successor) cold for 30+ days are purged.
+
+        Regression test: cold-start purge previously retained these forever
+        because their supersession chain never resolves to a valid fact, so
+        inactive projects' fact files bloated indefinitely.
+        """
+        orphan = Fact(id="orph", subject="Orphan", body="B", is_valid=False,
+                      metadata=FactMetadata(last_accessed=time.time() - 90 * 86400))
+        store._facts.append(orphan)
+        assert store.purge_dead_facts() == 1
+        assert len(store._facts) == 0
+
+    def test_purges_cold_broken_chain_tombstone(self, store):
+        """Invalid facts pointing at a missing successor are also purged when cold."""
         orphan = Fact(id="orph", subject="Orphan", body="B", is_valid=False,
                       superseded_by="gone",
                       metadata=FactMetadata(last_accessed=time.time() - 90 * 86400))
+        store._facts.append(orphan)
+        assert store.purge_dead_facts() == 1
+        assert len(store._facts) == 0
+
+    def test_keeps_recent_eviction_orphan(self, store):
+        """Recently-evicted orphans (< 30 days) are kept for contrast."""
+        orphan = Fact(id="orph", subject="Orphan", body="B", is_valid=False,
+                      metadata=FactMetadata(last_accessed=time.time() - 5 * 86400))
         store._facts.append(orphan)
         assert store.purge_dead_facts() == 0
         assert len(store._facts) == 1
