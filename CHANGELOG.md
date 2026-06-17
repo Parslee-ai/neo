@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.22.2] - 2026-06-17
+
+### Fixed
+
+- **Concurrent `success_count`/confidence reinforcements are no longer lost to last-writer-wins.** 0.22.1's merge-on-save preserved a concurrent writer's *added* facts but, for a fact present in both processes' memory, kept the in-memory copy wholesale — so a `success_count`/confidence bump one process committed could be erased when the other saved a stale copy. `_merge_on_save` now field-reconciles a same-id fact (`_reconcile_fact`) instead of overwriting: `success_count`/`access_count` (strictly monotonic) take the max of both copies, and confidence is lifted to the disk value only when that side recorded more successes. Crucially the reconcile keeps OUR record as the base, so our own independent edits (a MODIFIED confidence demotion, a supersession pointer, tags, effectiveness) survive — an "adopt the disk record wholesale" approach would have discarded them. A fact we invalidated this session still always wins (never resurrected). Remaining residual: when both processes independently edit confidence, resolution is deliberately best-effort (favoring recorded reinforcement) — lossless reconciliation there would require a per-fact version counter or a file lock. (`memory/store.py`)
+
 ## [0.22.1] - 2026-06-17
 
 ### Fixed

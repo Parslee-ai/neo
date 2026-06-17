@@ -1710,3 +1710,68 @@ class TestConcurrentSaveMerge:
         ids = {x.id for x in C._facts}
         assert dead.id not in ids, "purged fact resurrected through concurrent-merge re-read"
         assert fy.id in ids, "concurrent process's fact was lost"
+
+    def test_concurrent_success_bump_survives_stale_save(self, store, tmp_path):
+        """A success_count bump committed by one process must not be lost when
+        another process holds a stale copy and saves later (field reconcile)."""
+        A = store
+        fact = A.add_fact(subject="shared fact", body="b", kind=FactKind.PATTERN,
+                          scope=FactScope.PROJECT)  # disk has fact, success=0
+        # B loads the fact (stale copy, success=0).
+        B = FactStore(codebase_root=str(tmp_path))
+        bfact = next(f for f in B._facts if f.id == fact.id)
+        # A bumps success_count and persists.
+        fact.metadata.success_count += 1
+        fact.metadata.confidence = min(1.0, fact.metadata.confidence + 0.2)
+        A.save()
+        # B, unaware of the bump, saves its stale copy on top.
+        bfact.metadata.last_accessed = time.time()
+        B.save()
+        # The bump must survive on disk.
+        C = FactStore(codebase_root=str(tmp_path))
+        merged = next(f for f in C._facts if f.id == fact.id)
+        assert merged.metadata.success_count == 1, "concurrent success bump was lost"
+
+    def test_reconcile_never_resurrects_locally_invalidated(self, store, tmp_path):
+        """If we invalidated a fact this session, a higher-success disk copy
+        must not flip it back to valid."""
+        A = store
+        fact = A.add_fact(subject="to invalidate", body="b", kind=FactKind.PATTERN,
+                          scope=FactScope.PROJECT)
+        # Another process bumps success on disk.
+        B = FactStore(codebase_root=str(tmp_path))
+        bfact = next(f for f in B._facts if f.id == fact.id)
+        bfact.metadata.success_count = 5
+        B.save()
+        # A invalidates its copy, then saves (must re-read & reconcile).
+        fact.is_valid = False
+        A.save()
+        C = FactStore(codebase_root=str(tmp_path))
+        merged = next(f for f in C._facts if f.id == fact.id)
+        assert merged.is_valid is False, "locally-invalidated fact was resurrected"
+
+    def test_reconcile_preserves_our_independent_edits(self, store, tmp_path):
+        """Reconcile must keep OURS as the base, not adopt the disk record
+        wholesale — so a concurrent edit doesn't discard our own field changes
+        (e.g. a confidence demotion at equal success, or a tag we added)."""
+        A = store
+        fact = A.add_fact(subject="shared", body="b", kind=FactKind.PATTERN,
+                          scope=FactScope.PROJECT)
+        fact.metadata.success_count = 2
+        fact.metadata.confidence = 0.8
+        A.save()
+        # B loads the fact (success=2, conf=0.8).
+        B = FactStore(codebase_root=str(tmp_path))
+        bfact = next(f for f in B._facts if f.id == fact.id)
+        # A writes something else, changing the file mtime so B's next save
+        # must re-read + reconcile (not take the fast path).
+        A.add_fact(subject="other", body="b", kind=FactKind.PATTERN, scope=FactScope.PROJECT)
+        # B demotes confidence (success unchanged) and tags it, then saves.
+        bfact.metadata.confidence = 0.5
+        bfact.tags.append("b-only-tag")
+        B.save()
+        C = FactStore(codebase_root=str(tmp_path))
+        merged = next(f for f in C._facts if f.id == fact.id)
+        assert merged.metadata.confidence == 0.5, "our demotion was clobbered by wholesale adopt"
+        assert "b-only-tag" in merged.tags, "our tag edit was discarded"
+        assert merged.metadata.success_count == 2
