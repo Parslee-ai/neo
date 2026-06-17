@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.22.0] - 2026-06-17
+
+### Added
+
+neo's learning loop now closes: facts earn promotion from real outcomes instead of churning out of probation.
+
+- **Transcript-driven outcome mining via a durable suggestion ledger.** The outcome detector only ever bumped a fact's `success_count` when a suggestion's `file_path` matched a git-changed file (ACCEPTED). But neo's dominant workload is review/analysis, whose suggestions carry synthetic paths (`/REVIEW.md`, …) that never match git — so on a real project only 3 of 123 facts had ever earned a success signal, and the rest were pruned within the probation window. neo now records linked suggestions to an append-only `suggestion_ledger_<project>.jsonl` (durable, so it survives the session-log clearing that git-based detection does on the next invocation), and the async observer mines it: each ledger entry is correlated against later AI-tool transcript episodes within a 2h window by **embedding similarity** (reusing the Jina vectors — no extra LM call). A match is evidence the suggestion's area recurred in subsequent work, so it earns a **weak** `UNVERIFIED` reinforcement (+0.1 confidence, +1 `success_count` — enough to promote a fact off probation), never the strong reward the git matcher reserves for verified diff-overlap. Compaction runs before the (non-idempotent) apply and unconditionally, so a crash loses a noisy signal rather than double-counting and the ledger stays bounded. (`memory/transcript.py`, `memory/outcomes.py`, `memory/store.py`)
+
+### Fixed
+
+Two feedback-loop and memory-hygiene fixes, plus a flaky test, all aimed at memory that actually grows instead of churning.
+
+- **Outcome detection now sees review/analysis suggestions.** `_detect_non_git_outcomes` — which already emitted a weak acceptance signal for `/dev/null` and `docs/` paths — now also recognises review-document paths (`*REVIEW*.md`, `review/`/`reviews/` segments, the `NO_MODIFY` sentinel) via a deliberately narrow classifier, so the ~85% of suggestions that are structurally invisible to the git matcher finally produce a learning signal. Also fixes a pre-existing double-count (widened by the above): a path both git-changed and non-git-trackable now collapses to a single outcome (strongest signal wins) instead of bumping the same fact twice in one run. (`memory/outcomes.py`)
+- **Cold-start purge reclaims scope-eviction orphans.** `purge_dead_facts` only removed tombstones whose supersession chain resolved to a valid successor, so facts invalidated by scope-cap *eviction* (no `superseded_by` pointer) were retained forever — per-project fact files bloated to 62–81% dead rows (up to 46 MB; neo's own project held 427 unpurgeable orphans despite constant cold starts). It now drops any fact that is invalid and untouched for 30+ days regardless of supersession, matching the `neo memory prune` compactor. (`memory/store.py`)
+- **`test_live_oversized_prompt_does_not_crash_adapter` no longer flakes on a slow daemon.** The test whitelisted error-message substrings (`rpc`/`context`/`token`), so a graceful CAR daemon connect/read timeout — exactly the non-crash behaviour under test — failed it; it now accepts any readable `RuntimeError`. (`tests/test_car_adapter.py`)
+
 ## [0.21.0] - 2026-06-13
 
 ### Added
