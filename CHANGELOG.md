@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.22.4] - 2026-06-17
+
+### Fixed
+
+- **Outcome detection no longer over-reinforces a fact via suggestion fan-out.** One neo invocation links *all* its suggestions to a single reasoning fact (`engine._build_suggestion_fact_ids`), so both outcome paths could apply several reinforcements to that one fact from what is really a single acceptance/recurrence — inflating `success_count`, which gates probation-promotion *and* community contribution (`find_contributable`, `min_successes=3`). Now deduped per fact: the transcript miner (`mine_suggestion_outcomes`) reinforces each fact at most once per cycle (and compacts the fan-out sibling ledger entries so they can't drip later), and `detect_implicit_feedback` reinforces/demotes a given fact at most once per call (skipping duplicate MODIFIED REVIEW facts too). Mixed accept/modify across files of one fan-out resolves deterministically to the first outcome in suggestion order. Note: `MAX_MINED_OUTCOMES_PER_CYCLE` now bounds *distinct facts* per cycle rather than ledger entries — a more meaningful budget. Surfaced by having neo review its own codebase. (`memory/store.py`, `memory/transcript.py`)
+
 ## [0.22.3] - 2026-06-17
 
 ### Fixed
