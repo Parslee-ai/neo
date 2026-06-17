@@ -1,10 +1,14 @@
 """Tests for Claude Code transcript parsing (Stage A) and ingestion (B/C)."""
 
 import json
+import time as _time
+from dataclasses import dataclass as _dataclass
 
+import numpy as _np
 import pytest
 
 from neo.memory.models import FactKind, FactScope
+from neo.memory.outcomes import OUTCOME_CORRELATION_WINDOW_SECONDS
 from neo.memory.transcript import (
     CarSource,
     CodexSource,
@@ -610,13 +614,6 @@ def test_codex_source_skips_agent_history_wrapper(tmp_path):
 # --------------------------------------------------------------------------
 # Stage D: suggestion-outcome mining (durable ledger <-> transcript episodes)
 # --------------------------------------------------------------------------
-
-import time as _time
-from dataclasses import dataclass as _dataclass
-
-import numpy as _np
-
-from neo.memory.outcomes import OUTCOME_CORRELATION_WINDOW_SECONDS
 
 
 @_dataclass
