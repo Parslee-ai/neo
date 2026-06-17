@@ -1234,15 +1234,26 @@ class FactStore:
         earlier) saved its own transcript facts on top, silently breaking the
         outcome-linkage that feeds the learning loop.
 
-        NOT fully concurrency-safe: for the SAME fact id, the in-memory version
-        wins — only additions are merged, not concurrent *field edits* to a
-        shared fact. Concretely, a `success_count`/`confidence` bump applied by
-        the observer can be silently lost if a request-path process holds a
-        stale copy of that fact and saves later. That's a weak-signal loss (one
-        reinforcement), far less severe than losing a whole fact; closing it
-        needs file locking or a version vector and is out of scope here. Neo is
-        a single-user tool, so the dominant overlap is request-path vs observer
-        adding *different* facts, which this fully covers.
+        Same-id facts are field-reconciled, not blindly overwritten (see
+        ``_reconcile_fact``), keeping our record as the base. What's preserved
+        vs. resolved lossily, stated plainly:
+          - ``success_count`` / ``access_count``: preserved losslessly (max of
+            both — they're strictly monotonic).
+          - ``confidence``: resolved LOSSILY when both sides edited it. We lift
+            to the higher value only when the disk side had more successes;
+            otherwise ours stands. Reconstructing intent from two confidence
+            scalars (e.g. our MODIFIED demotion vs. a peer's ACCEPTED bump)
+            needs a per-fact version counter or a file lock — neither is here,
+            so this is a deliberate best-effort, favoring recorded reinforcement.
+          - validity: a fact WE invalidated this session always wins; a peer's
+            invalidation does not propagate mid-session (self-heals on cold start).
+
+        Side effect: reconcile mutates our in-memory metadata in place, so this
+        process's monotonic counters rise to match a concurrent writer after a
+        save — intended (next decision uses the merged truth). The only residual
+        loss is a sub-microsecond torn-write window (two processes' read→write
+        interleaving with no file lock), self-healing on the next save/load —
+        acceptable for a single-user tool.
         """
         for path, scope in (
             (self._global_path, FactScope.GLOBAL),
@@ -1273,10 +1284,15 @@ class FactStore:
 
         Fast path: if the file's mtime is unchanged since we last wrote/loaded
         it, no other process has touched it, so there is nothing to merge and we
-        skip the (potentially multi-MB) re-read+parse entirely. Same-id facts
-        keep the in-memory version. Facts this instance deliberately removed
-        this session (``_deleted_ids`` — purge) are never resurrected from disk,
-        so a re-read can't undo a deletion.
+        skip the (potentially multi-MB) re-read+parse entirely. Facts this
+        instance deliberately removed this session (``_deleted_ids`` — purge) are
+        never resurrected from disk, so a re-read can't undo a deletion.
+
+        Same-id reconciliation: when a fact exists in BOTH memory and disk, the
+        monotonic learning signals are reconciled rather than blindly
+        overwritten (``_reconcile_fact``), so a ``success_count``/confidence bump
+        another process committed isn't lost to last-writer-wins. A fact we
+        invalidated this session always wins (never resurrected as valid).
 
         The fast path assumes the wall clock advanced between two processes'
         writes. A same-nanosecond mtime collision across processes (clock not
@@ -1291,14 +1307,55 @@ class FactStore:
         if not disk_facts:
             return our_facts
 
+        disk_by_id = {f.id: f for f in disk_facts}
         our_ids = {f.id for f in our_facts}
+        reconciled = [
+            self._reconcile_fact(f, disk_by_id[f.id]) if f.id in disk_by_id else f
+            for f in our_facts
+        ]
         new_from_disk = [
             f for f in disk_facts
             if f.id not in our_ids and f.id not in self._deleted_ids
         ]
         if new_from_disk:
             logger.info(f"Preserved {len(new_from_disk)} fact(s) from {path.name} on save")
-        return our_facts + new_from_disk
+        return reconciled + new_from_disk
+
+    @staticmethod
+    def _reconcile_fact(ours: Fact, disk: Fact) -> Fact:
+        """Field-merge a same-id fact present in both memory and disk so a
+        concurrent process's learning gains aren't lost — WITHOUT discarding our
+        own independent edits.
+
+        Always keeps OURS as the base record (so a confidence demotion we
+        applied, a supersession pointer we set, tags, effectiveness, etc. all
+        survive) and reconciles only specific fields:
+          1. If we invalidated it this session, our version wins outright —
+             never resurrect a fact we dropped (validity isn't monotonic; ours
+             is the intentional state). NOTE: a *peer's* invalidation does not
+             propagate to us here (same stance as _deleted_ids — we can't tell a
+             peer's intentional prune from a fact we simply never loaded); it
+             self-heals when this process also prunes on a later cold start.
+          2. success_count / access_count are strictly monotonic (only ever
+             incremented), so take the max of both sides — neither counter can
+             go backwards.
+          3. confidence is NOT monotonic (MODIFIED / demote / prune lower it).
+             We lift it via max() ONLY when the disk side recorded strictly more
+             successes than we had (it saw an ACCEPTED we haven't, so its
+             confidence reflects a reinforcement worth keeping). When both sides
+             edited confidence independently this is a deliberate, lossy choice
+             — there's no field-blind way to reconstruct intent from two scalars
+             without a version counter — and we favor the recorded reinforcement.
+        """
+        if not ours.is_valid:
+            return ours
+        om, dm = ours.metadata, disk.metadata
+        ours_success = om.success_count
+        om.success_count = max(om.success_count, dm.success_count)
+        om.access_count = max(om.access_count, dm.access_count)
+        if disk.is_valid and dm.success_count > ours_success:
+            om.confidence = max(om.confidence, dm.confidence)
+        return ours
 
     def purge_dead_facts(self) -> int:
         """Remove invalid facts that have gone cold (untouched 30+ days).
