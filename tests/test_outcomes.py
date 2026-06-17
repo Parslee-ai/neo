@@ -308,6 +308,81 @@ class TestDetectOutcomesIndependent:
         assert OutcomeType.INDEPENDENT in types
 
 
+class TestReviewOnlyOutcomes:
+    """Review/analysis suggestions are neo's most common workload but can't be
+    tracked by git diff; they should still yield a weak UNVERIFIED signal."""
+
+    @pytest.mark.parametrize("path", [
+        "/REVIEW.md", "REVIEW.md", "/ARCHITECTURAL_REVIEW.md",
+        "/review/commit-abc-architecture.md", "/architecture-review/foo.md",
+        "NO_MODIFY", "/NO_MODIFY", "/docs/reviews/feedback.md",
+    ])
+    def test_review_path_classified_review_only(self, path):
+        assert OutcomeTracker._is_review_only_path(path) is True
+
+    @pytest.mark.parametrize("path", [
+        "src/review_service.py", "src/foo.py", "review_notes.txt",
+        "src/reviewer.py", "", "/", "N/A",
+    ])
+    def test_real_paths_not_review_only(self, path):
+        assert OutcomeTracker._is_review_only_path(path) is False
+
+    def test_review_suggestion_emits_unverified(self, tracker):
+        """A persisted review-doc suggestion produces an UNVERIFIED outcome
+        even when no files changed in git, preserving the linked fact id."""
+        suggestions = [FakeSuggestion(
+            file_path="/REVIEW.md", description="Linus review", confidence=0.87,
+        )]
+        tracker.save_session(
+            suggestions, "review my diff",
+            suggestion_fact_ids={"/REVIEW.md": "factR"},
+        )
+        with patch.object(tracker, "_get_changed_files_since", return_value=set()):
+            outcomes, fact_ids = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].outcome_type == OutcomeType.UNVERIFIED
+        assert outcomes[0].file_path == "/REVIEW.md"
+        assert fact_ids == {"/REVIEW.md": "factR"}
+
+    def test_git_match_wins_over_non_git_no_double_count(self, tracker):
+        """A docs path that is BOTH git-changed and non-git-trackable must
+        yield ONE outcome (the stronger git signal), not an ACCEPTED + a
+        duplicate UNVERIFIED that double-bumps the same fact."""
+        diff = "+new line"
+        suggestions = [FakeSuggestion(
+            file_path="docs/architecture.md", description="Update arch doc",
+            confidence=0.8, unified_diff=diff,
+        )]
+        tracker.save_session(suggestions, "doc it")
+
+        with patch.object(tracker, "_get_changed_files_since",
+                          return_value={"docs/architecture.md"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value=diff):
+            outcomes, _ = tracker.detect_outcomes()
+
+        paths = [o.file_path for o in outcomes]
+        assert paths.count("docs/architecture.md") == 1
+        assert outcomes[0].outcome_type in (OutcomeType.ACCEPTED, OutcomeType.MODIFIED)
+        assert all(o.outcome_type != OutcomeType.UNVERIFIED for o in outcomes)
+
+    def test_same_review_path_across_sessions_counts_once(self, tracker):
+        """The same review path queued in multiple unprocessed sessions
+        collapses to a single weak-acceptance outcome."""
+        for _ in range(3):
+            tracker.save_session(
+                [FakeSuggestion(file_path="/REVIEW.md", description="review", confidence=0.8)],
+                "review",
+                suggestion_fact_ids={"/REVIEW.md": "factR"},
+            )
+        with patch.object(tracker, "_get_changed_files_since", return_value=set()):
+            outcomes, _ = tracker.detect_outcomes()
+
+        review_outcomes = [o for o in outcomes if o.file_path == "/REVIEW.md"]
+        assert len(review_outcomes) == 1
+        assert review_outcomes[0].outcome_type == OutcomeType.UNVERIFIED
+
+
 class TestGitNotAvailable:
     def test_graceful_when_git_missing(self, tracker):
         suggestions = [FakeSuggestion(file_path="src/foo.py")]

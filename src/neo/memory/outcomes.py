@@ -374,6 +374,12 @@ class OutcomeTracker:
             if prev.project_id != self.project_id:
                 continue
 
+            # Merge fact-id links for EVERY same-project session, including
+            # those with no git changes: review-only / UNVERIFIED outcomes
+            # (below) resolve their linked fact through this map, and those
+            # sessions never reach the git-matching branch.
+            merged_fact_ids.update(prev.suggestion_fact_ids)
+
             changed_files = self._get_changed_files_since(prev.timestamp)
             if not changed_files:
                 continue
@@ -386,15 +392,16 @@ class OutcomeTracker:
                 f"{len(prev.suggestion_fact_ids)} linked fact(s)"
             )
 
-            outcomes = self._match_to_suggestions(changed_files, prev)
-            all_outcomes.extend(outcomes)
-            merged_fact_ids.update(prev.suggestion_fact_ids)
+            all_outcomes.extend(self._match_to_suggestions(changed_files, prev))
 
-        # Also check for non-git outcomes (implicit acceptance)
-        non_git = self._detect_non_git_outcomes(sessions)
-        all_outcomes.extend(non_git)
-        for prev in sessions:
-            merged_fact_ids.update(prev.suggestion_fact_ids)
+        # Also check for non-git outcomes (weak implicit acceptance for paths the
+        # git matcher can't see: review docs, /dev/null, docs/).
+        all_outcomes.extend(self._detect_non_git_outcomes(sessions))
+
+        # Collapse to one outcome per file path, strongest signal winning, so a
+        # path that is BOTH git-changed and non-git-trackable doesn't double-bump
+        # the same fact from a single user action.
+        all_outcomes = self._dedup_outcomes(all_outcomes)
 
         # Clear processed sessions from the log
         if clear_processed and (all_outcomes or sessions):
@@ -488,14 +495,78 @@ class OutcomeTracker:
             except OSError:
                 pass
 
+    @staticmethod
+    def _is_review_only_path(file_path: str) -> bool:
+        """True for suggestion paths that are review/analysis output, not a code edit.
+
+        neo's review workload (Linus/Liotta/code-review) emits suggestions whose
+        ``file_path`` names a review *document* (``REVIEW.md``,
+        ``ARCHITECTURAL_REVIEW.md``), lives under a ``review``/``reviews`` path
+        segment, or is the exact ``NO_MODIFY`` / ``/NO_MODIFY`` sentinel. These
+        never correspond to a tracked file, so the git-diff outcome matcher is
+        structurally blind to them — yet they are the most common kind of
+        suggestion. Recognising them lets ``_detect_non_git_outcomes`` emit the
+        same weak-acceptance signal it already gives ``docs/`` and ``/dev/null``
+        suggestions.
+
+        Deliberately narrow to avoid matching real source files (e.g.
+        ``src/review_service.py`` is NOT review-only).
+        """
+        fp = (file_path or "").strip()
+        if not fp:
+            return False
+        if fp in ("NO_MODIFY", "/NO_MODIFY"):
+            return True
+        low = fp.lower()
+        base = low.rsplit("/", 1)[-1]
+        # A markdown review document: REVIEW.md, ARCHITECTURAL_REVIEW.md, ...
+        if base.endswith(".md") and "review" in base:
+            return True
+        # A 'review'/'reviews' directory segment, or an explicit *-review dir
+        # (architecture-review/, code-review/). Only directory segments count,
+        # so review_service.py (a real file) is excluded.
+        dir_segments = low.strip("/").split("/")[:-1]
+        if any(seg in ("review", "reviews") or seg.endswith("-review")
+               for seg in dir_segments):
+            return True
+        return False
+
+    def _dedup_outcomes(self, outcomes: list[Outcome]) -> list[Outcome]:
+        """One outcome per (normalized) file path, strongest signal winning.
+
+        The git matcher's ACCEPTED/MODIFIED/INDEPENDENT are verified, stronger
+        signals than the non-git weak-acceptance heuristic (UNVERIFIED). When a
+        suggestion path is both git-changed and non-git-trackable (e.g. a
+        committed ``docs/`` or review ``.md``), the git outcome wins — preventing
+        a double success_count/confidence bump on one fact from a single user
+        action. Collapsing by path also bounds per-session-in-batch accrual: the
+        same review path queued across several unprocessed sessions counts once.
+        """
+        priority = {
+            OutcomeType.ACCEPTED: 3,
+            OutcomeType.MODIFIED: 3,
+            OutcomeType.INDEPENDENT: 2,
+            OutcomeType.UNVERIFIED: 1,
+        }
+        best: dict[str, Outcome] = {}
+        for o in outcomes:
+            key = self._normalize_path(o.file_path)
+            cur = best.get(key)
+            if cur is None or priority.get(o.outcome_type, 0) > priority.get(cur.outcome_type, 0):
+                best[key] = o
+        return list(best.values())
+
     def _detect_non_git_outcomes(
         self, sessions: list[SessionRecord]
     ) -> list[Outcome]:
         """Detect implicit acceptance for suggestions that can't be tracked by git.
 
-        When a suggestion targets /dev/null or a docs path, and the user invoked
-        neo again afterward, that's a weak acceptance signal — the user continued
-        working rather than abandoning the tool.
+        When a suggestion targets /dev/null, a docs path, or review/analysis
+        output (see _is_review_only_path), and the user invoked neo again
+        afterward, that's a weak acceptance signal — the user continued working
+        rather than abandoning the tool. Review/analysis is neo's most common
+        workload and is invisible to the git-diff matcher, so without this the
+        bulk of suggestions never produce any outcome signal.
 
         All sessions in the log are from PREVIOUS invocations (the current
         session hasn't been written yet when detect_outcomes runs), so we
@@ -516,14 +587,18 @@ class OutcomeTracker:
                     file_path in non_trackable
                     or normalized.startswith("docs/")
                     or "/docs/" in normalized
+                    or self._is_review_only_path(file_path)
                 )
                 if not is_non_trackable:
                     continue
 
-                # User came back and ran neo again — weak acceptance signal
+                # User came back and ran neo again — weak acceptance signal.
+                # Use the raw recorded path (falling back to normalized) so
+                # detect_implicit_feedback resolves the linked
+                # suggestion_fact_id, which is keyed by the path as recorded.
                 outcomes.append(Outcome(
                     outcome_type=OutcomeType.UNVERIFIED,
-                    file_path=normalized,
+                    file_path=file_path or normalized,
                     diff_summary="",
                     suggestion_description=sugg.get("description", ""),
                     suggestion_confidence=sugg.get("confidence", 0.0),
