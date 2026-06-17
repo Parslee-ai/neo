@@ -157,6 +157,15 @@ class FactStore:
         self._facts: list[Fact] = []
         self._cap_pending = False  # Set by _cap_independent_facts(save=False)
 
+        # Concurrency bookkeeping for the merge-on-save (see save()).
+        # _deleted_ids: facts this instance physically removed (purge/prune) —
+        #   excluded from the merge so a re-read can't resurrect them.
+        # _scope_mtimes: last mtime_ns we observed per scope file, so the merge
+        #   skips its re-read+parse when nothing else has written since (the
+        #   common single-process case; avoids re-parsing a multi-MB file per add).
+        self._deleted_ids: set[str] = set()
+        self._scope_mtimes: dict[str, int] = {}
+
         # Embedding model (lazy-initialized on first use to avoid slow startup)
         self._embedder = None
         self._embedder_initialized = False
@@ -1214,38 +1223,81 @@ class FactStore:
     def save(self) -> None:
         """Save facts to scoped JSON files.
 
-        Global facts use best-effort merge: re-reads the global file before
-        writing to preserve facts added by other FactStore instances since
-        load(). This is NOT concurrency-safe (no file locking). Neo is a
-        single-user CLI tool — concurrent writes are rare but possible if
-        multiple terminals invoke neo simultaneously. In that case, last
-        writer wins for same-ID facts, but cross-project additions survive.
+        EVERY scope file is written with a best-effort merge (not just global):
+        re-read the file and preserve any fact present on disk but absent from
+        memory, so a concurrent writer's *additions* survive. This matters most
+        for the PROJECT scope: the async observer and a request-path neo
+        invocation are separate processes writing the same
+        ``facts_project_<id>.json``. Without the merge, whichever saved last
+        clobbered the other's just-added facts — e.g. a neo invocation's linked
+        reasoning fact vanishing because the observer (which loaded the file
+        earlier) saved its own transcript facts on top, silently breaking the
+        outcome-linkage that feeds the learning loop.
+
+        NOT fully concurrency-safe: for the SAME fact id, the in-memory version
+        wins — only additions are merged, not concurrent *field edits* to a
+        shared fact. Concretely, a `success_count`/`confidence` bump applied by
+        the observer can be silently lost if a request-path process holds a
+        stale copy of that fact and saves later. That's a weak-signal loss (one
+        reinforcement), far less severe than losing a whole fact; closing it
+        needs file locking or a version vector and is out of scope here. Neo is
+        a single-user tool, so the dominant overlap is request-path vs observer
+        adding *different* facts, which this fully covers.
         """
-        global_facts = [f for f in self._facts if f.scope == FactScope.GLOBAL]
-        org_facts = [f for f in self._facts if f.scope == FactScope.ORG]
-        project_facts = [f for f in self._facts if f.scope == FactScope.PROJECT]
+        for path, scope in (
+            (self._global_path, FactScope.GLOBAL),
+            (self._org_path, FactScope.ORG),
+            (self._project_path, FactScope.PROJECT),
+        ):
+            if not path:
+                continue
+            scoped = [f for f in self._facts if f.scope == scope]
+            self._save_file(path, self._merge_on_save(path, scoped))
+            # Record the mtime we just wrote, so the next save can detect
+            # whether another process has written since (and skip the re-read).
+            mt = self._file_mtime(path)
+            if mt is not None:
+                self._scope_mtimes[str(path)] = mt
 
-        merged_global = self._merge_global_on_save(global_facts)
-        self._save_file(self._global_path, merged_global)
-        if self._org_path:
-            self._save_file(self._org_path, org_facts)
-        if self._project_path:
-            self._save_file(self._project_path, project_facts)
+    @staticmethod
+    def _file_mtime(path: "Path") -> Optional[int]:
+        """Return a file's mtime in ns, or None if it doesn't exist."""
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
 
-    def _merge_global_on_save(self, our_facts: list[Fact]) -> list[Fact]:
-        """Best-effort merge: keep disk facts we don't have in memory.
+    def _merge_on_save(self, path: "Path", our_facts: list[Fact]) -> list[Fact]:
+        """Best-effort merge for one scope file: keep disk facts we don't have
+        in memory, so a concurrent writer's additions aren't clobbered.
 
-        Not concurrency-safe. Reduces data loss from sequential (not
-        simultaneous) cross-project saves, which is the common case.
+        Fast path: if the file's mtime is unchanged since we last wrote/loaded
+        it, no other process has touched it, so there is nothing to merge and we
+        skip the (potentially multi-MB) re-read+parse entirely. Same-id facts
+        keep the in-memory version. Facts this instance deliberately removed
+        this session (``_deleted_ids`` — purge) are never resurrected from disk,
+        so a re-read can't undo a deletion.
+
+        The fast path assumes the wall clock advanced between two processes'
+        writes. A same-nanosecond mtime collision across processes (clock not
+        monotonic) would skip a needed merge — a single-fact loss, self-healing
+        on either side's next load(). Not realistic for a single-user tool.
         """
-        disk_facts = self._load_file(self._global_path)
+        current = self._file_mtime(path)
+        if current is not None and current == self._scope_mtimes.get(str(path)):
+            return our_facts  # we were the last writer; disk has nothing new
+
+        disk_facts = self._load_file(path)
         if not disk_facts:
             return our_facts
 
         our_ids = {f.id for f in our_facts}
-        new_from_disk = [f for f in disk_facts if f.id not in our_ids]
+        new_from_disk = [
+            f for f in disk_facts
+            if f.id not in our_ids and f.id not in self._deleted_ids
+        ]
         if new_from_disk:
-            logger.info(f"Preserved {len(new_from_disk)} global fact(s) from disk")
+            logger.info(f"Preserved {len(new_from_disk)} fact(s) from {path.name} on save")
         return our_facts + new_from_disk
 
     def purge_dead_facts(self) -> int:
@@ -1277,13 +1329,18 @@ class FactStore:
         now = time.time()
         thirty_days = 30 * 86400
 
-        before = len(self._facts)
-        self._facts = [
-            f for f in self._facts
-            if f.is_valid or (now - f.metadata.last_accessed) < thirty_days
-        ]
-        purged = before - len(self._facts)
+        kept, removed_ids = [], []
+        for f in self._facts:
+            if f.is_valid or (now - f.metadata.last_accessed) < thirty_days:
+                kept.append(f)
+            else:
+                removed_ids.append(f.id)
+        purged = len(removed_ids)
         if purged:
+            self._facts = kept
+            # Record physical deletions so the merge-on-save can't resurrect
+            # them from another process's stale copy on disk.
+            self._deleted_ids.update(removed_ids)
             self.save()
             logger.info(f"Purged {purged} dead invalid facts")
         return purged
@@ -1404,11 +1461,17 @@ class FactStore:
     def load(self) -> None:
         """Load facts from all scoped files and merge."""
         self._facts = []
-        self._facts.extend(self._load_file(self._global_path))
-        if self._org_path:
-            self._facts.extend(self._load_file(self._org_path))
-        if self._project_path:
-            self._facts.extend(self._load_file(self._project_path))
+        # Fresh load = fresh concurrency bookkeeping: forget prior deletions
+        # and re-baseline the per-file mtimes we compare against on save.
+        self._deleted_ids = set()
+        self._scope_mtimes = {}
+        for path in (self._global_path, self._org_path, self._project_path):
+            if not path:
+                continue
+            self._facts.extend(self._load_file(path))
+            mt = self._file_mtime(path)
+            if mt is not None:
+                self._scope_mtimes[str(path)] = mt
         logger.info(f"FactStore: Loaded {len(self._facts)} facts")
         # Cap runs in-memory only; save is deferred to initialize()
         self._cap_independent_facts(save=False)
