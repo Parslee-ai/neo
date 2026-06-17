@@ -1220,35 +1220,38 @@ class FactStore:
         return our_facts + new_from_disk
 
     def purge_dead_facts(self) -> int:
-        """Remove invalid facts whose chain resolves to a valid successor.
+        """Remove invalid facts that have gone cold (untouched 30+ days).
 
-        Follows supersession chains to find the terminal fact. If the chain
-        ends at a valid fact and the invalid fact hasn't been accessed in
-        30+ days, it's safe to purge.
+        Any fact that is invalid AND hasn't been accessed in 30+ days is
+        dropped, regardless of how it died. Two distinct death modes both
+        qualify:
+
+          - *superseded* tombstones (``superseded_by`` set, replaced by a
+            better fact), and
+          - *eviction orphans* — facts marked invalid by
+            ``_enforce_scope_limit`` for low quality, which carry **no**
+            ``superseded_by`` pointer.
+
+        This mirrors the on-demand compactor (``neo memory prune`` →
+        ``subcommands._compact_fact_file``); keeping the two in sync ensures
+        cold-start maintenance reclaims the same facts the manual command
+        does. The 30-day age gate is the safety net — recently-invalidated
+        facts are retained for contrast in retrieval.
+
+        Previously this additionally required the supersession chain to
+        resolve to a valid successor, which silently retained every eviction
+        orphan forever (they never resolve to a valid fact), letting inactive
+        projects' fact files bloat with dead rows indefinitely.
 
         Returns the number of purged facts.
         """
-        facts_by_id = {f.id: f for f in self._facts}
         now = time.time()
         thirty_days = 30 * 86400
-
-        def chain_resolves_to_valid(fact: Fact) -> bool:
-            """Follow superseded_by chain; return True if it ends at a valid fact."""
-            seen: set[str] = set()
-            current = fact
-            while current and not current.is_valid:
-                if current.id in seen:
-                    return False  # cycle
-                seen.add(current.id)
-                current = facts_by_id.get(current.superseded_by)  # type: ignore[arg-type]
-            return current is not None and current.is_valid
 
         before = len(self._facts)
         self._facts = [
             f for f in self._facts
-            if f.is_valid
-            or (now - f.metadata.last_accessed) < thirty_days
-            or not chain_resolves_to_valid(f)
+            if f.is_valid or (now - f.metadata.last_accessed) < thirty_days
         ]
         purged = before - len(self._facts)
         if purged:
