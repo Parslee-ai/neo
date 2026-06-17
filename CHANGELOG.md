@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.22.1] - 2026-06-17
+
+### Fixed
+
+A concurrency fix that protects the learning loop's integrity — found by exercising 0.22.0 end-to-end.
+
+- **`FactStore.save()` no longer lets the observer and a request-path invocation clobber each other's facts.** The async observer and an interactive `neo` run are separate processes writing the same `facts_project_<id>.json`. `save()` previously merged only the *global* scope on write and overwrote the *project*/*org* scopes with its in-memory snapshot — so whichever process saved last erased the other's just-added facts. Observed live: a `neo` invocation's linked reasoning fact was erased moments after creation because the observer (which had loaded the file earlier) saved its transcript facts on top, leaving the suggestion ledger pointing at a fact that no longer existed and silently breaking outcome linkage. The merge-on-save (re-read the file, preserve facts present on disk but absent from memory) now runs for **all** scopes, so a concurrent writer's additions survive. Two guards keep it correct and fast: facts physically removed this session (`_deleted_ids`, i.e. `purge_dead_facts`) are never resurrected by the re-read, so purge isn't undone; and an mtime fast-path skips the re-read+parse entirely when no other process has written since (avoiding a multi-MB re-parse on every `add_fact`). Same-id concurrent *field* edits (e.g. a `success_count` bump) remain last-writer-wins — a documented weak-signal residual that needs locking to close. (`memory/store.py`)
+
 ## [0.22.0] - 2026-06-17
 
 ### Added

@@ -1640,3 +1640,73 @@ class TestConstraintEmbeddings:
 
         constraints = [f for f in s._facts if f.kind == FactKind.CONSTRAINT]
         assert any(f.metadata.source_file == str(agents_md) for f in constraints)
+
+
+class TestConcurrentSaveMerge:
+    """save() must not let one process clobber facts another just added —
+    the observer-vs-request-path clobber that erased linked reasoning facts."""
+
+    def test_project_addition_survives_concurrent_save(self, store, tmp_path):
+        A = store  # "process A", project = testproj1234
+        # "process B" loads the (currently empty) project file.
+        B = FactStore(codebase_root=str(tmp_path))
+
+        # A adds a project fact and persists it to disk.
+        fx = A.add_fact(subject="Fact X from process A", body="b",
+                        kind=FactKind.REVIEW, scope=FactScope.PROJECT)
+        # B, which never saw X, adds its own fact and saves on top.
+        fy = B.add_fact(subject="Fact Y from process B", body="b",
+                        kind=FactKind.REVIEW, scope=FactScope.PROJECT)
+
+        # A fresh load from disk must contain BOTH.
+        C = FactStore(codebase_root=str(tmp_path))
+        ids = {f.id for f in C._facts}
+        assert fx.id in ids, "process A's project fact was clobbered by B's save"
+        assert fy.id in ids
+
+    def test_global_addition_still_survives_concurrent_save(self, store, tmp_path):
+        # Regression guard that generalizing the merge didn't break the
+        # original global-scope behavior.
+        A = store
+        B = FactStore(codebase_root=str(tmp_path))
+        fx = A.add_fact(subject="Global X", body="b", kind=FactKind.PATTERN,
+                        scope=FactScope.GLOBAL)
+        fy = B.add_fact(subject="Global Y", body="b", kind=FactKind.PATTERN,
+                        scope=FactScope.GLOBAL)
+        C = FactStore(codebase_root=str(tmp_path))
+        ids = {f.id for f in C._facts}
+        assert fx.id in ids and fy.id in ids
+
+    def test_purge_not_resurrected_by_merge(self, store, tmp_path):
+        """A physically purged fact must stay gone — the merge-on-save re-read
+        must not re-append it from the about-to-be-overwritten file."""
+        f = store.add_fact(subject="dead fact", body="b", kind=FactKind.REVIEW,
+                           scope=FactScope.PROJECT)
+        f.is_valid = False
+        f.metadata.last_accessed = time.time() - 40 * 86400  # cold (>30d)
+        store.save()
+        assert store.purge_dead_facts() == 1
+        # Reload from disk: the purged fact must not be present.
+        C = FactStore(codebase_root=str(tmp_path))
+        assert f.id not in {x.id for x in C._facts}, "purged fact was resurrected by merge"
+
+    def test_concurrent_purge_not_resurrected_via_merge(self, store, tmp_path):
+        """When another process writes the file (forcing a merge re-read), a
+        fact this process purged must still be excluded via _deleted_ids."""
+        A = store
+        dead = A.add_fact(subject="cold dead", body="b", kind=FactKind.REVIEW,
+                          scope=FactScope.PROJECT)  # disk now has `dead`
+        # B loads (sees `dead`) and writes its own fact -> changes file mtime,
+        # so A's next save can no longer take the mtime fast-path.
+        B = FactStore(codebase_root=str(tmp_path))
+        fy = B.add_fact(subject="B fact", body="b", kind=FactKind.REVIEW,
+                        scope=FactScope.PROJECT)
+        # A purges `dead`; its save must re-read (mtime changed) yet not
+        # resurrect `dead`, while still preserving B's addition.
+        dead.is_valid = False
+        dead.metadata.last_accessed = time.time() - 40 * 86400
+        assert A.purge_dead_facts() == 1
+        C = FactStore(codebase_root=str(tmp_path))
+        ids = {x.id for x in C._facts}
+        assert dead.id not in ids, "purged fact resurrected through concurrent-merge re-read"
+        assert fy.id in ids, "concurrent process's fact was lost"
