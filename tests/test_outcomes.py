@@ -83,6 +83,43 @@ class TestSaveAndLoadSession:
         assert tracker._load_previous_session() is None
 
 
+class TestSuggestionLedger:
+    """The durable, append-only ledger that survives session-log clearing and
+    feeds the async transcript outcome miner."""
+
+    def test_save_session_appends_linked_suggestions(self, tracker):
+        tracker.save_session(
+            [FakeSuggestion(file_path="/REVIEW.md", description="review verdict", confidence=0.8)],
+            "review my diff",
+            suggestion_fact_ids={"/REVIEW.md": "factR"},
+        )
+        led = tracker.load_suggestion_ledger()
+        assert len(led) == 1
+        assert led[0]["fact_id"] == "factR"
+        assert led[0]["file_path"] == "/REVIEW.md"
+        assert led[0]["ts"] > 0
+
+    def test_ledger_skips_unlinked_suggestions(self, tracker):
+        # No suggestion_fact_ids → nothing to reinforce → nothing recorded.
+        tracker.save_session([FakeSuggestion(file_path="src/x.py")], "prompt")
+        assert tracker.load_suggestion_ledger() == []
+
+    def test_compact_drops_expired_and_specified(self, tracker):
+        import json
+        now = time.time()
+        path = tracker._suggestion_ledger_path
+        rows = [
+            {"id": "fresh", "ts": now, "fact_id": "f1", "file_path": "/A", "description": "a"},
+            {"id": "old", "ts": now - 40 * 86400, "fact_id": "f2", "file_path": "/B", "description": "b"},
+            {"id": "drop", "ts": now, "fact_id": "f3", "file_path": "/C", "description": "c"},
+        ]
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+        tracker.compact_suggestion_ledger(drop_ids={"drop"}, max_age_days=30)
+        remaining = {e["id"] for e in tracker.load_suggestion_ledger()}
+        assert remaining == {"fresh"}  # 'old' aged out, 'drop' explicitly removed
+
+
 class TestSessionRecordWithFactIds:
     def test_save_and_load_with_fact_ids(self, tracker):
         suggestions = [
