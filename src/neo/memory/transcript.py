@@ -818,8 +818,8 @@ class TranscriptIngester:
 
         dated = [(t, e) for e in episodes if (t := _episode_epoch(e.timestamp)) is not None]
         now = time.time()
-        matched_fact_ids: list[str] = []
-        done_ids: set = set()
+        matched_fact_ids: set[str] = set()  # dedup: one reinforcement per fact per cycle
+        done_ids: set[str] = set()
 
         # Ledger order is append order (oldest first) — the right drain order,
         # since oldest entries are closest to window-expiry.
@@ -835,10 +835,22 @@ class TranscriptIngester:
             window_end = ets + OUTCOME_CORRELATION_WINDOW_SECONDS
             cands = [e for t, e in dated if ets <= t <= window_end]
             if self._match_episode(entry.get("description", ""), cands) is not None:
-                matched_fact_ids.append(fid)
+                matched_fact_ids.add(fid)
                 done_ids.add(eid)
             elif now > window_end:
                 done_ids.add(eid)  # window lapsed with no match — give up
+
+        # Fan-out dedup: one neo invocation links ALL its suggestions to a
+        # SINGLE reasoning fact, so the ledger holds many entries per fact_id.
+        # We reinforce each fact at most once per cycle (set above); consume the
+        # *other* still-pending entries for any reinforced fact too, so they
+        # can't drip extra bumps for the same fact in later cycles. (Genuinely
+        # later, post-compaction re-logging can still reinforce — that's a new
+        # recurrence, not this fan-out.)
+        if matched_fact_ids:
+            for entry in ledger:
+                if entry.get("fact_id") in matched_fact_ids:
+                    done_ids.add(entry.get("id", ""))
 
         # Compact BEFORE applying, and unconditionally:
         #  - before, because apply_mined_outcomes is NOT idempotent (it bumps the
@@ -850,7 +862,7 @@ class TranscriptIngester:
         #    always runs; gating it on done_ids let a ledger of young-unmatched
         #    entries grow without the backstop ever firing.
         tracker.compact_suggestion_ledger(drop_ids=done_ids)
-        return self._store.apply_mined_outcomes(matched_fact_ids) if matched_fact_ids else 0
+        return self._store.apply_mined_outcomes(list(matched_fact_ids)) if matched_fact_ids else 0
 
     def _watermark_path(self, source) -> Optional[Path]:
         if source.scope == FactScope.PROJECT:

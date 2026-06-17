@@ -860,6 +860,13 @@ class FactStore:
 
         facts_by_id = {f.id: f for f in self._facts}
         linked_count = 0
+        # One neo invocation links ALL its suggestions to a SINGLE reasoning
+        # fact, so several outcomes here can resolve to the same fact_id (each
+        # suggested file that changed). Reinforce/demote a given fact at most
+        # once per call — otherwise a multi-file suggestion ratchets one fact's
+        # success_count/confidence (and spawns duplicate MODIFIED REVIEWs) from
+        # what is really one acceptance/correction.
+        touched_fact_ids: set[str] = set()
 
         normalized_fact_ids: dict[str, str] = {}
         for path, fid in suggestion_fact_ids.items():
@@ -890,6 +897,8 @@ class FactStore:
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
 
                 if original_fact and original_fact.is_valid:
+                    if original_fact.id in touched_fact_ids:
+                        continue  # fan-out dedup: already reinforced this fact
                     # Boost original fact instead of creating orphan REVIEW.
                     # Base +0.2; modulated by arch delta so a session that
                     # regressed structure earns less trust than one that didn't.
@@ -900,6 +909,7 @@ class FactStore:
                     original_fact.metadata.success_count += 1
                     update_effectiveness(original_fact, outcome="better")
                     original_fact.metadata.last_accessed = time.time()
+                    touched_fact_ids.add(original_fact.id)
                     linked_count += 1
                     continue
 
@@ -937,19 +947,25 @@ class FactStore:
                 fact_id = _lookup_fact_id(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
                 if original_fact and original_fact.is_valid:
+                    if original_fact.id in touched_fact_ids:
+                        continue  # fan-out dedup: skip duplicate demote + REVIEW
                     penalty = min(-0.05, -0.2 + arch_mod)
                     original_fact.metadata.confidence = max(
                         0.1, original_fact.metadata.confidence + penalty
                     )
                     update_effectiveness(original_fact, outcome="worse")
                     original_fact.metadata.last_accessed = time.time()
+                    touched_fact_ids.add(original_fact.id)
                     linked_count += 1
             elif outcome.outcome_type == OutcomeType.UNVERIFIED:
                 # Suggested file changed, but no diff to compare — weak signal.
                 # Only update linked fact; never create standalone REVIEW.
                 fact_id = _lookup_fact_id(outcome.file_path)
                 original_fact = facts_by_id.get(fact_id) if fact_id else None
-                if original_fact and original_fact.is_valid:
+                if (
+                    original_fact and original_fact.is_valid
+                    and original_fact.id not in touched_fact_ids
+                ):
                     boost = max(-0.05, 0.1 + arch_mod)
                     original_fact.metadata.confidence = min(
                         1.0, max(0.0, original_fact.metadata.confidence + boost)
@@ -957,6 +973,7 @@ class FactStore:
                     original_fact.metadata.success_count += 1
                     update_effectiveness(original_fact, outcome="better")
                     original_fact.metadata.last_accessed = time.time()
+                    touched_fact_ids.add(original_fact.id)
                     linked_count += 1
                 continue  # Never create a REVIEW fact for unverified outcomes
             elif outcome.outcome_type == OutcomeType.INDEPENDENT:

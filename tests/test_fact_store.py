@@ -1802,3 +1802,56 @@ class TestConcurrentSaveMerge:
         C = FactStore(codebase_root=str(tmp_path))
         ids = {f.id for f in C._facts}
         assert {fa.id, fb.id, fa2.id} <= ids
+
+    def test_detect_feedback_dedupes_multi_suggestion_fan_out(self, store, tmp_path):
+        """Multiple ACCEPTED outcomes that resolve to the SAME reasoning fact
+        (one invocation links all its suggestions to one fact) must reinforce
+        that fact ONCE, not once per suggestion."""
+        f = store.add_fact(subject="reasoning", body="b", kind=FactKind.DECISION,
+                           scope=FactScope.PROJECT, confidence=0.5)
+        before_succ = f.metadata.success_count
+        # Three accepted outcomes for three suggested files, all linked to f.
+        sfi = {"a.py": f.id, "b.py": f.id, "c.py": f.id}
+        outcomes = [
+            Outcome(outcome_type=OutcomeType.ACCEPTED, file_path=p, diff_summary="+x",
+                    suggestion_description="d", suggestion_confidence=0.8)
+            for p in ("a.py", "b.py", "c.py")
+        ]
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=(outcomes, sfi)), \
+             patch.object(store._outcome_tracker, "compute_arch_delta", return_value=None):
+            store.detect_implicit_feedback({"prompt": "p"}, [])
+        assert f.metadata.success_count == before_succ + 1, "fan-out double-counted success"
+
+    def test_detect_feedback_modified_fan_out_demotes_once_one_review(self, store, tmp_path):
+        """Multiple MODIFIED outcomes resolving to one reasoning fact must demote
+        it ONCE and create exactly ONE correction REVIEW — not one per file."""
+        f = store.add_fact(subject="reasoning-mod", body="b", kind=FactKind.DECISION,
+                           scope=FactScope.PROJECT, confidence=0.8)
+        sfi = {p: f.id for p in ("a.py", "b.py", "c.py")}
+        outcomes = [
+            Outcome(outcome_type=OutcomeType.MODIFIED, file_path=p, diff_summary="+x",
+                    suggestion_description="d", suggestion_confidence=0.8)
+            for p in ("a.py", "b.py", "c.py")
+        ]
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=(outcomes, sfi)), \
+             patch.object(store._outcome_tracker, "compute_arch_delta", return_value=None):
+            store.detect_implicit_feedback({"prompt": "p"}, [])
+        assert f.metadata.confidence == pytest.approx(0.6), "fan-out demoted more than once"
+        modified_reviews = [x for x in store._facts if x.is_valid and "modified" in x.tags]
+        assert len(modified_reviews) == 1, "duplicate MODIFIED REVIEW per file"
+
+    def test_detect_feedback_modified_without_link_still_reviews(self, store, tmp_path):
+        """A MODIFIED outcome with no linked fact must still record its REVIEW
+        (the dedup guard must not suppress the no-link fallback)."""
+        outcomes = [
+            Outcome(outcome_type=OutcomeType.MODIFIED, file_path="unlinked.py",
+                    diff_summary="+x", suggestion_description="d", suggestion_confidence=0.8)
+        ]
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=(outcomes, {})), \
+             patch.object(store._outcome_tracker, "compute_arch_delta", return_value=None):
+            store.detect_implicit_feedback({"prompt": "p"}, [])
+        modified_reviews = [x for x in store._facts if x.is_valid and "modified" in x.tags]
+        assert len(modified_reviews) == 1
