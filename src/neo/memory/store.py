@@ -1100,6 +1100,35 @@ class FactStore:
 
         return stats
 
+    def apply_mined_outcomes(self, fact_ids: list[str]) -> int:
+        """Weakly reinforce facts linked to transcript-mined suggestion matches.
+
+        ``fact_ids`` come from ``TranscriptIngester.mine_suggestion_outcomes``,
+        which correlates a past suggestion to a later episode by *topic
+        similarity* — evidence the suggestion's area recurred in subsequent work,
+        not verified diff-overlap acceptance. So each match earns the same weak
+        delta neo gives its other non-git signals (UNVERIFIED): +0.1 confidence
+        and a success_count bump — enough to promote a fact off probation —
+        never the strong +0.2 the git matcher reserves for proven acceptance.
+        The ledger records the suggestion→fact link directly, so this applies by
+        fact_id without the path lookup ``detect_implicit_feedback`` needs.
+        Returns the number of facts updated.
+        """
+        by_id = {f.id: f for f in self._facts}
+        applied = 0
+        for fid in fact_ids:
+            fact = by_id.get(fid)
+            if fact is None or not fact.is_valid:
+                continue
+            fact.metadata.confidence = min(1.0, fact.metadata.confidence + 0.1)
+            fact.metadata.success_count += 1
+            update_effectiveness(fact, outcome="better")
+            fact.metadata.last_accessed = time.time()
+            applied += 1
+        if applied:
+            self.save()
+        return applied
+
     @property
     def entries(self) -> list[Fact]:
         """Backward-compatible access to all facts."""
