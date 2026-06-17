@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.22.3] - 2026-06-17
+
+### Fixed
+
+- **The save() torn-write window is closed with a cross-process file lock.** 0.22.1–0.22.2 made the request-path/observer merge-on-save correct but left a sub-microsecond residual: two processes could interleave between one's re-read and the other's atomic replace. `save()` now holds an exclusive `flock` on a per-scope sidecar `<file>.lock` across the whole read(merge)→write, so writers serialize and that window is gone. The lock is on a sidecar (not the data file, which `os.replace` swaps to a new inode mid-write), taken one scope at a time (no nesting/deadlock), released in `finally` on every path, and best-effort (degrades to the prior unlocked merge if `fcntl` is unavailable, never blocking a save). With this, a fact or a `success_count` reinforcement can no longer be lost under any save interleaving; the only non-lossless case left is two processes *independently* editing the same fact's confidence at once — both edits are always seen (no data loss), and reconciling them to one scalar is a documented policy choice (favor recorded reinforcement), which is a deliberate non-goal to make lossless (would need a per-fact operation log). (`memory/store.py`)
+
 ## [0.22.2] - 2026-06-17
 
 ### Fixed

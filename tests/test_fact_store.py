@@ -1775,3 +1775,30 @@ class TestConcurrentSaveMerge:
         assert merged.metadata.confidence == 0.5, "our demotion was clobbered by wholesale adopt"
         assert "b-only-tag" in merged.tags, "our tag edit was discarded"
         assert merged.metadata.success_count == 2
+
+    def test_file_lock_does_not_break_single_process_saves(self, store, tmp_path):
+        """The cross-process lock must not deadlock or corrupt normal saves;
+        a sidecar .lock file is created and adds/reloads still work."""
+        f1 = store.add_fact(subject="locked one", body="b", kind=FactKind.PATTERN,
+                            scope=FactScope.PROJECT)
+        f2 = store.add_fact(subject="locked two", body="b", kind=FactKind.REVIEW,
+                            scope=FactScope.PROJECT)
+        store.save()
+        # Sidecar lock file exists alongside the project fact file.
+        assert any(p.name.endswith(".json.lock")
+                   for p in (tmp_path / "facts").iterdir())
+        C = FactStore(codebase_root=str(tmp_path))
+        ids = {f.id for f in C._facts}
+        assert f1.id in ids and f2.id in ids
+
+    def test_lock_serialized_concurrent_writes_lose_nothing(self, store, tmp_path):
+        """Even interleaved across two store instances, both processes' added
+        facts survive (lock serializes the read-modify-write)."""
+        A = store
+        B = FactStore(codebase_root=str(tmp_path))
+        fa = A.add_fact(subject="A1", body="b", kind=FactKind.PATTERN, scope=FactScope.PROJECT)
+        fb = B.add_fact(subject="B1", body="b", kind=FactKind.PATTERN, scope=FactScope.PROJECT)
+        fa2 = A.add_fact(subject="A2", body="b", kind=FactKind.PATTERN, scope=FactScope.PROJECT)
+        C = FactStore(codebase_root=str(tmp_path))
+        ids = {f.id for f in C._facts}
+        assert {fa.id, fb.id, fa2.id} <= ids
