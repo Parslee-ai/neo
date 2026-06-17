@@ -6,6 +6,7 @@ fact store. No junk filter, no MinHash, no TF-IDF - just embeddings
 and supersession chains.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -14,6 +15,11 @@ import time
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import fcntl  # POSIX (macOS/Linux); used to serialize cross-process saves
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 import numpy as np
 
@@ -1250,10 +1256,16 @@ class FactStore:
 
         Side effect: reconcile mutates our in-memory metadata in place, so this
         process's monotonic counters rise to match a concurrent writer after a
-        save — intended (next decision uses the merged truth). The only residual
-        loss is a sub-microsecond torn-write window (two processes' read→write
-        interleaving with no file lock), self-healing on the next save/load —
-        acceptable for a single-user tool.
+        save — intended (next decision uses the merged truth).
+
+        The whole read(merge)→write runs under an exclusive cross-process lock
+        (``_scope_file_lock``), so there is no torn-write window: a concurrent
+        writer cannot interleave between our re-read and our atomic replace. The
+        only thing not perfectly composed is two processes *independently*
+        editing the SAME fact's confidence at once — both edits are always seen
+        (no data loss), but reconciling them into one scalar is a policy choice
+        (favor recorded reinforcement), not a lossless merge; lossless would
+        need a per-fact operation log, which is a deliberate non-goal.
         """
         for path, scope in (
             (self._global_path, FactScope.GLOBAL),
@@ -1263,12 +1275,50 @@ class FactStore:
             if not path:
                 continue
             scoped = [f for f in self._facts if f.scope == scope]
-            self._save_file(path, self._merge_on_save(path, scoped))
-            # Record the mtime we just wrote, so the next save can detect
-            # whether another process has written since (and skip the re-read).
-            mt = self._file_mtime(path)
-            if mt is not None:
-                self._scope_mtimes[str(path)] = mt
+            # Hold an exclusive cross-process lock across the whole
+            # read(merge)→write so a concurrent writer can't interleave between
+            # our re-read and our atomic replace — closing the torn-write window
+            # entirely. Locks are taken one scope at a time and released before
+            # the next, so there is no lock-ordering / deadlock concern.
+            with self._scope_file_lock(path):
+                self._save_file(path, self._merge_on_save(path, scoped))
+                # Record the mtime we just wrote, so the next save can detect
+                # whether another process wrote since (and skip the re-read).
+                mt = self._file_mtime(path)
+                if mt is not None:
+                    self._scope_mtimes[str(path)] = mt
+
+    @contextlib.contextmanager
+    def _scope_file_lock(self, path: "Path"):
+        """Exclusive cross-process lock for a scope file's read-modify-write.
+
+        Locks a sidecar ``<file>.lock`` (never the data file itself — that gets
+        atomically replaced by ``_save_file``, which would drop a lock held on
+        the original inode). Best-effort: if ``fcntl`` is unavailable or locking
+        fails, proceeds unlocked (degrades to the prior merge-on-save behavior)
+        rather than blocking a save.
+        """
+        if fcntl is None:
+            yield
+            return
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        fd = None
+        try:
+            fd = open(lock_path, "a")  # 'a': never truncate; content is unused
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            logger.debug(f"scope file lock unavailable for {path.name}: {e}")
+            if fd is not None:
+                fd.close()
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            finally:
+                fd.close()
 
     @staticmethod
     def _file_mtime(path: "Path") -> Optional[int]:
@@ -1294,10 +1344,11 @@ class FactStore:
         another process committed isn't lost to last-writer-wins. A fact we
         invalidated this session always wins (never resurrected as valid).
 
-        The fast path assumes the wall clock advanced between two processes'
-        writes. A same-nanosecond mtime collision across processes (clock not
-        monotonic) would skip a needed merge — a single-fact loss, self-healing
-        on either side's next load(). Not realistic for a single-user tool.
+        Callers hold ``_scope_file_lock`` across this read and the subsequent
+        write, so no other process can write between them. The mtime check only
+        compares against writes that completed *before* we took the lock; cross-
+        process writes are serialized, so the fast path is taken only when the
+        file genuinely hasn't changed since we last held the lock.
         """
         current = self._file_mtime(path)
         if current is not None and current == self._scope_mtimes.get(str(path)):
