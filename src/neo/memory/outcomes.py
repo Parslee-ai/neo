@@ -34,6 +34,17 @@ SESSIONS_DIR = Path.home() / ".neo" / "sessions"
 MAX_INDEPENDENT_OUTCOMES = 5
 CODE_OVERLAP_ACCEPTED_THRESHOLD = 0.8
 
+# Durable suggestion ledger + transcript outcome mining.
+# The session log is consumed (cleared) by git-based outcome detection on the
+# next invocation, so it can't be relied on for asynchronous, transcript-driven
+# correlation. The ledger is an append-only record of linked suggestions that
+# the async miner (TranscriptIngester.mine_suggestion_outcomes) drains on its
+# own cadence, independent of how soon neo is re-invoked.
+OUTCOME_CORRELATION_WINDOW_SECONDS = 2 * 3600  # episode must follow a suggestion within 2h
+OUTCOME_CORRELATION_SIMILARITY = 0.6           # min cosine(description, episode) to call it a match
+MAX_MINED_OUTCOMES_PER_CYCLE = 20              # bound observer work + confidence churn per cycle
+SUGGESTION_LEDGER_TTL_DAYS = 30                # ledger entries older than this are compacted away
+
 
 class OutcomeType(enum.Enum):
     """Classification of what the user did after a neo suggestion."""
@@ -217,6 +228,7 @@ class OutcomeTracker:
         self.project_id = project_id
         self._session_path = self._get_session_path()
         self._session_log_path = self._get_session_log_path()
+        self._suggestion_ledger_path = self._get_suggestion_ledger_path()
 
     def _get_session_path(self) -> Optional[Path]:
         if not self.project_id:
@@ -230,6 +242,108 @@ class OutcomeTracker:
             return None
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         return SESSIONS_DIR / f"session_log_{self.project_id}.jsonl"
+
+    def _get_suggestion_ledger_path(self) -> Optional[Path]:
+        """Path for the durable, append-only suggestion ledger.
+
+        Distinct from the session log: the session log is consumed by
+        git-based outcome detection, while the ledger persists until the
+        transcript outcome miner drains it (or it ages out), so asynchronous
+        correlation never races the request path.
+        """
+        if not self.project_id:
+            return None
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        return SESSIONS_DIR / f"suggestion_ledger_{self.project_id}.jsonl"
+
+    def append_suggestion_ledger(
+        self, suggestions: list, prompt: str,
+        suggestion_fact_ids: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Append linked suggestions to the durable ledger for later mining.
+
+        Only suggestions that carry a linked ``fact_id`` are recorded — the
+        miner can only reinforce a fact it can resolve. Best-effort: a write
+        failure must never break the request path.
+        """
+        path = self._suggestion_ledger_path
+        if not path or not suggestion_fact_ids:
+            return
+        ts = time.time()
+        rows = []
+        for s in suggestions:
+            file_path = getattr(s, "file_path", "")
+            fid = suggestion_fact_ids.get(file_path) if file_path else None
+            if not fid:
+                continue
+            rows.append({
+                "id": f"{ts:.6f}:{fid}:{file_path}",
+                "ts": ts,
+                "project_id": self.project_id,
+                "prompt": prompt[:200],
+                "file_path": file_path,
+                "description": getattr(s, "description", "")[:500],
+                "confidence": getattr(s, "confidence", 0.0),
+                "fact_id": fid,
+            })
+        if not rows:
+            return
+        try:
+            with open(path, "a") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+        except OSError as e:
+            logger.warning(f"Failed to append suggestion ledger: {e}")
+
+    def load_suggestion_ledger(self) -> list[dict]:
+        """Return all current ledger entries (skipping any corrupt lines)."""
+        path = self._suggestion_ledger_path
+        if not path or not path.exists():
+            return []
+        entries: list[dict] = []
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as e:
+            logger.warning(f"Failed to read suggestion ledger: {e}")
+        return entries
+
+    def compact_suggestion_ledger(
+        self, *, drop_ids: Optional[set] = None,
+        max_age_days: int = SUGGESTION_LEDGER_TTL_DAYS,
+    ) -> None:
+        """Rewrite the ledger, dropping mined/expired entries to keep it bounded.
+
+        Load→filter→tmp→replace. The replace is atomic (no corruption), but this
+        is unlocked: a save_session append (request process) landing between the
+        load and the replace is lost. That's acceptable here — the mined signal
+        is weak and plentiful, so losing the occasional suggestion is harmless;
+        not worth a cross-process file lock.
+        """
+        path = self._suggestion_ledger_path
+        if not path or not path.exists():
+            return
+        drop_ids = drop_ids or set()
+        cutoff = time.time() - max_age_days * 86400
+        kept = [
+            e for e in self.load_suggestion_ledger()
+            if e.get("id") not in drop_ids and float(e.get("ts", 0) or 0) >= cutoff
+        ]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with open(tmp, "w") as f:
+                for e in kept:
+                    f.write(json.dumps(e) + "\n")
+            tmp.replace(path)
+        except OSError as e:
+            logger.warning(f"Failed to compact suggestion ledger: {e}")
 
     def save_session(
         self,
@@ -282,6 +396,10 @@ class OutcomeTracker:
             if log_path:
                 with open(log_path, "a") as f:
                     f.write(json.dumps(asdict(session)) + "\n")
+
+            # Durable ledger for async transcript outcome mining (survives the
+            # session-log clearing done by git-based outcome detection).
+            self.append_suggestion_ledger(suggestions, prompt, suggestion_fact_ids)
 
             logger.info(
                 f"Saved session: {len(records)} suggestion(s), "

@@ -22,6 +22,7 @@ live in the ingester that consumes these episodes.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import re
@@ -30,10 +31,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Protocol
 
+from neo.math_utils import cosine_similarity
 from neo.memory.io_utils import atomic_write_json
 from neo.memory.metrics import record as metrics_record
 from neo.memory.models import FactKind, FactScope, Provenance
-from neo.memory.outcomes import SESSIONS_DIR
+from neo.memory.outcomes import (
+    MAX_MINED_OUTCOMES_PER_CYCLE,
+    OUTCOME_CORRELATION_SIMILARITY,
+    OUTCOME_CORRELATION_WINDOW_SECONDS,
+    SESSIONS_DIR,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +311,24 @@ def _parse_json(text: str) -> Optional[dict]:
 
 def _normalize_ws(s: str) -> str:
     return " ".join(s.split())
+
+
+def _episode_epoch(ts: str) -> Optional[float]:
+    """Parse an Episode timestamp to epoch seconds.
+
+    Transcript timestamps are ISO-8601 (``2026-06-17T15:37:23.572Z``); some
+    sources may already store epoch floats. Returns None if unparseable.
+    """
+    if not ts:
+        return None
+    try:
+        return float(ts)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +721,7 @@ class TranscriptIngester:
                 return True
             return bool(should_stop is not None and should_stop())
 
+        all_episodes: list[Episode] = []
         for source in self.sources:
             if stop_now():
                 break
@@ -705,6 +731,7 @@ class TranscriptIngester:
             except Exception as e:  # one bad source must not sink the others
                 logger.warning("transcript: source %s collect failed: %s", source.name, e)
                 continue
+            all_episodes.extend(episodes)
             new = [e for e in episodes if e.anchor_uuid not in consumed]
             stats["episodes_total"] += len(episodes)
             stats["episodes_new"] += len(new)
@@ -715,9 +742,115 @@ class TranscriptIngester:
                 consumed.add(ep.anchor_uuid)
                 self._persist_consumed(source, consumed)  # advance only after durable
                 stats["episodes_processed"] += 1
-        if stats["episodes_processed"]:
+
+        # Correlate neo's own past suggestions (durable ledger) against all
+        # collected episodes to derive real accept/modify outcomes. Best-effort:
+        # a failure here must not sink the lesson-ingest stats above.
+        try:
+            stats["outcomes_mined"] = self.mine_suggestion_outcomes(all_episodes)
+        except Exception as e:
+            logger.warning("transcript: suggestion-outcome mining failed: %s", e)
+            stats["outcomes_mined"] = 0
+
+        if stats["episodes_processed"] or stats.get("outcomes_mined"):
             metrics_record("transcript_ingest", **stats)
         return stats
+
+    # -- Stage D: suggestion-outcome mining ------------------------------
+    def _match_episode(self, description: str, candidates: list) -> Optional["Episode"]:
+        """Return the candidate episode whose text best matches a suggestion
+        description above the similarity floor, or None.
+
+        Uses the store's embedder (Jina) — same vectors as fact retrieval, so no
+        extra model is loaded and no LM call is made. Cost is
+        O(entries × candidates) embed lookups per cycle; bounded because the
+        ledger is compacted every cycle and matching is capped at
+        MAX_MINED_OUTCOMES_PER_CYCLE.
+        """
+        embed = getattr(self._store, "_embed_text", None)
+        if embed is None or not description or not candidates:
+            return None
+        try:
+            dvec = embed(description)
+        except Exception:
+            return None
+        if dvec is None:
+            return None
+        best, best_sim = None, OUTCOME_CORRELATION_SIMILARITY
+        for ep in candidates:
+            text = " ".join([ep.ask, *ep.assistant_text])[:_MAX_ASST_CHARS]
+            if not text.strip():
+                continue
+            try:
+                evec = embed(text)
+            except Exception:
+                continue
+            if evec is None:
+                continue
+            sim = cosine_similarity(dvec, evec)
+            if sim >= best_sim:
+                best, best_sim = ep, sim
+        return best
+
+    def mine_suggestion_outcomes(self, episodes: list) -> int:
+        """Weakly reinforce facts whose past suggestion recurs in later work.
+
+        The durable-ledger, semantically-correlated complement to
+        OutcomeTracker._detect_non_git_outcomes: a suggestion whose description
+        matches a *subsequent* transcript episode is evidence the suggestion's
+        area recurred in later work — weak implicit acceptance, not verified
+        diff-overlap. So a match earns the same weak UNVERIFIED delta as neo's
+        other non-git signals (see store.apply_mined_outcomes), NOT the strong
+        ACCEPTED reward the git matcher reserves for proven acceptance. The
+        episode does not contain neo's suggestion text, so this is topic
+        recurrence — deliberately not classified as accept-vs-modify (a matched
+        episode's tool errors are its own process noise, unrelated to the
+        suggestion's fate). Entries that find no match before their correlation
+        window lapses are dropped so the ledger stays bounded. Returns the number
+        of facts reinforced.
+        """
+        tracker = getattr(self._store, "_outcome_tracker", None)
+        if tracker is None or not hasattr(tracker, "load_suggestion_ledger"):
+            return 0
+        ledger = tracker.load_suggestion_ledger()
+        if not ledger:
+            return 0
+
+        dated = [(t, e) for e in episodes if (t := _episode_epoch(e.timestamp)) is not None]
+        now = time.time()
+        matched_fact_ids: list[str] = []
+        done_ids: set = set()
+
+        # Ledger order is append order (oldest first) — the right drain order,
+        # since oldest entries are closest to window-expiry.
+        for entry in ledger:
+            if len(matched_fact_ids) >= MAX_MINED_OUTCOMES_PER_CYCLE:
+                break
+            eid = entry.get("id", "")
+            fid = entry.get("fact_id", "")
+            ets = float(entry.get("ts", 0) or 0)
+            if not fid:
+                done_ids.add(eid)
+                continue
+            window_end = ets + OUTCOME_CORRELATION_WINDOW_SECONDS
+            cands = [e for t, e in dated if ets <= t <= window_end]
+            if self._match_episode(entry.get("description", ""), cands) is not None:
+                matched_fact_ids.append(fid)
+                done_ids.add(eid)
+            elif now > window_end:
+                done_ids.add(eid)  # window lapsed with no match — give up
+
+        # Compact BEFORE applying, and unconditionally:
+        #  - before, because apply_mined_outcomes is NOT idempotent (it bumps the
+        #    monotonic success_count); a crash between apply and compaction would
+        #    re-mine the entry and double-count. Dropping the ledger entry first
+        #    means a crash loses a (noisy, plentiful) signal rather than
+        #    corrupting the counter that gates community contribution.
+        #  - unconditionally, so the TTL cutoff inside compact_suggestion_ledger
+        #    always runs; gating it on done_ids let a ledger of young-unmatched
+        #    entries grow without the backstop ever firing.
+        tracker.compact_suggestion_ledger(drop_ids=done_ids)
+        return self._store.apply_mined_outcomes(matched_fact_ids) if matched_fact_ids else 0
 
     def _watermark_path(self, source) -> Optional[Path]:
         if source.scope == FactScope.PROJECT:

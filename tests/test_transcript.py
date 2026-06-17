@@ -605,3 +605,118 @@ def test_codex_source_skips_agent_history_wrapper(tmp_path):
     ])
     eps = CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes()
     assert len(eps) == 1 and eps[0].ask == "a genuine ask"
+
+
+# --------------------------------------------------------------------------
+# Stage D: suggestion-outcome mining (durable ledger <-> transcript episodes)
+# --------------------------------------------------------------------------
+
+import time as _time
+from dataclasses import dataclass as _dataclass
+
+import numpy as _np
+
+from neo.memory.outcomes import OUTCOME_CORRELATION_WINDOW_SECONDS
+
+
+@_dataclass
+class _Sugg:
+    file_path: str = ""
+    description: str = ""
+    confidence: float = 0.8
+    unified_diff: str = ""
+    code_block: str = ""
+
+
+@pytest.fixture
+def mining_store(tmp_path, monkeypatch):
+    """Real FactStore + OutcomeTracker, both rooted in tmp, with a deterministic
+    embedder so correlation is controllable (vector keyed on 'validation')."""
+    monkeypatch.setenv("NEO_METRICS", "off")
+    import neo.memory.outcomes as out_mod
+    import neo.memory.store as store_mod
+    monkeypatch.setattr(store_mod, "FACTS_DIR", tmp_path / "facts")
+    monkeypatch.setattr(out_mod, "SESSIONS_DIR", tmp_path / "sessions")
+    st = store_mod.FactStore(codebase_root="/tmp/proj_mining_test", eager_init=False)
+
+    def fake_embed(text):
+        return _np.array([1.0, 0.0]) if "validation" in (text or "").lower() else _np.array([0.0, 1.0])
+
+    monkeypatch.setattr(st, "_embed_text", fake_embed)
+    return st
+
+
+def _linked_review_fact(st, body="apply the validation fix"):
+    fact = st.add_fact(subject="Validation review", body=body,
+                       kind=FactKind.REVIEW, scope=FactScope.PROJECT, confidence=0.5)
+    st._outcome_tracker.append_suggestion_ledger(
+        [_Sugg(file_path="/REVIEW.md", description=body, confidence=0.8)],
+        "review", {"/REVIEW.md": fact.id},
+    )
+    return fact
+
+
+def test_mine_match_is_weak_reinforcement(mining_store):
+    st = mining_store
+    fact = _linked_review_fact(st)
+    ts = st._outcome_tracker.load_suggestion_ledger()[0]["ts"]
+    ep = Episode(session_id="s", anchor_uuid="a", last_uuid="b",
+                 timestamp=str(ts + 60), ask="please apply the validation fix", errors=[])
+
+    ing = TranscriptIngester(store=st, lm_adapter=None, sources=[])
+    applied = ing.mine_suggestion_outcomes([ep])
+
+    assert applied == 1
+    # Weak UNVERIFIED delta: +1 success (enough to promote off probation) and
+    # +0.1 confidence — never the strong +0.2 reserved for verified acceptance.
+    assert fact.metadata.success_count == 1
+    assert fact.metadata.confidence == pytest.approx(0.6)
+    assert st._outcome_tracker.load_suggestion_ledger() == []  # entry consumed
+
+
+def test_mine_ignores_episode_errors(mining_store):
+    """Tool errors in the matched episode are the assistant's process noise, not
+    a 'modify' signal about the suggestion — the reinforcement is unchanged."""
+    st = mining_store
+    fact = _linked_review_fact(st)
+    ts = st._outcome_tracker.load_suggestion_ledger()[0]["ts"]
+    ep = Episode(session_id="s", anchor_uuid="a", last_uuid="b",
+                 timestamp=str(ts + 60), ask="please apply the validation fix",
+                 errors=["TypeError: boom"])
+
+    ing = TranscriptIngester(store=st, lm_adapter=None, sources=[])
+    applied = ing.mine_suggestion_outcomes([ep])
+
+    assert applied == 1
+    assert fact.metadata.success_count == 1          # still reinforced, not demoted
+    assert fact.metadata.confidence == pytest.approx(0.6)
+
+
+def test_mine_no_match_keeps_entry_until_window_lapses(mining_store):
+    st = mining_store
+    fact = _linked_review_fact(st)
+    ts = st._outcome_tracker.load_suggestion_ledger()[0]["ts"]
+    # An unrelated episode within the window must not match.
+    ep = Episode(session_id="s", anchor_uuid="a", last_uuid="b",
+                 timestamp=str(ts + 60), ask="completely unrelated chatter", errors=[])
+
+    ing = TranscriptIngester(store=st, lm_adapter=None, sources=[])
+    assert ing.mine_suggestion_outcomes([ep]) == 0
+    assert fact.metadata.success_count == 0
+    assert len(st._outcome_tracker.load_suggestion_ledger()) == 1  # still pending
+
+
+def test_mine_gives_up_after_window(mining_store):
+    import json
+    st = mining_store
+    fact = _linked_review_fact(st)
+    # Backdate the ledger entry past the correlation window: no episode will come.
+    path = st._outcome_tracker._suggestion_ledger_path
+    entry = st._outcome_tracker.load_suggestion_ledger()[0]
+    entry["ts"] = _time.time() - OUTCOME_CORRELATION_WINDOW_SECONDS - 100
+    path.write_text(json.dumps(entry) + "\n")
+
+    ing = TranscriptIngester(store=st, lm_adapter=None, sources=[])
+    assert ing.mine_suggestion_outcomes([]) == 0
+    assert st._outcome_tracker.load_suggestion_ledger() == []  # expired, dropped
+    assert fact.metadata.success_count == 0
