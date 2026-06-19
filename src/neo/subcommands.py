@@ -359,6 +359,78 @@ def _parse_since(value: str) -> Optional[float]:
     raise ValueError(f"invalid --since value: {value!r} (use e.g. 14d, 48h, 30m)")
 
 
+def _handle_audit(args) -> None:
+    """Audit an AI tool's memory files for hygiene issues (read-only)."""
+    from neo.config import NeoConfig
+    from neo.memory.memaudit import find_memory_audit
+    from neo.memory.store import FactStore
+
+    root = getattr(args, "cwd", None) or os.getcwd()
+    config = NeoConfig.load()
+    store = FactStore(codebase_root=root, config=config, eager_init=False)
+
+    check_conflicts = not getattr(args, "no_conflicts", False)
+    lm = None
+    if check_conflicts:
+        try:
+            from neo.adapters import resolve_adapter
+
+            lm = resolve_adapter(config)
+        except Exception as e:
+            print(
+                f"[Neo] audit: no LM adapter for the conflict check ({e}); "
+                "reporting other findings only.",
+                file=sys.stderr,
+            )
+
+    report = find_memory_audit(
+        store, root=root, check_conflicts=check_conflicts, lm_adapter=lm
+    )
+
+    if getattr(args, "json", False):
+        payload = {
+            "memory_dir": report.memory_dir,
+            "entry_count": report.entry_count,
+            "clean": report.clean,
+            "note": report.note,
+            "malformed": [{"file": f, "issue": i} for f, i in report.malformed],
+            "duplicates": [{"names": d.names} for d in report.duplicates],
+            "conflicts": [
+                {"name_a": c.name_a, "name_b": c.name_b, "explanation": c.explanation}
+                for c in report.conflicts
+            ],
+            "index_issues": report.index_issues,
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    if report.note and report.entry_count == 0:
+        print(f"[Neo] memory audit: {report.note}")
+        return
+
+    print(f"[Neo] memory audit — {report.entry_count} memories in {report.memory_dir}")
+    if report.clean:
+        print("  ✓ no hygiene issues found")
+        return
+    if report.malformed:
+        print(f"\n  Malformed ({len(report.malformed)}):")
+        for fname, issue in report.malformed:
+            print(f"    • {fname}: {issue}")
+    if report.duplicates:
+        print(f"\n  Near-duplicates ({len(report.duplicates)}):")
+        for d in report.duplicates:
+            print(f"    • {', '.join(d.names)}")
+    if report.conflicts:
+        print(f"\n  Conflicts ({len(report.conflicts)}):")
+        for c in report.conflicts:
+            print(f"    • {c.name_a} ↔ {c.name_b}: {c.explanation}")
+    if report.index_issues:
+        print(f"\n  MEMORY.md index ({len(report.index_issues)}):")
+        for issue in report.index_issues:
+            print(f"    • {issue}")
+    print()
+
+
 def _handle_rules(args) -> None:
     """Flag drift between AGENTS.md / CLAUDE.md / GEMINI.md (read-only)."""
     from neo.config import NeoConfig
@@ -520,6 +592,9 @@ def handle_memory(args):
     if action == "rules":
         _handle_rules(args)
         return
+    if action == "audit":
+        _handle_audit(args)
+        return
     if action == "prune":
         files = _fact_files_for_prune(
             all_files=getattr(args, "all", False),
@@ -557,7 +632,7 @@ def handle_memory(args):
         return
 
     if action != "replay-feedback":
-        print("Usage: neo memory {replay-feedback|prune|observer|issues|rules} ...")
+        print("Usage: neo memory {replay-feedback|prune|observer|issues|rules|audit} ...")
         return
 
     from neo.config import NeoConfig
