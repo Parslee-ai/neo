@@ -35,6 +35,13 @@
     cold start (`store.py:190-192`). For on-demand compaction of tombstone bloat in a
     specific project's fact file, use `neo memory prune [--all] [--dry-run]`
     (`subcommands.py:_compact_fact_file`).
+  - Diagnostics (read-only, flag-and-propose): `neo memory issues [--since 14d]
+    [--min-cluster 3] [--suggest-rules] [--json]` surfaces recurring frictions mined from
+    transcript history (Claude Code / Codex / CAR) as ranked, evidence-cited issues
+    (`missing-tool` / `absent-guardrail` / `vague-rule`); `--suggest-rules` adds a bounded
+    LM call per issue to draft a preventive rule. `neo memory rules [--json]
+    [--no-conflicts]` flags drift between AGENTS.md / CLAUDE.md / GEMINI.md (gaps +
+    LM-judged conflicts). (`neo/memory/issues.py`, `neo/memory/rulesync.py`)
 - Domain tags (`Fact.domain`, `memory.models.SUGGESTED_DOMAINS`): optional free-form
   area tag orthogonal to `FactKind` — `code-style`, `testing`, `git`, `debugging`,
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the

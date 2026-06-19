@@ -359,6 +359,87 @@ def _parse_since(value: str) -> Optional[float]:
     raise ValueError(f"invalid --since value: {value!r} (use e.g. 14d, 48h, 30m)")
 
 
+def _handle_rules(args) -> None:
+    """Flag drift between AGENTS.md / CLAUDE.md / GEMINI.md (read-only)."""
+    from neo.config import NeoConfig
+    from neo.memory.rulesync import find_rule_sync
+    from neo.memory.store import FactStore
+
+    root = getattr(args, "cwd", None) or os.getcwd()
+    config = NeoConfig.load()
+    store = FactStore(codebase_root=root, config=config, eager_init=False)
+
+    check_conflicts = not getattr(args, "no_conflicts", False)
+    lm = None
+    if check_conflicts:
+        try:
+            from neo.adapters import resolve_adapter
+
+            lm = resolve_adapter(config)
+        except Exception as e:
+            print(
+                f"[Neo] rules: no LM adapter for the conflict check ({e}); "
+                "reporting gaps only.",
+                file=sys.stderr,
+            )
+
+    report = find_rule_sync(
+        store, root=root, check_conflicts=check_conflicts, lm_adapter=lm
+    )
+
+    if getattr(args, "json", False):
+        payload = {
+            "files": [
+                {"tool": f.tool, "path": f.path, "rule_count": len(f.units)}
+                for f in report.files
+            ],
+            "in_sync": report.in_sync,
+            "note": report.note,
+            "gaps": [
+                {
+                    "rule": g.rule,
+                    "present_in": g.present_in,
+                    "missing_from": g.missing_from,
+                    "suggestion": g.suggestion,
+                }
+                for g in report.gaps
+            ],
+            "conflicts": [
+                {
+                    "tool_a": c.tool_a, "text_a": c.text_a,
+                    "tool_b": c.tool_b, "text_b": c.text_b,
+                    "explanation": c.explanation,
+                    "suggestion": c.suggestion,
+                }
+                for c in report.conflicts
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    files_desc = ", ".join(f"{f.tool.upper()}.md ({len(f.units)} rules)" for f in report.files) or "none"
+    print(f"[Neo] memory rules — files: {files_desc}")
+    if report.note:
+        print(f"  {report.note}")
+    if report.in_sync:
+        if not report.note:
+            print("  ✓ rule files are in sync (no gaps or conflicts)")
+        return
+
+    if report.gaps:
+        print(f"\n  Gaps ({len(report.gaps)}):")
+        for g in report.gaps:
+            print(f"    • present in {', '.join(g.present_in)}; missing from {', '.join(g.missing_from)}")
+            print(f"      {g.rule}")
+            print(f"      → {g.suggestion}")
+    if report.conflicts:
+        print(f"\n  Conflicts ({len(report.conflicts)}):")
+        for c in report.conflicts:
+            print(f"    • {c.tool_a.upper()}.md vs {c.tool_b.upper()}.md: {c.explanation}")
+            print(f"      → {c.suggestion}")
+    print()
+
+
 def _handle_issues(args) -> None:
     """Surface recurring frictions mined from transcript history (read-only)."""
     from neo.config import NeoConfig
@@ -436,6 +517,9 @@ def handle_memory(args):
     if action == "issues":
         _handle_issues(args)
         return
+    if action == "rules":
+        _handle_rules(args)
+        return
     if action == "prune":
         files = _fact_files_for_prune(
             all_files=getattr(args, "all", False),
@@ -473,7 +557,7 @@ def handle_memory(args):
         return
 
     if action != "replay-feedback":
-        print("Usage: neo memory {replay-feedback|prune|observer|issues} ...")
+        print("Usage: neo memory {replay-feedback|prune|observer|issues|rules} ...")
         return
 
     from neo.config import NeoConfig

@@ -237,6 +237,18 @@ def parse_args():
         )
         issues_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
 
+        rules_p = subparsers.add_parser(
+            'rules',
+            help='Flag drift between AGENTS.md / CLAUDE.md / GEMINI.md (read-only)',
+        )
+        rules_p.add_argument('--json', action='store_true', help='Emit the sync report as JSON')
+        rules_p.add_argument(
+            '--no-conflicts',
+            action='store_true',
+            help='Skip the LM contradiction check; report gaps only (offline)',
+        )
+        rules_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
+
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
         args.memory_action = args.action
