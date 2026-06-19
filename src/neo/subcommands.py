@@ -339,6 +339,17 @@ def _handle_observer(args) -> None:
         parts.append(f"log={result['log_file']}")
     print(" ".join(parts))
 
+    orphans = result.get("orphans") or []
+    if orphans:
+        pidlist = " ".join(str(p) for p in orphans)
+        print(
+            f"[Neo] WARNING: {len(orphans)} orphaned observer process(es) for this "
+            f"project not supervised by CAR (pid {pidlist}) — a leftover from a prior "
+            f"car-server (pre-0.18.0 footgun). It runs redundant synthesis cycles; "
+            f"reap with: kill {pidlist}",
+            file=sys.stderr,
+        )
+
 
 def _parse_since(value: str) -> Optional[float]:
     """Parse a duration like ``14d`` / ``48h`` / ``30m`` / ``3600s`` to seconds.
