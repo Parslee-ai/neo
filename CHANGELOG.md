@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.27.0] - 2026-06-19
+
+### Added
+
+- **`neo memory import` — ingest a peer tool's memory into neo's store (phase 2 of cross-tool memory).** Reads Claude Code's per-project `memory/*.md` and admits each well-formed entry as a fact in neo's own store, so what one agent learned becomes available to neo's reasoning. **Trust-first admission**: imports enter as **REVIEW** (a decaying kind, never CONSTRAINT/ARCHITECTURE which would bypass decay and read as curated truth), with **INFERRED** provenance and an `imported:claude-memory` tag — so `add_fact` puts them on **probation** (they must earn promotion via access/success like any fluid fact) and gives them the lowest provenance bonus. Dedup/supersession is handled by `add_fact`'s existing cosine ≥ 0.85 machinery; a per-(project, tool) content-hash watermark makes re-runs idempotent (an *edited* memory re-imports and supersedes rather than duplicating). Malformed entries (no frontmatter / no description) are skipped. `--dry-run` previews without mutating; `--confidence` tunes the initial value (default 0.4). `neo memory import [--dry-run] [--confidence 0.4] [--cwd]`. (`memory/memimport.py`, `cli.py`, `subcommands.py`; see `docs/solutions/memory-audit.md`)
+
 ## [0.26.0] - 2026-06-19
 
 ### Added

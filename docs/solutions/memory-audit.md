@@ -37,11 +37,19 @@ not-yet-written memory is intentional ("marks something worth writing later").
 /projects/<encoded>`) plus `/memory`. So the audit targets the same project's
 Claude Code memory the transcript miner already knows how to locate.
 
+## Phase 2 (shipped v0.27.0): `neo memory import`
+
+`neo memory import [--dry-run] [--confidence 0.4]` (`neo/memory/memimport.py`)
+ingests Claude Code's `memory/*.md` into neo's own store. **Trust-first**: each
+well-formed entry is admitted as a **REVIEW** fact (decaying — never the
+decay-bypassing CONSTRAINT/ARCHITECTURE kinds), with **INFERRED** provenance and
+an `imported:claude-memory` tag, so `add_fact` puts it on **probation** — it must
+earn promotion via access/success like any fluid fact, mitigating the
+import-wrong/stale-facts risk. Dedup/supersession reuses `add_fact`'s cosine
+≥ 0.85 machinery; a per-(project, tool) content-hash watermark makes re-runs
+idempotent (edited memory re-imports and supersedes). `--dry-run` previews.
+
 ## Roadmap
 
-- **Phase 2 (deferred): ingest as a source.** A `MemorySource` adapter that
-  imports peer-tool memory into neo's own store **on probation** with an
-  `imported:<tool>` provenance, under existing hygiene (dedup, supersession,
-  caps). Makes neo the cross-tool memory hub. Gated behind the trust concern
-  that importing another tool's memory can import wrong/stale facts.
-- Other tools' memory formats (Cursor, Copilot) as they stabilize.
+- Other tools' memory formats (Cursor, Copilot) as they stabilize, each as an
+  additional source adapter.
