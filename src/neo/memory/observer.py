@@ -404,19 +404,36 @@ class Observer:
         batch = (roots[start:] + roots[:start])[:budget]
         self._sweep_offset = (start + len(batch)) % len(roots)
 
+        n = len(batch)
+        print(
+            f"neo observer sweep start: {n} of {len(roots)} project(s) this cycle",
+            flush=True,
+        )
+
         total_synth = total_mined = errors = covered = 0
-        for root in batch:
+        for i, root in enumerate(batch, 1):
             if self._stop:
                 break
+            label = os.path.basename(root.rstrip("/")) or root
+            p0 = time.time()
             try:
                 count, mined, _store = self._run_project(root)
                 total_synth += count
                 total_mined += mined
                 covered += 1
+                # Per-project heartbeat so a long first sweep is legible (it logs
+                # only at batch end otherwise — invisible during a multi-minute
+                # backlog catch-up).
+                print(
+                    f"neo observer sweep [{i}/{n}] {label}: "
+                    f"{count} synthesized, {mined} mined ({time.time() - p0:.1f}s)",
+                    flush=True,
+                )
             except Exception as e:
                 errors += 1
                 print(
-                    f"neo observer project error [{root}]: {type(e).__name__}: {e}",
+                    f"neo observer sweep [{i}/{n}] {label}: ERROR "
+                    f"{type(e).__name__}: {e}",
                     file=sys.stderr, flush=True,
                 )
 

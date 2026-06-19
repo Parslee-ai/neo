@@ -487,6 +487,19 @@ class TestGlobalSweep:
         assert swept == ["/a", "/b", "/c"]
         assert o._last_cycle_count == 3
 
+    def test_global_cycle_logs_per_project_progress(self, monkeypatch, capsys):
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a/foo", "/b/bar"])
+        monkeypatch.setattr(Observer, "_run_project", lambda self, root: (1, 0, object()))
+        o = Observer(global_mode=True)
+        o._cycle()
+        out = capsys.readouterr().out
+        assert "sweep start: 2 of 2 project(s)" in out
+        assert "[1/2] foo:" in out
+        assert "[2/2] bar:" in out
+        assert "cycle ok: swept 2/2" in out
+
     def test_global_cycle_round_robins_budget(self, monkeypatch):
         import neo.memory.observer as obs
         from neo.memory.observer import Observer, ObserverConfig
