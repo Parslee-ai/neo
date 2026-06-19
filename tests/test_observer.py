@@ -90,9 +90,77 @@ class TestCarVersionFloor:
         assert obs._require_car_runtime() is fake_car
 
 
-class TestOrphanDetection:
+class _FakeProc:
+    """Minimal psutil.Process stand-in for orphan-detection tests."""
+
+    def __init__(self, pid, ppid, cmdline, parent_alive=True):
+        self.pid = pid
+        self.info = {"pid": pid, "ppid": ppid, "cmdline": cmdline}
+        self._parent_alive = parent_alive
+
+    def parent(self):
+        return object() if self._parent_alive else None
+
+
+def _install_fake_psutil(monkeypatch, procs):
+    class NoSuchProcess(Exception):
+        pass
+
+    class AccessDenied(Exception):
+        pass
+
+    fake = types.SimpleNamespace(
+        process_iter=lambda attrs=None: list(procs),
+        NoSuchProcess=NoSuchProcess,
+        AccessDenied=AccessDenied,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+    return fake
+
+
+def _obs_cmd(root):
+    return ["/usr/bin/python", "-m", "neo.memory.observer", "--daemon", "--cwd", root]
+
+
+class TestOrphanDetectionPsutil:
+    """Cross-platform path (psutil): POSIX ppid==1 AND Windows parent-gone."""
+
+    def test_posix_orphan_ppid1(self, monkeypatch, tmp_path):
+        root = str(tmp_path)
+        _install_fake_psutil(monkeypatch, [_FakeProc(100, 1, _obs_cmd(root), parent_alive=True)])
+        from neo.memory.observer import _find_orphan_observers
+        assert _find_orphan_observers(root) == [100]
+
+    def test_windows_orphan_parent_gone(self, monkeypatch, tmp_path):
+        # No ppid==1 reparenting on Windows; the launching car-server is just gone.
+        root = str(tmp_path)
+        _install_fake_psutil(monkeypatch, [_FakeProc(200, 4321, _obs_cmd(root), parent_alive=False)])
+        from neo.memory.observer import _find_orphan_observers
+        assert _find_orphan_observers(root) == [200]
+
+    def test_supervised_not_flagged(self, monkeypatch, tmp_path):
+        root = str(tmp_path)
+        _install_fake_psutil(monkeypatch, [_FakeProc(300, 20656, _obs_cmd(root), parent_alive=True)])
+        from neo.memory.observer import _find_orphan_observers
+        assert _find_orphan_observers(root) == []
+
+    def test_ignores_other_project_and_nonobserver(self, monkeypatch, tmp_path):
+        root = str(tmp_path)
+        procs = [
+            _FakeProc(1, 1, _obs_cmd("/some/other/project"), parent_alive=False),
+            _FakeProc(2, 1, ["/usr/bin/python", "-m", "http.server"], parent_alive=False),
+        ]
+        _install_fake_psutil(monkeypatch, procs)
+        from neo.memory.observer import _find_orphan_observers
+        assert _find_orphan_observers(root) == []
+
+
+class TestOrphanDetectionPs:
+    """POSIX `ps` fallback path (psutil absent)."""
+
     def _fake_ps(self, monkeypatch, text):
         import neo.memory.observer as obs
+        monkeypatch.setitem(sys.modules, "psutil", None)  # force ImportError -> ps fallback
         monkeypatch.setattr(
             obs.subprocess, "run",
             lambda *a, **k: types.SimpleNamespace(stdout=text),
@@ -118,6 +186,7 @@ class TestOrphanDetection:
 
     def test_ps_failure_is_safe(self, monkeypatch, tmp_path):
         import neo.memory.observer as obs
+        monkeypatch.setitem(sys.modules, "psutil", None)
 
         def boom(*a, **k):
             raise OSError("no ps here")
@@ -125,6 +194,8 @@ class TestOrphanDetection:
         monkeypatch.setattr(obs.subprocess, "run", boom)
         assert obs._find_orphan_observers(str(tmp_path)) == []
 
+
+class TestOrphanStatus:
     def test_status_includes_orphans(self, monkeypatch):
         import neo.memory.observer as obs
         monkeypatch.setattr(obs, "_resolve_project_id", lambda root: "abc123def456")

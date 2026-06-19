@@ -617,18 +617,64 @@ def kick_observer(codebase_root: Optional[str] = None) -> dict:
             "message": f"restarted as pid {managed.get('pid')}"}
 
 
+def _cmd_is_our_observer(cmd: str, root: str) -> bool:
+    """True if a command line is an observer daemon for this project's root."""
+    if "neo.memory.observer" not in cmd or "--daemon" not in cmd:
+        return False
+    m = re.search(r"--cwd[\s=]+(\S+)", cmd)
+    if not m:
+        return False
+    try:
+        return os.path.realpath(m.group(1).strip('"\'')) == root
+    except OSError:
+        return False
+
+
 def _find_orphan_observers(codebase_root: Optional[str] = None) -> list[int]:
-    """Launchd/init-orphaned observer daemons for this project (ppid == 1).
+    """Orphaned observer daemons for this project — cross-platform.
 
     An orphan is an observer process the CAR supervisor no longer parents — left
     behind when a prior car-server died without reaping its child (the pre-0.18.0
-    footgun). It is reparented to init/launchd (ppid 1); the supervised observer
-    is always parented by car-server, so it is never matched. Scoped to this
-    project by the daemon's ``--cwd`` argument (realpath-compared). Best-effort
-    via ``ps`` — returns ``[]`` on any platform/parse/timeout failure so it can
-    never break ``status``.
+    footgun). The supervised observer is always parented by a live car-server, so
+    it is never matched. "No live parent" is the portable signal:
+
+    - POSIX: a dead parent reparents the child to init/launchd (``ppid == 1``).
+    - Windows: there is no reparenting; the parent pid simply no longer maps to a
+      live process, which ``psutil`` reports as ``parent() is None``.
+
+    Prefers ``psutil`` (works on macOS/Linux/Windows); falls back to ``ps`` on
+    POSIX when ``psutil`` is absent. Scoped to this project by the daemon's
+    ``--cwd`` (realpath-compared). Best-effort: returns ``[]`` on any
+    platform/parse/permission failure so it can never break ``status``.
     """
     root = os.path.realpath(codebase_root or os.getcwd())
+
+    try:
+        import psutil
+    except ImportError:
+        return _find_orphan_observers_ps(root)
+
+    orphans: list[int] = []
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            cmd = " ".join(proc.info.get("cmdline") or [])
+            if not _cmd_is_our_observer(cmd, root):
+                continue
+            try:
+                parent_alive = proc.parent() is not None
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                parent_alive = False
+            # POSIX orphan: reparented to init (ppid 1). Windows orphan: the
+            # launching car-server is gone, so psutil finds no live parent.
+            if proc.info.get("ppid") == 1 or not parent_alive:
+                orphans.append(int(proc.pid))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return sorted(orphans)
+
+
+def _find_orphan_observers_ps(root: str) -> list[int]:
+    """POSIX ``ps`` fallback for orphan detection (used when psutil is absent)."""
     try:
         out = subprocess.run(
             ["ps", "-ax", "-o", "pid=,ppid=,command="],
@@ -643,20 +689,15 @@ def _find_orphan_observers(codebase_root: Optional[str] = None) -> list[int]:
         if len(fields) < 3:
             continue
         pid_s, ppid_s, cmd = fields
-        if ppid_s != "1":
-            continue  # supervised processes are parented by car-server, not init
-        if "neo.memory.observer" not in cmd or "--daemon" not in cmd:
+        if ppid_s != "1":  # supervised processes are parented by car-server, not init
             continue
-        m = re.search(r"--cwd\s+(\S+)", cmd)
-        if not m:
+        if not _cmd_is_our_observer(cmd, root):
             continue
         try:
-            if os.path.realpath(m.group(1)) != root:
-                continue  # a different project's orphan, not ours
             orphans.append(int(pid_s))
-        except (ValueError, OSError):
+        except ValueError:
             continue
-    return orphans
+    return sorted(orphans)
 
 
 def observer_status(codebase_root: Optional[str] = None) -> dict:
