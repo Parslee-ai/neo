@@ -44,8 +44,11 @@
     [--no-conflicts]` flags drift between AGENTS.md / CLAUDE.md / GEMINI.md (gaps +
     LM-judged conflicts). `neo memory audit [--json] [--no-conflicts]` inspects an AI
     tool's memory files (Claude Code `memory/*.md`) for malformed entries, near-duplicates,
-    conflicts, and MEMORY.md index drift. (`neo/memory/issues.py`,
-    `neo/memory/rulesync.py`, `neo/memory/memaudit.py`)
+    conflicts, and MEMORY.md index drift. `neo memory import [--dry-run]` ingests a peer
+    tool's memory files into neo's store as REVIEW facts on probation (trust-first;
+    `imported:claude-memory` tag, content-hash watermark for idempotency).
+    (`neo/memory/issues.py`, `neo/memory/rulesync.py`, `neo/memory/memaudit.py`,
+    `neo/memory/memimport.py`)
     - `issues` reuses the ingester's `TranscriptSource` episodes but never admits facts or
       touches the `transcript_watermark_*` watermark — decoupled from fact admission and
       idempotent (`find_issues`). Gate mirrors synthesis discipline (≥`min_cluster`

@@ -359,6 +359,39 @@ def _parse_since(value: str) -> Optional[float]:
     raise ValueError(f"invalid --since value: {value!r} (use e.g. 14d, 48h, 30m)")
 
 
+def _handle_import(args) -> None:
+    """Import a peer tool's memory files into neo's store (on probation)."""
+    from neo.config import NeoConfig
+    from neo.memory.memimport import import_memory
+    from neo.memory.store import FactStore
+
+    root = getattr(args, "cwd", None) or os.getcwd()
+    config = NeoConfig.load()
+    store = FactStore(codebase_root=root, config=config, eager_init=False)
+
+    stats = import_memory(
+        store,
+        root=root,
+        confidence=getattr(args, "confidence", 0.4),
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+    if stats.note and stats.scanned == 0:
+        print(f"[Neo] memory import: {stats.note}")
+        return
+
+    verb = "would import" if stats.dry_run else "imported"
+    print(
+        f"[Neo] memory import — scanned {stats.scanned}; {verb} {stats.imported}"
+        + (f", deduped {stats.deduped}" if stats.deduped else "")
+        + (f", skipped {stats.skipped_existing} already-imported" if stats.skipped_existing else "")
+        + (f", skipped {stats.skipped_malformed} malformed" if stats.skipped_malformed else "")
+    )
+    if not stats.dry_run and stats.imported:
+        print("  imported as REVIEW facts on probation (decaying, must earn promotion); "
+              "tagged 'imported:claude-memory'")
+
+
 def _handle_audit(args) -> None:
     """Audit an AI tool's memory files for hygiene issues (read-only)."""
     from neo.config import NeoConfig
@@ -595,6 +628,9 @@ def handle_memory(args):
     if action == "audit":
         _handle_audit(args)
         return
+    if action == "import":
+        _handle_import(args)
+        return
     if action == "prune":
         files = _fact_files_for_prune(
             all_files=getattr(args, "all", False),
@@ -632,7 +668,7 @@ def handle_memory(args):
         return
 
     if action != "replay-feedback":
-        print("Usage: neo memory {replay-feedback|prune|observer|issues|rules|audit} ...")
+        print("Usage: neo memory {replay-feedback|prune|observer|issues|rules|audit|import} ...")
         return
 
     from neo.config import NeoConfig

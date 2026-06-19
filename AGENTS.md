@@ -43,8 +43,11 @@
     [--no-conflicts]` flags drift between AGENTS.md / CLAUDE.md / GEMINI.md (gaps +
     LM-judged conflicts). `neo memory audit [--json] [--no-conflicts]` inspects an AI
     tool's memory files (Claude Code `memory/*.md`) for malformed entries, near-duplicates,
-    conflicts, and MEMORY.md index drift. (`neo/memory/issues.py`,
-    `neo/memory/rulesync.py`, `neo/memory/memaudit.py`)
+    conflicts, and MEMORY.md index drift. `neo memory import [--dry-run]` ingests a peer
+    tool's memory files into neo's store as REVIEW facts on probation (trust-first;
+    `imported:claude-memory` tag, content-hash watermark for idempotency).
+    (`neo/memory/issues.py`, `neo/memory/rulesync.py`, `neo/memory/memaudit.py`,
+    `neo/memory/memimport.py`)
 - Domain tags (`Fact.domain`, `memory.models.SUGGESTED_DOMAINS`): optional free-form
   area tag orthogonal to `FactKind` — `code-style`, `testing`, `git`, `debugging`,
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the

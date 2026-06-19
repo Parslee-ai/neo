@@ -261,6 +261,23 @@ def parse_args():
         )
         audit_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
 
+        import_p = subparsers.add_parser(
+            'import',
+            help="Import a peer tool's memory files into neo's store (on probation)",
+        )
+        import_p.add_argument(
+            '--dry-run',
+            action='store_true',
+            help='Show what would be imported without mutating the store',
+        )
+        import_p.add_argument(
+            '--confidence',
+            type=float,
+            default=0.4,
+            help='Initial confidence for imported facts (default: 0.4)',
+        )
+        import_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
+
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
         args.memory_action = args.action
