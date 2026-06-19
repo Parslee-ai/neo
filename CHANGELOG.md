@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.23.0] - 2026-06-19
+
+### Added
+
+- **`neo memory issues` — a read-only diagnostic that surfaces recurring frictions mined from transcript history.** The ingester already parses Claude Code / Codex / CAR transcripts into episodes and computes friction signals (tool errors, assistant clarification), but only ever used them to silently enrich retrieval. This new subcommand (`neo memory issues [--since 14d] [--min-cluster 3] [--json]`) flips that into actionable output: it clusters similar asks by embedding (Jina, the same vectors as fact retrieval — no extra model, no LM call) and reports recurring frictions as ranked, evidence-cited issues categorized `missing-tool` / `absent-guardrail` / `vague-rule`. **Read-only / no-consume**: `find_issues` never constructs `TranscriptIngester` and never touches the `transcript_watermark_*` files, so it is fully decoupled from fact admission and idempotent. The gate mirrors synthesis discipline (≥`min_cluster` members, ≥2 distinct sessions, ≥2 frictional members, ≥1 verbatim evidence span), deliberately biased toward precision: an error must look like a diagnostic (prefix `error:`/`fatal:`, typed exception with a colon, lint code, or a curated failure phrase) — Claude Code `<tool_use_error>` guards, bare exit-code banners, non-error command output, and code identifiers like `WorkflowError` are filtered out. Validated against real history across 8 local projects, where it turned 7 noise findings into 2 genuine cross-session frictions on the busiest repo. (`memory/issues.py`, `cli.py`, `subcommands.py`; see `docs/solutions/conversation-mined-issues.md`)
+
+### Changed
+
+- **Extracted the complete-linkage clusterer into `math_utils.cluster_by_similarity`.** The greedy complete-linkage loop in `store._cluster_by_similarity` is now a generic `cluster_by_similarity(items, embed_fn, threshold)` shared by REVIEW→PATTERN synthesis and the new issue diagnostic (behavior-identical; existing synthesis tests unchanged). (`math_utils.py`, `memory/store.py`)
+
 ## [0.22.4] - 2026-06-17
 
 ### Fixed
