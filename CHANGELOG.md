@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.30.0] - 2026-06-19
+
+### Changed
+
+- **Observer orphan detection is now cross-platform (Windows support).** The 0.29.0 orphan check used `ps` and `ppid == 1`, both POSIX-only. `_find_orphan_observers` now prefers **psutil** (added to the `[car]` extra) for parent-liveness introspection that works on macOS/Linux/Windows, falling back to `ps` on POSIX when psutil is absent. The portable orphan signal is "no live parent": POSIX reparents a dead parent's child to init/launchd (`ppid == 1`), while Windows does not reparent — psutil reports the vanished launching car-server as `parent() is None`. The supervised observer (parented by a live car-server) is never flagged on any OS. Verified live (psutil path doesn't false-positive the real supervised observer) and unit-tested for POSIX-orphan, Windows-orphan, supervised, and non-observer cases. (`memory/observer.py`, `pyproject.toml`)
+
 ## [0.29.0] - 2026-06-19
 
 ### Added
