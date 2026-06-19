@@ -80,11 +80,17 @@ admission, idempotent, and safe to run repeatedly. Guarded by
   embed_fn, threshold)`; both synthesis and this diagnostic share one
   implementation.
 
+## `--suggest-rules` (shipped v0.24.0)
+
+`neo memory issues --suggest-rules` makes one bounded LM call per surviving
+issue (highest-confidence first, capped at `_MAX_SUGGESTED_RULES`) to draft a
+preventive AGENTS.md rule, populating `Issue.suggested_rule`. The LM-bearing
+step is confined to `suggest_rules` in the CLI path — `find_issues` stays
+deterministic and LM-free. Per-issue LM failure is graceful (leaves the rule
+unset); the adapter is built via `resolve_adapter` only when the flag is set.
+
 ## Deferred (post-v1)
 
-- `--suggest-rules`: one gated LM call per surviving cluster to phrase a
-  proposed AGENTS.md/CLAUDE.md rule (Stage-B style). `Issue.suggested_rule` is
-  the placeholder.
 - Dedup against existing FAILURE facts (annotate "already in memory").
 - Detectors 5–6: artifact drift (CLAUDE.md asserts X, transcripts show not-X)
   and contradiction (CLAUDE.md vs AGENTS.md vs Neo facts) — need an LM judge +
