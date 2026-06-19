@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.0] - 2026-06-19
+
+### Changed
+
+- **The memory observer is now a single global, auto-started process instead of one opt-in process per project.** Previously you had to run `neo memory observer start` in each repo, and each got its own supervised daemon — so in practice only one project was ever observed. Now a single CAR agent (`neo-observer`, daemon `--daemon --all`) **sweeps all discovered projects** each cycle (round-robin, `max_projects_per_cycle` default 25; watermark-gated so projects with no new transcripts do near-zero work), running synthesis + transcript mining per project. **No opt-in**: `maybe_autostart_observer()` (called from `cli.main`) auto-registers it whenever `car-server` is reachable — opt out with `NEO_OBSERVER_AUTOSTART=0`; when CAR is absent it prints a one-time hint then stays silent. On bootstrap/start, legacy per-project agents (`neo-observer-<id12>`) are stopped and removed. Lifecycle (`start`/`stop`/`kick`/`status`) and orphan detection now operate on the single global agent; orphan detection flags *any* unsupervised neo observer daemon (global or stranded legacy). Per-project mode (`--daemon --cwd`) and the A2UI inspector remain for direct use. (`memory/observer.py`, `cli.py`)
+
 ## [0.30.0] - 2026-06-19
 
 ### Changed

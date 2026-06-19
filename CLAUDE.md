@@ -108,14 +108,22 @@
   JSON-RPC over its WebSocket. `neo.a2ui.DaemonClient` is that bridge.
   Activation: auto when `127.0.0.1:9100` is reachable; silent no-op
   otherwise. Adds `websockets>=12.0` to the `[car]` extra.
-- Async synthesis observer (`memory.observer`): a per-project background process
-  that runs `synthesize_reviews` on a wall-clock cadence, decoupled from the
-  request path. *Additive* — the inline triple-trigger gate keeps firing too;
-  the observer just makes synthesis more frequent. **Hard dep**: car-runtime
-  ≥ 0.18.0 and a running `car-server` daemon — CAR's supervisor owns the
-  spawn / restart-on-failure / log redirection / clean SIGTERM shutdown.
-  Spec persisted to `~/.car/agents.json` (`auto_start: true` so it comes back
-  on daemon boot); logs land at `~/.car/logs/neo-observer-<id8>.{stdout,stderr}.log`.
+- Async synthesis observer (`memory.observer`): a **single global** background
+  process (CAR agent `neo-observer`, daemon `--daemon --all`) that **sweeps all
+  discovered projects** each cycle — round-robin/budgeted (`max_projects_per_cycle`,
+  default 25; watermark-gated so unchanged projects do near-zero work) — running
+  `synthesize_reviews` + transcript mining per project. *Additive* — the inline
+  triple-trigger gate keeps firing too. **Not opt-in**: `maybe_autostart_observer()`
+  (called from `cli.main`) auto-registers it whenever `car-server` is reachable;
+  opt out with `NEO_OBSERVER_AUTOSTART=0`. No CAR → one-time hint, then silent.
+  Projects are discovered from `~/.claude/projects/*` (decoded roots). On
+  bootstrap/start, legacy **per-project** agents (`neo-observer-<id12>`, the old
+  model) are stopped + `agents_remove`d. **Hard dep**: car-runtime ≥ 0.18.0
+  (pin floor 0.27.0) + a running `car-server` — CAR's supervisor owns
+  spawn / restart-on-failure / clean SIGTERM. Logs at
+  `~/.car/logs/neo-observer.{stdout,stderr}.log`. Lifecycle/`status`/orphan-check
+  all operate on the single global agent. (A2UI per-project inspector is skipped
+  in global mode.)
   Lifecycle: `neo memory observer {start|stop|status|kick}` — `kick` maps to
   `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
   CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |
