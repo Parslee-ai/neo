@@ -90,6 +90,55 @@ class TestCarVersionFloor:
         assert obs._require_car_runtime() is fake_car
 
 
+class TestOrphanDetection:
+    def _fake_ps(self, monkeypatch, text):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(
+            obs.subprocess, "run",
+            lambda *a, **k: types.SimpleNamespace(stdout=text),
+        )
+
+    def test_finds_launchd_orphan_for_this_root(self, monkeypatch, tmp_path):
+        root = str(tmp_path)
+        text = (
+            f"100     1 /usr/bin/python -m neo.memory.observer --daemon --cwd {root}\n"       # orphan
+            f"200 20656 /usr/bin/python -m neo.memory.observer --daemon --cwd {root}\n"       # supervised
+            f"300     1 /usr/bin/python -m neo.memory.observer --daemon --cwd /other/proj\n"  # other project
+            f"400     1 /usr/bin/python -m http.server\n"                                     # not observer
+        )
+        self._fake_ps(monkeypatch, text)
+        from neo.memory.observer import _find_orphan_observers
+        assert _find_orphan_observers(root) == [100]
+
+    def test_no_orphan_when_only_supervised(self, monkeypatch, tmp_path):
+        root = str(tmp_path)
+        self._fake_ps(monkeypatch, f"200 20656 python -m neo.memory.observer --daemon --cwd {root}\n")
+        from neo.memory.observer import _find_orphan_observers
+        assert _find_orphan_observers(root) == []
+
+    def test_ps_failure_is_safe(self, monkeypatch, tmp_path):
+        import neo.memory.observer as obs
+
+        def boom(*a, **k):
+            raise OSError("no ps here")
+
+        monkeypatch.setattr(obs.subprocess, "run", boom)
+        assert obs._find_orphan_observers(str(tmp_path)) == []
+
+    def test_status_includes_orphans(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_resolve_project_id", lambda root: "abc123def456")
+        monkeypatch.setattr(obs, "_require_car_runtime", lambda: object())
+        monkeypatch.setattr(
+            obs, "_find_managed_agent",
+            lambda car, aid: {"status": "running", "pid": 555, "restart_count": 0},
+        )
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda root: [777])
+        st = obs.observer_status("/repo")
+        assert st["status"] == "running"
+        assert st["orphans"] == [777]
+
+
 class TestSpecBuilding:
     def test_spec_uses_current_python(self, fake_project_id):
         from neo.memory.observer import _build_spec

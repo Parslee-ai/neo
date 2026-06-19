@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.29.0] - 2026-06-19
+
+### Added
+
+- **`neo memory observer status` now flags orphaned observer processes.** A prior car-server that died without reaping its child leaves an observer reparented to init/launchd (the pre-0.18.0 footgun) — running redundant synthesis cycles and invisible to `status`, which only knew about CAR's supervised agent. Status now scans for `neo.memory.observer --daemon` processes scoped to this project (matched by the daemon's `--cwd`, realpath-compared) whose parent is init/launchd (`ppid == 1`) — the supervised observer is always parented by car-server, so it's never falsely flagged — and prints a `WARNING` with the orphan pid(s) and a `kill` hint. Best-effort via `ps`; returns no orphans (never errors) on any platform/parse failure. The status result gains an `orphans` field. Found and reaped a real 4-day-old orphan during validation. (`memory/observer.py:_find_orphan_observers`, `subcommands.py`)
+
 ## [0.28.1] - 2026-06-19
 
 ### Changed

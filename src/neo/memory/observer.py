@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -616,21 +617,66 @@ def kick_observer(codebase_root: Optional[str] = None) -> dict:
             "message": f"restarted as pid {managed.get('pid')}"}
 
 
+def _find_orphan_observers(codebase_root: Optional[str] = None) -> list[int]:
+    """Launchd/init-orphaned observer daemons for this project (ppid == 1).
+
+    An orphan is an observer process the CAR supervisor no longer parents — left
+    behind when a prior car-server died without reaping its child (the pre-0.18.0
+    footgun). It is reparented to init/launchd (ppid 1); the supervised observer
+    is always parented by car-server, so it is never matched. Scoped to this
+    project by the daemon's ``--cwd`` argument (realpath-compared). Best-effort
+    via ``ps`` — returns ``[]`` on any platform/parse/timeout failure so it can
+    never break ``status``.
+    """
+    root = os.path.realpath(codebase_root or os.getcwd())
+    try:
+        out = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    orphans: list[int] = []
+    for line in out.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3:
+            continue
+        pid_s, ppid_s, cmd = fields
+        if ppid_s != "1":
+            continue  # supervised processes are parented by car-server, not init
+        if "neo.memory.observer" not in cmd or "--daemon" not in cmd:
+            continue
+        m = re.search(r"--cwd\s+(\S+)", cmd)
+        if not m:
+            continue
+        try:
+            if os.path.realpath(m.group(1)) != root:
+                continue  # a different project's orphan, not ours
+            orphans.append(int(pid_s))
+        except (ValueError, OSError):
+            continue
+    return orphans
+
+
 def observer_status(codebase_root: Optional[str] = None) -> dict:
     project_id = _resolve_project_id(codebase_root)
     if not project_id:
         return {"status": "error", "message": "No project_id"}
 
+    orphans = _find_orphan_observers(codebase_root)
+
     try:
         car = _require_car_runtime()
     except RuntimeError as e:
-        return {"status": "error", "project_id": project_id, "message": str(e)}
+        return {"status": "error", "project_id": project_id,
+                "message": str(e), "orphans": orphans}
 
     aid = _agent_id(project_id)
     existing = _find_managed_agent(car, aid)
     if not existing:
         return {"status": "not_running", "project_id": project_id, "agent_id": aid,
-                "message": "no managed agent registered"}
+                "message": "no managed agent registered", "orphans": orphans}
 
     # CAR's `status` field is one of: stopped | starting | running |
     # backoff | errored — we surface it directly so operators can tell
@@ -645,6 +691,7 @@ def observer_status(codebase_root: Optional[str] = None) -> dict:
         "restart_count": existing.get("restart_count", 0),
         "last_exit_code": existing.get("last_exit_code"),
         "log_file": f"~/.car/logs/{aid}.stdout.log",
+        "orphans": orphans,
         "message": (
             f"observer pid {existing.get('pid')} "
             f"(restarts={existing.get('restart_count', 0)})"

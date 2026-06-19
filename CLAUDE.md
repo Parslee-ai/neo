@@ -119,7 +119,11 @@
   Lifecycle: `neo memory observer {start|stop|status|kick}` — `kick` maps to
   `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
   CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |
-  `errored`) so restart-loops are diagnosable. Tunables:
+  `errored`) so restart-loops are diagnosable, and also flags **orphaned**
+  observer processes — a `neo.memory.observer --daemon` for this project
+  reparented to init/launchd (`ppid==1`) by a dead prior car-server, which CAR's
+  supervised view can't see (`observer._find_orphan_observers`; the `orphans`
+  field + a `WARNING` with a `kill` hint). Tunables:
   `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
   (default 60, per-process). **Footgun**: the interpreter path (`sys.executable`)
   must not live under a world-writable directory (`/tmp`, `/private/tmp`,
