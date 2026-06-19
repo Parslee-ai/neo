@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.28.1] - 2026-06-19
+
+### Changed
+
+- **`[car]` extra floor raised to `car-runtime>=0.27.0,<1.0`** (was `>=0.18.0`). The spec already tracked latest *within* the 0.x line — a fresh install / `pipx upgrade` resolves to the newest compatible release, since car-runtime is on the package index — so this raises the floor to the newest version neo is validated against (a fresh install can no longer land on an old 0.x). The `<1.0` cap is kept deliberately: car-runtime is a sealed binary where 0.x minors can carry breaking changes, so a breaking 1.0 rewrite is not adopted silently on upgrade. The observer's *runtime* floor stays a separate, more permissive `0.18.0` (`memory.observer._CAR_MIN_VERSION`) — the functionally footgun-free minimum — so an existing 0.18–0.26 install keeps working while fresh installs ship the latest. (`pyproject.toml`)
+
 ## [0.28.0] - 2026-06-19
 
 ### Fixed
