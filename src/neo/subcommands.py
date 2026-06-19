@@ -340,11 +340,84 @@ def _handle_observer(args) -> None:
     print(" ".join(parts))
 
 
+def _parse_since(value: str) -> Optional[float]:
+    """Parse a duration like ``14d`` / ``48h`` / ``30m`` / ``3600s`` to seconds.
+
+    Returns None for an empty value or ``all`` (no window). A bare number is
+    treated as seconds. Raises ValueError on anything else.
+    """
+    if not value:
+        return None
+    v = value.strip().lower()
+    if v in ("all", "0"):
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    if v[-1] in units and v[:-1].replace(".", "", 1).isdigit():
+        return float(v[:-1]) * units[v[-1]]
+    if v.replace(".", "", 1).isdigit():
+        return float(v)
+    raise ValueError(f"invalid --since value: {value!r} (use e.g. 14d, 48h, 30m)")
+
+
+def _handle_issues(args) -> None:
+    """Surface recurring frictions mined from transcript history (read-only)."""
+    from neo.config import NeoConfig
+    from neo.memory.issues import find_issues
+    from neo.memory.store import FactStore
+
+    root = getattr(args, "cwd", None) or os.getcwd()
+    try:
+        since_seconds = _parse_since(getattr(args, "since", "14d"))
+    except ValueError as e:
+        print(f"[Neo] {e}", file=sys.stderr)
+        return
+    min_cluster = getattr(args, "min_cluster", 3)
+
+    config = NeoConfig.load()
+    store = FactStore(codebase_root=root, config=config, eager_init=False)
+    issues = find_issues(store, since_seconds=since_seconds, min_cluster=min_cluster)
+
+    if getattr(args, "json", False):
+        payload = [
+            {
+                "title": iss.title,
+                "category": iss.category,
+                "confidence": iss.confidence,
+                "session_count": iss.session_count,
+                "member_count": iss.member_count,
+                "evidence": [
+                    {"session_id": ev.session_id, "timestamp": ev.timestamp, "span": ev.span}
+                    for ev in iss.evidence
+                ],
+                "suggested_rule": iss.suggested_rule,
+            }
+            for iss in issues
+        ]
+        print(json.dumps(payload, indent=2))
+        return
+
+    window = getattr(args, "since", "14d")
+    if not issues:
+        print(f"[Neo] memory issues: no recurring frictions found (window: {window}).")
+        return
+
+    print(f"[Neo] memory issues — {len(issues)} issue(s) (window: {window})\n")
+    for iss in issues:
+        print(f"[{iss.confidence:.2f}] {iss.title}    ·{iss.category}")
+        print(f"  {iss.member_count} episodes across {iss.session_count} sessions")
+        for ev in iss.evidence:
+            print(f"    {ev.timestamp or '?'}  {ev.span}")
+        print()
+
+
 def handle_memory(args):
     """Memory maintenance subcommands."""
     action = getattr(args, "memory_action", None)
     if action == "observer":
         _handle_observer(args)
+        return
+    if action == "issues":
+        _handle_issues(args)
         return
     if action == "prune":
         files = _fact_files_for_prune(
@@ -383,7 +456,7 @@ def handle_memory(args):
         return
 
     if action != "replay-feedback":
-        print("Usage: neo memory {replay-feedback|prune|observer} ...")
+        print("Usage: neo memory {replay-feedback|prune|observer|issues} ...")
         return
 
     from neo.config import NeoConfig

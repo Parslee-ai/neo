@@ -118,6 +118,52 @@ def batched_cosine(
         sims[idx] = float(c)
     return sims
 
+def cluster_by_similarity(
+    items: list,
+    embed_fn,
+    threshold: float,
+) -> list[list]:
+    """Greedy complete-linkage clustering of items by cosine similarity.
+
+    ``embed_fn(item)`` returns the item's embedding (an ``np.ndarray``) or
+    ``None``; items with no embedding are dropped. A candidate joins a cluster
+    only if it is similar (cosine >= ``threshold``) to *all* current members
+    (complete-linkage), so every item in a returned cluster is mutually
+    similar. Clusters are seeded greedily in input order, which makes the
+    partition order-dependent — callers that need determinism should pass a
+    stably-ordered ``items`` list.
+
+    Returns a list of clusters, each a list of the original items.
+    """
+    embedded: list[tuple] = []
+    for item in items:
+        emb = embed_fn(item)
+        if emb is not None:
+            embedded.append((item, emb))
+    if not embedded:
+        return []
+
+    assigned = [False] * len(embedded)
+    clusters: list[list] = []
+    for i, (item_i, emb_i) in enumerate(embedded):
+        if assigned[i]:
+            continue
+        cluster = [item_i]
+        cluster_embs = [emb_i]
+        assigned[i] = True
+        for j in range(i + 1, len(embedded)):
+            if assigned[j]:
+                continue
+            item_j, emb_j = embedded[j]
+            # Complete-linkage: must be similar to ALL current members.
+            if all(cosine_similarity(m, emb_j) >= threshold for m in cluster_embs):
+                cluster.append(item_j)
+                cluster_embs.append(emb_j)
+                assigned[j] = True
+        clusters.append(cluster)
+    return clusters
+
+
 NumberLike = Union[int, float, Decimal, str]
 
 

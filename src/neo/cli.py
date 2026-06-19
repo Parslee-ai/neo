@@ -214,6 +214,24 @@ def parse_args():
         )
         observer_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
 
+        issues_p = subparsers.add_parser(
+            'issues',
+            help='Surface recurring frictions mined from transcript history (read-only)',
+        )
+        issues_p.add_argument(
+            '--since',
+            default='14d',
+            help='Only consider episodes within this window, e.g. 14d, 48h, 30m (default: 14d)',
+        )
+        issues_p.add_argument(
+            '--min-cluster',
+            type=int,
+            default=3,
+            help='Minimum recurring episodes before a friction is reported (default: 3)',
+        )
+        issues_p.add_argument('--json', action='store_true', help='Emit issues as JSON')
+        issues_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
+
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
         args.memory_action = args.action

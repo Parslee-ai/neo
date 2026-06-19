@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 import numpy as np
 
-from neo.math_utils import batched_cosine, cosine_similarity
+from neo.math_utils import batched_cosine, cluster_by_similarity, cosine_similarity
 from neo.memory.bm25 import BM25, tokenize
 from neo.memory.query_routing import QueryShape, decompose as _decompose_query
 from neo.memory.claude_memory import ClaudeMemoryIngester
@@ -2145,34 +2145,9 @@ class FactStore:
 
         Returns list of clusters (each a list of facts).
         """
-        embedded = [f for f in facts if f.embedding is not None]
-        if not embedded:
-            return []
-
-        assigned: set[str] = set()
-        clusters: list[list[Fact]] = []
-
-        for fact in embedded:
-            if fact.id in assigned:
-                continue
-
-            cluster = [fact]
-            assigned.add(fact.id)
-
-            for other in embedded:
-                if other.id in assigned:
-                    continue
-                # Complete-linkage: must be similar to ALL cluster members
-                if all(
-                    self._cosine_similarity(member.embedding, other.embedding) >= threshold  # type: ignore[arg-type]
-                    for member in cluster
-                ):
-                    cluster.append(other)
-                    assigned.add(other.id)
-
-            clusters.append(cluster)
-
-        return clusters
+        return cluster_by_similarity(
+            facts, embed_fn=lambda f: f.embedding, threshold=threshold
+        )
 
     def _synthesize_cluster(
         self, cluster: list[Fact], group_key: str
