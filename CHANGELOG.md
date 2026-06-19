@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.26.0] - 2026-06-19
+
+### Added
+
+- **`neo memory audit` — read-only hygiene inspection of an AI tool's memory files.** Distinct from `neo memory rules` (which compares human-authored rule files), this inspects a tool's *accumulated, learned* memory. v1 targets Claude Code's per-project `~/.claude/projects/<proj>/memory/` dir (a `MEMORY.md` index plus fact files with YAML frontmatter). It reports four hygiene problems: **malformed** (missing frontmatter/description, invalid `type`), **near-duplicate** memories (embedding cosine ≥ 0.93 via the shared clusterer), **conflicts** (same-topic-but-divergent pairs, LM-judged; `--no-conflicts` to skip), and **index** drift (a memory file absent from `MEMORY.md`, or `MEMORY.md` pointing at a missing file). Dangling `[[links]]` are intentional per the memory spec and are not flagged. Read-only — never edits memory. Dogfooded across local projects (correctly flagged a memory file missing from its `MEMORY.md` index). `neo memory audit [--json] [--no-conflicts] [--cwd]`. (`memory/memaudit.py`, `cli.py`, `subcommands.py`; see `docs/solutions/memory-audit.md`) This is phase 1 of cross-tool memory support; phase 2 (ingesting peer memory into neo's store as a `MemorySource`, on probation) is deferred.
+
 ## [0.25.0] - 2026-06-19
 
 ### Added

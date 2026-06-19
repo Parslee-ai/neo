@@ -249,6 +249,18 @@ def parse_args():
         )
         rules_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
 
+        audit_p = subparsers.add_parser(
+            'audit',
+            help="Audit an AI tool's memory files for hygiene issues (read-only)",
+        )
+        audit_p.add_argument('--json', action='store_true', help='Emit the audit report as JSON')
+        audit_p.add_argument(
+            '--no-conflicts',
+            action='store_true',
+            help='Skip the LM contradiction check; report other findings only',
+        )
+        audit_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
+
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
         args.memory_action = args.action

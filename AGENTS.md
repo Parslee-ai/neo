@@ -41,7 +41,10 @@
     (`missing-tool` / `absent-guardrail` / `vague-rule`); `--suggest-rules` adds a bounded
     LM call per issue to draft a preventive rule. `neo memory rules [--json]
     [--no-conflicts]` flags drift between AGENTS.md / CLAUDE.md / GEMINI.md (gaps +
-    LM-judged conflicts). (`neo/memory/issues.py`, `neo/memory/rulesync.py`)
+    LM-judged conflicts). `neo memory audit [--json] [--no-conflicts]` inspects an AI
+    tool's memory files (Claude Code `memory/*.md`) for malformed entries, near-duplicates,
+    conflicts, and MEMORY.md index drift. (`neo/memory/issues.py`,
+    `neo/memory/rulesync.py`, `neo/memory/memaudit.py`)
 - Domain tags (`Fact.domain`, `memory.models.SUGGESTED_DOMAINS`): optional free-form
   area tag orthogonal to `FactKind` — `code-style`, `testing`, `git`, `debugging`,
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the

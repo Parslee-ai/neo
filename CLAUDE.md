@@ -42,7 +42,10 @@
     (`missing-tool` / `absent-guardrail` / `vague-rule`); `--suggest-rules` adds a bounded
     LM call per issue to draft a preventive rule. `neo memory rules [--json]
     [--no-conflicts]` flags drift between AGENTS.md / CLAUDE.md / GEMINI.md (gaps +
-    LM-judged conflicts). (`neo/memory/issues.py`, `neo/memory/rulesync.py`)
+    LM-judged conflicts). `neo memory audit [--json] [--no-conflicts]` inspects an AI
+    tool's memory files (Claude Code `memory/*.md`) for malformed entries, near-duplicates,
+    conflicts, and MEMORY.md index drift. (`neo/memory/issues.py`,
+    `neo/memory/rulesync.py`, `neo/memory/memaudit.py`)
     - `issues` reuses the ingester's `TranscriptSource` episodes but never admits facts or
       touches the `transcript_watermark_*` watermark — decoupled from fact admission and
       idempotent (`find_issues`). Gate mirrors synthesis discipline (≥`min_cluster`
