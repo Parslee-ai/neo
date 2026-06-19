@@ -135,9 +135,15 @@
   fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
   the LM, then exits without making the LLM call. Faster iteration on context-gatherer
   and retrieval changes than waiting for an inference round trip.
-- CarAdapter defaults `intent_hint={"task":"code"}` so CAR's router picks a code-capable
-  model rather than the chat default. This is the local workaround for
+- CarAdapter defaults `intent_hint={"task":"code","prefer_quality":True}` so CAR's router
+  routes neo to the most capable model, not the chat/cost default. This is the *intended*
+  router API, not a hack:
   [Parslee-ai/car-releases#52](https://github.com/Parslee-ai/car-releases/issues/52)
-  (`route_model` is cost-biased for "simple" prompts and ranks `gpt-5.3-codex`/`o3`
-  behind `gpt-4.1-mini`). If that upstream lands, revisit the default.
+  (router cost-bias on `task=code`) is **closed** — the router now prioritizes
+  quality > speed > cost for `task=code`, and the 0.25–0.27 reworks add capability-honest
+  routing + `exclude_models`. We keep `prefer_quality` explicit as belt-and-suspenders
+  (CAR's *default* profile without it is still latency/cost-biased). Rationale lives on
+  `CarAdapter.DEFAULT_INTENT_HINT` in `adapters.py`. Observer floor is car-runtime ≥0.18.0,
+  now enforced at runtime by `_require_car_runtime` (version check, not just the `agents_*`
+  attr); latest validated against car-runtime 0.27.0.
 - When creating a pull request, always use the PR template included in the repo.

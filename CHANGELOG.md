@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.28.0] - 2026-06-19
+
+### Fixed
+
+- **The observer now enforces its documented car-runtime ≥ 0.18.0 floor at runtime.** `_require_car_runtime` previously gated only on `hasattr(car_runtime, "agents_upsert")`, which 0.16.x/0.17.0 also satisfy — so the observer would silently run on an under-spec binding exposed to the pre-0.18.0 supervisor footguns (orphaned child / restart-storm on start-during-backoff / stale `last_exit_code`) that 0.18.0 fixed. It now also checks the installed version (via `importlib.metadata`) and raises an actionable error below 0.18.0. An unparseable/missing version is allowed through (lenient about unknown, strict about known-too-old) so a vendored build isn't falsely rejected. (`memory/observer.py`)
+
+### Changed
+
+- **Revisited the `CarAdapter` `task=code` intent hint now that [car-releases#52](https://github.com/Parslee-ai/car-releases/issues/52) is closed.** The router cost-bias that motivated the hint is fixed upstream (the router now prioritizes quality > speed > cost for `task=code`, plus the 0.25–0.27 capability-honest routing + `exclude_models` reworks), so the `{"task":"code","prefer_quality":True}` default is the *intended* router API rather than a bug workaround — kept, with the rationale in CLAUDE.md updated accordingly. Validated against car-runtime 0.27.0. (docs only; `adapters.py` default unchanged)
+
 ## [0.27.0] - 2026-06-19
 
 ### Added

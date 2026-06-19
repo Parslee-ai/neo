@@ -32,9 +32,11 @@ Tunables (env, read by the daemon child):
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -61,12 +63,33 @@ _CAR_REQUIRED_MSG = (
 )
 
 
-def _require_car_runtime():
-    """Import car_runtime and verify it has the agent-supervisor API.
+_CAR_MIN_VERSION = (0, 18, 0)
 
-    Raises ``RuntimeError`` with an actionable message when missing or
-    too old, instead of a cryptic ImportError/AttributeError at the
-    call site.
+
+def _parse_version(v: Optional[str]) -> Optional[tuple]:
+    """Best-effort parse of a version string to a numeric tuple, or None."""
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(x) for x in nums[:3]) if nums else None
+
+
+def _installed_car_version() -> Optional[str]:
+    try:
+        return importlib.metadata.version("car-runtime")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _require_car_runtime():
+    """Import car_runtime and verify it satisfies the observer's floor.
+
+    Two gates: the ``agents_*`` supervisor API must be present, AND the
+    installed version must be >= 0.18.0. 0.16.x/0.17.0 expose ``agents_upsert``
+    but carry the supervisor footguns (orphaned child / restart-storm / stale
+    exit code) that 0.18.0 fixed, so the attribute check alone is not enough —
+    we must also enforce the version. Raises ``RuntimeError`` with an actionable
+    message instead of silently running on an under-spec binding. An
+    unparseable / missing version is allowed through (lenient about unknown,
+    strict about known-too-old) so a vendored build is not falsely rejected.
     """
     try:
         import car_runtime
@@ -75,6 +98,11 @@ def _require_car_runtime():
 
     if not hasattr(car_runtime, "agents_upsert"):
         raise RuntimeError(_CAR_REQUIRED_MSG)
+
+    version = _installed_car_version()
+    parsed = _parse_version(version)
+    if parsed is not None and parsed < _CAR_MIN_VERSION:
+        raise RuntimeError(f"car-runtime {version} is too old. " + _CAR_REQUIRED_MSG)
 
     return car_runtime
 
