@@ -113,10 +113,41 @@ def _resolve_project_id(codebase_root: Optional[str]) -> str:
     return project_id
 
 
+# A single, global observer supervises ALL projects (one process, one CAR
+# agent) rather than one per project. Legacy per-project agents use the
+# ``neo-observer-<id12>`` form and are migrated away on bootstrap.
+GLOBAL_AGENT_ID = "neo-observer"
+_LEGACY_AGENT_RE = re.compile(r"^neo-observer-[0-9a-f]{6,}$")
+
+
 def _agent_id(project_id: str) -> str:
     """Filename-safe ID for the supervisor. Short prefix keeps logs
     grep-able when multiple projects are active."""
     return f"neo-observer-{project_id[:12]}"
+
+
+def _discover_project_roots() -> list[str]:
+    """All project roots neo has seen, for the global observer's sweep.
+
+    Source of truth is Claude Code's per-project transcript dirs
+    (``~/.claude/projects/<encoded>``); the encoded name decodes back to an
+    absolute root. Best-effort — returns ``[]`` if the dir is absent/unreadable.
+    """
+    from neo.memory.transcript import CLAUDE_PROJECTS_DIR
+    from neo.prompt.scanner import _decode_project_path
+
+    roots: set[str] = set()
+    try:
+        entries = list(CLAUDE_PROJECTS_DIR.iterdir())
+    except OSError:
+        return []
+    for d in entries:
+        if not d.is_dir():
+            continue
+        root = _decode_project_path(d.name)
+        if root:
+            roots.add(root)
+    return sorted(roots)
 
 
 def _build_spec(project_id: str, codebase_root: str) -> dict:
@@ -172,6 +203,11 @@ class ObserverConfig:
     # the interval so a slow pass doesn't swallow the wake cadence.
     ingest_budget: int = 8
     ingest_deadline_seconds: float = 120.0
+    # Global-mode sweep: cap projects visited per cycle. The sweep round-robins
+    # across cycles, so all projects get covered over a few cycles without one
+    # cycle paying to load every project's FactStore. Projects with no new
+    # transcripts since their watermark do near-zero work (ingest finds nothing).
+    max_projects_per_cycle: int = 25
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -200,18 +236,25 @@ class Observer:
     supervisor on stop and exits cleanly.
     """
 
-    def __init__(self, codebase_root: str, config: Optional[ObserverConfig] = None):
+    def __init__(self, codebase_root: Optional[str] = None,
+                 config: Optional[ObserverConfig] = None, global_mode: bool = False):
+        self.global_mode = global_mode
         self.codebase_root = codebase_root
         self.config = config or ObserverConfig.from_env()
-        self.project_id = _resolve_project_id(codebase_root)
-        if not self.project_id:
-            raise RuntimeError(
-                "Cannot run observer without a resolvable project_id "
-                "(no codebase_root and no git repo in cwd)"
-            )
+        if global_mode:
+            # Sweeps all discovered projects; no single project_id.
+            self.project_id = ""
+        else:
+            self.project_id = _resolve_project_id(codebase_root)
+            if not self.project_id:
+                raise RuntimeError(
+                    "Cannot run observer without a resolvable project_id "
+                    "(no codebase_root and no git repo in cwd)"
+                )
         self._stop = False
         self._last_analysis_epoch = 0.0
         self._cycles_total = 0
+        self._sweep_offset = 0  # round-robin cursor for global-mode sweeps
         # Recent cycles for the A2UI Observer tab. List of
         # ``{"timestamp": float, "text": "..."}`` capped client-side at
         # RECENT_CYCLES_MAX.
@@ -241,14 +284,14 @@ class Observer:
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
 
-        print(
-            f"neo observer started pid={os.getpid()} project={self.project_id[:8]}",
-            flush=True,
-        )
+        scope = "all projects" if self.global_mode else f"project={self.project_id[:8]}"
+        print(f"neo observer started pid={os.getpid()} {scope}", flush=True)
 
-        # Best-effort A2UI surface. Daemon may not be up; if not, we
-        # skip silently and the rest of the loop runs unchanged.
-        await self._init_surface()
+        # Best-effort A2UI surface (per-project inspector). The surface is keyed
+        # to one project_id, so it only applies in per-project mode; the global
+        # sweep skips it.
+        if not self.global_mode:
+            await self._init_surface()
 
         # `get_running_loop()` (not `get_event_loop()`) is the
         # canonical API inside a coroutine — the latter is deprecated
@@ -283,30 +326,34 @@ class Observer:
         return elapsed >= self.config.cooldown_seconds
 
     def _cycle(self) -> None:
-        """One synthesis pass. Errors are caught and logged — never
-        propagate, so a bad cycle doesn't cause the supervisor to
-        restart-loop us into a backoff hell.
+        """One pass. Dispatches to the global sweep or the per-project cycle."""
+        if self.global_mode:
+            self._cycle_global()
+        else:
+            self._cycle_one()
 
-        Also stashes a FactStore snapshot on ``self`` so the post-cycle
-        A2UI push can update the Memory tab without re-loading.
+    def _run_project(self, root: str) -> tuple[int, int, object]:
+        """Synthesize + transcript-mine one project. Returns (synthesized,
+        mined, store). Transcript mining MUST run AFTER synthesis so a durable
+        synthesis can't be aborted by an ingest/LM failure (isolated in its own
+        guard). Do not reorder.
+        """
+        from neo.memory.store import FactStore
+
+        store = FactStore(codebase_root=root, eager_init=False)
+        store.initialize()
+        count = store.synthesize_reviews()
+        mined = self._ingest_transcripts(store, root)
+        return count, mined, store
+
+    def _cycle_one(self) -> None:
+        """Per-project pass (also feeds the A2UI inspector). Errors are caught
+        and logged — never propagate, so a bad cycle can't drive the supervisor
+        into backoff hell.
         """
         try:
-            # Lazy import — FactStore pulls fastembed/numpy/etc.; defer
-            # so a malformed --cwd reports cleanly before paying that
-            # import cost.
-            from neo.memory.store import FactStore
-
             t0 = time.time()
-            store = FactStore(codebase_root=self.codebase_root, eager_init=False)
-            store.initialize()
-            count = store.synthesize_reviews()
-            # Transcript mining MUST run AFTER synthesis: synthesis is then
-            # already durable, so an ingest/LM failure (isolated in its own
-            # guard) can never abort it. Both passes share this executor-run
-            # call (run_in_executor keeps the WS loop draining); tick is logged
-            # so we can tell if it stalls and needs splitting into a separate
-            # cycle. Do not reorder.
-            ingested = self._ingest_transcripts(store)
+            count, ingested, store = self._run_project(self.codebase_root)
             tick = time.time() - t0
             mined = (f"{ingested} mined" if not self._last_ingest_error
                      else f"ingest ERROR {self._last_ingest_error}")
@@ -321,8 +368,6 @@ class Observer:
                     f"{count} synthesized, {mined}"
                 ),
             })
-            # Stash for the post-cycle Memory tab update. Keep the ref
-            # around for ~1 cycle; FactStore is GC'd otherwise.
             self._last_store_snapshot = self._build_store_snapshot(store)
             print(
                 f"neo observer cycle ok: {count} synthesized, {mined} ({tick:.1f}s)",
@@ -341,7 +386,56 @@ class Observer:
                 flush=True,
             )
 
-    def _ingest_transcripts(self, store) -> int:
+    def _cycle_global(self) -> None:
+        """Global sweep: round-robin a budgeted batch of all discovered projects,
+        synthesizing + mining each. Per-project errors are isolated so one bad
+        project never aborts the sweep.
+        """
+        t0 = time.time()
+        roots = _discover_project_roots()
+        if not roots:
+            self._last_analysis_epoch = time.time()
+            self._cycles_total += 1
+            print("neo observer cycle ok: 0 projects discovered", flush=True)
+            return
+
+        budget = max(1, int(self.config.max_projects_per_cycle))
+        start = self._sweep_offset % len(roots)
+        batch = (roots[start:] + roots[:start])[:budget]
+        self._sweep_offset = (start + len(batch)) % len(roots)
+
+        total_synth = total_mined = errors = covered = 0
+        for root in batch:
+            if self._stop:
+                break
+            try:
+                count, mined, _store = self._run_project(root)
+                total_synth += count
+                total_mined += mined
+                covered += 1
+            except Exception as e:
+                errors += 1
+                print(
+                    f"neo observer project error [{root}]: {type(e).__name__}: {e}",
+                    file=sys.stderr, flush=True,
+                )
+
+        tick = time.time() - t0
+        self._last_analysis_epoch = time.time()
+        self._cycles_total += 1
+        self._last_cycle_count = total_synth
+        self._last_cycle_error = None
+        summary = (
+            f"swept {covered}/{len(roots)} projects: {total_synth} synthesized, "
+            f"{total_mined} mined" + (f", {errors} errors" if errors else "")
+        )
+        self._recent_cycles.append({
+            "timestamp": self._last_analysis_epoch,
+            "text": f"{time.strftime('%H:%M:%S', time.localtime(self._last_analysis_epoch))} · {summary}",
+        })
+        print(f"neo observer cycle ok: {summary} ({tick:.1f}s)", flush=True)
+
+    def _ingest_transcripts(self, store, root: str) -> int:
         """Mine Claude Code transcripts for lessons, bounded by the per-cycle
         episode budget AND a wall-clock deadline. Isolated in its own
         try/except so an LM or transcript failure never aborts the synthesis
@@ -360,7 +454,7 @@ class Observer:
             cfg = NeoConfig.load()
             adapter = resolve_adapter(cfg)
             ingester = TranscriptIngester(
-                store=store, lm_adapter=adapter, codebase_root=self.codebase_root
+                store=store, lm_adapter=adapter, codebase_root=root
             )
             stats = ingester.ingest(
                 max_episodes=self.config.ingest_budget,
@@ -501,133 +595,149 @@ def _find_managed_agent(car, agent_id: str) -> Optional[dict]:
     return None
 
 
-def start_observer(codebase_root: Optional[str] = None) -> dict:
-    """Register the spec and start the supervised child.
+def _build_global_spec() -> dict:
+    """Spec for the single global observer that sweeps all projects."""
+    return {
+        "id": GLOBAL_AGENT_ID,
+        "name": "Neo observer (all projects)",
+        "command": sys.executable,
+        "args": ["-m", "neo.memory.observer", "--daemon", "--all"],
+        "cwd": os.path.expanduser("~"),
+        "env": {
+            k: os.environ[k]
+            for k in (
+                "NEO_OBSERVER_INTERVAL_SECONDS",
+                "NEO_OBSERVER_COOLDOWN",
+                "NEO_PROFILE",
+                "NEO_METRICS",
+            )
+            if k in os.environ
+        },
+        "restart": "on_failure",
+        "max_restarts": 10,
+        "backoff_secs": 5,
+        "auto_start": True,
+    }
 
-    Returns: ``{"status": "started"|"already_running"|"error", ...}``.
+
+def _migrate_legacy_per_project_agents(car) -> list[str]:
+    """Stop + remove legacy per-project observer agents (``neo-observer-<id>``).
+
+    The single global observer replaces them. Best-effort; returns removed ids.
     """
-    project_id = _resolve_project_id(codebase_root)
-    if not project_id:
-        return {"status": "error", "project_id": "",
-                "message": "No project_id (run from a git repo or pass --cwd)"}
+    removed: list[str] = []
+    try:
+        managed = json.loads(car.agents_list())
+    except Exception as e:
+        logger.debug("agents_list failed during migration: %s", e)
+        return removed
+    for m in managed:
+        aid = m.get("id", "")
+        if aid == GLOBAL_AGENT_ID or not _LEGACY_AGENT_RE.match(aid):
+            continue
+        try:
+            car.agents_stop(aid)
+        except Exception:
+            pass
+        try:
+            car.agents_remove(aid)
+            removed.append(aid)
+        except Exception as e:
+            logger.debug("agents_remove(%s) failed: %s", aid, e)
+    return removed
 
+
+def start_observer(codebase_root: Optional[str] = None) -> dict:
+    """Register + start the single global observer (migrating legacy agents).
+
+    ``codebase_root`` is accepted for CLI compatibility but ignored — the
+    observer is global, not per-project.
+    """
     try:
         car = _require_car_runtime()
     except RuntimeError as e:
-        return {"status": "error", "project_id": project_id, "message": str(e)}
+        return {"status": "error", "message": str(e)}
 
-    aid = _agent_id(project_id)
-    spec = _build_spec(project_id, codebase_root or os.getcwd())
-
+    migrated = _migrate_legacy_per_project_agents(car)
     try:
-        car.agents_upsert(json.dumps(spec))
+        car.agents_upsert(json.dumps(_build_global_spec()))
     except Exception as e:
-        return {"status": "error", "project_id": project_id,
-                "message": f"agents_upsert failed: {e}"}
+        return {"status": "error", "message": f"agents_upsert failed: {e}"}
 
-    existing = _find_managed_agent(car, aid)
+    existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
     if existing and existing.get("status") == "running":
-        return {"status": "already_running", "project_id": project_id,
-                "agent_id": aid, "pid": existing.get("pid"),
+        return {"status": "already_running", "agent_id": GLOBAL_AGENT_ID,
+                "pid": existing.get("pid"), "migrated": migrated,
                 "message": f"observer pid {existing.get('pid')}"}
 
     try:
-        managed_json = car.agents_start(aid)
-        managed = json.loads(managed_json)
+        managed = json.loads(car.agents_start(GLOBAL_AGENT_ID))
     except Exception as e:
-        return {"status": "error", "project_id": project_id,
-                "message": f"agents_start failed: {e}"}
+        return {"status": "error", "message": f"agents_start failed: {e}"}
 
     return {
         "status": "started",
-        "project_id": project_id,
-        "agent_id": aid,
+        "agent_id": GLOBAL_AGENT_ID,
         "pid": managed.get("pid"),
-        "message": (
-            f"observer pid {managed.get('pid')}, "
-            f"log ~/.car/logs/{aid}.stdout.log"
-        ),
+        "migrated": migrated,
+        "message": f"observer pid {managed.get('pid')}, log ~/.car/logs/{GLOBAL_AGENT_ID}.stdout.log",
     }
 
 
 def stop_observer(codebase_root: Optional[str] = None) -> dict:
-    project_id = _resolve_project_id(codebase_root)
-    if not project_id:
-        return {"status": "error", "message": "No project_id"}
-
     try:
         car = _require_car_runtime()
     except RuntimeError as e:
-        return {"status": "error", "project_id": project_id, "message": str(e)}
+        return {"status": "error", "message": str(e)}
 
-    aid = _agent_id(project_id)
-    existing = _find_managed_agent(car, aid)
+    existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
     if not existing:
-        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+        return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "message": "no managed agent registered"}
     if existing.get("status") != "running":
-        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+        return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "pid": existing.get("pid"),
                 "message": f"agent {existing.get('status', 'unknown')}"}
 
     try:
-        managed_json = car.agents_stop(aid)
-        managed = json.loads(managed_json)
+        managed = json.loads(car.agents_stop(GLOBAL_AGENT_ID))
     except Exception as e:
-        return {"status": "error", "project_id": project_id,
-                "message": f"agents_stop failed: {e}"}
+        return {"status": "error", "message": f"agents_stop failed: {e}"}
 
-    return {"status": "stopped", "project_id": project_id, "agent_id": aid,
+    return {"status": "stopped", "agent_id": GLOBAL_AGENT_ID,
             "pid": managed.get("pid"),
             "message": f"SIGTERM sent to pid {managed.get('pid')}"}
 
 
 def kick_observer(codebase_root: Optional[str] = None) -> dict:
-    """Force an early cycle by restarting the child.
+    """Force an early sweep by restarting the global observer.
 
-    CAR's supervisor has no SIGUSR1 / signal-passthrough primitive, so
-    kick maps to ``agents_restart`` — stop, then start. The new
-    process runs its first cycle immediately (modulo cooldown, which
-    is per-process and so resets on restart).
+    CAR's supervisor has no SIGUSR1 / signal-passthrough primitive, so kick maps
+    to ``agents_restart``. The new process runs its first sweep immediately.
     """
-    project_id = _resolve_project_id(codebase_root)
-    if not project_id:
-        return {"status": "error", "message": "No project_id"}
-
     try:
         car = _require_car_runtime()
     except RuntimeError as e:
-        return {"status": "error", "project_id": project_id, "message": str(e)}
+        return {"status": "error", "message": str(e)}
 
-    aid = _agent_id(project_id)
-    existing = _find_managed_agent(car, aid)
+    existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
     if not existing:
-        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+        return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "message": "no managed agent registered"}
 
     try:
-        managed_json = car.agents_restart(aid)
-        managed = json.loads(managed_json)
+        managed = json.loads(car.agents_restart(GLOBAL_AGENT_ID))
     except Exception as e:
-        return {"status": "error", "project_id": project_id,
-                "message": f"agents_restart failed: {e}"}
+        return {"status": "error", "message": f"agents_restart failed: {e}"}
 
-    return {"status": "kicked", "project_id": project_id, "agent_id": aid,
+    return {"status": "kicked", "agent_id": GLOBAL_AGENT_ID,
             "pid": managed.get("pid"),
             "message": f"restarted as pid {managed.get('pid')}"}
 
 
-def _cmd_is_our_observer(cmd: str, root: str) -> bool:
-    """True if a command line is an observer daemon for this project's root."""
-    if "neo.memory.observer" not in cmd or "--daemon" not in cmd:
-        return False
-    m = re.search(r"--cwd[\s=]+(\S+)", cmd)
-    if not m:
-        return False
-    try:
-        return os.path.realpath(m.group(1).strip('"\'')) == root
-    except OSError:
-        return False
+def _cmd_is_our_observer(cmd: str) -> bool:
+    """True if a command line is a neo observer daemon (global or legacy)."""
+    return "neo.memory.observer" in cmd and "--daemon" in cmd
 
 
 def _find_orphan_observers(codebase_root: Optional[str] = None) -> list[int]:
@@ -643,22 +753,22 @@ def _find_orphan_observers(codebase_root: Optional[str] = None) -> list[int]:
       live process, which ``psutil`` reports as ``parent() is None``.
 
     Prefers ``psutil`` (works on macOS/Linux/Windows); falls back to ``ps`` on
-    POSIX when ``psutil`` is absent. Scoped to this project by the daemon's
-    ``--cwd`` (realpath-compared). Best-effort: returns ``[]`` on any
-    platform/parse/permission failure so it can never break ``status``.
+    POSIX when ``psutil`` is absent. With the single global observer there is at
+    most one supervised daemon, so any neo observer daemon with no live parent —
+    a stale per-project legacy daemon, or one stranded by a dead car-server — is
+    an orphan. Best-effort: returns ``[]`` on any failure so it never breaks
+    ``status``.
     """
-    root = os.path.realpath(codebase_root or os.getcwd())
-
     try:
         import psutil
     except ImportError:
-        return _find_orphan_observers_ps(root)
+        return _find_orphan_observers_ps()
 
     orphans: list[int] = []
     for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
         try:
             cmd = " ".join(proc.info.get("cmdline") or [])
-            if not _cmd_is_our_observer(cmd, root):
+            if not _cmd_is_our_observer(cmd):
                 continue
             try:
                 parent_alive = proc.parent() is not None
@@ -673,7 +783,7 @@ def _find_orphan_observers(codebase_root: Optional[str] = None) -> list[int]:
     return sorted(orphans)
 
 
-def _find_orphan_observers_ps(root: str) -> list[int]:
+def _find_orphan_observers_ps() -> list[int]:
     """POSIX ``ps`` fallback for orphan detection (used when psutil is absent)."""
     try:
         out = subprocess.run(
@@ -691,7 +801,7 @@ def _find_orphan_observers_ps(root: str) -> list[int]:
         pid_s, ppid_s, cmd = fields
         if ppid_s != "1":  # supervised processes are parented by car-server, not init
             continue
-        if not _cmd_is_our_observer(cmd, root):
+        if not _cmd_is_our_observer(cmd):
             continue
         try:
             orphans.append(int(pid_s))
@@ -701,22 +811,16 @@ def _find_orphan_observers_ps(root: str) -> list[int]:
 
 
 def observer_status(codebase_root: Optional[str] = None) -> dict:
-    project_id = _resolve_project_id(codebase_root)
-    if not project_id:
-        return {"status": "error", "message": "No project_id"}
-
-    orphans = _find_orphan_observers(codebase_root)
+    orphans = _find_orphan_observers()
 
     try:
         car = _require_car_runtime()
     except RuntimeError as e:
-        return {"status": "error", "project_id": project_id,
-                "message": str(e), "orphans": orphans}
+        return {"status": "error", "message": str(e), "orphans": orphans}
 
-    aid = _agent_id(project_id)
-    existing = _find_managed_agent(car, aid)
+    existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
     if not existing:
-        return {"status": "not_running", "project_id": project_id, "agent_id": aid,
+        return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "message": "no managed agent registered", "orphans": orphans}
 
     # CAR's `status` field is one of: stopped | starting | running |
@@ -726,12 +830,11 @@ def observer_status(codebase_root: Optional[str] = None) -> dict:
     is_running = car_status == "running"
     return {
         "status": car_status,
-        "project_id": project_id,
-        "agent_id": aid,
+        "agent_id": GLOBAL_AGENT_ID,
         "pid": existing.get("pid") if is_running else None,
         "restart_count": existing.get("restart_count", 0),
         "last_exit_code": existing.get("last_exit_code"),
-        "log_file": f"~/.car/logs/{aid}.stdout.log",
+        "log_file": f"~/.car/logs/{GLOBAL_AGENT_ID}.stdout.log",
         "orphans": orphans,
         "message": (
             f"observer pid {existing.get('pid')} "
@@ -744,8 +847,70 @@ def observer_status(codebase_root: Optional[str] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Daemon entrypoint — `python -m neo.memory.observer --daemon --cwd <path>`
-# Invoked by CAR's supervisor via the spec from ``_build_spec``.
+# Auto-bootstrap — neo registers the single global observer when CAR is present,
+# so users never opt in per project. Opt out with NEO_OBSERVER_AUTOSTART=0.
+# ---------------------------------------------------------------------------
+
+_CAR_HINT_FLAG = os.path.expanduser("~/.neo/.car_observer_hint_shown")
+
+
+def _car_server_reachable(host: str = "127.0.0.1", port: int = 9100,
+                          timeout: float = 0.3) -> bool:
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _maybe_print_car_hint() -> None:
+    """One-time quiet hint that CAR enables continuous background observation."""
+    try:
+        if os.path.exists(_CAR_HINT_FLAG):
+            return
+        os.makedirs(os.path.dirname(_CAR_HINT_FLAG), exist_ok=True)
+        with open(_CAR_HINT_FLAG, "w", encoding="utf-8") as f:
+            f.write("shown\n")
+    except OSError:
+        return  # can't track -> stay silent rather than nag every run
+    print(
+        "[Neo] tip: install the `car` extra and run car-server to enable "
+        "continuous background memory observation across your projects.",
+        file=sys.stderr,
+    )
+
+
+def maybe_autostart_observer() -> None:
+    """Register + start the single global observer when CAR is present.
+
+    Called once per neo CLI run. No-op (with a one-time hint) when CAR is absent;
+    opt out with ``NEO_OBSERVER_AUTOSTART=0``. Never raises — must not break a
+    neo command for any reason.
+    """
+    try:
+        if os.getenv("NEO_OBSERVER_AUTOSTART", "").strip() == "0":
+            return
+        if not _car_server_reachable():
+            _maybe_print_car_hint()
+            return
+        try:
+            car = _require_car_runtime()
+        except RuntimeError:
+            return
+        if _find_managed_agent(car, GLOBAL_AGENT_ID) is not None:
+            return  # already registered; the supervisor owns its lifecycle
+        _migrate_legacy_per_project_agents(car)
+        car.agents_upsert(json.dumps(_build_global_spec()))
+        car.agents_start(GLOBAL_AGENT_ID)
+        logger.debug("auto-started global observer")
+    except Exception as e:  # never break the CLI
+        logger.debug("observer autostart skipped: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Daemon entrypoint — `python -m neo.memory.observer --daemon --all`
+# (legacy `--cwd <path>` runs a single project). Invoked by CAR's supervisor.
 # ---------------------------------------------------------------------------
 
 
@@ -755,11 +920,18 @@ def _daemon_main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="neo.memory.observer")
     p.add_argument("--daemon", action="store_true", required=True,
                    help="(internal) marks this as the daemon entrypoint")
-    p.add_argument("--cwd", required=True, help="codebase root for project resolution")
+    p.add_argument("--all", action="store_true",
+                   help="sweep all discovered projects (global observer)")
+    p.add_argument("--cwd", help="single-project mode: codebase root")
     args = p.parse_args(argv)
 
+    if not args.all and not args.cwd:
+        print("observer requires --all or --cwd", file=sys.stderr)
+        return 2
+
     try:
-        observer = Observer(codebase_root=args.cwd)
+        observer = (Observer(global_mode=True) if args.all
+                    else Observer(codebase_root=args.cwd))
     except RuntimeError as e:
         print(f"observer init failed: {e}", file=sys.stderr)
         return 1

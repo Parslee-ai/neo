@@ -454,6 +454,21 @@ def main():
         except Exception as e:
             logger.debug(f"Update check failed: {e}")
 
+    # Auto-start the single global memory observer when CAR is present (no
+    # per-project opt-in). Non-blocking, silent, never raises; opt out with
+    # NEO_OBSERVER_AUTOSTART=0. Skipped for explicit `memory observer` commands
+    # (the handler manages the agent) and version/config short-circuits.
+    if not (
+        (hasattr(args, 'version') and args.version)
+        or (hasattr(args, 'config') and args.config)
+        or (getattr(args, 'memory_action', None) == 'observer')
+    ):
+        try:
+            from neo.memory.observer import maybe_autostart_observer
+            maybe_autostart_observer()
+        except Exception as e:
+            logger.debug(f"Observer autostart failed: {e}")
+
     # Handle global flags first (exist on all parsers, must check before subcommand-specific attributes)
 
     # Handle --version flag
