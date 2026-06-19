@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.24.0] - 2026-06-19
+
+### Added
+
+- **`neo memory issues --suggest-rules`** — for each surfaced friction, makes one bounded LM call to draft a preventive `AGENTS.md`/`CLAUDE.md` rule, populating the `Issue.suggested_rule` field (shown in both human and `--json` output). This closes the loop the issue diagnostic opened: v0.23.0 automated *detecting* recurring agent mistakes; this drafts the first version of the rule that would stop them, leaving the developer to review and apply (consistent with neo's read-only, advisory role). The LM-bearing step is confined to this flag — `find_issues` stays deterministic and LM-free — and is cost-bounded (one call per issue, highest-confidence first, capped at `_MAX_SUGGESTED_RULES`). Per-issue LM failure is graceful (leaves `suggested_rule` unset rather than aborting the batch); the adapter is built via `resolve_adapter` only when the flag is set. (`memory/issues.py`, `cli.py`, `subcommands.py`)
+
 ## [0.23.0] - 2026-06-19
 
 ### Added

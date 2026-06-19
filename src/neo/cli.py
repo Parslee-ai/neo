@@ -230,6 +230,11 @@ def parse_args():
             help='Minimum recurring episodes before a friction is reported (default: 3)',
         )
         issues_p.add_argument('--json', action='store_true', help='Emit issues as JSON')
+        issues_p.add_argument(
+            '--suggest-rules',
+            action='store_true',
+            help='For each issue, make one LM call to draft a preventive AGENTS.md rule',
+        )
         issues_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
 
         args = p.parse_args(sys.argv[2:])

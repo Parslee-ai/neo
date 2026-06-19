@@ -497,3 +497,78 @@ def find_issues(
     return detect_issues(
         episodes, signals, embeddings, min_cluster=min_cluster, now=now
     )
+
+
+# ---------------------------------------------------------------------------
+# --suggest-rules: one gated LM call per issue to phrase a proposed rule.
+# ---------------------------------------------------------------------------
+
+# Bounds LM cost. The gate already keeps the issue list small, but a target
+# repo could in principle surface many; cap to stay cheap and predictable.
+_MAX_SUGGESTED_RULES = 25
+
+_RULE_PROMPT = """You improve a software project's AGENTS.md / CLAUDE.md rules \
+for an AI coding agent.
+
+A recurring friction was mined from the agent's own transcript history:
+
+  Category:  <<CATEGORY>>
+  Summary:   <<TITLE>>
+  Recurred:  <<MEMBERS>> times across <<SESSIONS>> sessions
+  Evidence (verbatim from transcripts):
+<<EVIDENCE>>
+
+Write ONE concise, imperative rule (1-2 sentences) that, added to AGENTS.md, \
+would prevent this friction from recurring. Be specific and actionable; do not \
+merely restate the problem. If no useful preventive rule applies, return an \
+empty string.
+
+Respond with JSON only: {"rule": "<the rule, or empty string>"}"""
+
+
+def _suggest_one(iss: Issue, lm_adapter) -> Optional[str]:
+    """One LM call to phrase a preventive rule for an issue, or None."""
+    from neo.memory.transcript import _parse_json
+
+    evidence = "\n".join(f"    - {ev.span}" for ev in iss.evidence) or "    (none)"
+    prompt = (
+        _RULE_PROMPT
+        .replace("<<CATEGORY>>", iss.category)
+        .replace("<<TITLE>>", iss.title)
+        .replace("<<MEMBERS>>", str(iss.member_count))
+        .replace("<<SESSIONS>>", str(iss.session_count))
+        .replace("<<EVIDENCE>>", evidence)
+    )
+    try:
+        out = lm_adapter.generate(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.2,
+        )
+    except Exception as e:
+        logger.warning("memory issues: rule-suggestion LM call failed: %s", e)
+        return None
+    data = _parse_json(out)
+    if not isinstance(data, dict):
+        return None
+    rule = str(data.get("rule") or "").strip()
+    return rule or None
+
+
+def suggest_rules(
+    issues: list[Issue], lm_adapter, *, max_rules: int = _MAX_SUGGESTED_RULES
+) -> list[Issue]:
+    """Populate ``Issue.suggested_rule`` with an LM-phrased preventive rule.
+
+    Mutates issues in place (and returns them). One bounded LM call per issue,
+    highest-confidence first, up to ``max_rules``. A no-op when ``lm_adapter``
+    is None; any per-issue LM failure leaves that issue's ``suggested_rule`` as
+    None rather than aborting the batch.
+    """
+    if lm_adapter is None:
+        return issues
+    for iss in issues[:max_rules]:
+        rule = _suggest_one(iss, lm_adapter)
+        if rule:
+            iss.suggested_rule = rule
+    return issues

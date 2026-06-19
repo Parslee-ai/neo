@@ -14,6 +14,7 @@ from neo.memory.issues import (
     IssueEvidence,
     detect_issues,
     find_issues,
+    suggest_rules,
     tag_signals,
 )
 from neo.memory.models import FactScope
@@ -386,6 +387,82 @@ def test_find_issues_is_read_only_never_invokes_ingester(monkeypatch):
     ]
     issues = find_issues(_FakeStore(), sources=[_StaticSource(eps)], now=NOW)
     assert len(issues) == 1  # ran to completion without touching the ingester
+
+
+# --------------------------------------------------------------------------
+# suggest_rules (--suggest-rules)
+# --------------------------------------------------------------------------
+
+
+class _FakeLM:
+    """Records prompts; returns a canned reply (str or Exception to raise)."""
+
+    def __init__(self, reply):
+        self._reply = reply
+        self.prompts = []
+
+    def generate(self, messages, max_tokens=None, temperature=None):
+        self.prompts.append(messages[0]["content"])
+        if isinstance(self._reply, Exception):
+            raise self._reply
+        return self._reply
+
+
+def _issue(title="t", category=CATEGORY_ABSENT_GUARDRAIL, conf=0.9):
+    return Issue(
+        title=title, category=category, confidence=conf,
+        evidence=[IssueEvidence("s1", "1000", "error: boom")],
+        session_count=2, member_count=3,
+    )
+
+
+def test_suggest_rules_populates_from_json():
+    lm = _FakeLM('{"rule": "Always stash before merging."}')
+    issues = [_issue()]
+    suggest_rules(issues, lm)
+    assert issues[0].suggested_rule == "Always stash before merging."
+
+
+def test_suggest_rules_prompt_includes_evidence():
+    lm = _FakeLM('{"rule": "x"}')
+    suggest_rules([_issue(title="git merge friction")], lm)
+    assert "error: boom" in lm.prompts[0]
+    assert "git merge friction" in lm.prompts[0]
+
+
+def test_suggest_rules_none_adapter_is_noop():
+    issues = [_issue()]
+    suggest_rules(issues, None)
+    assert issues[0].suggested_rule is None
+
+
+def test_suggest_rules_lm_failure_is_graceful():
+    lm = _FakeLM(RuntimeError("api down"))
+    issues = [_issue()]
+    suggest_rules(issues, lm)
+    assert issues[0].suggested_rule is None  # batch not aborted, just left unset
+
+
+def test_suggest_rules_empty_rule_stays_none():
+    lm = _FakeLM('{"rule": ""}')
+    issues = [_issue()]
+    suggest_rules(issues, lm)
+    assert issues[0].suggested_rule is None
+
+
+def test_suggest_rules_unparseable_response_stays_none():
+    lm = _FakeLM("Sure! Here is a great rule for you.")  # no JSON object
+    issues = [_issue()]
+    suggest_rules(issues, lm)
+    assert issues[0].suggested_rule is None
+
+
+def test_suggest_rules_respects_max_rules_cap():
+    lm = _FakeLM('{"rule": "r"}')
+    issues = [_issue(title=f"i{i}") for i in range(5)]
+    suggest_rules(issues, lm, max_rules=2)
+    assert len(lm.prompts) == 2
+    assert [bool(i.suggested_rule) for i in issues] == [True, True, False, False, False]
 
 
 def test_issue_dataclass_shape():

@@ -377,6 +377,21 @@ def _handle_issues(args) -> None:
     store = FactStore(codebase_root=root, config=config, eager_init=False)
     issues = find_issues(store, since_seconds=since_seconds, min_cluster=min_cluster)
 
+    if getattr(args, "suggest_rules", False) and issues:
+        try:
+            from neo.adapters import resolve_adapter
+            from neo.memory.issues import suggest_rules
+
+            adapter = resolve_adapter(config)
+        except Exception as e:
+            print(
+                f"[Neo] --suggest-rules: could not build an LM adapter ({e}); "
+                "reporting issues without suggested rules.",
+                file=sys.stderr,
+            )
+        else:
+            suggest_rules(issues, adapter)
+
     if getattr(args, "json", False):
         payload = [
             {
@@ -407,6 +422,8 @@ def _handle_issues(args) -> None:
         print(f"  {iss.member_count} episodes across {iss.session_count} sessions")
         for ev in iss.evidence:
             print(f"    {ev.timestamp or '?'}  {ev.span}")
+        if iss.suggested_rule:
+            print(f"  suggested rule: {iss.suggested_rule}")
         print()
 
 
