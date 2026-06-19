@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.31.1] - 2026-06-19
+
+### Changed
+
+- **The global observer sweep now logs per-project progress.** Previously a sweep logged only a `swept N/M …` summary at the *end*, so a long first sweep (catching up the transcript backlog of every previously-unobserved project) had no heartbeat and looked hung. The sweep now prints a `sweep start: N of M project(s)` line, then a `sweep [i/N] <project>: X synthesized, Y mined (Zs)` line as each project completes (errors per project logged to stderr). Subsequent watermark-fast sweeps stay quiet. (`memory/observer.py`)
+
 ## [0.31.0] - 2026-06-19
 
 ### Changed
