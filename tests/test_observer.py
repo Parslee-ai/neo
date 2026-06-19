@@ -62,6 +62,34 @@ class TestRequireCarRuntime:
             _require_car_runtime()
 
 
+class TestCarVersionFloor:
+    def test_parse_version(self):
+        from neo.memory.observer import _parse_version
+        assert _parse_version("0.27.0") == (0, 27, 0)
+        assert _parse_version("0.18.0rc1") == (0, 18, 0)
+        assert _parse_version("0.16.1") == (0, 16, 1)
+        assert _parse_version(None) is None
+        assert _parse_version("garbage") is None
+
+    def test_old_version_rejected(self, fake_car, monkeypatch):
+        # agents_upsert present (0.16.x/0.17.0) but below the 0.18.0 floor.
+        from neo.memory import observer as obs
+        monkeypatch.setattr(obs, "_installed_car_version", lambda: "0.17.0")
+        with pytest.raises(RuntimeError, match="too old"):
+            obs._require_car_runtime()
+
+    def test_current_version_accepted(self, fake_car, monkeypatch):
+        from neo.memory import observer as obs
+        monkeypatch.setattr(obs, "_installed_car_version", lambda: "0.27.0")
+        assert obs._require_car_runtime() is fake_car
+
+    def test_unknown_version_allowed(self, fake_car, monkeypatch):
+        # Lenient about unknown (vendored build), strict about known-too-old.
+        from neo.memory import observer as obs
+        monkeypatch.setattr(obs, "_installed_car_version", lambda: None)
+        assert obs._require_car_runtime() is fake_car
+
+
 class TestSpecBuilding:
     def test_spec_uses_current_python(self, fake_project_id):
         from neo.memory.observer import _build_spec
