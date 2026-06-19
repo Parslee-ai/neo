@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neo-reasoner"
-version = "0.28.0"
+version = "0.28.1"
 description = "A self-improving code reasoning engine with persistent semantic memory"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -61,7 +61,8 @@ ollama = ["requests>=2.31.0"]
 # Requires the car-server daemon (`python -m car_runtime.server`)
 # running locally; see INSTALL.md.
 #
-# Minimum is 0.18.0: 0.16.x has the `agents_*` API but the PyO3
+# Functional minimum is 0.18.0 (the pin floor below is higher — newest
+# validated): 0.16.x has the `agents_*` API but the PyO3
 # binding still tries to acquire the supervisor manifest lock
 # in-process, which collides with a running CarHost.app/car-server
 # (Parslee-ai/car-releases#54). 0.17.0 routes those calls through
@@ -76,13 +77,17 @@ ollama = ["requests>=2.31.0"]
 # for `CarAdapter`-only use, but `neo memory observer start` will
 # reject them with an actionable error.
 car = [
-    # Upper-capped at the next major so `keep current` (a plain
-    # `pipx upgrade`) tracks latest within a compatible major rather
-    # than silently adopting a breaking rewrite of this sealed binary.
-    # NB: car-runtime is pre-1.0, so 0.x minor bumps can still carry
-    # breaking changes (see history above) — validate the observer
-    # after upgrading across a minor.
-    "car-runtime>=0.18.0,<1.0",
+    # Tracks latest within the 0.x line: a fresh install / `pipx upgrade`
+    # resolves to the newest compatible release (car-runtime is on the index).
+    # Upper-capped at the next major so it does NOT silently adopt a breaking
+    # 1.0 rewrite of this sealed binary. Floor raised to 0.27.0 — the latest
+    # version neo is validated against — so a fresh install can't land on an
+    # old 0.x. NB: car-runtime is pre-1.0, so 0.x minor bumps can still carry
+    # breaking changes (see history above) — validate the observer after
+    # upgrading across a minor. (The observer's *runtime* floor is a separate,
+    # more permissive 0.18.0 in `memory.observer._CAR_MIN_VERSION`: the minimum
+    # that is functionally footgun-free, vs. this pin's "ship latest validated".)
+    "car-runtime>=0.27.0,<1.0",
     # JSON-RPC-over-WebSocket client for the A2UI surface
     # (`neo.a2ui`). The Python `car_runtime.a2ui_*` helpers are
     # in-process only; reaching the daemon's a2ui store — which is
