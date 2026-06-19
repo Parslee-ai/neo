@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.25.0] - 2026-06-19
+
+### Added
+
+- **`neo memory rules` — flag drift between `AGENTS.md` / `CLAUDE.md` / `GEMINI.md`.** A repo worked by multiple coding agents has multiple rule files, and teams update one while forgetting the others; no single tool notices because each reads only its own. This static cross-file diagnostic discovers the rule files at the repo root, parses each into rule units (bullets with wrapped continuations folded in; headings/fences/prose dropped), embeds them (Jina, shared infra), and reports two divergence kinds: **gaps** (a rule present in one file with no aligned equivalent in another, at cosine < 0.78) and **conflicts** (aligned-but-divergent pairs judged contradictory by a bounded, graceful LM judge — opt out with `--no-conflicts`). Read-only / flag-and-propose: it prints proposed reconciling edits (`Add to AGENTS.md: …` / `Reconcile: …`) but never writes files. Byte-identical files (e.g. a symlinked single source) and single-file repos report "in sync." Dogfooded on this repo, where it correctly surfaced one real gap (a diagnostics section added to CLAUDE.md but not AGENTS.md). `neo memory rules [--json] [--no-conflicts] [--cwd]`. (`memory/rulesync.py`, `cli.py`, `subcommands.py`; see `docs/solutions/rule-file-sync.md`)
+
 ## [0.24.0] - 2026-06-19
 
 ### Added

@@ -36,17 +36,19 @@
     specific project's fact file, use `neo memory prune [--all] [--dry-run]`
     (`neo/subcommands.py:_compact_fact_file` — at the package root, not
     under `memory/`).
-  - Diagnostics: `neo memory issues [--since 14d] [--min-cluster 3] [--json]`
-    surfaces recurring frictions mined from transcript history (Claude Code /
-    Codex / CAR) as ranked, evidence-cited issues (categories: `missing-tool`,
-    `absent-guardrail`, `vague-rule`). **Read-only**: it reuses the ingester's
-    `TranscriptSource` episodes but never admits facts or touches the
-    `transcript_watermark_*` watermark — decoupled from fact admission and
-    idempotent (`neo/memory/issues.py:find_issues`). Gate mirrors synthesis
-    discipline (≥`min_cluster` members, ≥2 sessions, ≥2 frictional, verbatim
-    evidence). LM-free in v1; clusters at `SYNTHESIS_SIMILARITY` via the shared
-    `math_utils.cluster_by_similarity`. See
-    `docs/solutions/conversation-mined-issues.md`.
+  - Diagnostics (read-only, flag-and-propose): `neo memory issues [--since 14d]
+    [--min-cluster 3] [--suggest-rules] [--json]` surfaces recurring frictions mined from
+    transcript history (Claude Code / Codex / CAR) as ranked, evidence-cited issues
+    (`missing-tool` / `absent-guardrail` / `vague-rule`); `--suggest-rules` adds a bounded
+    LM call per issue to draft a preventive rule. `neo memory rules [--json]
+    [--no-conflicts]` flags drift between AGENTS.md / CLAUDE.md / GEMINI.md (gaps +
+    LM-judged conflicts). (`neo/memory/issues.py`, `neo/memory/rulesync.py`)
+    - `issues` reuses the ingester's `TranscriptSource` episodes but never admits facts or
+      touches the `transcript_watermark_*` watermark — decoupled from fact admission and
+      idempotent (`find_issues`). Gate mirrors synthesis discipline (≥`min_cluster`
+      members, ≥2 sessions, ≥2 frictional, verbatim evidence); clusters at
+      `SYNTHESIS_SIMILARITY` via the shared `math_utils.cluster_by_similarity`. See
+      `docs/solutions/conversation-mined-issues.md` and `docs/solutions/rule-file-sync.md`.
 - Domain tags (`Fact.domain`, `memory.models.SUGGESTED_DOMAINS`): optional free-form
   area tag orthogonal to `FactKind` — `code-style`, `testing`, `git`, `debugging`,
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the
