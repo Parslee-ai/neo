@@ -55,6 +55,27 @@
       members, ≥2 sessions, ≥2 frictional, verbatim evidence); clusters at
       `SYNTHESIS_SIMILARITY` via the shared `math_utils.cluster_by_similarity`. See
       `docs/solutions/conversation-mined-issues.md` and `docs/solutions/rule-file-sync.md`.
+- Transcript sources (`memory.transcript`, the `TranscriptSource` Protocol): the
+  `TranscriptIngester` mines lessons from four sources by default —
+  `ClaudeCodeSource` (`~/.claude/projects/**/*.jsonl`), `CodexSource`
+  (`~/.codex/sessions/**/rollout-*.jsonl`), `CarSource` (`~/.car/sessions/*.json`),
+  and `GitHubPRSource` (merged PRs + review threads via the `gh` CLI). A source may
+  declare optional `fact_kind` / `extra_tags` trust overrides that the ingester's
+  `admit` reads (default = today's PATTERN/FAILURE + `transcript-derived` tag).
+  `GitHubPRSource`: PROJECT-scoped (owner/repo derived from the git remote, so PR
+  facts co-scope with that repo's transcript facts under the same `project_id`);
+  enters facts as **REVIEW on probation** (`imported:github-pr` tag) — trust-first,
+  and NOT promoted by recurrence (synthesis keys it `"other"` → stays REVIEW; only an
+  independent git-verified acceptance ever mints PATTERN). Mine-once (watermark keyed
+  on PR number, bounded); maps title+body→`ask`, reviews/comments/inline-thread
+  comments→`assistant_text`, `CHANGES_REQUESTED`→`errors`; filters bot authors;
+  skips PRs with no human discussion. Throttled to one `gh` fetch per repo per
+  `_GH_PR_FETCH_INTERVAL` (3600s) so the all-projects sweep keeps near-zero work on
+  unchanged repos. Self-disables (returns `[]`) when the remote isn't github.com or
+  `gh` is absent — no env flag. Known limits (deferred): merged-only, no PR-diff
+  ingestion (discussion text only), no historical backfill beyond the
+  `_GH_PR_PAGE`(=25)-most-recently-updated window, GitHub Enterprise hosts and
+  fork-origin upstreams not handled.
 - Domain tags (`Fact.domain`, `memory.models.SUGGESTED_DOMAINS`): optional free-form
   area tag orthogonal to `FactKind` — `code-style`, `testing`, `git`, `debugging`,
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the

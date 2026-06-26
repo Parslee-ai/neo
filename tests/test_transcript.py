@@ -2,6 +2,7 @@
 
 import json
 import time as _time
+import types
 from dataclasses import dataclass as _dataclass
 
 import numpy as _np
@@ -13,7 +14,11 @@ from neo.memory.transcript import (
     CarSource,
     CodexSource,
     Episode,
+    GitHubPRSource,
     TranscriptIngester,
+    _fetch_merged_prs,
+    _gh_graphql,
+    _owner_repo_from_remote,
     _parse_json,
     build_episodes,
     collect_episodes,
@@ -717,3 +722,256 @@ def test_mine_gives_up_after_window(mining_store):
     assert ing.mine_suggestion_outcomes([]) == 0
     assert st._outcome_tracker.load_suggestion_ledger() == []  # expired, dropped
     assert fact.metadata.success_count == 0
+
+
+# ===========================================================================
+# GitHubPRSource — merged PRs + review threads as a transcript source.
+# All network is faked; no test touches the real `gh` CLI or GitHub.
+# ===========================================================================
+
+
+def _pr(number=1, title="t", body="", updated="u1", merged="m1",
+        reviews=None, comments=None, threads=None):
+    """A GraphQL PR node shaped like _fetch_merged_prs returns."""
+    return {
+        "number": number, "title": title, "body": body,
+        "updatedAt": updated, "mergedAt": merged,
+        "author": {"login": "author"},
+        "reviews": {"nodes": reviews or []},
+        "comments": {"nodes": comments or []},
+        "reviewThreads": {"nodes": threads or []},
+    }
+
+
+class TestOwnerRepoParsing:
+    @pytest.mark.parametrize("url,expected", [
+        ("git@github.com:Parslee-ai/neo.git", ("Parslee-ai", "neo")),
+        ("https://github.com/Parslee-ai/neo", ("Parslee-ai", "neo")),
+        ("https://x-token@github.com/Parslee-ai/neo.git", ("Parslee-ai", "neo")),
+        ("ssh://git@github.com/Parslee-ai/neo.git", ("Parslee-ai", "neo")),
+        ("git@gitlab.com:foo/bar.git", None),   # non-GitHub remote
+        ("", None),                              # no remote
+    ])
+    def test_parses(self, monkeypatch, url, expected):
+        monkeypatch.setattr("neo.memory.transcript._get_git_remote_url",
+                            lambda root: url)
+        assert _owner_repo_from_remote("/x") == expected
+
+
+class TestPRToEpisode:
+    def test_maps_reviews_comments_inline_and_errors(self):
+        pr = _pr(
+            number=42, title="Add cache", body="why", updated="2026-06-02",
+            merged="2026-06-01",
+            reviews=[
+                {"body": "LGTM", "state": "APPROVED", "author": {"login": "bob"}},
+                {"body": "key collides", "state": "CHANGES_REQUESTED",
+                 "author": {"login": "carol"}},
+            ],
+            comments=[
+                {"body": "bump", "author": {"login": "dependabot[bot]"}},  # bot
+                {"body": "nice", "author": {"login": "dave"}},
+            ],
+            threads=[{"isResolved": True, "comments": {"nodes": [
+                {"body": "use LRU", "path": "cache.py", "author": {"login": "carol"}},
+            ]}}],
+        )
+        ep = GitHubPRSource._pr_to_episode(pr)
+        joined = " ".join(ep.assistant_text)
+        assert ep.ask.startswith("PR #42: Add cache")
+        assert "review APPROVED by bob" in joined
+        assert "review CHANGES_REQUESTED by carol" in joined
+        assert "comment by dave" in joined
+        assert "inline cache.py by carol" in joined
+        assert "dependabot" not in joined            # bot filtered out
+        assert ep.errors and "changes requested by carol" in ep.errors[0]
+        assert ep.anchor_uuid == "pr-42"             # mine-once: keyed on number
+        assert ep.timestamp == "2026-06-01"
+        assert ep.is_substantive
+
+    def test_no_discussion_returns_none(self):
+        assert GitHubPRSource._pr_to_episode(_pr(number=7, title="typo")) is None
+
+    def test_all_bot_discussion_returns_none(self):
+        pr = _pr(comments=[{"body": "bump", "author": {"login": "renovate"}}])
+        assert GitHubPRSource._pr_to_episode(pr) is None
+
+    def test_missing_title_returns_none(self):
+        assert GitHubPRSource._pr_to_episode(_pr(title="")) is None
+
+    def test_handles_null_author_and_null_nodes(self):
+        """GraphQL returns author:null for deleted accounts and may null whole
+        connections — none of it should raise."""
+        pr = {
+            "number": 3, "title": "x", "body": "", "updatedAt": "u", "mergedAt": "m",
+            "author": None,                       # deleted account
+            "reviews": None,                      # whole connection null
+            "comments": {"nodes": [None, {"body": "real point", "author": None}]},
+            "reviewThreads": {"nodes": [None]},   # null node in list
+        }
+        ep = GitHubPRSource._pr_to_episode(pr)
+        assert ep is not None
+        assert any("real point" in t for t in ep.assistant_text)
+        assert ep.anchor_uuid == "pr-3"
+
+
+class TestGhFetchFailureModes:
+    def _run(self, monkeypatch, *, rc=0, stdout="", raises=None):
+        def fake_run(*a, **k):
+            if raises:
+                raise raises
+            return types.SimpleNamespace(returncode=rc, stdout=stdout, stderr="e")
+        monkeypatch.setattr("neo.memory.transcript.subprocess.run", fake_run)
+
+    def test_none_on_nonzero(self, monkeypatch):
+        self._run(monkeypatch, rc=1)
+        assert _gh_graphql("q") is None
+
+    def test_none_on_exception(self, monkeypatch):
+        self._run(monkeypatch, raises=OSError("no gh"))
+        assert _gh_graphql("q") is None
+
+    def test_none_on_timeout(self, monkeypatch):
+        import subprocess
+        self._run(monkeypatch, raises=subprocess.TimeoutExpired("gh", 20))
+        assert _gh_graphql("q") is None
+
+    def test_none_on_bad_json(self, monkeypatch):
+        self._run(monkeypatch, rc=0, stdout="not json")
+        assert _gh_graphql("q") is None
+
+    def test_string_vars_use_lowercase_f_int_vars_use_uppercase_F(self, monkeypatch):
+        """Regression: a repo named "2048" must go via -f (String!), not -F,
+        which would coerce it to an Int and silently fail the query."""
+        captured = {}
+
+        def fake_run(cmd, **k):
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(returncode=0, stdout='{"data":{}}', stderr="")
+        monkeypatch.setattr("neo.memory.transcript.subprocess.run", fake_run)
+        _gh_graphql("Q", str_vars={"owner": "2048", "repo": "2048"}, int_vars={"n": 25})
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("owner=2048") - 1] == "-f"   # String! via -f
+        assert cmd[cmd.index("repo=2048") - 1] == "-f"
+        assert cmd[cmd.index("n=25") - 1] == "-F"         # Int! via -F
+
+    def test_fetch_empty_when_graphql_none(self, monkeypatch):
+        monkeypatch.setattr("neo.memory.transcript._gh_graphql", lambda *a, **k: None)
+        assert _fetch_merged_prs("o", "r") == []
+
+    def test_fetch_empty_on_malformed_payload(self, monkeypatch):
+        monkeypatch.setattr("neo.memory.transcript._gh_graphql",
+                            lambda *a, **k: {"repository": None})
+        assert _fetch_merged_prs("o", "r") == []
+
+
+class TestCollectEpisodesGuards:
+    def test_empty_when_no_gh(self, monkeypatch):
+        monkeypatch.setattr("neo.memory.transcript._gh_available", lambda: False)
+        monkeypatch.setattr("neo.memory.transcript._owner_repo_from_remote",
+                            lambda root: ("o", "r"))
+        assert GitHubPRSource("/x").collect_episodes() == []
+
+    def test_empty_when_non_github_remote(self, monkeypatch):
+        monkeypatch.setattr("neo.memory.transcript._gh_available", lambda: True)
+        monkeypatch.setattr("neo.memory.transcript._owner_repo_from_remote",
+                            lambda root: None)
+        assert GitHubPRSource("/x").collect_episodes() == []
+
+    def test_maps_fetched_prs(self, tmp_path, monkeypatch):
+        # SESSIONS_DIR → tmp so the throttle stamp never touches real state.
+        monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "s")
+        monkeypatch.setattr("neo.memory.transcript._gh_available", lambda: True)
+        monkeypatch.setattr("neo.memory.transcript._owner_repo_from_remote",
+                            lambda root: ("o", "r"))
+        monkeypatch.setattr(
+            "neo.memory.transcript._fetch_merged_prs",
+            lambda o, r: [_pr(number=1, title="x",
+                              comments=[{"body": "good", "author": {"login": "u"}}])])
+        eps = GitHubPRSource("/x").collect_episodes()
+        assert len(eps) == 1 and eps[0].session_id == "pr-1"
+
+    def test_fetch_is_throttled_per_repo(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "s")
+        monkeypatch.setattr("neo.memory.transcript._gh_available", lambda: True)
+        monkeypatch.setattr("neo.memory.transcript._owner_repo_from_remote",
+                            lambda root: ("o", "r"))
+        calls = []
+        monkeypatch.setattr(
+            "neo.memory.transcript._fetch_merged_prs",
+            lambda o, r: calls.append(1) or [
+                _pr(number=1, comments=[{"body": "x", "author": {"login": "u"}}])])
+        src = GitHubPRSource("/x")
+        src.collect_episodes()          # no stamp → fetches
+        src.collect_episodes()          # within interval → throttled, no fetch
+        assert len(calls) == 1
+        monkeypatch.setattr("neo.memory.transcript._GH_PR_FETCH_INTERVAL", 0)
+        src.collect_episodes()          # interval elapsed → fetches again
+        assert len(calls) == 2
+
+
+def test_pr_facts_enter_as_review_on_probation(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("neo.memory.transcript._gh_available", lambda: True)
+    monkeypatch.setattr("neo.memory.transcript._owner_repo_from_remote",
+                        lambda root: ("o", "r"))
+    pr = _pr(number=5, title="Add cache",
+             reviews=[{"body": "key collides under load", "state": "CHANGES_REQUESTED",
+                       "author": {"login": "carol"}}])
+    monkeypatch.setattr("neo.memory.transcript._fetch_merged_prs", lambda o, r: [pr])
+    ad = _StubAdapter([{"kind": "pattern", "subject": "cache key design",
+                        "body": "Cache keys must include all inputs to avoid collisions.",
+                        "evidence_span": "key collides under load"}], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[GitHubPRSource("/x")])
+    stats = ing.ingest()
+    assert stats["facts_admitted"] == 1
+    facts = [f for f in temp_store._facts if f.is_valid]
+    assert len(facts) == 1
+    f = facts[0]
+    assert f.kind == FactKind.REVIEW                  # trust-first, not PATTERN
+    assert "imported:github-pr" in f.tags
+    assert "transcript-derived" in f.tags
+    assert "probation" in f.tags                      # enters on probation
+
+
+def test_pr_ingest_is_mine_once(temp_store, tmp_path, monkeypatch):
+    """A merged PR is mined exactly once (watermark keyed on PR number), even if
+    its thread grows after merge — keeps the watermark bounded and avoids re-
+    paying extraction. Throttle disabled so this exercises the watermark itself."""
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("neo.memory.transcript._GH_PR_FETCH_INTERVAL", 0)  # no throttle
+    monkeypatch.setattr("neo.memory.transcript._gh_available", lambda: True)
+    monkeypatch.setattr("neo.memory.transcript._owner_repo_from_remote",
+                        lambda root: ("o", "r"))
+    lesson = [{"kind": "pattern", "subject": "bounded cache",
+               "body": "Use a bounded LRU to cap cache memory.",
+               "evidence_span": "use a bounded LRU here"}]
+    ad = _StubAdapter(lesson, keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[GitHubPRSource("/x")])
+
+    v1 = [_pr(number=9, title="x", updated="2026-01-01",
+              comments=[{"body": "use a bounded LRU here", "author": {"login": "carol"}}])]
+    monkeypatch.setattr("neo.memory.transcript._fetch_merged_prs", lambda o, r: v1)
+    assert ing.ingest()["episodes_new"] == 1
+    assert ing.ingest()["episodes_new"] == 0          # already mined
+
+    # Thread grew (new updatedAt) — but mine-once keys on number, so still 0 new.
+    v2 = [_pr(number=9, title="x", updated="2026-02-02",
+              comments=[{"body": "use a bounded LRU here", "author": {"login": "carol"}},
+                        {"body": "and add a metric", "author": {"login": "dave"}}])]
+    monkeypatch.setattr("neo.memory.transcript._fetch_merged_prs", lambda o, r: v2)
+    assert ing.ingest()["episodes_new"] == 0          # not re-mined
+
+
+def test_source_without_fact_kind_defaults_to_pattern(temp_store, tmp_path, monkeypatch):
+    """Backward-compat: a source that declares no fact_kind still yields PATTERN."""
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    src = _StaticSource([_episode()])  # no fact_kind / extra_tags attributes
+    ad = _StubAdapter([{"kind": "pattern", "subject": "s",
+                        "body": "Check the venv before blaming the code.",
+                        "evidence_span": "venv was missing pytest-asyncio"}], keep=True)
+    ing = TranscriptIngester(store=temp_store, lm_adapter=ad, sources=[src])
+    ing.ingest()
+    facts = [f for f in temp_store._facts if f.is_valid]
+    assert facts and facts[0].kind == FactKind.PATTERN
+    assert "imported:github-pr" not in facts[0].tags

@@ -26,6 +26,8 @@ import datetime
 import json
 import logging
 import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +37,7 @@ from neo.math_utils import cosine_similarity
 from neo.memory.io_utils import atomic_write_json
 from neo.memory.metrics import record as metrics_record
 from neo.memory.models import FactKind, FactScope, Provenance
+from neo.memory.scope import _get_git_remote_url, _normalize_remote_url
 from neo.memory.outcomes import (
     MAX_MINED_OUTCOMES_PER_CYCLE,
     OUTCOME_CORRELATION_SIMILARITY,
@@ -343,10 +346,21 @@ class TranscriptSource(Protocol):
     ``name`` namespaces the watermark; ``scope`` is the FactScope for facts
     derived from this source (PROJECT for repo-bound tools, GLOBAL for
     cross-agent tools that aren't tied to one repo).
+
+    Optional trust overrides (a source may define neither, either, or both):
+    ``fact_kind`` forces the FactKind for derived facts (e.g. REVIEW for
+    lower-trust, decaying material that synthesis later promotes) instead of
+    the default PATTERN/FAILURE inferred per-lesson; ``extra_tags`` are appended
+    to the standard transcript tag so the source is identifiable and dedup-able.
+    When unset, ``admit`` keeps today's behavior. See ``GitHubPRSource``.
     """
 
     name: str
     scope: FactScope
+    # Optional; read via getattr in the ingester so existing sources that don't
+    # define them keep the default PATTERN/FAILURE + transcript-tag behavior.
+    fact_kind: Optional["FactKind"]
+    extra_tags: Optional[list[str]]
 
     def collect_episodes(self) -> list[Episode]:
         ...
@@ -595,6 +609,281 @@ class CodexSource:
         return episodes
 
 
+# ---------------------------------------------------------------------------
+# GitHub PR source helpers (task #2): derive owner/repo from the repo's git
+# remote and fetch merged PRs + their review threads via the `gh` CLI. Every
+# failure path returns empty/None so a missing/unauthenticated gh, a non-GitHub
+# remote, an offline box, or a rate-limit never raises into the ingest loop.
+# ---------------------------------------------------------------------------
+
+# One GraphQL call pulls this many most-recently-updated merged PRs. This is a
+# fixed window, NOT paginated: PRs older than the window at first run are not
+# backfilled. Forward coverage still holds — a newly-merged PR surfaces at the
+# top (merge bumps updatedAt) and is mined before it falls out, as long as the
+# fetch cadence outpaces the merge rate.
+_GH_PR_PAGE = 25
+_GH_API_TIMEOUT = 20  # seconds for a single gh invocation
+# PRs change far slower than transcripts. Fetch at most once per this interval
+# per repo so the observer's all-projects sweep keeps its "unchanged projects do
+# near-zero work" property instead of firing a gh subprocess every cycle.
+_GH_PR_FETCH_INTERVAL = 3600  # seconds
+
+# One GraphQL query gets each merged PR with its review summaries, conversation
+# comments, and inline review-thread comments — bounded fan-out (1 call/repo)
+# instead of REST's 1 + 3N.
+_GH_PR_QUERY = """
+query($owner:String!, $repo:String!, $n:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequests(states:MERGED, first:$n, orderBy:{field:UPDATED_AT, direction:DESC}) {
+      nodes {
+        number title body mergedAt updatedAt
+        author { login }
+        reviews(first:50) { nodes { body state author { login } } }
+        comments(first:50) { nodes { body author { login } } }
+        reviewThreads(first:50) { nodes {
+          isResolved
+          comments(first:20) { nodes { body path author { login } } }
+        } }
+      }
+    }
+  }
+}
+"""
+
+
+def _owner_repo_from_remote(codebase_root: Optional[str]) -> Optional[tuple[str, str]]:
+    """``(owner, repo)`` for a github.com remote, or None.
+
+    Reuses ``scope._normalize_remote_url`` (the same normalization that derives
+    ``project_id``), so PR facts co-scope with that repo's transcript facts.
+    GitHub Enterprise hosts (``github.<company>.com``) are intentionally not
+    matched yet — only public github.com.
+    """
+    norm = _normalize_remote_url(_get_git_remote_url(codebase_root))
+    m = re.match(r"github\.com/([^/]+)/([^/]+)$", norm)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _gh_available() -> bool:
+    """True if the ``gh`` CLI is on PATH. Auth/network failures are handled at
+    call time (a fetch just returns []), so we don't pay a `gh auth status`
+    subprocess on every cycle."""
+    return shutil.which("gh") is not None
+
+
+def _gh_graphql(query: str, str_vars: Optional[dict] = None,
+                int_vars: Optional[dict] = None) -> Optional[dict]:
+    """Run a ``gh api graphql`` query, returning parsed ``data`` or None.
+
+    None on any failure — gh absent, not authenticated, offline, rate-limited,
+    timeout, or malformed JSON — so callers degrade to an empty source.
+
+    ``str_vars`` go via ``-f`` (raw string); ``int_vars`` via ``-F`` (typed).
+    The split matters: ``-F`` coerces values (a bare integer becomes an Int, a
+    leading ``@`` reads a file), so a String! variable like a repo literally
+    named ``2048`` MUST use ``-f`` or it fails the schema and silently mines
+    nothing.
+    """
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for k, v in (str_vars or {}).items():
+        cmd += ["-f", f"{k}={v}"]
+    for k, v in (int_vars or {}).items():
+        cmd += ["-F", f"{k}={v}"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("github-pr: gh graphql failed: %s", e)
+        return None
+    if result.returncode != 0:
+        logger.debug("github-pr: gh graphql rc=%s: %s",
+                     result.returncode, (result.stderr or "")[:200])
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def _fetch_merged_prs(owner: str, repo: str, limit: int = _GH_PR_PAGE) -> list[dict]:
+    """The ``limit`` most-recently-updated merged PRs for ``owner/repo`` with
+    their reviews and comments, or [] on any failure."""
+    data = _gh_graphql(_GH_PR_QUERY,
+                       str_vars={"owner": owner, "repo": repo},
+                       int_vars={"n": limit})
+    if not data:
+        return []
+    try:
+        nodes = data["repository"]["pullRequests"]["nodes"]
+    except (KeyError, TypeError):
+        return []
+    return [n for n in nodes if isinstance(n, dict)]
+
+
+# Authored-by-automation noise: GitHub App accounts end in "[bot]"; the rest are
+# common review/CI bots posting under plain logins. Their comments are high
+# volume, low lesson density.
+_PR_BOT_LOGINS = {"dependabot", "renovate", "github-actions", "codecov",
+                  "coderabbitai", "sonarcloud", "netlify", "vercel"}
+
+
+def _is_bot(login: str) -> bool:
+    low = (login or "").lower()
+    return low.endswith("[bot]") or low in _PR_BOT_LOGINS
+
+
+def _node_list(obj: dict, key: str) -> list[dict]:
+    """Safely pull ``obj[key]['nodes']`` as a list of dicts ([] if absent)."""
+    try:
+        nodes = obj[key]["nodes"]
+    except (KeyError, TypeError):
+        return []
+    return [n for n in nodes if isinstance(n, dict)]
+
+
+def _author_login(obj: dict) -> str:
+    a = obj.get("author") if isinstance(obj, dict) else None
+    return a.get("login", "") if isinstance(a, dict) else ""
+
+
+class GitHubPRSource:
+    """Merged GitHub PRs + their review threads for one repo, via the ``gh`` CLI.
+
+    Repo-bound, so derived facts are PROJECT-scoped and co-scope with that
+    repo's transcript facts (same git-remote ``project_id``). Facts enter as
+    REVIEW on probation (trust-first): PR reviews are other people's opinions on
+    code, topic-correlated and not neo's own validated outcomes, so they're
+    low-trust, decaying material. They are NOT promoted by recurrence — synthesis
+    consolidates them into another REVIEW, and only an independent git-verified
+    acceptance of a suggestion neo itself surfaced ever mints a PATTERN. That is
+    deliberate: promoting other people's opinions by repetition is exactly the
+    false-accept vector neo guards against. ``fact_kind``/``extra_tags`` carry
+    this posture to the ingester's ``admit`` (task #1).
+
+    Each merged PR is mined once (watermark keyed on PR number); post-merge
+    thread growth is not re-mined — merged-PR discussion is effectively final,
+    and mine-once keeps the watermark bounded (one entry/PR, like the other
+    sources) instead of accreting one per edit.
+    """
+
+    name = "github-pr"
+    scope = FactScope.PROJECT
+    fact_kind = FactKind.REVIEW
+    extra_tags = ["imported:github-pr"]
+
+    def __init__(self, codebase_root: Optional[str]):
+        self.codebase_root = codebase_root
+
+    def collect_episodes(self) -> list[Episode]:
+        repo = _owner_repo_from_remote(self.codebase_root)
+        if repo is None or not _gh_available():
+            return []  # non-GitHub remote / no gh on PATH → silent no-op
+        owner, name = repo
+        if not self._fetch_due(owner, name):
+            return []  # throttled: a gh subprocess at most once per interval/repo
+        episodes: list[Episode] = []
+        for pr in _fetch_merged_prs(owner, name):
+            ep = self._pr_to_episode(pr)
+            if ep is not None:
+                episodes.append(ep)
+        # Advance the throttle only after a real fetch — if the budget skipped us
+        # this cycle (collect never ran), we retry next cycle rather than waiting
+        # a full interval, so a busy repo isn't starved on first mining.
+        self._mark_fetched(owner, name)
+        return episodes
+
+    @staticmethod
+    def _fetch_stamp_path(owner: str, repo: str) -> "Path":
+        # Sanitize: owner/repo are GitHub handles (no "/"), but be defensive.
+        slug = f"{owner}_{repo}".replace("/", "_")
+        return SESSIONS_DIR / f"github_pr_fetch_{slug}.stamp"
+
+    def _fetch_due(self, owner: str, repo: str) -> bool:
+        try:
+            age = time.time() - self._fetch_stamp_path(owner, repo).stat().st_mtime
+        except OSError:
+            return True  # no stamp yet → due
+        return age >= _GH_PR_FETCH_INTERVAL
+
+    def _mark_fetched(self, owner: str, repo: str) -> None:
+        try:
+            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+            self._fetch_stamp_path(owner, repo).write_text(str(time.time()))
+        except OSError as e:
+            logger.debug("github-pr: could not write fetch stamp: %s", e)
+
+    @staticmethod
+    def _pr_to_episode(pr: dict) -> Optional[Episode]:
+        try:
+            number = int(pr["number"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        title = str(pr.get("title") or "").strip()
+        if not title:
+            return None
+        body = str(pr.get("body") or "").strip()
+        ask = f"PR #{number}: {title}"
+        if body:
+            ask = f"{ask}\n\n{body}"
+        ask = ask[:_MAX_ASK_CHARS]
+
+        texts: list[str] = []
+        errors: list[str] = []
+        # Review summaries, carrying the verdict state.
+        for r in _node_list(pr, "reviews"):
+            login = _author_login(r)
+            if _is_bot(login):
+                continue
+            rb = str(r.get("body") or "").strip()
+            state = str(r.get("state") or "").strip()
+            if state == "CHANGES_REQUESTED":
+                errors.append(f"changes requested by {login}: {rb}"[:300])
+            if rb:
+                texts.append(f"[review {state} by {login}] {rb}")
+        # Conversation (issue-style) comments.
+        for c in _node_list(pr, "comments"):
+            login = _author_login(c)
+            cb = str(c.get("body") or "").strip()
+            if _is_bot(login) or not cb:
+                continue
+            texts.append(f"[comment by {login}] {cb}")
+        # Inline review-thread comments (line-level discussion).
+        for th in _node_list(pr, "reviewThreads"):
+            for c in _node_list(th, "comments"):
+                login = _author_login(c)
+                cb = str(c.get("body") or "").strip()
+                if _is_bot(login) or not cb:
+                    continue
+                path = str(c.get("path") or "").strip()
+                loc = f" {path}" if path else ""
+                texts.append(f"[inline{loc} by {login}] {cb}")
+
+        # A merged PR with no human review discussion has nothing to teach — the
+        # lesson lives in the review, not the description. Skip it (and leave it
+        # un-watermarked so it ingests later if review activity appears).
+        if not texts:
+            return None
+
+        # Mine-once: anchor on the PR number alone, so re-fetching a
+        # already-consumed PR is a no-op and the watermark stays bounded at one
+        # entry per PR (no per-edit accretion).
+        anchor = f"pr-{number}"
+        return Episode(
+            session_id=f"pr-{number}",
+            anchor_uuid=anchor,
+            last_uuid=anchor,
+            timestamp=str(pr.get("mergedAt") or ""),
+            ask=ask,
+            assistant_text=texts,
+            errors=errors,
+        )
+
+
 class TranscriptIngester:
     """Extract verified, generalizable lessons from transcript episodes and
     admit them directly as PATTERN/FAILURE facts.
@@ -610,11 +899,15 @@ class TranscriptIngester:
         self._store = store
         self._lm = lm_adapter
         self.codebase_root = codebase_root or getattr(store, "codebase_root", None)
-        # Default source set; add new tool adapters here as they land.
+        # Default source set; add new tool adapters here as they land. No env
+        # toggles: GitHubPRSource self-disables (returns []) when the repo has no
+        # github.com remote or `gh` isn't on PATH, so it costs nothing where it
+        # doesn't apply rather than needing an opt-out flag.
         self.sources = sources if sources is not None else [
             ClaudeCodeSource(self.codebase_root),
             CodexSource(self.codebase_root),
             CarSource(),
+            GitHubPRSource(self.codebase_root),
         ]
 
     # -- Stage B ---------------------------------------------------------
@@ -652,8 +945,16 @@ class TranscriptIngester:
         return bool(data and data.get("keep") is True)
 
     # -- admission -------------------------------------------------------
-    def admit(self, lesson: dict, ep: Episode, scope: FactScope = FactScope.PROJECT):
-        kind = FactKind.FAILURE if lesson.get("kind") == "failure" else FactKind.PATTERN
+    def admit(self, lesson: dict, ep: Episode, scope: FactScope = FactScope.PROJECT,
+              fact_kind: Optional[FactKind] = None,
+              extra_tags: Optional[list[str]] = None):
+        # ``fact_kind`` (when a source declares one) overrides the per-lesson
+        # PATTERN/FAILURE split — e.g. a PR source enters everything as REVIEW
+        # (low-trust, decaying) and lets synthesis promote clusters later.
+        if fact_kind is not None:
+            kind = fact_kind
+        else:
+            kind = FactKind.FAILURE if lesson.get("kind") == "failure" else FactKind.PATTERN
         try:
             raw_conf = float(lesson.get("confidence", 0.5) or 0.5)
         except (TypeError, ValueError):
@@ -669,12 +970,14 @@ class TranscriptIngester:
             scope=scope,
             confidence=confidence,
             source_prompt=ep.ask[:200],
-            tags=[_TRANSCRIPT_TAG],
+            tags=[_TRANSCRIPT_TAG, *(extra_tags or [])],
             provenance=Provenance.INFERRED,  # LM generalization, no bonus over corroborated facts
             domain=domain,  # first-class field so retrieve_relevant(domain=...) matches
         )
 
-    def ingest_episode(self, ep: Episode, scope: FactScope = FactScope.PROJECT) -> int:
+    def ingest_episode(self, ep: Episode, scope: FactScope = FactScope.PROJECT,
+                       fact_kind: Optional[FactKind] = None,
+                       extra_tags: Optional[list[str]] = None) -> int:
         """Full per-episode pipeline; returns number of facts admitted.
 
         ``store.add_fact`` saves to disk on each call, so an episode's facts
@@ -685,7 +988,7 @@ class TranscriptIngester:
         admitted = 0
         for lesson in self.extract_lessons(ep):
             if self.verify(lesson, ep):
-                self.admit(lesson, ep, scope)
+                self.admit(lesson, ep, scope, fact_kind=fact_kind, extra_tags=extra_tags)
                 admitted += 1
         return admitted
 
@@ -735,10 +1038,14 @@ class TranscriptIngester:
             new = [e for e in episodes if e.anchor_uuid not in consumed]
             stats["episodes_total"] += len(episodes)
             stats["episodes_new"] += len(new)
+            # Optional per-source trust overrides (default None → today's behavior).
+            src_kind = getattr(source, "fact_kind", None)
+            src_tags = getattr(source, "extra_tags", None)
             for ep in new:
                 if stop_now():
                     break
-                stats["facts_admitted"] += self.ingest_episode(ep, source.scope)
+                stats["facts_admitted"] += self.ingest_episode(
+                    ep, source.scope, fact_kind=src_kind, extra_tags=src_tags)
                 consumed.add(ep.anchor_uuid)
                 self._persist_consumed(source, consumed)  # advance only after durable
                 stats["episodes_processed"] += 1
