@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.33.0] - 2026-06-26
+
+### Added
+
+- **neo now learns from merged GitHub PRs and their review threads, not just AI-tool transcripts.** A fourth transcript source, `GitHubPRSource`, mines each repo's merged PRs via the `gh` CLI (one GraphQL call/repo) — review summaries, conversation comments, and inline line-comments — and turns the review discussion into memory facts. owner/repo is auto-derived from the git remote, so PR facts co-scope with that repo's transcript facts under the same `project_id`. Facts enter as **REVIEW on probation** (`imported:github-pr` tag) — trust-first, since PR reviews are other people's opinions, not neo's validated outcomes; they are not promoted by recurrence. The source filters bot authors, skips PRs with no human discussion, mines each PR once (bounded watermark keyed on PR number), and is throttled to one fetch per repo per hour so the all-projects observer sweep keeps near-zero work on unchanged repos. It self-disables (no env flag) when the remote isn't github.com or `gh` is absent. Known limits: merged-only, discussion text only (no PR diff), no historical backfill beyond the 25 most-recently-updated PRs, GitHub Enterprise and fork-origin remotes not yet handled. A new optional `fact_kind`/`extra_tags` on the `TranscriptSource` Protocol carries the trust posture into the ingester's `admit` (backward-compatible; existing sources unchanged). (`memory/transcript.py`)
+
 ## [0.32.0] - 2026-06-26
 
 ### Fixed
