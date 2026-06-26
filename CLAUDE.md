@@ -128,10 +128,24 @@
   `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
   CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |
   `errored`) so restart-loops are diagnosable, and also flags **orphaned**
-  observer processes — a `neo.memory.observer --daemon` for this project
-  reparented to init/launchd (`ppid==1`) by a dead prior car-server, which CAR's
-  supervised view can't see (`observer._find_orphan_observers`; the `orphans`
-  field + a `WARNING` with a `kill` hint). Tunables:
+  observer processes — a `neo.memory.observer --daemon` reparented to
+  init/launchd (`ppid==1`, or no live parent on Windows) by a dead prior
+  car-server, which CAR's supervised view can't see
+  (`observer._find_orphan_observers`; the `orphans` field + a `WARNING`).
+  Orphans are now **auto-reaped**, not just reported: `_reap_orphan_observers`
+  SIGTERMs them (re-checking each pid's cmdline right before the signal to
+  defend against pid reuse) and is wired into `start`/`stop`/autostart and the
+  daemon's own startup. A second guarantee backs it up — the daemon holds a
+  cross-process **single-instance lock** (`_SingleInstanceLock`, `fcntl`/`msvcrt`
+  on `~/.neo/observer.lock`) for its lifetime, so two observers can never run
+  synthesis at once even in the handoff window; a contended daemon exits 0
+  (benign no-op, no CAR backoff). If a straggler ignores SIGTERM past the
+  `_LOCK_ESCALATE_AFTER` grace, the daemon escalates to SIGKILL so the kernel
+  frees the lock — safe because `FactStore._save_file` is atomic (temp +
+  `os.replace`), so a hard kill can only leave a stray `.tmp`, never a torn
+  fact file. (This is belt-and-suspenders: `store.save()` already serializes
+  writers with its own per-scope flock, so the orphan was never a corruption
+  bug — just doubled LM spend and synthesis.) Tunables:
   `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
   (default 60, per-process). **Footgun**: the interpreter path (`sys.executable`)
   must not live under a world-writable directory (`/tmp`, `/private/tmp`,
