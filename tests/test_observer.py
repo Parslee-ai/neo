@@ -44,6 +44,17 @@ def fake_car(monkeypatch):
         __spec__=None,
     )
     monkeypatch.setitem(sys.modules, "car_runtime", car)
+    # Pin a known-good version so the lifecycle gate doesn't depend on which
+    # car-runtime wheel happens to be installed in the dev venv (the metadata
+    # version is read from the installed package, not the injected module).
+    monkeypatch.setattr(
+        "neo.memory.observer._installed_car_version", lambda: "0.27.0"
+    )
+    # Neutralize reaping by default so lifecycle tests never scan or signal the
+    # host's real process table. Tests that assert reaping override this.
+    monkeypatch.setattr(
+        "neo.memory.observer._reap_orphan_observers", lambda *a, **k: []
+    )
     return car
 
 
@@ -216,6 +227,275 @@ class TestOrphanStatus:
         assert st["orphans"] == [777]
 
 
+_OBS_CMD = "python -m neo.memory.observer --daemon --all"
+
+
+class TestReapOrphans:
+    """`_reap_orphan_observers` signals unsupervised observer daemons."""
+
+    def test_reaps_each_found_orphan(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda *a: [101, 202])
+        monkeypatch.setattr(obs, "_pid_cmdline", lambda pid: _OBS_CMD)
+        killed = []
+        monkeypatch.setattr(obs.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+        reaped = obs._reap_orphan_observers()
+        assert reaped == [101, 202]
+        assert killed == [(101, obs.signal.SIGTERM), (202, obs.signal.SIGTERM)]
+
+    def test_force_escalates_to_sigkill(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda *a: [101])
+        monkeypatch.setattr(obs, "_pid_cmdline", lambda pid: _OBS_CMD)
+        killed = []
+        monkeypatch.setattr(obs.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+        obs._reap_orphan_observers(force=True)
+        assert killed == [(101, obs._SIGKILL)]
+
+    def test_no_orphans_is_noop(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda *a: [])
+        called = []
+        monkeypatch.setattr(obs.os, "kill", lambda *a: called.append(a))
+        assert obs._reap_orphan_observers() == []
+        assert called == []
+
+    def test_recycled_pid_is_not_signalled(self, monkeypatch):
+        """Identity recheck: a pid whose cmdline no longer matches is skipped."""
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda *a: [101, 202])
+        # 101 got recycled onto an unrelated process; 202 is still our observer.
+        monkeypatch.setattr(
+            obs, "_pid_cmdline",
+            lambda pid: "/usr/bin/vim notes.txt" if pid == 101 else _OBS_CMD,
+        )
+        killed = []
+        monkeypatch.setattr(obs.os, "kill", lambda pid, sig: killed.append(pid))
+        assert obs._reap_orphan_observers() == [202]
+        assert killed == [202]  # the innocent recycled pid is never signalled
+
+    def test_unreadable_cmdline_is_skipped(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda *a: [101])
+        monkeypatch.setattr(obs, "_pid_cmdline", lambda pid: None)  # gone/denied
+        killed = []
+        monkeypatch.setattr(obs.os, "kill", lambda pid, sig: killed.append(pid))
+        assert obs._reap_orphan_observers() == []
+        assert killed == []
+
+    def test_already_gone_pid_is_skipped(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda *a: [101, 202])
+        monkeypatch.setattr(obs, "_pid_cmdline", lambda pid: _OBS_CMD)
+
+        def kill(pid, _sig):
+            if pid == 101:
+                raise ProcessLookupError
+        monkeypatch.setattr(obs.os, "kill", kill)
+        # 101 raced away; 202 still reaped. Never raises.
+        assert obs._reap_orphan_observers() == [202]
+
+    def test_unsignalable_pid_is_skipped(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_find_orphan_observers", lambda *a: [303])
+        monkeypatch.setattr(obs, "_pid_cmdline", lambda pid: _OBS_CMD)
+
+        def kill(_pid, _sig):
+            raise PermissionError("not owner")
+        monkeypatch.setattr(obs.os, "kill", kill)
+        assert obs._reap_orphan_observers() == []  # swallowed, not raised
+
+
+class TestReapWiring:
+    """Reaping is invoked from the lifecycle entry points."""
+
+    def test_start_reaps_and_reports(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_reap_orphan_observers", lambda *a: [999])
+        fake_car.agents_list.return_value = "[]"
+        fake_car.agents_start.return_value = json.dumps({"id": "neo-observer", "pid": 1})
+        result = obs.start_observer()
+        assert result["status"] == "started"
+        assert result["reaped"] == [999]
+
+    def test_autostart_reaps_even_when_already_registered(self, monkeypatch, fake_car):
+        import neo.memory.observer as obs
+        monkeypatch.setenv("NEO_OBSERVER_AUTOSTART", "")
+        monkeypatch.setattr(obs, "_car_server_reachable", lambda **k: True)
+        reaped = []
+        monkeypatch.setattr(obs, "_reap_orphan_observers",
+                            lambda *a: reaped.append(True) or [])
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": "neo-observer", "status": "running"}]
+        )
+        obs.maybe_autostart_observer()
+        # Did not re-register, but DID reap (the exact double-observer scenario).
+        fake_car.agents_upsert.assert_not_called()
+        assert reaped == [True]
+
+
+class TestSingleInstanceLock:
+    def test_second_acquire_blocked_while_held(self, tmp_path):
+        from neo.memory.observer import _SingleInstanceLock
+        path = str(tmp_path / "observer.lock")
+        a = _SingleInstanceLock(path)
+        b = _SingleInstanceLock(path)
+        assert a.acquire() is True
+        try:
+            assert b.acquire() is False  # contended
+        finally:
+            a.release()
+
+    def test_reacquire_after_release(self, tmp_path):
+        from neo.memory.observer import _SingleInstanceLock
+        path = str(tmp_path / "observer.lock")
+        a = _SingleInstanceLock(path)
+        assert a.acquire() is True
+        a.release()
+        b = _SingleInstanceLock(path)
+        try:
+            assert b.acquire() is True  # freed
+        finally:
+            b.release()
+
+    def test_release_without_acquire_is_safe(self, tmp_path):
+        from neo.memory.observer import _SingleInstanceLock
+        _SingleInstanceLock(str(tmp_path / "x.lock")).release()  # no raise
+
+    def test_cross_process_contention_and_handoff(self, tmp_path):
+        """A real second process can't take the lock until the holder releases."""
+        import os
+        import subprocess
+        path = str(tmp_path / "observer.lock")
+        # Child acquires the lock, announces, waits for a line, then releases.
+        child = (
+            "import sys; from neo.memory.observer import _SingleInstanceLock;"
+            "lk=_SingleInstanceLock(sys.argv[1]); assert lk.acquire();"
+            "print('locked', flush=True); sys.stdin.readline();"
+            "lk.release(); print('released', flush=True)"
+        )
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child, path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env,
+        )
+        from neo.memory.observer import _SingleInstanceLock
+        try:
+            assert proc.stdout.readline().strip() == "locked"
+            ours = _SingleInstanceLock(path)
+            assert ours.acquire() is False  # genuinely contended across processes
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+            assert proc.stdout.readline().strip() == "released"
+            proc.wait(timeout=5)
+            assert ours.acquire() is True  # handed off after release
+            ours.release()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_acquire_falls_back_when_lockfile_unavailable(self, tmp_path, caplog):
+        """Can't-open-lock-file degrades to no-op and WARNs (doesn't block)."""
+        import logging
+        from neo.memory.observer import _SingleInstanceLock
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")  # a file where a dir is needed → makedirs fails
+        lk = _SingleInstanceLock(str(blocker / "nested" / "observer.lock"))
+        with caplog.at_level(logging.WARNING):
+            assert lk.acquire() is True
+        assert any("single-instance lock unavailable" in r.message
+                   for r in caplog.records)
+        lk.release()
+
+
+class TestDaemonLock:
+    def test_daemon_exits_clean_when_lock_held(self, monkeypatch):
+        """Losing the lock is a benign no-op (exit 0), never a CAR-backoff failure."""
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_reap_orphan_observers", lambda *a, **k: [])
+        monkeypatch.setattr(obs.time, "sleep", lambda _s: None)  # don't actually wait
+
+        class _HeldLock:
+            def __init__(self, _path):
+                pass
+
+            def acquire(self):
+                return False
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(obs, "_SingleInstanceLock", _HeldLock)
+        built = []
+        monkeypatch.setattr(obs, "Observer", lambda **k: built.append(k))
+        assert obs._daemon_main(["--daemon", "--all"]) == 0
+        assert built == []  # never constructed the observer
+
+    def test_daemon_escalates_to_sigkill_when_straggler_holds_lock(self, monkeypatch):
+        """A straggler that ignores SIGTERM gets SIGKILLed so the lock frees."""
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs.time, "sleep", lambda _s: None)
+        reap_calls = []
+
+        def fake_reap(*a, force=False):
+            reap_calls.append(force)
+            return [4242]  # an orphan exists, so escalation is allowed to fire
+
+        monkeypatch.setattr(obs, "_reap_orphan_observers", fake_reap)
+
+        class _StubbornLock:
+            n = 0
+
+            def __init__(self, _path):
+                pass
+
+            def acquire(self):
+                _StubbornLock.n += 1
+                # Held until the SIGKILL escalation (fires on attempt index 3,
+                # i.e. before the 5th acquire); then it frees.
+                return _StubbornLock.n > obs._LOCK_ESCALATE_AFTER + 1
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(obs, "_SingleInstanceLock", _StubbornLock)
+        monkeypatch.setattr(obs, "Observer", lambda **k: type("O", (), {"run": lambda s: None})())
+        assert obs._daemon_main(["--daemon", "--all"]) == 0
+        # SIGTERM first (False), then exactly one SIGKILL escalation (True).
+        assert reap_calls == [False, True]
+
+    def test_daemon_reaps_before_locking(self, monkeypatch):
+        import neo.memory.observer as obs
+        order = []
+        monkeypatch.setattr(obs, "_reap_orphan_observers",
+                            lambda *a, **k: order.append("reap") or [])
+
+        class _OkLock:
+            def __init__(self, _path):
+                pass
+
+            def acquire(self):
+                order.append("lock")
+                return True
+
+            def release(self):
+                order.append("release")
+
+        monkeypatch.setattr(obs, "_SingleInstanceLock", _OkLock)
+
+        class _FakeObserver:
+            def __init__(self, **k):
+                order.append("init")
+
+            def run(self):
+                order.append("run")
+
+        monkeypatch.setattr(obs, "Observer", _FakeObserver)
+        assert obs._daemon_main(["--daemon", "--all"]) == 0
+        assert order == ["reap", "lock", "init", "run", "release"]
+
+
 class TestGlobalSpec:
     def test_spec_is_global_all_projects(self):
         from neo.memory.observer import GLOBAL_AGENT_ID, _build_global_spec
@@ -349,6 +629,27 @@ class TestStopObserver:
         )
         assert stop_observer()["status"] == "not_running"
         fake_car.agents_stop.assert_not_called()
+
+    def test_stop_reaps_orphans_too(self, fake_car, monkeypatch):
+        """`stop` halts ALL synthesis, including an unsupervised straggler."""
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_reap_orphan_observers", lambda *a, **k: [4242])
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": obs.GLOBAL_AGENT_ID, "pid": 9001, "status": "running"}]
+        )
+        fake_car.agents_stop.return_value = json.dumps(
+            {"id": obs.GLOBAL_AGENT_ID, "pid": 9001})
+        result = obs.stop_observer()
+        assert result["status"] == "stopped"
+        assert result["reaped"] == [4242]
+
+    def test_stop_reaps_even_when_no_managed_agent(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_reap_orphan_observers", lambda *a, **k: [4242])
+        fake_car.agents_list.return_value = "[]"  # no managed agent, but an orphan exists
+        result = obs.stop_observer()
+        assert result["status"] == "not_running"
+        assert result["reaped"] == [4242]
 
 
 class TestKickObserver:

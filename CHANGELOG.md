@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.32.0] - 2026-06-26
+
+### Fixed
+
+- **Orphaned observer processes are now auto-reaped instead of only reported, and a single-instance lock prevents two observers from ever running synthesis at once.** When a car-server died ungracefully (crash, force-quit, `kill -9`) its supervised observer reparented to init/launchd and kept running its synthesis loop forever; a new car-server then started a *second* supervised observer, so two ran concurrently (observed live: a straggler ran 2d18h). Previously `status` only *flagged* the orphan with a manual `kill` hint. Now `_reap_orphan_observers` SIGTERMs any unsupervised observer daemon — re-reading each pid's command line right before the signal to defend against pid reuse — wired into `start`/`stop`/autostart and the daemon's own startup. A second guarantee backs it up: the daemon holds a cross-platform single-instance file lock (`_SingleInstanceLock`, `fcntl`/`msvcrt` on `~/.neo/observer.lock`) for its lifetime, so even in the restart handoff window two observers can't both write; a daemon that can't get the lock exits 0 (benign no-op, no CAR backoff). If a straggler ignores SIGTERM past a short grace, the daemon escalates to SIGKILL so the kernel frees the lock — safe because `FactStore._save_file` is atomic (temp + `os.replace`), so a hard kill can only leave a stray `.tmp`, never a torn fact file. This was never a corruption bug (`store.save()` already serializes writers with its own per-scope flock) — just doubled LM spend and synthesis. (`memory/observer.py`)
+
 ## [0.31.1] - 2026-06-19
 
 ### Changed

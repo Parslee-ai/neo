@@ -675,6 +675,7 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
 
+    reaped = _reap_orphan_observers()
     migrated = _migrate_legacy_per_project_agents(car)
     try:
         car.agents_upsert(json.dumps(_build_global_spec()))
@@ -685,6 +686,7 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
     if existing and existing.get("status") == "running":
         return {"status": "already_running", "agent_id": GLOBAL_AGENT_ID,
                 "pid": existing.get("pid"), "migrated": migrated,
+                "reaped": reaped,
                 "message": f"observer pid {existing.get('pid')}"}
 
     try:
@@ -697,6 +699,7 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
         "agent_id": GLOBAL_AGENT_ID,
         "pid": managed.get("pid"),
         "migrated": migrated,
+        "reaped": reaped,
         "message": f"observer pid {managed.get('pid')}, log ~/.car/logs/{GLOBAL_AGENT_ID}.stdout.log",
     }
 
@@ -707,13 +710,17 @@ def stop_observer(codebase_root: Optional[str] = None) -> dict:
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
 
+    # "Stop" must halt ALL synthesis, including any unsupervised straggler —
+    # an orphan isn't CAR-managed, so agents_stop alone wouldn't touch it.
+    reaped = _reap_orphan_observers()
+
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
     if not existing:
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
-                "message": "no managed agent registered"}
+                "reaped": reaped, "message": "no managed agent registered"}
     if existing.get("status") != "running":
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
-                "pid": existing.get("pid"),
+                "pid": existing.get("pid"), "reaped": reaped,
                 "message": f"agent {existing.get('status', 'unknown')}"}
 
     try:
@@ -722,7 +729,7 @@ def stop_observer(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": f"agents_stop failed: {e}"}
 
     return {"status": "stopped", "agent_id": GLOBAL_AGENT_ID,
-            "pid": managed.get("pid"),
+            "pid": managed.get("pid"), "reaped": reaped,
             "message": f"SIGTERM sent to pid {managed.get('pid')}"}
 
 
@@ -827,6 +834,83 @@ def _find_orphan_observers_ps() -> list[int]:
     return sorted(orphans)
 
 
+# SIGKILL where available; on Windows there is no SIGKILL and os.kill maps any
+# signal to TerminateProcess, so SIGTERM already is the hard kill.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def _pid_cmdline(pid: int) -> Optional[str]:
+    """Best-effort current command line for ``pid``, or None if unreadable.
+
+    Used to re-verify a process's identity immediately before we signal it, so
+    a recycled pid (the orphan exited and the OS reassigned its number between
+    detection and the kill) isn't mistaken for the observer.
+    """
+    try:
+        import psutil
+        try:
+            return " ".join(psutil.Process(pid).cmdline())
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return None
+    except ImportError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _reap_orphan_observers(codebase_root: Optional[str] = None,
+                           force: bool = False) -> list[int]:
+    """Signal any orphaned observer daemons, returning the pids signalled.
+
+    In global mode exactly one observer is legitimate — the one CAR supervises
+    (it always has a live parent, so ``_find_orphan_observers`` never returns
+    it). Any neo observer daemon with no live parent is therefore redundant: a
+    straggler left by a car-server that died without reaping its child. Left
+    alone it keeps running synthesis cycles, doubling LM spend and exercising
+    the (documented-lossy) concurrent confidence-merge path on the shared fact
+    files, so we clear it before standing up a fresh supervised observer.
+
+    ``force`` escalates SIGTERM to SIGKILL — used by the daemon when a straggler
+    is mid-cycle and won't honor SIGTERM before our lock-acquire window closes.
+    A hard kill is safe for the fact files: ``FactStore._save_file`` writes a
+    temp file and ``os.replace``s it (atomic), so an interrupted save can only
+    leave a stray ``.tmp``, never a torn fact file.
+
+    The caller is never itself a match: a ``neo`` CLI process doesn't carry the
+    ``neo.memory.observer --daemon`` command line, and a freshly-spawned
+    supervised daemon still has its live car-server parent. We re-read each
+    pid's command line right before signalling to defend against pid reuse.
+    Best-effort — a pid that already exited (``ProcessLookupError``) or that we
+    can't signal (permissions) is skipped, so this never raises into the
+    lifecycle path.
+    """
+    sig = _SIGKILL if force else signal.SIGTERM
+    reaped: list[int] = []
+    for pid in _find_orphan_observers(codebase_root):
+        # Identity recheck: detection snapshotted this pid earlier; re-confirm
+        # it's still our observer so a recycled pid isn't signalled by mistake.
+        cmd = _pid_cmdline(pid)
+        if cmd is None or not _cmd_is_our_observer(cmd):
+            continue
+        try:
+            os.kill(pid, sig)
+            reaped.append(pid)
+        except ProcessLookupError:
+            continue  # already gone between recheck and signal
+        except OSError as e:
+            logger.debug("could not reap orphan observer pid %s: %s", pid, e)
+    if reaped:
+        verb = "killed" if force else "reaped"
+        logger.info("%s %d orphaned observer(s): %s", verb, len(reaped), reaped)
+    return reaped
+
+
 def observer_status(codebase_root: Optional[str] = None) -> dict:
     orphans = _find_orphan_observers()
 
@@ -915,6 +999,11 @@ def maybe_autostart_observer() -> None:
             car = _require_car_runtime()
         except RuntimeError:
             return
+        # Reap before the early return: a straggler can coexist with a live
+        # managed agent (a dead car-server orphaned its child, then a new one
+        # registered a fresh observer), so clear it on every run, not just when
+        # we're about to register.
+        _reap_orphan_observers()
         if _find_managed_agent(car, GLOBAL_AGENT_ID) is not None:
             return  # already registered; the supervisor owns its lifecycle
         _migrate_legacy_per_project_agents(car)
@@ -923,6 +1012,79 @@ def maybe_autostart_observer() -> None:
         logger.debug("auto-started global observer")
     except Exception as e:  # never break the CLI
         logger.debug("observer autostart skipped: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock — belt-and-suspenders against doubled synthesis.
+# Reaping (above) resolves *which* observer survives; this lock guarantees that
+# even in the handoff window two observers never write the shared fact files at
+# once. Cross-platform: ``fcntl`` on POSIX, ``msvcrt`` on Windows.
+# ---------------------------------------------------------------------------
+
+# A reaped straggler can stay mid-cycle (synthesis/ingest aren't interruptible)
+# well past its 1s sleep slice, so retry the lock briefly. If it still holds
+# after a SIGTERM grace, escalate to SIGKILL so the kernel drops its flock
+# inside the window — otherwise we'd concede and exit, leaving the unsupervised
+# straggler as the sole observer.
+_LOCK_ACQUIRE_ATTEMPTS = 10
+_LOCK_ESCALATE_AFTER = 3  # attempts of SIGTERM grace before SIGKILL
+_LOCK_PATH = os.path.expanduser("~/.neo/observer.lock")
+
+
+class _SingleInstanceLock:
+    """Advisory exclusive file lock held for the observer's lifetime.
+
+    The kernel releases it when the holder exits or the fd closes, so a crashed
+    observer never wedges the lock (unlike a pidfile). ``acquire`` is
+    non-blocking: it returns ``False`` when another live observer holds the
+    lock rather than waiting.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fh = None
+
+    def acquire(self) -> bool:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            fh = open(self.path, "a+")
+        except OSError as e:
+            # If we can't even open the lock file, don't block the observer —
+            # fall back to reap-only protection. Warn (not debug): we're
+            # silently dropping the second guarantee, which an operator should
+            # be able to see.
+            logger.warning(
+                "single-instance lock unavailable (%s); running without it", e)
+            return True
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False  # another live observer holds it
+        self._fh = fh
+        return True
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass  # process exit releases it regardless
+        finally:
+            self._fh.close()
+            self._fh = None
 
 
 # ---------------------------------------------------------------------------
@@ -946,15 +1108,43 @@ def _daemon_main(argv: list[str]) -> int:
         print("observer requires --all or --cwd", file=sys.stderr)
         return 2
 
-    try:
-        observer = (Observer(global_mode=True) if args.all
-                    else Observer(codebase_root=args.cwd))
-    except RuntimeError as e:
-        print(f"observer init failed: {e}", file=sys.stderr)
-        return 1
+    # Clear any straggler from a dead car-server, then claim the lock so we
+    # never run synthesis concurrently with another observer. SIGTERM first;
+    # the reap frees a straggler's lock once it finishes its current cycle.
+    orphans = _reap_orphan_observers()
+    lock = _SingleInstanceLock(_LOCK_PATH)
+    acquired = False
+    for attempt in range(_LOCK_ACQUIRE_ATTEMPTS):
+        if lock.acquire():
+            acquired = True
+            break
+        # If a straggler is still holding the lock after the SIGTERM grace,
+        # escalate to SIGKILL so the kernel releases its flock immediately
+        # (safe: saves are atomic). Guaranteeing the lock frees here is what
+        # keeps exit-0 reserved for a genuine second live observer.
+        if attempt == _LOCK_ESCALATE_AFTER and orphans:
+            _reap_orphan_observers(force=True)
+        if attempt < _LOCK_ACQUIRE_ATTEMPTS - 1:
+            time.sleep(1.0)
+    if not acquired:
+        # Another live observer owns synthesis. Exit cleanly (0) so CAR treats
+        # this as a benign no-op, not a failure that triggers backoff.
+        print("another neo observer holds the single-instance lock; exiting",
+              file=sys.stderr)
+        return 0
 
-    observer.run()
-    return 0
+    try:
+        try:
+            observer = (Observer(global_mode=True) if args.all
+                        else Observer(codebase_root=args.cwd))
+        except RuntimeError as e:
+            print(f"observer init failed: {e}", file=sys.stderr)
+            return 1
+
+        observer.run()
+        return 0
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
