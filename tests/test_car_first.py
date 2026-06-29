@@ -130,3 +130,34 @@ def test_autoadapter_fallback_built_lazily():
     a = AutoAdapter(car, lambda: built.append(1) or _FakeAdapter("fb"))
     a.generate([])                        # CAR ok -> fallback never constructed
     assert built == []
+
+
+class _HangingAdapter:
+    """A CAR adapter whose generate() blocks until released — models a dead
+    daemon leaving infer_tracked stuck on a socket read (no exception, ever)."""
+
+    def __init__(self):
+        self.release = __import__("threading").Event()
+        self.entered = __import__("threading").Event()
+
+    def generate(self, messages, **kw):
+        self.entered.set()
+        self.release.wait(30)             # blocks; test never releases in time
+        return "car"
+
+    def name(self):
+        return "car"
+
+
+def test_autoadapter_times_out_hang_and_falls_back():
+    # A *hang* (not an exception) must still trip the breaker. The error-only
+    # path never fires here — the watchdog deadline is what saves us.
+    car, fb = _HangingAdapter(), _FakeAdapter("fb")
+    a = AutoAdapter(car, lambda: fb, car_timeout=0.2)
+    assert a.generate([]) == "fb"         # CAR hangs -> deadline -> fallback
+    assert car.entered.is_set()           # we really did enter the CAR call
+    assert fb.calls == 1
+    # breaker is now open: next call goes straight to fallback, no new hang
+    assert a.generate([]) == "fb"
+    assert fb.calls == 2
+    car.release.set()                     # let the orphaned worker exit cleanly

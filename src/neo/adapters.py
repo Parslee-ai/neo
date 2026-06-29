@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -924,6 +925,28 @@ def create_adapter(
 #: from a transient CAR outage instead of pinning to the fallback forever.
 _CAR_RETRY_COOLDOWN_S = 300.0
 
+#: Default per-call wall-clock deadline (seconds) for a single CAR inference
+#: call in auto mode. ``car_runtime.infer_tracked`` is a blocking FFI call; if
+#: the daemon is restarted mid-call (its PID churns on every CarHost relaunch)
+#: the client's socket read can block with no deadline — observed once as a
+#: 5-day hang of the whole neo process. Bounding the call turns that into a
+#: clean failover to the static provider. Healthy CAR calls finish in seconds,
+#: so this is generous. Override with ``NEO_CAR_TIMEOUT_SECONDS``.
+_CAR_CALL_TIMEOUT_S = 180.0
+
+
+def _car_call_timeout() -> float:
+    """Per-call CAR deadline, overridable via ``NEO_CAR_TIMEOUT_SECONDS``."""
+    raw = os.environ.get("NEO_CAR_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _CAR_CALL_TIMEOUT_S
+
 
 class AutoAdapter(LMAdapter):
     """CAR-first adapter: route through CAR's dynamic router, fall back to a
@@ -947,11 +970,13 @@ class AutoAdapter(LMAdapter):
     """
 
     def __init__(self, car: LMAdapter, fallback_factory,
-                 retry_cooldown: float = _CAR_RETRY_COOLDOWN_S):
+                 retry_cooldown: float = _CAR_RETRY_COOLDOWN_S,
+                 car_timeout: Optional[float] = None):
         self._car = car
         self._make_fallback = fallback_factory
         self._fallback: Optional[LMAdapter] = None
         self._retry_cooldown = retry_cooldown
+        self._car_timeout = car_timeout if car_timeout is not None else _car_call_timeout()
         self._disabled_until = 0.0  # monotonic deadline; <= now => CAR eligible
 
     def _fallback_adapter(self) -> LMAdapter:
@@ -959,13 +984,47 @@ class AutoAdapter(LMAdapter):
             self._fallback = self._make_fallback()
         return self._fallback
 
+    def _car_generate_bounded(self, messages, stop, max_tokens,
+                              temperature, reasoning_effort) -> str:
+        """Run the CAR call under a wall-clock deadline.
+
+        ``infer_tracked`` is a blocking FFI call with no caller-visible
+        timeout, so an error-only breaker can't catch a *hang* (a dead/
+        restarted daemon leaving the socket read blocked forever). We run it
+        in a daemon worker thread and abandon it on timeout, raising so the
+        breaker opens and the next call routes to the fallback. The orphaned
+        worker can't be force-killed, but it's a daemon (won't block process
+        exit) and timeouts are rare + cooldown-bounded, so leaked threads
+        can't accumulate unbounded.
+        """
+        box: dict = {}
+
+        def _worker():
+            try:
+                box["value"] = self._car.generate(
+                    messages, stop=stop, max_tokens=max_tokens,
+                    temperature=temperature, reasoning_effort=reasoning_effort,
+                )
+            except BaseException as exc:  # noqa: BLE001 — relay to caller thread
+                box["error"] = exc
+
+        worker = threading.Thread(target=_worker, name="neo-car-call", daemon=True)
+        worker.start()
+        worker.join(self._car_timeout)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"CAR inference exceeded {self._car_timeout:.0f}s deadline"
+            )
+        if "error" in box:
+            raise box["error"]
+        return box.get("value", "")
+
     def generate(self, messages, stop=None, max_tokens: int = 4096,
                  temperature: float = 0.7, reasoning_effort: Optional[str] = None) -> str:
         if time.monotonic() >= self._disabled_until:
             try:
-                return self._car.generate(
-                    messages, stop=stop, max_tokens=max_tokens,
-                    temperature=temperature, reasoning_effort=reasoning_effort,
+                return self._car_generate_bounded(
+                    messages, stop, max_tokens, temperature, reasoning_effort,
                 )
             except Exception as e:
                 self._disabled_until = time.monotonic() + self._retry_cooldown
