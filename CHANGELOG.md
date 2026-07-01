@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.34.0] - 2026-07-01
+
+### Fixed
+
+- **`neo` can no longer hang forever on a non-tty stdin.** `detect_input_mode()` eagerly drained stdin (`sys.stdin.read()`, a read-until-EOF) whenever stdin wasn't a tty — even when the prompt was supplied on argv. Launched with a non-tty stdin that the peer holds open without data or EOF (a background job, a daemon, a mis-wired subprocess pipe), that read blocks indefinitely; a native stack trace caught the main thread parked in `_io_FileIO_readall_impl → read()` on fd 0 (an open unix socket). An argv prompt now skips the stdin read entirely (`neo "query"` — the common case, and the one that hung), and when stdin genuinely is the input, `_read_stdin_guarded()` `select()`s for readability with a deadline (`NEO_STDIN_TIMEOUT_SECONDS`, default 1.0s) before reading, treating a never-EOF stdin as empty rather than hanging. Real pipes and redirects report ready immediately and are unaffected; interactive terminal use was never affected (tty stdin → the read was already skipped). (`cli.py`)
+
+### Added
+
+- **CAR inference calls are now bounded and large-context calls are given room to finish.** Two complementary changes to `AutoAdapter`/`CarAdapter`: (1) a wall-clock watchdog around each CAR call (`NEO_CAR_TIMEOUT_SECONDS`, default 240s) — `car_runtime.infer_tracked` is a blocking FFI call, and a daemon restarted mid-call could leave the client's socket read blocked forever with the breaker's exception-only path unable to catch it; the call now runs in a daemon worker thread joined with a deadline, so a hang trips the breaker and fails over to the static provider. (2) `CarAdapter` raises CAR's per-call FFI read-timeout floor (`CAR_DAEMON_TIMEOUT`, default 180s, only when the operator hasn't set it) — a quality remote serving neo's large multi-file context legitimately takes ~140s, but CAR's 30s default cut those calls off mid-inference and forced a fallback every time. The watchdog sits above the FFI timeout so CAR's own clean timeout fires first and the watchdog only catches a true hang. (`adapters.py`)
+
 ## [0.33.0] - 2026-06-26
 
 ### Added
