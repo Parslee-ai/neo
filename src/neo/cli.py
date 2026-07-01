@@ -14,6 +14,7 @@ This module serves as the thin CLI entry point. Core logic has been split into:
 import json
 import logging
 import os
+import select
 import sys
 
 # Disable tokenizer parallelism warning (fastembed uses HuggingFace tokenizers)
@@ -357,6 +358,44 @@ def parse_args():
     return p.parse_args()
 
 
+def _stdin_read_timeout() -> float:
+    """Seconds to wait for stdin to become readable before treating it as
+    empty. Overridable via ``NEO_STDIN_TIMEOUT_SECONDS``."""
+    raw = os.environ.get("NEO_STDIN_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            v = float(raw)
+            if v >= 0:
+                return v
+        except ValueError:
+            pass
+    return 1.0
+
+
+def _read_stdin_guarded() -> str:
+    """Read all of stdin, but never block forever waiting for it.
+
+    ``sys.stdin.read()`` is a read-until-EOF: if stdin is a non-tty that the
+    peer holds open without sending data or EOF — a background job, a daemon,
+    a mis-wired subprocess pipe — it blocks indefinitely (observed once as a
+    multi-hour neo hang). We first ``select()`` for readability with a short
+    deadline; if nothing is ready we treat stdin as empty rather than hang.
+    A real pipe (``echo x | neo``) or a redirect (``neo < f``) reports ready
+    immediately, so legitimate piping is unaffected. ``select`` can raise on
+    odd stdin objects (already a StringIO, closed, no fileno — the latter is
+    ``io.UnsupportedOperation``, a subclass of both ``OSError`` and
+    ``ValueError``); any failure falls through to a best-effort direct read.
+    """
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], _stdin_read_timeout())
+    except (ValueError, OSError):
+        ready = [sys.stdin]  # can't poll it; fall back to a direct read
+    if not ready:
+        logger.debug("stdin not readable within deadline; treating as empty")
+        return ""
+    return sys.stdin.read()
+
+
 def detect_input_mode(args):
     """Detect whether input is JSON or plain text."""
     import io
@@ -366,9 +405,14 @@ def detect_input_mode(args):
     if args.stdin_text:
         return "text"
 
-    # Auto-detect from stdin
+    # A prompt supplied on argv never needs stdin — skip the read entirely so
+    # `neo "query"` can't hang on a non-tty stdin that never sends EOF.
+    if getattr(args, "prompt", None) and args.prompt != "-":
+        return "text"
+
+    # Auto-detect from stdin (guarded so a never-EOF stdin can't hang us).
     if not sys.stdin.isatty():
-        buf = sys.stdin.read()
+        buf = _read_stdin_guarded()
         stripped = buf.lstrip()
         if stripped.startswith(("{", "[")):
             try:
@@ -391,7 +435,7 @@ def read_prompt_from_argv_or_stdin(args):
         return args.prompt
 
     if not sys.stdin.isatty():
-        return sys.stdin.read().strip()
+        return _read_stdin_guarded().strip()
 
     print("Error: No prompt provided. Use: neo \"your prompt\" or pipe via stdin", file=sys.stderr)
     sys.exit(2)
@@ -669,7 +713,7 @@ def main():
     # Parse input based on mode
     if input_mode == "json":
         try:
-            input_data = json.loads(sys.stdin.read())
+            input_data = json.loads(_read_stdin_guarded())
             working_dir = input_data.get("working_directory") or args.cwd or os.getcwd()
             neo_input = NeoInput(
                 prompt=input_data["prompt"],
