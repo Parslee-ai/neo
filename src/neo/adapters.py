@@ -720,6 +720,23 @@ class ClaudeCodeAdapter(LMAdapter):
 # ============================================================================
 
 
+#: Default for CAR's per-call FFI read timeout (``CAR_DAEMON_TIMEOUT``, seconds).
+#: CAR ships a 30s default, but a quality remote serving neo's large multi-file
+#: code context legitimately takes longer — measured ~140s for a 143 KB prompt
+#: via parslee. At 30s those calls are cut off mid-inference and neo falls back
+#: every time, so we raise the floor. Only applied when the operator hasn't set
+#: ``CAR_DAEMON_TIMEOUT`` themselves. Kept strictly below the AutoAdapter
+#: watchdog (``_CAR_CALL_TIMEOUT_S``) so CAR's own clean timeout fires first and
+#: the watchdog only catches a true hang where even that doesn't return.
+_CAR_DAEMON_TIMEOUT_DEFAULT_S = 180
+
+
+def _apply_car_daemon_timeout_default() -> None:
+    """Raise CAR's FFI read-timeout floor for neo's long-inference workload,
+    unless the operator already set ``CAR_DAEMON_TIMEOUT``."""
+    os.environ.setdefault("CAR_DAEMON_TIMEOUT", str(_CAR_DAEMON_TIMEOUT_DEFAULT_S))
+
+
 class CarAdapter(LMAdapter):
     """Route Neo's outbound inference through CAR's unified inference layer.
 
@@ -764,8 +781,11 @@ class CarAdapter(LMAdapter):
         runtime: Optional[object] = None,
     ):
         self.model = model
-        # Caller-supplied intent wins; otherwise default to coding workload.
+        # Caller-supplied intent wins; otherwise default to the coding workload.
         self.intent_hint = dict(intent_hint) if intent_hint else dict(self.DEFAULT_INTENT_HINT)
+        # Give large-context inference room to finish before CAR's FFI read
+        # timeout cuts it off (a quality remote can take ~140s on neo's context).
+        _apply_car_daemon_timeout_default()
         if runtime is None:
             from neo.car_inference import get_runtime
             runtime = get_runtime()
@@ -930,9 +950,11 @@ _CAR_RETRY_COOLDOWN_S = 300.0
 #: the daemon is restarted mid-call (its PID churns on every CarHost relaunch)
 #: the client's socket read can block with no deadline — observed once as a
 #: 5-day hang of the whole neo process. Bounding the call turns that into a
-#: clean failover to the static provider. Healthy CAR calls finish in seconds,
-#: so this is generous. Override with ``NEO_CAR_TIMEOUT_SECONDS``.
-_CAR_CALL_TIMEOUT_S = 180.0
+#: clean failover to the static provider. Kept ABOVE the CAR FFI read timeout
+#: (``_CAR_DAEMON_TIMEOUT_DEFAULT_S``) so CAR's own clean timeout normally fires
+#: first (→ breaker → fallback) and this watchdog only catches a genuine hang
+#: where even that never returns. Override with ``NEO_CAR_TIMEOUT_SECONDS``.
+_CAR_CALL_TIMEOUT_S = 240.0
 
 
 def _car_call_timeout() -> float:

@@ -7,6 +7,7 @@ fake runtime injected via the constructor or via ``car_inference.set_runtime``.
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -93,7 +94,8 @@ def test_generate_returns_text_field_from_infer_tracked():
     # Default IntentHint should request the code task so the router
     # picks a code-capable model instead of the chat default.
     assert "intent_json" in kwargs
-    assert json.loads(kwargs["intent_json"]) == {"task": "code", "prefer_quality": True}
+    intent = json.loads(kwargs["intent_json"])
+    assert intent["task"] == "code" and intent["prefer_quality"] is True
 
 
 def test_default_intent_hint_is_code_task():
@@ -104,6 +106,27 @@ def test_default_intent_hint_is_code_task():
     adapter.generate("anything", max_tokens=8)
     _, kwargs = rt.calls[0]
     assert json.loads(kwargs["intent_json"]) == {"task": "code", "prefer_quality": True}
+
+
+def test_sets_car_daemon_timeout_default_when_unset(monkeypatch):
+    """Large-context inference needs more than CAR's 30s FFI default, so neo
+    raises the floor — but only when the operator hasn't set it."""
+    monkeypatch.delenv("CAR_DAEMON_TIMEOUT", raising=False)
+    CarAdapter(runtime=FakeRuntime())
+    assert int(os.environ["CAR_DAEMON_TIMEOUT"]) >= 180
+
+
+def test_respects_operator_car_daemon_timeout(monkeypatch):
+    monkeypatch.setenv("CAR_DAEMON_TIMEOUT", "45")
+    CarAdapter(runtime=FakeRuntime())
+    assert os.environ["CAR_DAEMON_TIMEOUT"] == "45"  # not overridden
+
+
+def test_watchdog_default_exceeds_daemon_timeout():
+    """The AutoAdapter watchdog must sit above CAR's own read timeout so CAR's
+    clean timeout fires first; the watchdog only catches a true hang."""
+    import neo.adapters as A
+    assert A._CAR_CALL_TIMEOUT_S > A._CAR_DAEMON_TIMEOUT_DEFAULT_S
 
 
 def test_explicit_intent_hint_overrides_default():
@@ -130,7 +153,8 @@ def test_generate_string_prompt_skips_messages_json():
     assert prompt == "just a string prompt"
     assert "messages_json" not in kwargs
     # Default coding intent still applies on bare-string prompts.
-    assert json.loads(kwargs["intent_json"]) == {"task": "code", "prefer_quality": True}
+    intent = json.loads(kwargs["intent_json"])
+    assert intent["task"] == "code" and intent["prefer_quality"] is True
 
 
 def test_generate_pins_model_when_set():
