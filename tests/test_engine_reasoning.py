@@ -2,8 +2,6 @@
 
 import json
 
-import pytest
-
 from neo.engine import NeoEngine
 from neo.reasoning_effort import MemorySignal
 from neo.reasoning_mode import ReasoningMode
