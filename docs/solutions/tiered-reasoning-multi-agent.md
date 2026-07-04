@@ -49,8 +49,34 @@ work — which is precisely what the novelty gate reserves it for.
 (gpt-5.5) — so this isolates the value of the **orchestration structure** (plan
 vote → adversarial critique → repair) with **zero model diversity**. Real
 deployment adds distinct models per role (§4), which should widen the gap
-further, but that lift is *not* measured here (it needs ≥2 fast capable models
-wired up). Raw results: `/tmp/ab_low.json`.
+further. Raw results: `/tmp/ab_low.json`.
+
+### Model diversity: mechanism validated, quality lift not yet measurable
+
+The **routing mechanism works** against real CAR: `plan_role_models` +
+`exclude_models` routed the critic to a *different* model than the coder
+(`coder → parslee/advisor`, `critic → parslee/reasoning`; `critic ≠ coder`
+confirmed). But the **quality lift from diversity could not be measured on this
+host**, for two concrete reasons — neither of which is an unreleased CAR
+feature:
+
+1. **`capable_model_count` overcounts.** It reported 3 models, but
+   `parslee/advisor` and `parslee/reasoning` are **both Azure gpt-5.5 underneath**
+   (Parslee assistant personas). So the "diverse pool" is really gpt-5.5 ×2 plus
+   one local qwen — the `≥2 distinct models` gate can be *fooled* by same-backend
+   personas. **Refinement needed:** dedupe the diversity count by backing model,
+   not catalog ID (neo can't currently tell that `parslee/*` share a backend).
+2. **No second *fast+capable+distinct* model exists here.** The only genuinely
+   different family is a local MLX model, and it **timed out (180s) on every
+   critique** — a 4B local model answers a one-word probe in ~8s but can't do a
+   real critique (full solution + token budget) in time. And there's no
+   Anthropic/Google credential wired up.
+
+So a real frontier-vs-frontier diversity A/B needs a **second fast capable model
+credential** (a Parslee/infra decision), or Parslee's `/inference/responses`
+backend serving a genuinely different model family (its model-agnostic future).
+The harness supports it now (`tools/ab_reasoning.py --critic-model ...`); it just
+needs a viable second model to point at.
 
 ## Problem
 

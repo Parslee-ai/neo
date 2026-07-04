@@ -44,6 +44,16 @@ def test_capable_model_count_reads_candidates():
     assert capable_model_count(make_route_fn([])) == 0
 
 
+def test_capable_model_count_dedupes_same_backend_personas():
+    # parslee/advisor + parslee/reasoning are both gpt-5.5 -> one family.
+    pool = [
+        {"id": "parslee/advisor", "score": 0.90},
+        {"id": "parslee/reasoning", "score": 0.85},
+        {"id": "mlx/qwen3-4b:4bit", "score": 0.60},
+    ]
+    assert capable_model_count(make_route_fn(pool)) == 2  # {parslee, mlx}, not 3
+
+
 def test_critic_is_forced_off_the_coder_model():
     plan = plan_role_models(make_route_fn(POOL), "task")
     # coder gets the top model; critic must be excluded off it -> different model
