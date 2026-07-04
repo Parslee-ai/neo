@@ -67,6 +67,8 @@ def parse_args():
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
+    global_parser.add_argument('--deep', action='store_true', help='Force multi-agent deliberation (needs CAR + a diverse model pool; degrades to a high-effort single pass otherwise)')
+    global_parser.add_argument('--fast', action='store_true', help='Force the fast single-call path (skip multi-agent deliberation)')
 
     # Detect if 'contribute' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'contribute':
@@ -810,6 +812,12 @@ def main():
     try:
         # Load config to get API key
         config = NeoConfig.load()
+
+        # CLI reasoning-tier overrides (--deep / --fast beat config).
+        if getattr(args, "deep", False):
+            config.reasoning_mode = "deep"
+        elif getattr(args, "fast", False):
+            config.reasoning_mode = "fast"
 
         # Upgrade log level from config if no CLI flag was set
         if not getattr(args, "debug", False) and not getattr(args, "verbose", False):

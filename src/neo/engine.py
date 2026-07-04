@@ -241,10 +241,34 @@ class NeoEngine:
                 for c in extracted_constraints
             ]
 
-        # Single LLM call for all 3 phases (plan + simulation + code)
-        # This is 59% faster than the old 3-call approach (22s vs 55s)
-        self._log_action("lm_call", neo_input.prompt[:60])
-        plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
+        # Decide the reasoning tier. Default: a single combined call (fast,
+        # memory-primed). Novel queries with CAR + a diverse model pool escalate
+        # to multi-agent deliberation. See
+        # docs/solutions/tiered-reasoning-multi-agent.md.
+        from neo.reasoning_mode import ReasoningMode
+        self.last_deliberation = None
+        decision, route_fn = self._decide_reasoning_mode(enriched_context, difficulty, neo_input)
+        self.last_reasoning_mode = decision.mode.value
+        self.last_reasoning_reason = decision.reason
+        logger.info("Reasoning mode: %s — %s", decision.mode.value, decision.reason)
+
+        plan = simulation_traces = code_suggestions = None
+        if decision.mode is ReasoningMode.MULTI_AGENT:
+            self._log_action("deliberate", neo_input.prompt[:60])
+            plan, simulation_traces, code_suggestions, deliberation = self._deliberate(
+                enriched_context, route_fn
+            )
+            if deliberation is not None and deliberation.confidence > 0.0 and code_suggestions:
+                self.last_deliberation = deliberation
+            else:
+                logger.warning("Deliberation yielded no usable result; falling back to fast path")
+                self.last_reasoning_mode = "fast"  # honest metadata: we fell back
+                plan = None
+
+        if plan is None:
+            # Fast path (default, or fallback from a failed panel).
+            self._log_action("lm_call", neo_input.prompt[:60])
+            plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
         self.last_simulation_traces = simulation_traces
 
         # Phase 5: Run static checks BEFORE deciding early-exit.
@@ -360,6 +384,20 @@ class NeoEngine:
         self._log_metrics(difficulty, time_budget, elapsed, early_exit=early_exit)
 
         metadata: dict[str, Any] = {"early_exit": early_exit} if early_exit else {}
+        # Reasoning-tier provenance — always explainable which path ran and why.
+        metadata["reasoning_mode"] = getattr(self, "last_reasoning_mode", "fast")
+        reason = getattr(self, "last_reasoning_reason", "")
+        if reason:
+            metadata["reasoning_reason"] = reason
+        deliberation = getattr(self, "last_deliberation", None)
+        if deliberation is not None:
+            metadata["provenance"] = deliberation.provenance
+            metadata["panel"] = {
+                "consensus": round(deliberation.consensus, 3),
+                "rounds": deliberation.rounds,
+                "models_used": deliberation.models_used,
+                **deliberation.meta,
+            }
         if extra_metadata:
             metadata.update(extra_metadata)
 
@@ -778,6 +816,97 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         except ValueError:
             # Block not found - return empty (parser will fail gracefully)
             return ""
+
+    # ------------------------------------------------------------------
+    # Tiered reasoning: fast single call vs multi-agent deliberation.
+    # docs/solutions/tiered-reasoning-multi-agent.md
+    # ------------------------------------------------------------------
+
+    def _compute_memory_signal(self, context: dict[str, Any]):
+        """Novelty signal (pattern_count / avg_confidence) from retrieval — the
+        same signal ``_format_combined_prompt`` uses, surfaced early to gate the
+        reasoning tier."""
+        from neo.reasoning_effort import MemorySignal, signal_from_facts
+        if self.fact_store is not None:
+            try:
+                prompt_text = context.get("prompt", "")
+                k = self._adaptive_k_selection(prompt_text, context)
+                fc = self.fact_store.build_context(prompt_text, environment=context, k=k)
+                return signal_from_facts(fc.valid_facts)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("memory signal computation failed: %s", e)
+        return MemorySignal()
+
+    def _car_route_capability(self, prompt: str):
+        """(car_available, capable_model_count, route_fn|None). Multi-agent needs
+        CAR reachable AND a diverse pool; ``route_model`` (decision-only) reports
+        the pool via its ``candidates`` ranking."""
+        try:
+            from neo.a2ui import is_daemon_reachable
+            from neo.car_inference import is_available as car_available, get_runtime
+        except Exception:
+            return False, 0, None
+        try:
+            if not (car_available() and is_daemon_reachable()):
+                return False, 0, None
+            runtime = get_runtime()
+            route_model = getattr(runtime, "route_model", None)
+            if not callable(route_model):
+                return True, 0, None
+            route_fn = lambda p, intent_json: route_model(p, intent_json)  # noqa: E731
+            from neo.panel import capable_model_count
+            return True, capable_model_count(route_fn, probe=(prompt[:200] or "code task")), route_fn
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("CAR route capability check failed: %s", e)
+            return False, 0, None
+
+    def _decide_reasoning_mode(self, context: dict[str, Any], difficulty: str, neo_input):
+        """Gate: fast vs multi-agent. Returns (ModeDecision, route_fn|None)."""
+        from neo.reasoning_mode import decide_mode
+        signal = self._compute_memory_signal(context)
+        explicit = (getattr(self.config, "reasoning_mode", "auto") if self.config else "auto") or "auto"
+        explicit = None if explicit.lower() == "auto" else explicit.lower()
+        car_available, model_count, route_fn = self._car_route_capability(context.get("prompt", ""))
+        decision = decide_mode(
+            signal, difficulty=difficulty,
+            car_available=car_available, capable_model_count=model_count, explicit=explicit,
+        )
+        return decision, route_fn
+
+    def _build_car_role_factory(self, route_fn, prompt: str):
+        """role_adapter(role) → a distinct CAR-pinned adapter per role (planner /
+        coder / critic / judge), falling back to ``self.lm``. Diversity comes from
+        the routing plan (``plan_role_models`` threads exclude_models)."""
+        fallback = self.lm
+        if route_fn is None:
+            return lambda role: fallback
+        from neo.panel import plan_role_models, build_role_factory
+        try:
+            role_models = plan_role_models(route_fn, prompt[:500])
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("role model planning failed: %s", e)
+            role_models = {}
+        from neo.adapters import create_adapter
+        return build_role_factory(role_models, lambda m: create_adapter("car", model=m), fallback)
+
+    def _deliberate(self, context: dict[str, Any], route_fn):
+        """Run the multi-agent panel. Returns (plan, sims, code, DeliberationResult|None)."""
+        from neo.multi_agent import MultiAgentReasoner
+        prompt = context.get("prompt", "")
+        ctx_str = ""
+        for key in ("past_learnings", "verifiable_constraints"):
+            v = context.get(key)
+            if v:
+                ctx_str += (str(v)[:2000] + "\n\n")
+        role_factory = self._build_car_role_factory(route_fn, prompt)
+        try:
+            result = MultiAgentReasoner(role_factory, k_plans=3, max_repair_rounds=1).deliberate(
+                prompt, context=ctx_str.strip()[:6000]
+            )
+        except Exception as e:
+            logger.warning("deliberation failed: %s", e)
+            return None, None, None, None
+        return result.plan, result.simulation_traces, result.code_suggestions, result
 
     def _format_combined_prompt(self, context: dict[str, Any]) -> tuple[str, "MemorySignal"]:
         """Format the combined prompt and return it alongside the memory signal.
