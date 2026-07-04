@@ -98,10 +98,23 @@ def judge(adapter, task: str, sol_a: str, sol_b: str) -> dict:
     }
 
 
-def run(n: int, k: int, model: str, out: Path, effort: str = "low") -> dict:
+def _role_factory(default_adapter, critic_model):
+    """Route the critic role to a *distinct-family* model (e.g. a local CAR
+    model) while other roles use the default — to measure model diversity, not
+    just orchestration."""
+    if not critic_model:
+        return lambda role: default_adapter
+    from neo.adapters import CarAdapter
+    critic = CarAdapter(model=critic_model)
+    return lambda role: critic if role == "critic" else default_adapter
+
+
+def run(n: int, k: int, model: str, out: Path, effort: str = "low",
+        critic_model: str = "") -> dict:
     key = NeoConfig.load().api_key
     adapter = EffortAdapter(OpenAIAdapter(model=model, api_key=key), effort)
-    reasoner = MultiAgentReasoner(lambda role: adapter, k_plans=k, max_repair_rounds=1)
+    reasoner = MultiAgentReasoner(_role_factory(adapter, critic_model),
+                                  k_plans=k, max_repair_rounds=1)
 
     rng = random.Random(1234)
     tasks = TASKS[:n]
@@ -160,7 +173,8 @@ def run(n: int, k: int, model: str, out: Path, effort: str = "low") -> dict:
     scored = multi_wins + single_wins + ties
     denom = max(1, scored)
     summary = {
-        "model": model, "effort": effort, "n": len(tasks), "scored": scored, "k_plans": k,
+        "model": model, "effort": effort, "critic_model": critic_model or model,
+        "n": len(tasks), "scored": scored, "k_plans": k,
         "multi_wins": multi_wins, "single_wins": single_wins, "ties": ties,
         "multi_win_rate": round(multi_wins / denom, 3),
         "decisive_multi_win_rate": round(multi_wins / max(1, multi_wins + single_wins), 3),
@@ -182,6 +196,7 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--model", default="gpt-5.5")
     ap.add_argument("--effort", default="low")
+    ap.add_argument("--critic-model", default="", help="Distinct-family model for the critic role (e.g. mlx/qwen3-4b:4bit)")
     ap.add_argument("--out", default="/tmp/ab_reasoning_results.json")
     a = ap.parse_args()
-    run(a.n, a.k, a.model, Path(a.out), effort=a.effort)
+    run(a.n, a.k, a.model, Path(a.out), effort=a.effort, critic_model=a.critic_model)

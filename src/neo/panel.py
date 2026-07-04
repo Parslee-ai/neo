@@ -50,18 +50,33 @@ def _selected_model(decision: dict) -> Optional[str]:
     return None
 
 
+def _family(model_id: str) -> str:
+    """Coarse model-*family* key for diversity counting. Providers expose
+    multiple catalog IDs backed by the *same* model — e.g. ``parslee/advisor``
+    and ``parslee/reasoning`` are both Azure gpt-5.5 (assistant personas), so
+    they must count as ONE, not two, or the ``>=2 distinct models`` gate is
+    fooled into deliberating with no real diversity. We key on the provider
+    prefix before the first ``/`` (``parslee/*`` → ``parslee``, ``mlx/*`` →
+    ``mlx``). This is conservative — it may merge genuinely-distinct models of
+    one provider — which is the safe direction (bias toward the fast path).
+    """
+    return model_id.split("/", 1)[0] if "/" in model_id else model_id
+
+
 def capable_model_count(route_fn: Callable[[str, str], str], probe: str = "code task") -> int:
-    """Distinct capable models CAR could route a code task to (the panel's
-    diversity ceiling). Reads ``route_model``'s advisory ``candidates`` ranking.
-    Returns 0 on any failure (→ gate falls back to the fast path)."""
+    """Distinct capable model *families* CAR could route a code task to (the
+    panel's real diversity ceiling — see ``_family``). Reads ``route_model``'s
+    advisory ``candidates`` ranking. Returns 0 on any failure (→ gate falls back
+    to the fast path)."""
     try:
         decision = json.loads(route_fn(probe, json.dumps(ROLE_INTENTS["coder"])) or "{}")
     except (ValueError, TypeError):
         return 0
     cands = decision.get("candidates") or []
-    ids = {c.get("model_id") for c in cands if isinstance(c, dict) and c.get("model_id")}
-    if ids:
-        return len(ids)
+    families = {_family(c["model_id"]) for c in cands
+                if isinstance(c, dict) and c.get("model_id")}
+    if families:
+        return len(families)
     # Cold-start / explicit-model paths return no ranking but did pick one.
     return 1 if _selected_model(decision) else 0
 
