@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.35.0] - 2026-07-04
+
+### Added
+
+- **Tiered reasoning: a real, CAR-gated multi-agent deliberation tier.** Neo's "MapCoder/CodeSim" reasoning was a single combined call playing three roles, and its "simulation" was self-narration the engine already distrusted. This adds a genuine panel — **plan-vote → code → adversarial critique → repair** — and gates it so the fast, memory-driven single call stays the default. Multi-agent fires only when a query is **novel** (the existing `effort_from_memory` signal, promoted from a token dimmer to a mode switch) **and** CAR is reachable **and** there are **≥2 genuinely-distinct capable models** — because a single-model panel just pays latency to re-confirm one model's blind spots. Model diversity is engineered via CAR's `route_model` candidates + `exclude_models` (car#358), so the critic routes to a *different* model than the coder; a decision-only routing-plan pass assigns roles up front. Confidence is a **consensus** of independent signals (plan agreement × coder confidence × critic verdict), not one model's self-report. `--deep`/`--fast` override the `reasoning_mode` config (`auto` default); output metadata always carries `reasoning_mode` + `reasoning_reason`, and panel runs add `provenance` + `panel` (models_used/consensus/rounds). A blind-judge A/B (`tools/ab_reasoning.py`) measured **+1.12 quality** (panel 9.25 vs single 8.12 / 10) with wins clustered on edge-case-heavy tasks — reinforcing that deliberation is worth its ~5× latency only on hard/novel work. Execution-grounded verification (L4) is deferred: most real code needs infra a sandbox can't conjure, so verification leans on the adversarial critic + static analysis. (`reasoning_mode.py`, `multi_agent.py`, `panel.py`, `engine.py`)
+- **Deliberated outcomes are routed through probation with provenance.** Facts a panel produces enter memory tagged `[multi-agent, probation]` — recognizable and trust-first: promoted only by real outcomes (`access_count>=2` / `success_count>0`) via the existing pipeline, so a wrong panel answer never becomes confident memory unchecked. Stored confidence is the panel consensus. (`engine.py`)
+
+### Fixed
+
+- **The multi-agent diversity gate no longer miscounts same-backend model personas.** `capable_model_count` treated `parslee/advisor` and `parslee/reasoning` as two distinct models, but both are Azure gpt-5.5 (Parslee assistant personas) — so the "≥2 distinct models" gate could deliberate with no real diversity. It now counts distinct provider *families* (`parslee/*` → 1), biasing conservatively toward the fast path. (`panel.py`)
+
 ## [0.34.0] - 2026-07-01
 
 ### Fixed
