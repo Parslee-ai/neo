@@ -89,3 +89,47 @@ def test_deliberate_failure_returns_none_for_fallback():
     e = _engine(FakeLM(lambda m: "no json"))
     plan, sims, code, result = e._deliberate({"prompt": "x"}, route_fn=None)
     assert result is not None and result.confidence == 0.0
+
+
+class _FakeStore:
+    def __init__(self):
+        self.added = []
+
+    def add_fact(self, **kw):
+        self.added.append(kw)
+        return type("F", (), {"id": "f1"})()
+
+
+def _store_engine():
+    from neo.models import NeoInput, PlanStep, CodeSuggestion, TaskType
+    e = _engine(FakeLM(lambda m: "{}"))
+    store = _FakeStore()
+    e.fact_store = store
+    e.persistent_memory = store
+    ni = NeoInput(prompt="do x", task_type=TaskType.FEATURE)
+    plan = [PlanStep(description="step", rationale="r")]
+    code = [CodeSuggestion(file_path="f.py", unified_diff="", description="d",
+                           confidence=0.8, code_block="x=1")]
+    return e, store, ni, plan, code
+
+
+def test_fast_path_facts_have_no_provenance_tags():
+    e, store, ni, plan, code = _store_engine()
+    e.last_deliberation = None
+    e._store_reasoning(ni, plan, code, 0.8, {})
+    assert "multi-agent" not in store.added[-1]["tags"]
+    assert "probation" not in store.added[-1]["tags"]
+
+
+def test_deliberated_facts_get_provenance_and_probation():
+    from neo.multi_agent import DeliberationResult
+    e, store, ni, plan, code = _store_engine()
+    e.last_deliberation = DeliberationResult(
+        plan=[], simulation_traces=[], code_suggestions=[],
+        confidence=0.7, consensus=0.8, rounds=0,
+    )
+    e._store_reasoning(ni, plan, code, 0.7, {})
+    tags = store.added[-1]["tags"]
+    assert "multi-agent" in tags and "probation" in tags
+    # confidence stored is the consensus-based value passed in, not self-report
+    assert store.added[-1]["confidence"] == 0.7

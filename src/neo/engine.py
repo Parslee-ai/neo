@@ -1472,13 +1472,25 @@ RULES:
             if pitfalls:
                 body_parts.append("Pitfalls: " + "; ".join(pitfalls[:5]))
 
+            tags = [task_type_str]
+            deliberation = getattr(self, "last_deliberation", None)
+            if deliberation is not None:
+                # Provenance for deliberated outcomes: recognizable (`multi-agent`)
+                # and trust-first (`probation`). They enter on probation and are
+                # promoted only by real outcomes (access_count>=2 / success_count>0)
+                # via the existing pipeline — so a wrong panel answer never becomes
+                # confident memory unchecked. `confidence` here already reflects the
+                # panel *consensus*, not a single model's self-report.
+                # docs/solutions/tiered-reasoning-multi-agent.md §5.
+                tags += ["multi-agent", "probation"]
+
             fact = self.fact_store.add_fact(
                 subject=pattern,
                 body="\n".join(body_parts),
                 kind=fact_kind,
                 confidence=confidence,
                 source_prompt=neo_input.prompt[:200],
-                tags=[task_type_str],
+                tags=tags,
             )
             logger.info(f"_store_reasoning: created fact id={fact.id} subject={pattern[:50]}")
             return fact
