@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.36.0] - 2026-07-06
+
+### Fixed
+
+- **LM adapters no longer break on newer reasoning models that reject standard chat parameters.** Neo unconditionally sent `temperature` (and `max_tokens`) on every request, but newer reasoning models reject them with a 400 — surfacing as the reported `ProcessingError` / `BadRequestError`: Anthropic Opus 4.7+/Sonnet 5/Fable 5 reject `temperature` ("temperature is deprecated for this model"); OpenAI o-series/gpt-5, Azure reasoning deployments, and OpenAI-compatible reasoners (xAI Grok, DeepSeek behind a `base_url`) reject `temperature`, and the OpenAI-family additionally require `max_completion_tokens` instead of `max_tokens`. There is no reliable model-string rule (`opus-4-6` accepts `temperature`, `opus-4-7` rejects it; on Azure `model` is an arbitrary deployment name), so a hardcoded allow/deny list would silently break on the next model. Instead the adapters **adapt reactively**: catch the 400, drop/rename the offending param, retry, and remember the model so subsequent calls skip it up front. Any 400 for another reason re-raises untouched (fail-fast preserved). The three OpenAI-SDK adapters (OpenAI chat path, Azure, Local) share `_chat_completion_resilient`, which handles both the `temperature` drop and the `max_completion_tokens` rename, copies its kwargs, and is robust to minor error-wording changes; `AnthropicAdapter` has its own inline learn-and-retry. The OpenAI `gpt-5`/codex `/v1/responses` path (which already omits `temperature`) is unchanged. (`adapters.py`)
+
+### Added
+
+- **Learned reasoning-model parameter adaptations now persist across invocations.** The reactive learn-and-retry above recorded each model's needed adaptations in in-memory sets, so every short-lived CLI invocation re-paid the first-call 400-retry penalty (up to two wasted round-trips for a model that rejects both params). Learnings now persist in `_ModelParamCompat` (`~/.neo/model_param_compat.json`, keyed `"<provider>:<model>" → [flags]`) so a fresh process skips the bad params on the first call. The store is provider-keyed (a bare `gpt-4` behind a Local endpoint can't collide with Azure/OpenAI), uses merge-on-write + atomic `os.replace` without an flock (writes are rare and additive-only, so a lost update self-heals on the next reactive retry), resolves its path at call time (per-test `Path.home()` stubs apply), and is **best-effort and totally guarded** — a missing/corrupt/wrong-shape file or an unresolvable home degrades to "not learned" and never breaks inference. (`adapters.py`)
+
 ## [0.35.0] - 2026-07-04
 
 ### Added
