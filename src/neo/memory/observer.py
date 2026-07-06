@@ -1,15 +1,22 @@
 """Async out-of-band synthesis observer, supervised by car-server.
 
-A per-project background process that runs REVIEW→PATTERN/FAILURE
-synthesis on a wall-clock cadence. Lifecycle is owned by CAR's
-agent supervisor:
+A **single global** background process (CAR agent ``neo-observer``,
+``GLOBAL_AGENT_ID``) that runs REVIEW→PATTERN/FAILURE synthesis on a
+wall-clock cadence, **sweeping every discovered project each cycle** —
+round-robin/budgeted (``max_projects_per_cycle``, watermark-gated so
+unchanged projects do near-zero work). The earlier model spawned one
+per-project agent (``neo-observer-<id12>``, ``--cwd <root>``); those
+legacy agents are stopped and ``agents_remove``d on bootstrap. Lifecycle
+is owned by CAR's agent supervisor:
 
   - ``agents_upsert`` registers the spec under ``~/.car/agents.json``
   - ``agents_start`` spawns the child
-    (``python -m neo.memory.observer --daemon --cwd <root>``)
+    (``python -m neo.memory.observer --daemon --all``; the legacy
+    ``--cwd <root>`` form runs a single project and is kept only for
+    migration/back-compat)
   - Supervisor handles restart-on-failure, clean SIGTERM shutdown, log
-    redirection to ``~/.car/logs/<id>.{stdout,stderr}.log``, and auto-
-    start at daemon boot when ``auto_start=True``.
+    redirection to ``~/.car/logs/neo-observer.{stdout,stderr}.log``, and
+    auto-start at daemon boot when ``auto_start=True``.
 
 Hard dependency on ``car-runtime>=0.18.0`` (the ``agents_*`` lifecycle
 API landed in 0.16.1, but earlier bindings grab the supervisor manifest
