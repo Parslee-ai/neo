@@ -72,11 +72,33 @@ feature:
    real critique (full solution + token budget) in time. And there's no
    Anthropic/Google credential wired up.
 
-So a real frontier-vs-frontier diversity A/B needs a **second fast capable model
-credential** (a Parslee/infra decision), or Parslee's `/inference/responses`
-backend serving a genuinely different model family (its model-agnostic future).
-The harness supports it now (`tools/ab_reasoning.py --critic-model ...`); it just
-needs a viable second model to point at.
+A real frontier-vs-frontier diversity A/B needs a **second fast capable model
+credential**. The harness supports it (`--critic-model ... --critic-provider anthropic`).
+
+### Diversity A/B — gpt-5.5 roles + Claude critic (measured)
+
+With an Anthropic key wired up, the panel ran with a **genuinely distinct
+critic** (Claude Sonnet reviewing gpt-5.5's code) — 8 tasks, same harness:
+
+| Metric | Claude critic | (baseline: gpt-5.5 critic) |
+|---|---|---|
+| Wins: panel / single / tie | **4 / 0 / 4** | 3 / 1 / 4 |
+| Decisive win rate | **100% (4/4)** | 75% (3/4) |
+| Avg panel score | 9.5 / 10 | 9.25 |
+| Avg single score | 8.5 | 8.12 |
+| Quality delta | **+1.0** | +1.12 |
+
+**Read it honestly:** the two runs are separate (judge variance; `single` also
+moved 8.12→8.5), so the *average delta* difference (+1.0 vs +1.12) is within
+noise — a distinct critic did **not** dramatically widen the average gap here.
+What it *did* change is **robustness**: the diverse-critic panel **never lost**
+(0 single wins, decisive 4/4), where the same-model panel had lost the trivial
+"merge two sorted lists" case. So a genuinely-distinct critic added uncorrelated
+scrutiny without introducing the noise that made the same-model panel regress on
+an easy task — consistent with, but a *modest* confirmation of, the diversity
+thesis. A definitive claim needs a controlled A/B/A (panel-Claude-critic vs
+panel-gpt-critic vs single) on the *same* tasks in one judged session; that's the
+clean next measurement. Raw: `/tmp/ab_claude.json`.
 
 ## Problem
 

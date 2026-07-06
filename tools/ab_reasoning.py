@@ -98,22 +98,52 @@ def judge(adapter, task: str, sol_a: str, sol_b: str) -> dict:
     }
 
 
-def _role_factory(default_adapter, critic_model):
-    """Route the critic role to a *distinct-family* model (e.g. a local CAR
-    model) while other roles use the default — to measure model diversity, not
-    just orchestration."""
-    if not critic_model:
-        return lambda role: default_adapter
+def _anthropic_key():
+    """Anthropic key from the standard neo locations (env, then keychain) — a
+    targeted single-key read, not a scan."""
+    import os
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+    try:
+        from neo.config import load_api_key_from_keychain
+        return load_api_key_from_keychain("anthropic")
+    except Exception:
+        return None
+
+
+def _critic_adapter(provider: str, model: str):
+    if provider == "anthropic":
+        from neo.adapters import AnthropicAdapter
+        key = _anthropic_key()
+        if not key:
+            raise RuntimeError(
+                "no Anthropic key found (set ANTHROPIC_API_KEY or store it in the "
+                "keychain as 'neo:anthropic:api_key')"
+            )
+        return AnthropicAdapter(model=model or "claude-sonnet-4-5-20250929", api_key=key)
+    if provider == "openai":
+        from neo.adapters import OpenAIAdapter
+        return OpenAIAdapter(model=model or "gpt-5.5", api_key=NeoConfig.load().api_key)
     from neo.adapters import CarAdapter
-    critic = CarAdapter(model=critic_model)
+    return CarAdapter(model=model)
+
+
+def _role_factory(default_adapter, critic_model, critic_provider="car"):
+    """Route the critic role to a *distinct-family* model (e.g. Claude via
+    Anthropic, or a local CAR model) while other roles use the default — to
+    measure model diversity, not just orchestration."""
+    if not critic_model and critic_provider == "car":
+        return lambda role: default_adapter
+    critic = _critic_adapter(critic_provider, critic_model)
     return lambda role: critic if role == "critic" else default_adapter
 
 
 def run(n: int, k: int, model: str, out: Path, effort: str = "low",
-        critic_model: str = "") -> dict:
+        critic_model: str = "", critic_provider: str = "car") -> dict:
     key = NeoConfig.load().api_key
     adapter = EffortAdapter(OpenAIAdapter(model=model, api_key=key), effort)
-    reasoner = MultiAgentReasoner(_role_factory(adapter, critic_model),
+    reasoner = MultiAgentReasoner(_role_factory(adapter, critic_model, critic_provider),
                                   k_plans=k, max_repair_rounds=1)
 
     rng = random.Random(1234)
@@ -196,7 +226,9 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--model", default="gpt-5.5")
     ap.add_argument("--effort", default="low")
-    ap.add_argument("--critic-model", default="", help="Distinct-family model for the critic role (e.g. mlx/qwen3-4b:4bit)")
+    ap.add_argument("--critic-model", default="", help="Distinct-family model for the critic role (e.g. claude-sonnet-4-5-20250929, mlx/qwen3-4b:4bit)")
+    ap.add_argument("--critic-provider", default="car", choices=["car", "anthropic", "openai"], help="Provider for the critic model")
     ap.add_argument("--out", default="/tmp/ab_reasoning_results.json")
     a = ap.parse_args()
-    run(a.n, a.k, a.model, Path(a.out), effort=a.effort, critic_model=a.critic_model)
+    run(a.n, a.k, a.model, Path(a.out), effort=a.effort,
+        critic_model=a.critic_model, critic_provider=a.critic_provider)
