@@ -152,10 +152,16 @@ gains.
 
 ## Open questions
 
-- **Should the observer run per-project or per-machine?** ECC runs per-project
-  (each has its own PID file). Neo's `metrics.jsonl` is global; per-project
-  observers would need to filter by `project_id`. Easier: one observer per
-  machine that handles all active projects. Recommend per-machine to start.
+- **Should the observer run per-project or per-machine? — RESOLVED: per-machine
+  (single global).** The first shipped cut ran **per-project** agents
+  (`neo-observer-<id12>`, one CAR agent per discovered project). That was
+  replaced by a **single global** observer (CAR agent `neo-observer`, daemon
+  `--daemon --all`) that sweeps every discovered project each cycle —
+  round-robin/budgeted (`max_projects_per_cycle`, watermark-gated so unchanged
+  projects do near-zero work). On bootstrap the legacy per-project agents are
+  stopped and `agents_remove`d. Lifecycle/`status`/orphan-checks all operate on
+  the one global agent. See `src/neo/memory/observer.py` and the "Async
+  synthesis observer" note in `CLAUDE.md` for the current shape.
 - **What's "active"?** ECC uses the metrics file's mtime. Same approach works
   here — if `metrics.jsonl` hasn't been touched in 30 minutes, exit.
 - **Routing cost.** Each observer cycle costs ~1 cheap LM call. At 5-min

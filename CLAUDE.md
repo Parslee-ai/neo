@@ -36,6 +36,13 @@
     specific project's fact file, use `neo memory prune [--all] [--dry-run]`
     (`neo/subcommands.py:_compact_fact_file` — at the package root, not
     under `memory/`).
+  - `neo memory replay-feedback [--all] [--dry-run] [--include-legacy-fallback]
+    [--limit N]` re-processes linked session outcomes (ACCEPTED/MODIFIED/UNVERIFIED)
+    to update the linked facts' confidence + `success_count` — a manual re-run of
+    the implicit-feedback pass, for after a memory-loop fix (`store.replay_linked_feedback`).
+    `--dry-run` reports what would change without mutating; `--include-legacy-fallback`
+    also inspects legacy `session_*.json` files (may re-replay already-processed
+    sessions). Only touches linked, non-independent outcomes.
   - Diagnostics (read-only, flag-and-propose): `neo memory issues [--since 14d]
     [--min-cluster 3] [--suggest-rules] [--json]` surfaces recurring frictions mined from
     transcript history (Claude Code / Codex / CAR) as ranked, evidence-cited issues
