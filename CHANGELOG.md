@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.36.1] - 2026-07-06
+
+### Documentation
+
+- **Corrected neo's self-description of the synthesis observer, and documented `neo memory replay-feedback`.** The `observer.py` module docstring and `docs/solutions/async-observer.md` still described the background synthesis observer as a *per-project* process; it has been a **single global** CAR agent (`neo-observer`, `--daemon --all`) that sweeps every discovered project each cycle since the per-project agents (`neo-observer-<id12>`) were migrated away. The docstring now leads with the global model and the async-observer proposal's "open question" is marked resolved. Separately, the `neo memory replay-feedback` subcommand (re-processes linked ACCEPTED/MODIFIED/UNVERIFIED outcomes to update fact confidence + `success_count`) was undocumented and is now covered in the memory-hygiene notes. Docstring/doc-only — no behavior change. (#136)
+
 ## [0.36.0] - 2026-07-06
 
 ### Fixed
