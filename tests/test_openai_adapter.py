@@ -4,6 +4,12 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+# Pre-warm the numpy-backed import chain that OpenAIAdapter.generate() pulls in
+# lazily (via neo.memory.metrics). Importing it inside a patch.dict(sys.modules)
+# window causes patch.dict to delete numpy's C-extensions on teardown, which
+# then fail to reload ("cannot load module more than once per process").
+import neo.memory.metrics  # noqa: E402,F401
+
 
 def _make_mock_response():
     return SimpleNamespace(
