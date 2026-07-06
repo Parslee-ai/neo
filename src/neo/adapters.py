@@ -25,6 +25,87 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# Reasoning-model parameter compatibility (OpenAI-SDK adapters)
+# ============================================================================
+#
+# Newer reasoning models reject standard chat-completions parameters:
+#   - `temperature` is rejected (OpenAI o-series / gpt-5, xAI Grok and DeepSeek
+#     reasoners behind an OpenAI-compatible endpoint, Azure reasoning deploys).
+#   - `max_tokens` must be sent as `max_completion_tokens`.
+# There is no reliable model-string rule — and on Azure `model` is an arbitrary
+# deployment name — so we learn each adaptation from the API's own 400 and
+# remember it process-wide to avoid repeat round-trips. Same learn-and-retry
+# shape as AnthropicAdapter's temperature handling.
+_MODELS_REJECTING_TEMPERATURE: set[str] = set()
+_MODELS_NEEDING_MAX_COMPLETION_TOKENS: set[str] = set()
+
+
+def _chat_completion_resilient(client, kwargs: dict):
+    """Call ``client.chat.completions.create(**kwargs)``, recovering from the
+    reasoning-model parameter rejections described above.
+
+    Adaptations already learned for this model are applied up front; anything
+    new is discovered from the 400, applied, remembered, and retried. A 400 for
+    any other reason re-raises untouched. Loop is bounded implicitly: each
+    adaptation removes the key it keys on, so it can fire at most once (worst
+    case: temperature + max_tokens + success = 3 calls). ``kwargs`` is copied,
+    not mutated, so callers may safely pass a shared/cached dict.
+
+    Scope of each adaptation:
+      - `temperature` drop is broad — o-series / gpt-5, Azure reasoning
+        deployments, and OpenAI-compatible reasoners (xAI Grok, DeepSeek) all
+        reject it.
+      - `max_completion_tokens` rename is OpenAI-family only (OpenAI + Azure,
+        which share the `openai` SDK's error text). Grok/DeepSeek accept
+        `max_tokens`, so they never hit that branch.
+    """
+    import openai
+
+    kwargs = dict(kwargs)  # own our copy — never mutate the caller's dict
+    model = kwargs.get("model", "")
+    if model in _MODELS_REJECTING_TEMPERATURE:
+        kwargs.pop("temperature", None)
+    if model in _MODELS_NEEDING_MAX_COMPLETION_TOKENS and "max_tokens" in kwargs:
+        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+
+    while True:
+        try:
+            return client.chat.completions.create(**kwargs)
+        except openai.BadRequestError as e:
+            msg = str(e).lower()
+            # NOTE: we can't distinguish "temperature is deprecated/unsupported"
+            # from an out-of-range value error ("temperature must be <= 2") by
+            # message alone. That's fine here: neo only ever sends in-range
+            # temperatures, so a `temperature` 400 always means rejection.
+            if "temperature" in kwargs and "temperature" in msg:
+                _MODELS_REJECTING_TEMPERATURE.add(model)
+                kwargs.pop("temperature", None)
+                logger.debug(
+                    "Model %s rejected `temperature`; dropped it and retrying",
+                    model,
+                )
+                continue
+            # Rename trigger: the message references `max_tokens` and signals
+            # the param is unsupported (either by naming the replacement or by
+            # an unsupported/not-supported phrase — robust to minor OpenAI
+            # wording changes). A plain value error on max_tokens carries none
+            # of these and correctly re-raises.
+            if "max_tokens" in kwargs and "max_tokens" in msg and (
+                "max_completion_tokens" in msg
+                or "unsupported" in msg
+                or "not supported" in msg
+            ):
+                _MODELS_NEEDING_MAX_COMPLETION_TOKENS.add(model)
+                kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                logger.debug(
+                    "Model %s requires `max_completion_tokens`; renamed and "
+                    "retrying", model,
+                )
+                continue
+            raise
+
+
+# ============================================================================
 # OpenAI Adapter
 # ============================================================================
 
@@ -107,14 +188,17 @@ class OpenAIAdapter(LMAdapter):
 
                 raise ValueError(f"No completed message in response: {data}")
             else:
-                # Standard chat completions for other models
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stop=stop,
-                )
+                # Standard chat completions for other models. Route through the
+                # resilient helper so o-series (and other reasoning models that
+                # aren't matched above) recover from `temperature` /
+                # `max_tokens` rejections instead of erroring.
+                response = _chat_completion_resilient(self.client, {
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "stop": stop,
+                })
                 self._emit_usage_metric(getattr(response, "usage", None))
                 return response.choices[0].message.content
 
@@ -195,6 +279,15 @@ class OpenAIAdapter(LMAdapter):
 class AnthropicAdapter(LMAdapter):
     """Adapter for Anthropic models (Claude)."""
 
+    # Claude models that reject the `temperature` sampling parameter with a 400
+    # ("temperature is deprecated for this model") — Opus 4.7+, Sonnet 5,
+    # Fable 5, and later. There's no clean model-string rule (opus-4-6 accepts
+    # it, opus-4-7 rejects it), so instead of hardcoding a taxonomy that goes
+    # stale on the next release, we learn it from the API's own error and
+    # remember it. Class-level so the lesson persists across adapter instances
+    # in a process (multi_agent makes several calls per query).
+    _models_without_temperature: set[str] = set()
+
     def __init__(self, model: str = "claude-sonnet-4-5-20250929", api_key: Optional[str] = None):
         self.model = model
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -233,8 +326,12 @@ class AnthropicAdapter(LMAdapter):
             "model": self.model,
             "messages": formatted_messages,
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # Only send `temperature` to models known to accept it. Newer Claude
+        # models (Opus 4.7+, Sonnet 5, Fable 5) reject it; see
+        # `_models_without_temperature`.
+        if self.model not in self._models_without_temperature:
+            kwargs["temperature"] = temperature
 
         if system_message:
             kwargs["system"] = system_message
@@ -242,6 +339,7 @@ class AnthropicAdapter(LMAdapter):
         if stop:
             kwargs["stop_sequences"] = stop
 
+        import anthropic
         from neo.memory.metrics import capture_lm_call_failure
         with capture_lm_call_failure(
             provider="anthropic",
@@ -249,7 +347,21 @@ class AnthropicAdapter(LMAdapter):
             max_tokens=max_tokens,
             temperature=temperature,
         ):
-            response = self.client.messages.create(**kwargs)
+            try:
+                response = self.client.messages.create(**kwargs)
+            except anthropic.BadRequestError as e:
+                # Newer Claude models reject `temperature` with a 400. Learn
+                # the model, drop the param, and retry once so the call still
+                # succeeds. A 400 for any other reason re-raises untouched.
+                if "temperature" not in kwargs or "temperature" not in str(e).lower():
+                    raise
+                self._models_without_temperature.add(self.model)
+                kwargs.pop("temperature", None)
+                logger.debug(
+                    "Anthropic model %s rejected `temperature`; dropped it "
+                    "and retrying", self.model,
+                )
+                response = self.client.messages.create(**kwargs)
             self._emit_usage_metric(response)
             return response.content[0].text
 
@@ -414,13 +526,17 @@ class LocalAdapter(LMAdapter):
         reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using local API."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=stop,
-        )
+        # OpenAI-compatible endpoints front many providers (vLLM, llama.cpp,
+        # xAI Grok, DeepSeek); resilient helper recovers if the model behind
+        # the endpoint is a reasoning model that rejects `temperature` /
+        # `max_tokens`.
+        response = _chat_completion_resilient(self.client, {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stop": stop,
+        })
         return response.choices[0].message.content
 
     def name(self) -> str:
@@ -538,13 +654,17 @@ class AzureOpenAIAdapter(LMAdapter):
         reasoning_effort: Optional[str] = None,  # not supported; accepted for ABC compat
     ) -> str:
         """Generate response using Azure OpenAI API."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=stop,
-        )
+        # Azure `model` is an arbitrary deployment name, so reasoning models
+        # (gpt-5 / o-series deployments) can't be detected by string — they
+        # reject `temperature` and require `max_completion_tokens` instead of
+        # `max_tokens`. The resilient helper learns both from the 400.
+        response = _chat_completion_resilient(self.client, {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stop": stop,
+        })
         return response.choices[0].message.content
 
     def name(self) -> str:
