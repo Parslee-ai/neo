@@ -100,6 +100,51 @@ thesis. A definitive claim needs a controlled A/B/A (panel-Claude-critic vs
 panel-gpt-critic vs single) on the *same* tasks in one judged session; that's the
 clean next measurement. Raw: `/tmp/ab_claude.json`.
 
+### Controlled A/B/A — diversity isolated from orchestration (the real answer)
+
+`tools/ab_controlled.py`: three arms per task, scored in **one** judge call
+(order randomized) so there is **zero cross-run variance** and the critic's
+*model* is the only thing that changes between B and C. 8 tasks, gpt-5.5,
+`effort=low`, `k=2`:
+
+| Arm | avg score |
+|---|---|
+| A — single call | 7.88 |
+| B — panel, **gpt-5.5** critic | **9.00** |
+| C — panel, **Claude** critic | **9.00** |
+
+- **Orchestration gain (B − A) = +1.12** — the plan-vote → adversarial-critique
+  → repair *structure* is the whole win, and it's substantial.
+- **Diversity gain (C − B) = 0.00** — swapping the critic to a different frontier
+  model changed nothing on average. Head-to-head: **1 / 1 / 6** (Claude / gpt /
+  tie) — a wash.
+
+**This overturns a central assumption of this design.** I argued the panel's
+value is *model diversity* and that a same-model panel just re-confirms one
+model's blind spots. The controlled experiment says the opposite: **the value is
+the orchestration structure, and it holds fully same-model.** An adversarial
+critic in a *fresh context* prompted to "find the flaw" catches errors even with
+shared weights — the reframing does the work, not the different weights. (That's
+the "narrow exception" §6 flagged — it turns out to be the *whole* effect, at
+least on this workload.)
+
+**Honest bounds:** n=8, self-contained algorithmic tasks (HumanEval-like), two
+*strong* frontier critics. Diversity may still pay off on (a) harder/ambiguous
+tasks where strong models genuinely disagree, (b) domains where one model has a
+specific blind spot, or (c) larger, more-diversified panels — none tested here.
+But on this workload the signal is clean: **orchestration ≫ diversity.**
+
+**Design implications (proposed, not yet applied):**
+1. The gate's `≥2 distinct capable models` condition is likely **too strict** —
+   a same-model panel already delivers the +1.12. Relaxing to `≥1 capable model`
+   would let deliberation fire far more often (and removes the `parslee`-family
+   miscount problem entirely).
+2. The "**never build single-model multi-agent-lite**" stance (§6) is contradicted
+   by this data — a same-model panel is worth it, and could even run without
+   CAR's diverse routing (CAR still provides the *orchestration* primitives).
+
+Raw: `/tmp/ab_controlled.json`.
+
 ## Problem
 
 Neo is described as "MapCoder/CodeSim-style multi-agent reasoning," but the
