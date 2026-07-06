@@ -3,8 +3,9 @@ adapters (OpenAI chat path, Azure OpenAI, Local/OpenAI-compatible).
 
 Newer reasoning models reject `temperature` and require `max_completion_tokens`
 instead of `max_tokens`. `_chat_completion_resilient` learns each adaptation
-from the API's own 400 and remembers it. On Azure the model is an arbitrary
-deployment name, so this reactive approach is the only reliable one.
+from the API's own 400 and remembers it via the persistent `_PARAM_COMPAT`
+store. On Azure the model is an arbitrary deployment name, so this reactive
+approach is the only reliable one.
 """
 
 import sys
@@ -42,20 +43,24 @@ def _ok(text="ok"):
 
 @pytest.fixture
 def _fake_openai():
-    """Inject a fake `openai` module (with a real BadRequestError) and reset
-    the process-wide learned-model caches."""
+    """Inject a fake `openai` module (with a real BadRequestError) and reset the
+    persistent param-compat store's in-memory cache. The autouse
+    `isolate_neo_home` fixture points ~/.neo at a fresh tmp dir, so on-disk
+    state starts empty per test; clearing the cache forces a reload from it."""
     mock_openai = MagicMock()
     mock_openai.BadRequestError = _BadRequest
     with patch.dict(sys.modules, {"openai": mock_openai}):
         from neo import adapters
 
-        adapters._MODELS_REJECTING_TEMPERATURE.clear()
-        adapters._MODELS_NEEDING_MAX_COMPLETION_TOKENS.clear()
+        def _reset():
+            adapters._PARAM_COMPAT._path = None
+            adapters._PARAM_COMPAT._data = {}
+
+        _reset()
         try:
             yield adapters
         finally:
-            adapters._MODELS_REJECTING_TEMPERATURE.clear()
-            adapters._MODELS_NEEDING_MAX_COMPLETION_TOKENS.clear()
+            _reset()
 
 
 def _client_with(side_effect):
@@ -64,13 +69,15 @@ def _client_with(side_effect):
     return client
 
 
+def _call(adapters, client, kwargs, provider="openai"):
+    return adapters._chat_completion_resilient(client, kwargs, provider)
+
+
 # --- the shared helper directly -------------------------------------------
 
 def test_helper_passes_through_when_accepted(_fake_openai):
     client = _client_with([_ok("fine")])
-    out = _fake_openai._chat_completion_resilient(
-        client, {"model": "gpt-4", "temperature": 0.7, "max_tokens": 100}
-    )
+    out = _call(_fake_openai, client, {"model": "gpt-4", "temperature": 0.7, "max_tokens": 100})
     assert out.choices[0].message.content == "fine"
     assert client.chat.completions.create.call_count == 1
 
@@ -79,9 +86,7 @@ def test_helper_drops_temperature_then_renames_max_tokens(_fake_openai):
     """A reasoning model that rejects both params: temperature is dropped, then
     max_tokens is renamed, then the call succeeds — three attempts total."""
     client = _client_with([_TEMP_ERR, _MAXTOK_ERR, _ok("recovered")])
-    out = _fake_openai._chat_completion_resilient(
-        client, {"model": "o3-mini", "temperature": 0.7, "max_tokens": 100}
-    )
+    out = _call(_fake_openai, client, {"model": "o3-mini", "temperature": 0.7, "max_tokens": 100})
     assert out.choices[0].message.content == "recovered"
     calls = client.chat.completions.create.call_args_list
     assert len(calls) == 3
@@ -93,20 +98,18 @@ def test_helper_drops_temperature_then_renames_max_tokens(_fake_openai):
     assert "max_tokens" not in calls[2].kwargs
     assert calls[2].kwargs["max_completion_tokens"] == 100
     assert "temperature" not in calls[2].kwargs
-    # both adaptations remembered
-    assert "o3-mini" in _fake_openai._MODELS_REJECTING_TEMPERATURE
-    assert "o3-mini" in _fake_openai._MODELS_NEEDING_MAX_COMPLETION_TOKENS
+    # both adaptations remembered, scoped to the openai provider
+    assert _fake_openai._PARAM_COMPAT.has("openai", "o3-mini", "drop_temperature")
+    assert _fake_openai._PARAM_COMPAT.has("openai", "o3-mini", "rename_max_tokens")
 
 
 def test_helper_applies_learned_adaptations_up_front(_fake_openai):
     """Once learned, a model skips both bad params on the first attempt."""
-    _fake_openai._MODELS_REJECTING_TEMPERATURE.add("o3-mini")
-    _fake_openai._MODELS_NEEDING_MAX_COMPLETION_TOKENS.add("o3-mini")
+    _fake_openai._PARAM_COMPAT.learn("openai", "o3-mini", "drop_temperature")
+    _fake_openai._PARAM_COMPAT.learn("openai", "o3-mini", "rename_max_tokens")
     client = _client_with([_ok()])
 
-    _fake_openai._chat_completion_resilient(
-        client, {"model": "o3-mini", "temperature": 0.7, "max_tokens": 100}
-    )
+    _call(_fake_openai, client, {"model": "o3-mini", "temperature": 0.7, "max_tokens": 100})
 
     assert client.chat.completions.create.call_count == 1
     kw = client.chat.completions.create.call_args.kwargs
@@ -118,11 +121,9 @@ def test_helper_applies_learned_adaptations_up_front(_fake_openai):
 def test_helper_reraises_unrelated_400(_fake_openai):
     client = _client_with([_BadRequest("messages: must be a non-empty array")])
     with pytest.raises(_BadRequest):
-        _fake_openai._chat_completion_resilient(
-            client, {"model": "gpt-4", "temperature": 0.7, "max_tokens": 100}
-        )
+        _call(_fake_openai, client, {"model": "gpt-4", "temperature": 0.7, "max_tokens": 100})
     assert client.chat.completions.create.call_count == 1
-    assert not _fake_openai._MODELS_REJECTING_TEMPERATURE
+    assert not _fake_openai._PARAM_COMPAT.has("openai", "gpt-4", "drop_temperature")
 
 
 def test_helper_renames_on_unsupported_wording_without_replacement_named(_fake_openai):
@@ -130,12 +131,10 @@ def test_helper_renames_on_unsupported_wording_without_replacement_named(_fake_o
     `unsupported`/`not supported` signal on max_tokens is enough."""
     err = _BadRequest("Unsupported parameter: 'max_tokens' is not supported with this model.")
     client = _client_with([err, _ok("renamed")])
-    out = _fake_openai._chat_completion_resilient(
-        client, {"model": "some-reasoner", "max_tokens": 100}
-    )
+    out = _call(_fake_openai, client, {"model": "some-reasoner", "max_tokens": 100})
     assert out.choices[0].message.content == "renamed"
     assert client.chat.completions.create.call_args_list[-1].kwargs["max_completion_tokens"] == 100
-    assert "some-reasoner" in _fake_openai._MODELS_NEEDING_MAX_COMPLETION_TOKENS
+    assert _fake_openai._PARAM_COMPAT.has("openai", "some-reasoner", "rename_max_tokens")
 
 
 def test_helper_does_not_rename_on_plain_max_tokens_value_error(_fake_openai):
@@ -143,11 +142,9 @@ def test_helper_does_not_rename_on_plain_max_tokens_value_error(_fake_openai):
     trigger a spurious rename."""
     client = _client_with([_BadRequest("max_tokens must be at least 1")])
     with pytest.raises(_BadRequest):
-        _fake_openai._chat_completion_resilient(
-            client, {"model": "gpt-4", "max_tokens": 0}
-        )
+        _call(_fake_openai, client, {"model": "gpt-4", "max_tokens": 0})
     assert client.chat.completions.create.call_count == 1
-    assert not _fake_openai._MODELS_NEEDING_MAX_COMPLETION_TOKENS
+    assert not _fake_openai._PARAM_COMPAT.has("openai", "gpt-4", "rename_max_tokens")
 
 
 def test_helper_does_not_mutate_callers_kwargs(_fake_openai):
@@ -155,8 +152,16 @@ def test_helper_does_not_mutate_callers_kwargs(_fake_openai):
     caller_kwargs = {"model": "o3-mini", "temperature": 0.7, "max_tokens": 100}
     snapshot = dict(caller_kwargs)
     client = _client_with([_TEMP_ERR, _MAXTOK_ERR, _ok()])
-    _fake_openai._chat_completion_resilient(client, caller_kwargs)
+    _call(_fake_openai, client, caller_kwargs)
     assert caller_kwargs == snapshot  # untouched despite two adaptations
+
+
+def test_provider_keys_are_independent(_fake_openai):
+    """The same model name behind different providers doesn't collide."""
+    _fake_openai._PARAM_COMPAT.learn("azure", "gpt-4", "drop_temperature")
+    assert _fake_openai._PARAM_COMPAT.has("azure", "gpt-4", "drop_temperature")
+    assert not _fake_openai._PARAM_COMPAT.has("openai", "gpt-4", "drop_temperature")
+    assert not _fake_openai._PARAM_COMPAT.has("local", "gpt-4", "drop_temperature")
 
 
 # --- through the adapters ---------------------------------------------------
@@ -169,7 +174,7 @@ def test_local_adapter_recovers_from_temperature_rejection(_fake_openai):
 
     assert out == "hi"
     assert adapter.client.chat.completions.create.call_count == 2
-    assert "grok-4-reasoning" in _fake_openai._MODELS_REJECTING_TEMPERATURE
+    assert _fake_openai._PARAM_COMPAT.has("local", "grok-4-reasoning", "drop_temperature")
 
 
 def test_azure_adapter_recovers_from_both_rejections(_fake_openai):
@@ -185,7 +190,7 @@ def test_azure_adapter_recovers_from_both_rejections(_fake_openai):
     assert len(calls) == 3
     assert calls[-1].kwargs["max_completion_tokens"] == 4096
     assert "temperature" not in calls[-1].kwargs
-    assert "my-o3-deploy" in _fake_openai._MODELS_NEEDING_MAX_COMPLETION_TOKENS
+    assert _fake_openai._PARAM_COMPAT.has("azure", "my-o3-deploy", "rename_max_tokens")
 
 
 def test_openai_chat_path_recovers_for_o_series(_fake_openai):
@@ -197,4 +202,4 @@ def test_openai_chat_path_recovers_for_o_series(_fake_openai):
     out = adapter.generate([{"role": "user", "content": "yo"}], temperature=0.9)
 
     assert out == "chat-ok"
-    assert "o3-mini" in _fake_openai._MODELS_REJECTING_TEMPERATURE
+    assert _fake_openai._PARAM_COMPAT.has("openai", "o3-mini", "drop_temperature")

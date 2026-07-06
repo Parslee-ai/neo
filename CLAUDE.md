@@ -193,4 +193,19 @@
   `CarAdapter.DEFAULT_INTENT_HINT` in `adapters.py`. Observer floor is car-runtime ≥0.18.0,
   now enforced at runtime by `_require_car_runtime` (version check, not just the `agents_*`
   attr); latest validated against car-runtime 0.27.0.
+- Reasoning-model param compatibility (`adapters.py`): newer models reject standard
+  chat params — Anthropic Opus 4.7+/Sonnet 5/Fable 5 reject `temperature`; OpenAI
+  o-series/gpt-5, Azure reasoning deployments, and OpenAI-compatible reasoners (xAI
+  Grok, DeepSeek) reject `temperature`, and the OpenAI-family require
+  `max_completion_tokens` instead of `max_tokens`. There's no reliable model-string
+  rule (opus-4-6 accepts `temperature`, opus-4-7 rejects it; Azure `model` is an
+  arbitrary deployment name), so adapters **learn reactively**: catch the 400, drop/
+  rename the param, retry, remember. The learnings persist in `_ModelParamCompat`
+  (`~/.neo/model_param_compat.json`, keyed `"<provider>:<model>" → [flags]`) so the
+  first-call retry penalty isn't re-paid every CLI invocation. Store is best-effort
+  (I/O failure → in-memory only, never breaks inference), merge-on-write + atomic
+  `os.replace`, path resolved at call time (per-test `Path.home()` stubs apply). The
+  OpenAI-family adapters share `_chat_completion_resilient(client, kwargs, provider)`;
+  Anthropic has its own inline learn-and-retry. **Footgun**: recovery keys on HTTP 400
+  (`BadRequestError`); a provider returning 422 for a param error won't be caught.
 - When creating a pull request, always use the PR template included in the repo.
