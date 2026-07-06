@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.37.0] - 2026-07-06
+
+### Changed
+
+- **Multi-agent deliberation now fires with ≥1 capable model, not ≥2 distinct ones — a controlled experiment overturned the "diversity is the value" assumption.** The tiered-reasoning gate (#129) offered the panel only when a query was novel AND CAR was reachable AND there were **≥2 genuinely-distinct capable models**, on the theory that a single-model panel just re-confirms one model's blind spots. A controlled A/B/A (n=8, three arms per task — single vs panel-with-gpt-critic vs panel-with-Claude-critic — scored in one judge call so the critic model is the only variable) measured: single **7.88**, panel same-model **9.00** (+1.12), panel distinct-critic **9.00** (diversity delta **~0**; head-to-head 1/1/6). The panel's win is the **orchestration structure** (plan-vote → code → adversarial critique → repair), which holds fully same-model; an adversarial critic in a fresh context catches errors via *reframing*, not different weights. So `DEFAULT_MIN_MODELS` drops 2 → 1: deliberation now fires on novelty + CAR + one capable model, and the parslee-family model-miscount no longer changes the decision. `min_models` stays tunable for callers who still want a diverse pool (harder/ambiguous tasks aren't yet measured). Internally `diversity_ok` → `can_deliberate`, with updated rationale/reason strings. Bounds: n=8 self-contained tasks, two strong critics. (`reasoning_mode.py`, `config.py`)
+
+### Added
+
+- **Controlled A/B/A reasoning harness with a pluggable critic provider.** `tools/ab_controlled.py` runs the three-arm, single-judge-call comparison above (isolating diversity from orchestration), and `tools/ab_reasoning.py` gains `--critic-provider {anthropic,openai,car}` so the panel critic can route to a different frontier model than the coder. (`tools/ab_controlled.py`, `tools/ab_reasoning.py`, `docs/solutions/tiered-reasoning-multi-agent.md`)
+
 ## [0.36.1] - 2026-07-06
 
 ### Documentation
