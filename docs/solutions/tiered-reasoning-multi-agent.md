@@ -72,11 +72,84 @@ feature:
    real critique (full solution + token budget) in time. And there's no
    Anthropic/Google credential wired up.
 
-So a real frontier-vs-frontier diversity A/B needs a **second fast capable model
-credential** (a Parslee/infra decision), or Parslee's `/inference/responses`
-backend serving a genuinely different model family (its model-agnostic future).
-The harness supports it now (`tools/ab_reasoning.py --critic-model ...`); it just
-needs a viable second model to point at.
+A real frontier-vs-frontier diversity A/B needs a **second fast capable model
+credential**. The harness supports it (`--critic-model ... --critic-provider anthropic`).
+
+### Diversity A/B — gpt-5.5 roles + Claude critic (measured)
+
+With an Anthropic key wired up, the panel ran with a **genuinely distinct
+critic** (Claude Sonnet reviewing gpt-5.5's code) — 8 tasks, same harness:
+
+| Metric | Claude critic | (baseline: gpt-5.5 critic) |
+|---|---|---|
+| Wins: panel / single / tie | **4 / 0 / 4** | 3 / 1 / 4 |
+| Decisive win rate | **100% (4/4)** | 75% (3/4) |
+| Avg panel score | 9.5 / 10 | 9.25 |
+| Avg single score | 8.5 | 8.12 |
+| Quality delta | **+1.0** | +1.12 |
+
+**Read it honestly:** the two runs are separate (judge variance; `single` also
+moved 8.12→8.5), so the *average delta* difference (+1.0 vs +1.12) is within
+noise — a distinct critic did **not** dramatically widen the average gap here.
+What it *did* change is **robustness**: the diverse-critic panel **never lost**
+(0 single wins, decisive 4/4), where the same-model panel had lost the trivial
+"merge two sorted lists" case. So a genuinely-distinct critic added uncorrelated
+scrutiny without introducing the noise that made the same-model panel regress on
+an easy task — consistent with, but a *modest* confirmation of, the diversity
+thesis. A definitive claim needs a controlled A/B/A (panel-Claude-critic vs
+panel-gpt-critic vs single) on the *same* tasks in one judged session; that's the
+clean next measurement. Raw: `/tmp/ab_claude.json`.
+
+### Controlled A/B/A — diversity isolated from orchestration (the real answer)
+
+`tools/ab_controlled.py`: three arms per task, scored in **one** judge call
+(order randomized) so there is **zero cross-run variance** and the critic's
+*model* is the only thing that changes between B and C. 8 tasks, gpt-5.5,
+`effort=low`, `k=2`:
+
+| Arm | avg score |
+|---|---|
+| A — single call | 7.88 |
+| B — panel, **gpt-5.5** critic | **9.00** |
+| C — panel, **Claude** critic | **9.00** |
+
+- **Orchestration gain (B − A) = +1.12** — the plan-vote → adversarial-critique
+  → repair *structure* is the whole win, and it's substantial.
+- **Diversity gain (C − B) = 0.00** — swapping the critic to a different frontier
+  model changed nothing on average. Head-to-head: **1 / 1 / 6** (Claude / gpt /
+  tie) — a wash.
+
+**This overturns a central assumption of this design.** I argued the panel's
+value is *model diversity* and that a same-model panel just re-confirms one
+model's blind spots. The controlled experiment says the opposite: **the value is
+the orchestration structure, and it holds fully same-model.** An adversarial
+critic in a *fresh context* prompted to "find the flaw" catches errors even with
+shared weights — the reframing does the work, not the different weights. (That's
+the "narrow exception" §6 flagged — it turns out to be the *whole* effect, at
+least on this workload.)
+
+**Honest bounds:** n=8, self-contained algorithmic tasks (HumanEval-like), two
+*strong* frontier critics. Diversity may still pay off on (a) harder/ambiguous
+tasks where strong models genuinely disagree, (b) domains where one model has a
+specific blind spot, or (c) larger, more-diversified panels — none tested here.
+But on this workload the signal is clean: **orchestration ≫ diversity.**
+
+**Design implications:**
+1. **Applied** — the gate's floor is relaxed from `≥2 distinct capable models`
+   to `≥1 capable model` (`DEFAULT_MIN_MODELS = 1`), since a same-model panel
+   already delivers the +1.12 and diversity added ~0. Deliberation now fires
+   whenever a query is novel and CAR can serve one capable model; the
+   `parslee`-family miscount no longer changes the decision. (`min_models`
+   remains a tunable for callers who want to require a diverse pool on workloads
+   where diversity might yet pay off.)
+2. The "**never build single-model multi-agent-lite**" stance (§6) is contradicted
+   by this data — a same-model panel is worth it, and could even run without
+   CAR's diverse routing (CAR still provides the *orchestration* primitives).
+   Not acted on yet: multi-agent stays CAR-gated for now (CAR owns the
+   orchestration reliability), but the diversity *rationale* for that gate is
+   retired.
+
+Raw: `/tmp/ab_controlled.json`.
 
 ## Problem
 

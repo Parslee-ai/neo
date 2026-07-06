@@ -107,9 +107,11 @@ class NeoConfig:
     inference_mode: str = "static"
 
     # Reasoning tier: "auto" gates multi-agent deliberation on novelty + CAR +
-    # a diverse model pool (docs/solutions/tiered-reasoning-multi-agent.md);
-    # "fast" forces the single-call path; "deep" forces deliberation (degrades to
-    # a high-effort single pass when CAR / a diverse pool isn't available).
+    # at least one capable model (docs/solutions/tiered-reasoning-multi-agent.md;
+    # a controlled A/B/A found the panel's win is the orchestration structure,
+    # which holds same-model, so no diverse pool is required); "fast" forces the
+    # single-call path; "deep" forces deliberation (degrades to a high-effort
+    # single pass when CAR isn't available).
     reasoning_mode: str = "auto"  # "auto" | "fast" | "deep"
 
     # Generation settings
