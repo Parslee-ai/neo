@@ -5,11 +5,16 @@ Promotes the existing novelty signal (``reasoning_effort.effort_from_memory``)
 from a token-budget dimmer to a mode switch, per
 ``docs/solutions/tiered-reasoning-multi-agent.md``.
 
-Key rule: multi-agent is offered ONLY when CAR is reachable AND there are at
-least ``min_models`` genuinely-capable, *distinct* models available — because
-the value of a panel is model diversity, and a single-model panel just pays
-latency to re-confirm one model's blind spots. Below that bar we degrade to the
-fast path (or a high-effort single pass for explicit ``--deep``).
+Key rule: multi-agent is offered when CAR is reachable AND there is at least
+``min_models`` capable model available (default 1). A controlled A/B/A
+(``tools/ab_controlled.py``) found the panel's gain is the *orchestration
+structure* (plan-vote → adversarial critique → repair), worth +1.12/10, and that
+it holds **fully same-model** — an adversarial critic in a fresh context catches
+errors via reframing, not different weights; a distinct frontier critic added
+~0. So one capable model suffices. (The original ``≥2 distinct models`` bar
+assumed diversity was the value; the experiment overturned that.) Below the bar
+we degrade to the fast path (or a high-effort single pass for explicit
+``--deep``). See ``docs/solutions/tiered-reasoning-multi-agent.md``.
 """
 
 from __future__ import annotations
@@ -25,8 +30,12 @@ __all__ = ["ReasoningMode", "ModeDecision", "decide_mode", "DEFAULT_MIN_MODELS"]
 #: of ``effort_from_memory``. (``low``/``medium`` mean memory has this covered.)
 _DELIBERATE_EFFORTS = frozenset({"high", "xhigh"})
 
-#: A panel needs at least this many distinct capable models to be worth running.
-DEFAULT_MIN_MODELS = 2
+#: A panel needs at least this many capable models to be worth running. A
+#: controlled A/B/A showed the orchestration structure — not model diversity —
+#: is the win and it holds same-model, so 1 capable model suffices. (Kept as a
+#: tunable so a caller can still require a diverse pool for workloads where
+#: diversity might pay off — harder/ambiguous tasks not yet measured.)
+DEFAULT_MIN_MODELS = 1
 
 
 class ReasoningMode(str, Enum):
@@ -67,20 +76,20 @@ def decide_mode(
         capable_model_count: distinct capable models CAR could route to (from
             ``route_model``'s ``candidates``). 0 when unknown/no CAR.
         explicit: user override — "fast" | "deep" | None.
-        min_models: distinct-model floor for a worthwhile panel.
+        min_models: capable-model floor for a worthwhile panel (default 1).
 
     Returns:
         ModeDecision(mode, reason, effort).
     """
     effort = effort_from_memory(signal, difficulty=difficulty)
-    diversity_ok = car_available and capable_model_count >= min_models
+    can_deliberate = car_available and capable_model_count >= min_models
     override = (explicit or "").strip().lower()
 
     if override in ("fast", "single"):
         return ModeDecision(ReasoningMode.FAST, "explicit --fast", effort)
 
     if override in ("deep", "deliberate", "multi", "multi_agent", "multi-agent"):
-        if diversity_ok:
+        if can_deliberate:
             return ModeDecision(
                 ReasoningMode.MULTI_AGENT,
                 f"explicit --deep ({capable_model_count} capable models)",
@@ -98,9 +107,9 @@ def decide_mode(
             "xhigh",
         )
 
-    # Auto: novelty gates the mode, diversity gates whether we *can* deliberate.
+    # Auto: novelty gates the mode; the model-pool floor gates whether we *can*.
     novel = effort in _DELIBERATE_EFFORTS
-    if novel and diversity_ok:
+    if novel and can_deliberate:
         return ModeDecision(
             ReasoningMode.MULTI_AGENT,
             (
@@ -113,7 +122,7 @@ def decide_mode(
         return ModeDecision(
             ReasoningMode.FAST,
             (
-                f"novel (effort={effort}) but no diverse panel available "
+                f"novel (effort={effort}) but no capable panel available "
                 f"(car={car_available}, models={capable_model_count})"
             ),
             effort,

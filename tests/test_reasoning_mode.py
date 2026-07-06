@@ -42,12 +42,18 @@ def test_low_confidence_is_deliberation_worthy():
 def test_novel_without_car_falls_back_to_fast():
     d = decide_mode(_novel(), car_available=False, capable_model_count=0)
     assert d.mode is ReasoningMode.FAST
-    assert "no diverse panel" in d.reason
+    assert "no capable panel" in d.reason
 
 
-def test_novel_with_only_one_model_falls_back():
-    # CAR present but only one capable model -> single-model panel is worthless
+def test_novel_with_one_capable_model_deliberates():
+    # Default floor is 1: the controlled A/B/A showed a same-model panel is
+    # worth it (orchestration is the win, not diversity).
     d = decide_mode(_novel(), car_available=True, capable_model_count=1)
+    assert d.mode is ReasoningMode.MULTI_AGENT
+
+
+def test_car_up_but_zero_capable_models_falls_back():
+    d = decide_mode(_novel(), car_available=True, capable_model_count=0)
     assert d.mode is ReasoningMode.FAST
 
 

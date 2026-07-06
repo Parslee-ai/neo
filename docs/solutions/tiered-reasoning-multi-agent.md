@@ -134,14 +134,20 @@ tasks where strong models genuinely disagree, (b) domains where one model has a
 specific blind spot, or (c) larger, more-diversified panels — none tested here.
 But on this workload the signal is clean: **orchestration ≫ diversity.**
 
-**Design implications (proposed, not yet applied):**
-1. The gate's `≥2 distinct capable models` condition is likely **too strict** —
-   a same-model panel already delivers the +1.12. Relaxing to `≥1 capable model`
-   would let deliberation fire far more often (and removes the `parslee`-family
-   miscount problem entirely).
+**Design implications:**
+1. **Applied** — the gate's floor is relaxed from `≥2 distinct capable models`
+   to `≥1 capable model` (`DEFAULT_MIN_MODELS = 1`), since a same-model panel
+   already delivers the +1.12 and diversity added ~0. Deliberation now fires
+   whenever a query is novel and CAR can serve one capable model; the
+   `parslee`-family miscount no longer changes the decision. (`min_models`
+   remains a tunable for callers who want to require a diverse pool on workloads
+   where diversity might yet pay off.)
 2. The "**never build single-model multi-agent-lite**" stance (§6) is contradicted
    by this data — a same-model panel is worth it, and could even run without
    CAR's diverse routing (CAR still provides the *orchestration* primitives).
+   Not acted on yet: multi-agent stays CAR-gated for now (CAR owns the
+   orchestration reliability), but the diversity *rationale* for that gate is
+   retired.
 
 Raw: `/tmp/ab_controlled.json`.
 
