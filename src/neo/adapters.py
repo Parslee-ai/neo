@@ -30,26 +30,135 @@ logger = logging.getLogger(__name__)
 #
 # Newer reasoning models reject standard chat-completions parameters:
 #   - `temperature` is rejected (OpenAI o-series / gpt-5, xAI Grok and DeepSeek
-#     reasoners behind an OpenAI-compatible endpoint, Azure reasoning deploys).
-#   - `max_tokens` must be sent as `max_completion_tokens`.
+#     reasoners behind an OpenAI-compatible endpoint, Azure reasoning deploys,
+#     Anthropic Opus 4.7+ / Sonnet 5 / Fable 5).
+#   - `max_tokens` must be sent as `max_completion_tokens` (OpenAI-family).
 # There is no reliable model-string rule — and on Azure `model` is an arbitrary
-# deployment name — so we learn each adaptation from the API's own 400 and
-# remember it process-wide to avoid repeat round-trips. Same learn-and-retry
-# shape as AnthropicAdapter's temperature handling.
-_MODELS_REJECTING_TEMPERATURE: set[str] = set()
-_MODELS_NEEDING_MAX_COMPLETION_TOKENS: set[str] = set()
+# deployment name — so we learn each adaptation from the API's own 400. The
+# learnings are persisted (see `_ModelParamCompat`) so the first-call retry
+# penalty isn't re-paid on every short-lived CLI invocation.
+
+# Adaptation flags recorded per model.
+_ADAPT_DROP_TEMPERATURE = "drop_temperature"
+_ADAPT_RENAME_MAX_TOKENS = "rename_max_tokens"
 
 
-def _chat_completion_resilient(client, kwargs: dict):
+class _ModelParamCompat:
+    """Persistent record of which parameter adaptations each model needs.
+
+    Backed by ``~/.neo/model_param_compat.json`` as ``{"<provider>:<model>":
+    ["<flag>", ...]}``. Keyed by provider so a bare model name (e.g. ``gpt-4``)
+    behind a Local endpoint can't collide with the same name on Azure/OpenAI.
+
+    - The path is resolved at call time so per-test ``Path.home()`` stubs apply
+      (mirrors ``neo.memory.metrics._metrics_path``).
+    - An in-memory cache avoids re-reading on every call; it reloads whenever
+      the resolved path changes (so each isolated test home starts clean, while
+      production loads once).
+    - Writes are merge-on-write + atomic replace, so concurrent neo processes
+      union their learnings rather than clobbering each other.
+    - Persistence is best-effort: any I/O failure degrades to in-memory-only
+      and never breaks inference.
+    """
+
+    def __init__(self) -> None:
+        self._path: Optional[Path] = None
+        self._data: dict[str, set[str]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _resolve() -> Path:
+        return Path.home() / ".neo" / "model_param_compat.json"
+
+    @staticmethod
+    def _read(path: Path) -> dict[str, set[str]]:
+        """Load the store, tolerating anything. A missing file, invalid JSON,
+        or valid JSON of the wrong shape (``null``, a list, a scalar, non-list
+        values, unhashable flags) all degrade to an empty mapping — never a
+        raise. This cache must never break inference (see `has`/`learn`)."""
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, set[str]] = {}
+        for key, flags in raw.items():
+            if isinstance(key, str) and isinstance(flags, list):
+                out[key] = {f for f in flags if isinstance(f, str)}
+        return out
+
+    def _ensure_loaded(self, path: Path) -> None:
+        if path != self._path:
+            self._data = self._read(path)
+            self._path = path
+
+    def has(self, provider: str, model: str, adaptation: str) -> bool:
+        # Totally guarded: a compat cache must never propagate a failure into
+        # the inference path. Any error (unreadable ~/.neo, no resolvable home,
+        # …) degrades to "not learned" so the caller sends the param as usual.
+        try:
+            path = self._resolve()
+            with self._lock:
+                self._ensure_loaded(path)
+                return adaptation in self._data.get(f"{provider}:{model}", ())
+        except Exception:
+            logger.debug("param-compat has() failed; assuming not-learned", exc_info=True)
+            return False
+
+    def learn(self, provider: str, model: str, adaptation: str) -> None:
+        try:
+            path = self._resolve()
+            key = f"{provider}:{model}"
+            with self._lock:
+                self._ensure_loaded(path)
+                if adaptation in self._data.get(key, ()):
+                    return
+                self._data.setdefault(key, set()).add(adaptation)
+                self._persist(path)
+        except Exception:
+            logger.debug("param-compat learn() failed; skipping", exc_info=True)
+
+    def _persist(self, path: Path) -> None:
+        # Merge with whatever's on disk now — another process may have learned
+        # something since we loaded — then atomically replace. Deliberately no
+        # flock (unlike FactStore): writes are rare and additive-only, so the
+        # merge self-heals a lost update (the loser re-persists its own
+        # `self._data` on its next learn()). Not worth locking the hot path for.
+        merged = self._read(path)
+        for key, flags in self._data.items():
+            merged.setdefault(key, set()).update(flags)
+        self._data = merged
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump({k: sorted(v) for k, v in merged.items()}, f)
+                os.replace(tmp, str(path))
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            pass  # best-effort; in-memory cache still holds the learning
+
+
+_PARAM_COMPAT = _ModelParamCompat()
+
+
+def _chat_completion_resilient(client, kwargs: dict, provider: str):
     """Call ``client.chat.completions.create(**kwargs)``, recovering from the
     reasoning-model parameter rejections described above.
 
-    Adaptations already learned for this model are applied up front; anything
-    new is discovered from the 400, applied, remembered, and retried. A 400 for
-    any other reason re-raises untouched. Loop is bounded implicitly: each
-    adaptation removes the key it keys on, so it can fire at most once (worst
-    case: temperature + max_tokens + success = 3 calls). ``kwargs`` is copied,
-    not mutated, so callers may safely pass a shared/cached dict.
+    Adaptations already learned for ``provider``/model are applied up front;
+    anything new is discovered from the 400, applied, remembered, and retried.
+    A 400 for any other reason re-raises untouched. Loop is bounded implicitly:
+    each adaptation removes the key it keys on, so it can fire at most once
+    (worst case: temperature + max_tokens + success = 3 calls). ``kwargs`` is
+    copied, not mutated, so callers may safely pass a shared/cached dict.
 
     Scope of each adaptation:
       - `temperature` drop is broad — o-series / gpt-5, Azure reasoning
@@ -63,9 +172,9 @@ def _chat_completion_resilient(client, kwargs: dict):
 
     kwargs = dict(kwargs)  # own our copy — never mutate the caller's dict
     model = kwargs.get("model", "")
-    if model in _MODELS_REJECTING_TEMPERATURE:
+    if _PARAM_COMPAT.has(provider, model, _ADAPT_DROP_TEMPERATURE):
         kwargs.pop("temperature", None)
-    if model in _MODELS_NEEDING_MAX_COMPLETION_TOKENS and "max_tokens" in kwargs:
+    if _PARAM_COMPAT.has(provider, model, _ADAPT_RENAME_MAX_TOKENS) and "max_tokens" in kwargs:
         kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
 
     while True:
@@ -78,11 +187,11 @@ def _chat_completion_resilient(client, kwargs: dict):
             # message alone. That's fine here: neo only ever sends in-range
             # temperatures, so a `temperature` 400 always means rejection.
             if "temperature" in kwargs and "temperature" in msg:
-                _MODELS_REJECTING_TEMPERATURE.add(model)
+                _PARAM_COMPAT.learn(provider, model, _ADAPT_DROP_TEMPERATURE)
                 kwargs.pop("temperature", None)
                 logger.debug(
-                    "Model %s rejected `temperature`; dropped it and retrying",
-                    model,
+                    "Model %s/%s rejected `temperature`; dropped it and retrying",
+                    provider, model,
                 )
                 continue
             # Rename trigger: the message references `max_tokens` and signals
@@ -95,11 +204,11 @@ def _chat_completion_resilient(client, kwargs: dict):
                 or "unsupported" in msg
                 or "not supported" in msg
             ):
-                _MODELS_NEEDING_MAX_COMPLETION_TOKENS.add(model)
+                _PARAM_COMPAT.learn(provider, model, _ADAPT_RENAME_MAX_TOKENS)
                 kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
                 logger.debug(
-                    "Model %s requires `max_completion_tokens`; renamed and "
-                    "retrying", model,
+                    "Model %s/%s requires `max_completion_tokens`; renamed and "
+                    "retrying", provider, model,
                 )
                 continue
             raise
@@ -198,7 +307,7 @@ class OpenAIAdapter(LMAdapter):
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "stop": stop,
-                })
+                }, provider="openai")
                 self._emit_usage_metric(getattr(response, "usage", None))
                 return response.choices[0].message.content
 
@@ -277,16 +386,14 @@ class OpenAIAdapter(LMAdapter):
 # ============================================================================
 
 class AnthropicAdapter(LMAdapter):
-    """Adapter for Anthropic models (Claude)."""
+    """Adapter for Anthropic models (Claude).
 
-    # Claude models that reject the `temperature` sampling parameter with a 400
-    # ("temperature is deprecated for this model") — Opus 4.7+, Sonnet 5,
-    # Fable 5, and later. There's no clean model-string rule (opus-4-6 accepts
-    # it, opus-4-7 rejects it), so instead of hardcoding a taxonomy that goes
-    # stale on the next release, we learn it from the API's own error and
-    # remember it. Class-level so the lesson persists across adapter instances
-    # in a process (multi_agent makes several calls per query).
-    _models_without_temperature: set[str] = set()
+    Newer Claude models (Opus 4.7+, Sonnet 5, Fable 5) reject the `temperature`
+    sampling parameter with a 400. There's no clean model-string rule (opus-4-6
+    accepts it, opus-4-7 rejects it), so rather than hardcode a taxonomy that
+    goes stale on the next release, we learn it from the API's own error and
+    remember it via the persistent `_PARAM_COMPAT` store.
+    """
 
     def __init__(self, model: str = "claude-sonnet-4-5-20250929", api_key: Optional[str] = None):
         self.model = model
@@ -327,10 +434,10 @@ class AnthropicAdapter(LMAdapter):
             "messages": formatted_messages,
             "max_tokens": max_tokens,
         }
-        # Only send `temperature` to models known to accept it. Newer Claude
-        # models (Opus 4.7+, Sonnet 5, Fable 5) reject it; see
-        # `_models_without_temperature`.
-        if self.model not in self._models_without_temperature:
+        # Only send `temperature` to models not already known to reject it
+        # (Opus 4.7+, Sonnet 5, Fable 5). The learn-and-retry below records
+        # rejections into the persistent `_PARAM_COMPAT` store.
+        if not _PARAM_COMPAT.has("anthropic", self.model, _ADAPT_DROP_TEMPERATURE):
             kwargs["temperature"] = temperature
 
         if system_message:
@@ -355,7 +462,7 @@ class AnthropicAdapter(LMAdapter):
                 # succeeds. A 400 for any other reason re-raises untouched.
                 if "temperature" not in kwargs or "temperature" not in str(e).lower():
                     raise
-                self._models_without_temperature.add(self.model)
+                _PARAM_COMPAT.learn("anthropic", self.model, _ADAPT_DROP_TEMPERATURE)
                 kwargs.pop("temperature", None)
                 logger.debug(
                     "Anthropic model %s rejected `temperature`; dropped it "
@@ -536,7 +643,7 @@ class LocalAdapter(LMAdapter):
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stop": stop,
-        })
+        }, provider="local")
         return response.choices[0].message.content
 
     def name(self) -> str:
@@ -664,7 +771,7 @@ class AzureOpenAIAdapter(LMAdapter):
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stop": stop,
-        })
+        }, provider="azure")
         return response.choices[0].message.content
 
     def name(self) -> str:
