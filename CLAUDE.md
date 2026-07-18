@@ -31,11 +31,33 @@
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
     `outcomes.py`) and 50/project (`MAX_INDEPENDENT_FACTS` in `store.py`).
-  - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` run on every
-    cold start (`store.py:190-192`). For on-demand compaction of tombstone bloat in a
-    specific project's fact file, use `neo memory prune [--all] [--dry-run]`
-    (`neo/subcommands.py:_compact_fact_file` — at the package root, not
-    under `memory/`).
+  - Invalidation choke point: `_invalidate(fact, *, cascade=True)` is the single
+    path that sets `is_valid=False`. It **strips the 768-dim embedding at the
+    transition** — a tombstone is never retrieved/deduped/clustered (all such
+    paths pre-filter `is_valid`) but is retained up to 30 days for
+    supersession/audit, so its embedding (~24 KB/fact) is immediate dead weight;
+    stripping at the source keeps bloat from accumulating between sweeps. All six
+    FactStore invalidation sites route through it (eviction, prune, demote,
+    `_cap_independent_facts` with `cascade=False`, `_supersede`,
+    `_synthesize_cluster`); `superseded_by`/`event_time_end` stay at the call
+    site. Safe because invalidation is terminal (merge-on-save returns OURS when
+    we hold it invalid); no current command re-embeds existing facts
+    (`--regenerate-embeddings` targets the legacy ReasoningMemory cache), so the
+    strip is one-way in practice.
+  - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` →
+    `strip_tombstone_embeddings` run on every cold start (`store.py:190-192`),
+    each taking `save=False` so the chain flushes **one** merge-on-save instead
+    of four. `strip_tombstone_embeddings` is now a **backfill** — it only catches
+    tombstones minted off the `_invalidate` path (an ingester superseding a fact;
+    a peer process's still-embedded copy reconciled in) plus any legacy
+    pre-strip rows; it self-heals across processes since every cold start /
+    `detect_implicit_feedback` re-runs it. For on-demand compaction of tombstone
+    bloat in a specific project's fact file, use `neo memory prune [--all]
+    [--dry-run]` (`neo/subcommands.py:_compact_fact_file` — at the package root,
+    not under `memory/`); it both drops 30-day-cold invalid rows and strips
+    embeddings off the retained (<30-day) tombstones (reports `removed` +
+    `stripped`), under the shared `scope_file_lock` so it can't clobber a
+    concurrent observer/request-path `save()`.
   - `neo memory replay-feedback [--all] [--dry-run] [--include-legacy-fallback]
     [--limit N]` re-processes linked session outcomes (ACCEPTED/MODIFIED/UNVERIFIED)
     to update the linked facts' confidence + `success_count` — a manual re-run of
