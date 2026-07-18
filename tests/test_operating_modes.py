@@ -223,6 +223,15 @@ def test_verify_cli_needs_no_provider_and_agent_cli_fails_before_provider(tmp_pa
             "file_path": "src/example.py",
             "code_block": "value = 1",
         }],
+        "goal": {
+            "description": "All checks pass",
+            "success_criteria": [{
+                "type": "command", "command": "pytest", "expected_exit_code": 0,
+            }],
+        },
+        "intent": {"type": "verify_attempt"},
+        "outcome": {"status": "passed", "summary": "checks passed"},
+        "role": "verifier",
     }
 
     verified = subprocess.run(
@@ -237,6 +246,8 @@ def test_verify_cli_needs_no_provider_and_agent_cli_fails_before_provider(tmp_pa
     output = json.loads(verified.stdout)
     assert output["metadata"]["operating_mode"] == "verify"
     assert output["metadata"]["lm_calls"] == 0
+    assert output["goal_assessment"]["status"] == "satisfied"
+    assert output["strategy_assessment"]["decision"] == "stop_success"
 
     agent = subprocess.run(
         [sys.executable, "-m", "neo", "--json"],

@@ -13,8 +13,10 @@ Wire shape:
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from typing import Any
 
+from neo.execution_context import CallerRole, execution_fields_from_dict
 from neo.models import (
     CodeSuggestion,
     ContextFile,
@@ -31,7 +33,9 @@ from neo.operating_mode import AuthorityPolicy, OperatingMode
 
 TOOL_NAME = "neo.process"
 TOOL_DESCRIPTION = (
-    "Mode-explicit code reasoning helper. LEARN is the backward-compatible "
+    "Goal-aware, mode-explicit code reasoning component for agent loops. "
+    "Accepts goal, intent, trajectory, attempt, outcome, role, and success evidence. "
+    "LEARN is the backward-compatible "
     "read-only repository default; AGENT requires explicit authority and a "
     "host execution adapter. Neo never executes generated shell commands."
 )
@@ -135,11 +139,97 @@ def tool_schema() -> dict[str, Any]:
                         "allow_learning": {"type": "boolean", "default": True},
                     },
                 },
+                "goal": {
+                    "type": "object",
+                    "description": "Larger final state pursued by the caller.",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "success_criteria": {"type": "array", "items": {"type": "object"}},
+                    },
+                },
+                "intent": {
+                    "type": "object",
+                    "description": "Why Neo is invoked at this trajectory point.",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                },
+                "constraints": {"type": "array", "items": {"type": "string"}},
+                "success_criteria": {"type": "array", "items": {"type": "object"}},
+                "attempt": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "action_id": {"type": "string"},
+                        "state_fingerprint": {"type": "string"},
+                    },
+                },
+                "outcome": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "goal_progress": {"type": "number"},
+                        "metrics": {"type": "object"},
+                        "new_errors": {"type": "array", "items": {"type": "string"}},
+                        "side_effects": {"type": "array", "items": {"type": "string"}},
+                        "summary": {"type": "string"},
+                        "lesson": {"type": "string"},
+                        "disposition": {"type": "string"},
+                    },
+                },
+                "progress": {
+                    "type": "object",
+                    "properties": {
+                        "metric": {"type": "string"},
+                        "before": {},
+                        "after": {},
+                        "direction": {"type": "string"},
+                    },
+                },
+                "trajectory": {
+                    "type": "object",
+                    "properties": {
+                        "iteration": {"type": "integer", "minimum": 0},
+                        "max_iterations": {"type": "integer", "minimum": 0},
+                        "attempts": {"type": "array", "items": {"type": "object"}},
+                    },
+                },
+                "current_state": {"type": "object"},
+                "role": {
+                    "type": "string",
+                    "enum": [role.value for role in CallerRole],
+                    "default": CallerRole.PLANNER.value,
+                },
+                "requested_output": {"type": "string", "default": "next_action"},
             },
         },
         "returns": {
             "type": "object",
             "description": "Structured NeoOutput. See neo_output_to_dict for the shape.",
+            "properties": {
+                "goal_assessment": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "progress": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                },
+                "strategy_assessment": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {
+                            "type": "string",
+                            "enum": [
+                                "continue", "change_strategy", "stop_success", "stop_blocked",
+                            ],
+                        },
+                        "reason": {"type": "string"},
+                    },
+                },
+                "recommended_next_action": {"type": "object"},
+            },
         },
         "idempotent": False,
     }
@@ -230,6 +320,7 @@ def dict_to_neo_input(params: dict[str, Any]) -> NeoInput:
         operating_mode=operating_mode,
         authority=authority,
         proposed_changes=proposed_changes,
+        **execution_fields_from_dict(params),
     )
 
 
@@ -249,6 +340,13 @@ def neo_output_to_dict(output: NeoOutput) -> dict[str, Any]:
         "confidence": output.confidence,
         "notes": output.notes,
         "metadata": dict(output.metadata),
+        "goal_assessment": (
+            asdict(output.goal_assessment) if output.goal_assessment else None
+        ),
+        "strategy_assessment": (
+            asdict(output.strategy_assessment) if output.strategy_assessment else None
+        ),
+        "recommended_next_action": dict(output.recommended_next_action),
     }
 
 

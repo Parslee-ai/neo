@@ -152,4 +152,10 @@
   caller-provided changes and makes zero LM calls; `agent` requires explicit
   workspace-relative write globs plus a host `ExecutionAdapter`. Neo never executes
   generated command strings, and standalone/CAR-without-executor fail closed.
+- Goal-aware execution envelope (`neo.execution_context`): JSON/CAR callers may supply
+  goal, intent, constraints, success criteria, attempt, outcome, progress, trajectory,
+  caller role, and requested output. Missing goal/intent values are deterministic,
+  confidence-scored provisional context; never promote an inferred goal or intent as
+  durable truth. Retrieval is conditioned on the resolved envelope. Loop stop/change
+  decisions must use observed progress/outcome evidence, never model confidence alone.
 - When creating a pull request, always use the PR template included in the repo.

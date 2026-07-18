@@ -568,6 +568,41 @@ no built-in shell or repository executor, never invokes generated command
 strings, and the standalone CLI fails closed for `agent`. See the
 [operating-mode contract](docs/solutions/operating-modes.md).
 
+### Goal-aware agent-loop envelope
+
+JSON, CAR, and A2A callers can distinguish the larger goal from the current
+task, the reason Neo was invoked, the current attempt, and its observed outcome:
+
+```json
+{
+  "prompt": "Tests still fail in auth/session_test.py",
+  "goal": {
+    "description": "All authentication tests pass",
+    "success_criteria": [
+      {"type": "command", "command": "pytest tests/auth", "expected_exit_code": 0}
+    ]
+  },
+  "intent": {
+    "type": "diagnose_failed_attempt",
+    "description": "Explain why the last fix stalled"
+  },
+  "constraints": ["Do not weaken tests", "Do not change public APIs"],
+  "attempt": {"summary": "Changed session expiry handling"},
+  "outcome": {"status": "failed", "summary": "3 tests remain"},
+  "progress": {"metric": "failing_tests", "before": 11, "after": 3},
+  "trajectory": {"iteration": 4, "max_iterations": 10},
+  "role": "diagnostician",
+  "requested_output": "next_action"
+}
+```
+
+The response includes `goal_assessment`, `strategy_assessment`, and
+`recommended_next_action`. Missing goal and intent fields are inferred locally,
+marked `origin=inferred` with bounded confidence, and retained only as
+provisional episode context. They cannot become durable policy. Retrieval uses
+the resolved goal, intent, constraints, attempt, and outcome—not just the task
+string. See the [execution-envelope contract](docs/solutions/goal-aware-execution-envelope.md).
+
 
 ### Memory Maintenance
 

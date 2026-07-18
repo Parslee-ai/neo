@@ -161,11 +161,26 @@ class NeoEngine:
         9. Return structured output
         """
         self._validate_operating_mode(neo_input)
+        from neo.execution_context import resolve_execution_context
+        self.resolved_execution_context = resolve_execution_context(neo_input)
         self.context = neo_input
         start_time = time.time()
         self.action_log.clear()
         self.last_applied_actions: list[AppliedAction] = []
         self.current_learning_episode = self._begin_learning_episode(neo_input)
+        from neo.memory.metrics import record as record_memory_metric
+        record_memory_metric(
+            "execution_context_resolved",
+            episode_id=self.current_learning_episode.episode_id,
+            session_id=self.current_learning_episode.session_id,
+            task_id=self.current_learning_episode.task_id,
+            goal_origin=self.resolved_execution_context.goal.origin,
+            goal_confidence=self.resolved_execution_context.goal.confidence,
+            intent_origin=self.resolved_execution_context.intent.origin,
+            intent_confidence=self.resolved_execution_context.intent.confidence,
+            role=self.resolved_execution_context.role.value,
+            iteration=self.resolved_execution_context.trajectory.iteration,
+        )
 
         # Spawn the loop-detection watchdog for this run (G3 wire-up).
         # The overseer ticks on a deterministic schedule and emits
@@ -246,7 +261,46 @@ class NeoEngine:
             model=model,
             operating_mode=neo_input.operating_mode.value,
             authority=(neo_input.authority.public_summary() if neo_input.authority else {}),
+            execution_context=self._safe_execution_context_dict(),
         )
+
+    def _safe_execution_context_dict(self) -> dict[str, Any]:
+        """Return a bounded, secret-redacted envelope safe for local evidence."""
+        from neo.memory.episodes import redact_sensitive_text
+
+        def clean(value, depth=0, key=""):
+            if depth > 5:
+                return "[TRUNCATED]"
+            sensitive_payload_key = any(
+                token in key.lower()
+                for token in ("content", "source", "code", "diff", "patch")
+            )
+            if sensitive_payload_key and value not in (None, ""):
+                serialized = json.dumps(value, sort_keys=True, default=str)
+                return {
+                    "sha256": content_hash(serialized),
+                    "size": len(serialized),
+                }
+            if key == "current_state" and isinstance(value, dict):
+                return {
+                    str(item_key)[:100]: clean(item, depth + 1, str(item_key))
+                    for item_key, item in list(value.items())[:50]
+                }
+            if isinstance(value, str):
+                return redact_sensitive_text(value)[:2000]
+            if isinstance(value, dict):
+                return {
+                    str(item_key)[:100]: clean(item, depth + 1, str(item_key))
+                    for item_key, item in list(value.items())[:50]
+                }
+            if isinstance(value, list):
+                return [clean(item, depth + 1, key) for item in value[:50]]
+            if isinstance(value, (int, float, bool)) or value is None:
+                return value
+            return redact_sensitive_text(str(value))[:500]
+
+        from neo.memory.episodes import content_hash
+        return clean(self.resolved_execution_context.to_dict())
 
     def _validate_operating_mode(self, neo_input: NeoInput) -> None:
         """Fail closed before inference for invalid verification or agent requests."""
@@ -354,7 +408,7 @@ class NeoEngine:
             )
             for change in neo_input.proposed_changes
         ]
-        constraints = self._extract_prompt_constraints(neo_input.prompt)
+        constraints = self._extract_input_constraints(neo_input)
         static_checks = self._run_static_checks(suggestions, constraints)
         statuses = [self._static_check_status(check) for check in static_checks]
         confidence = (
@@ -463,7 +517,7 @@ class NeoEngine:
 
         # Extract verifiable constraints from the prompt so the LM sees them
         # explicitly and we can check them post-hoc.
-        extracted_constraints = self._extract_prompt_constraints(neo_input.prompt)
+        extracted_constraints = self._extract_input_constraints(neo_input)
         if extracted_constraints:
             enriched_context["verifiable_constraints"] = [
                 {"type": c.type.value, "description": c.description}
@@ -502,6 +556,7 @@ class NeoEngine:
             self._log_action("lm_call", neo_input.prompt[:60])
             plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
         self._capture_detectable_fact_use(plan, simulation_traces, code_suggestions)
+        code_suggestions = self._apply_role_boundary(code_suggestions)
         self.last_simulation_traces = simulation_traces
         self.last_applied_actions = self._execute_authorized_suggestions(
             neo_input, code_suggestions
@@ -579,6 +634,26 @@ class NeoEngine:
             early_exit=False,
         )
 
+    def _apply_role_boundary(
+        self, suggestions: list[CodeSuggestion]
+    ) -> list[CodeSuggestion]:
+        """Prevent advisory loop roles from silently becoming implementers."""
+        from neo.execution_context import CallerRole
+
+        restricted = {
+            CallerRole.CRITIC,
+            CallerRole.VERIFIER,
+            CallerRole.STRATEGY_SELECTOR,
+            CallerRole.MEMORY_RETRIEVER,
+            CallerRole.POSTMORTEM_ANALYZER,
+        }
+        explicit_code_request = self.resolved_execution_context.requested_output in {
+            "patch", "implementation", "code_change",
+        }
+        if self.resolved_execution_context.role in restricted and not explicit_code_request:
+            return []
+        return suggestions
+
     def _finalize_output(
         self,
         *,
@@ -640,6 +715,22 @@ class NeoEngine:
                 ],
                 candidates_by_suggestion=candidates,
             )
+            attempt_fact = self.fact_store.persist_attempt_outcome(
+                execution_context=self._safe_execution_context_dict(),
+                learning_episode_id=episode.episode_id if episode else "",
+                repository_revision=episode.repository_revision if episode else "",
+            )
+            if attempt_fact is not None and episode is not None:
+                import uuid
+                from neo.memory.episodes import MemoryMutationEvidence
+
+                episode.memory_mutations.append(MemoryMutationEvidence(
+                    mutation_id=uuid.uuid4().hex,
+                    operation="add_observed_attempt_episode_fact",
+                    fact_id=attempt_fact.id,
+                    reason="caller supplied both attempt and observed outcome",
+                    after_state=self.fact_store._fact_learning_state(attempt_fact),
+                ))
 
         elapsed = time.time() - start_time
         self._log_metrics(difficulty, time_budget, elapsed, early_exit=early_exit)
@@ -648,6 +739,7 @@ class NeoEngine:
         metadata["operating_mode"] = neo_input.operating_mode.value
         metadata["learning_enabled_for_request"] = learning_allowed
         metadata["repository_actions"] = len(self.last_applied_actions)
+        metadata["execution_context"] = self._safe_execution_context_dict()
         # Reasoning-tier provenance — always explainable which path ran and why.
         metadata["reasoning_mode"] = getattr(self, "last_reasoning_mode", "fast")
         reason = getattr(self, "last_reasoning_reason", "")
@@ -673,6 +765,31 @@ class NeoEngine:
             metadata=metadata,
         )
 
+        from neo.execution_context import assess_loop
+        goal_assessment, strategy_assessment = assess_loop(
+            self.resolved_execution_context
+        )
+        from neo.memory.metrics import record as record_memory_metric
+        record_memory_metric(
+            "loop_assessed",
+            episode_id=(
+                self.current_learning_episode.episode_id
+                if self.current_learning_episode else ""
+            ),
+            goal_status=goal_assessment.status,
+            progress=goal_assessment.progress,
+            strategy_decision=strategy_assessment.decision,
+        )
+        recommended_next_action: dict[str, Any] = {}
+        if plan:
+            recommended_next_action = {
+                "description": plan[0].description,
+                "rationale": plan[0].rationale,
+            }
+        if code_suggestions:
+            recommended_next_action["suggestion_id"] = code_suggestions[0].suggestion_id
+            recommended_next_action["file_path"] = code_suggestions[0].file_path
+
         output = NeoOutput(
             plan=plan,
             simulation_traces=simulation_traces,
@@ -682,6 +799,9 @@ class NeoEngine:
             confidence=confidence,
             notes=self._generate_notes(plan, simulation_traces, static_checks),
             metadata=metadata,
+            goal_assessment=goal_assessment,
+            strategy_assessment=strategy_assessment,
+            recommended_next_action=recommended_next_action,
         )
         self._log_usage_telemetry(output, neo_input)
         return output
@@ -905,6 +1025,8 @@ class NeoEngine:
             "files": neo_input.context_files,
             "error_trace": neo_input.error_trace,
             "commands": neo_input.recent_commands,
+            "execution_context": self.resolved_execution_context,
+            "execution_envelope_text": self.resolved_execution_context.prompt_section(),
         }
 
         # Optionally read additional files within safe allowlist
@@ -916,6 +1038,14 @@ class NeoEngine:
             context["additional_files"] = additional_files
 
         return context
+
+    @staticmethod
+    def _retrieval_query(context: dict[str, Any]) -> str:
+        """Condition semantic retrieval on the larger goal and trajectory."""
+        envelope = context.get("execution_context")
+        if envelope is not None:
+            return envelope.retrieval_query()
+        return context.get("prompt", "")
 
     def _read_safe_files(
         self, safe_paths: list[str], working_dir: Optional[str]
@@ -959,7 +1089,7 @@ class NeoEngine:
         past_learnings = []
         if self.fact_store is not None:
             # Use FactStore: build_context + format_context_for_prompt
-            prompt_text = context.get("prompt", "")
+            prompt_text = self._retrieval_query(context)
             k = self._adaptive_k_selection(prompt_text, context)
             fact_context = self.fact_store.build_context(prompt_text, environment=context, k=k)
             self._capture_retrieval_context(fact_context, included=True)
@@ -1201,7 +1331,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         from neo.reasoning_effort import MemorySignal, signal_from_facts
         if self.fact_store is not None:
             try:
-                prompt_text = context.get("prompt", "")
+                prompt_text = self._retrieval_query(context)
                 k = self._adaptive_k_selection(prompt_text, context)
                 fc = self.fact_store.build_context(prompt_text, environment=context, k=k)
                 self._capture_retrieval_context(fc, included=False)
@@ -1267,7 +1397,9 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         from neo.multi_agent import MultiAgentReasoner
         prompt = context.get("prompt", "")
         ctx_str = ""
-        for key in ("past_learnings", "verifiable_constraints"):
+        for key in (
+            "execution_envelope_text", "past_learnings", "verifiable_constraints",
+        ):
             v = context.get(key)
             if v:
                 ctx_str += (str(v)[:2000] + "\n\n")
@@ -1303,7 +1435,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         past_learnings = []
         memory_signal = MemorySignal()
         if self.fact_store is not None:
-            prompt_text = context.get("prompt", "")
+            prompt_text = self._retrieval_query(context)
             k = self._adaptive_k_selection(prompt_text, context)
             fact_context = self.fact_store.build_context(prompt_text, environment=context, k=k)
             self._capture_retrieval_context(fact_context, included=True)
@@ -1334,6 +1466,8 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         task_type = context.get('task_type', 'unknown')
         task_type_str = task_type.value if hasattr(task_type, 'value') else str(task_type)
         parts = [f"Task: {context['prompt']}", f"Task Type: {task_type_str}"]
+        if context.get("execution_envelope_text"):
+            parts.append(context["execution_envelope_text"])
 
         # Inject project-local agent instructions (CLAUDE.md, .cursor/rules, etc.)
         # before the file dump so the model sees the team's written guidance
@@ -1513,6 +1647,15 @@ RULES:
         except Exception as e:
             logger.debug(f"Constraint extraction failed: {e}")
             return []
+
+    def _extract_input_constraints(self, neo_input: NeoInput) -> list:
+        """Combine task text and explicit envelope constraints for static checks."""
+        text = neo_input.prompt
+        if neo_input.constraints:
+            text += "\nConstraints:\n" + "\n".join(
+                f"- {item}" for item in neo_input.constraints
+            )
+        return self._extract_prompt_constraints(text)
 
     @staticmethod
     def _strip_comments_and_strings(code: str) -> str:
@@ -2615,6 +2758,9 @@ Generate precise unified diffs based on the plan and simulation results. Keep ch
             f"\nTask Type: {context.get('task_type', 'unknown')}",
         ]
 
+        if context.get("execution_envelope_text"):
+            prompt_parts.append(f"\n{context['execution_envelope_text']}")
+
         if context.get("files"):
             prompt_parts.append(f"\nContext Files: {len(context['files'])} provided")
 
@@ -2639,7 +2785,9 @@ Generate precise unified diffs based on the plan and simulation results. Keep ch
         self, plan: list[PlanStep], context: dict[str, Any]
     ) -> str:
         """Format prompt for algorithm simulation."""
-        return f"""Given this plan:
+        return f"""{context.get('execution_envelope_text', '')}
+
+Given this plan:
 {self._format_plan_for_prompt(plan)}
 
 Synthesize 3-5 test inputs and trace through expected outputs step by step.
@@ -2649,7 +2797,9 @@ Identify any edge cases or issues."""
         self, plan: list[PlanStep], context: dict[str, Any]
     ) -> str:
         """Format prompt for refactor simulation."""
-        return f"""Given this refactoring plan:
+        return f"""{context.get('execution_envelope_text', '')}
+
+Given this refactoring plan:
 {self._format_plan_for_prompt(plan)}
 
 Analyze dependency impact. What modules/functions will be affected?
@@ -2660,7 +2810,9 @@ What are the risks?"""
     ) -> str:
         """Format prompt for bugfix simulation."""
         error_trace = context.get("error_trace", "No trace provided")
-        return f"""Given this bugfix plan:
+        return f"""{context.get('execution_envelope_text', '')}
+
+Given this bugfix plan:
 {self._format_plan_for_prompt(plan)}
 
 Error Trace:
@@ -2672,7 +2824,9 @@ Trace the execution path that leads to the error. What's the root cause?"""
         self, plan: list[PlanStep], context: dict[str, Any]
     ) -> str:
         """Format prompt for generic simulation."""
-        return f"""Given this plan:
+        return f"""{context.get('execution_envelope_text', '')}
+
+Given this plan:
 {self._format_plan_for_prompt(plan)}
 
 Reason through the execution step by step. Identify potential issues."""
@@ -2684,7 +2838,9 @@ Reason through the execution step by step. Identify potential issues."""
         context: dict[str, Any],
     ) -> str:
         """Format prompt for code generation."""
-        return f"""Plan:
+        return f"""{context.get('execution_envelope_text', '')}
+
+Plan:
 {self._format_plan_for_prompt(plan)}
 
 Simulation Results:

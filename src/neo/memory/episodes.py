@@ -24,7 +24,7 @@ from neo.memory.io_utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
-EPISODE_SCHEMA_VERSION = 2
+EPISODE_SCHEMA_VERSION = 3
 MAX_EPISODES_PER_PROJECT = 500
 
 _SECRET_PATTERNS = (
@@ -176,6 +176,7 @@ class LearningEpisode:
     model: str = ""
     operating_mode: str = "learn"
     authority: dict[str, Any] = field(default_factory=dict)
+    execution_context: dict[str, Any] = field(default_factory=dict)
     suggestions: list[SuggestionEvidence] = field(default_factory=list)
     applied_actions: list[dict[str, Any]] = field(default_factory=list)
     verification: list[VerificationEvidence] = field(default_factory=list)
@@ -227,6 +228,7 @@ class LearningEpisode:
             model=str(data.get("model", "")),
             operating_mode=str(data.get("operating_mode", "learn")),
             authority=dict(data.get("authority", {})),
+            execution_context=dict(data.get("execution_context", {})),
             suggestions=[SuggestionEvidence(**item) for item in data.get("suggestions", [])],
             applied_actions=list(data.get("applied_actions", [])),
             verification=verification,

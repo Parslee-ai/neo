@@ -37,6 +37,7 @@ from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
 from neo.memory.models import (
     ContextResult,
+    EpisodeContext,
     Fact,
     FactKind,
     FactMetadata,
@@ -430,7 +431,10 @@ class FactStore:
         # chance to fire. The supersession check below handles fuzzy
         # near-duplicates; this catches exact (post-generalize) twins
         # within the same scope, regardless of kind.
-        existing = self._exact_canonical_match(fact)
+        # Instance-specific EPISODE facts are evidence events, not semantic
+        # assertions. Repeated attempts must remain distinct for trajectory
+        # attribution, so they bypass semantic dedup and supersession.
+        existing = None if kind == FactKind.EPISODE else self._exact_canonical_match(fact)
         if existing is not None:
             # Bump access metadata on the existing record and return it
             # rather than writing a new row. Idempotent re-ingestion.
@@ -452,7 +456,7 @@ class FactStore:
         fact.embedding = self._embed_text(fact.embed_text())
 
         # Check for supersession candidate (fuzzy near-duplicate, same kind+scope).
-        candidate = self._find_supersession_candidate(fact)
+        candidate = None if kind == FactKind.EPISODE else self._find_supersession_candidate(fact)
         if candidate:
             self._supersede(candidate, fact)
 
@@ -843,6 +847,78 @@ class FactStore:
         # know this represents a simulation that ran *now*.
         fact.metadata.event_time = ts_now
         fact.metadata.ingest_time = ts_now
+        self.save()
+        return fact
+
+    def persist_attempt_outcome(
+        self,
+        *,
+        execution_context: dict[str, Any],
+        learning_episode_id: str,
+        repository_revision: str,
+    ) -> Optional[Fact]:
+        """Persist one caller-observed attempt/outcome as procedural evidence.
+
+        This writes an EPISODE fact, never a constraint, policy, or promoted
+        pattern. The caller must pass an already bounded and redacted envelope.
+        """
+        attempt = execution_context.get("attempt")
+        outcome = execution_context.get("outcome")
+        if not isinstance(attempt, dict) or not isinstance(outcome, dict):
+            return None
+
+        goal = execution_context.get("goal", {})
+        intent = execution_context.get("intent", {})
+        goal_value = (
+            goal.get("value", "")
+            if isinstance(goal, dict) and goal.get("origin") == "explicit"
+            else ""
+        )
+        intent_value = (
+            intent.get("value", "")
+            if isinstance(intent, dict) and intent.get("origin") == "explicit"
+            else ""
+        )
+        status = str(outcome.get("status", "unknown"))
+        observed_status = status.lower() in {
+            "passed", "success", "succeeded", "failed", "failure",
+            "modified", "regressed", "reverted",
+        }
+        action = str(attempt.get("summary", ""))
+        narrative = {
+            "goal": goal_value,
+            "intent": intent_value,
+            "action": action,
+            "outcome": outcome,
+            "progress": execution_context.get("progress"),
+            "trajectory": execution_context.get("trajectory"),
+            "source_learning_episode_id": learning_episode_id,
+            "repository_revision": repository_revision,
+        }
+        body = json.dumps(narrative, sort_keys=True, ensure_ascii=False)
+        fact = self.add_fact(
+            subject=f"attempt outcome: {status} — {action[:120]}",
+            body=body,
+            kind=FactKind.EPISODE,
+            scope=FactScope.PROJECT,
+            confidence=0.7 if observed_status else 0.3,
+            source_prompt=str(execution_context.get("task", ""))[:500],
+            tags=["attempt", "observed-outcome", f"outcome:{status}"],
+            provenance=Provenance.OBSERVED,
+            retrieval_text=(
+                f"Goal: {goal_value}\nIntent: {intent_value}\n"
+                f"Action: {action}\nOutcome: {status} {outcome.get('summary', '')}"
+            ),
+            context_text=body,
+        )
+        fact.episode_context = EpisodeContext(
+            when=str(time.time()),
+            where=self.codebase_root or "",
+            why=intent_value or None,
+            with_whom="external-agent-loop",
+        )
+        fact.metadata.event_time = time.time()
+        fact.metadata.ingest_time = fact.metadata.event_time
         self.save()
         return fact
 

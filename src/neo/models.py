@@ -13,6 +13,18 @@ from enum import Enum
 import uuid
 from typing import Any, Literal, Optional, TypedDict
 
+from neo.execution_context import (
+    AttemptContext,
+    CallerRole,
+    GoalAssessment,
+    GoalSpec,
+    IntentSpec,
+    OutcomeContext,
+    ProgressSignal,
+    StrategyAssessment,
+    SuccessCriterion,
+    TrajectoryContext,
+)
 from neo.operating_mode import AuthorityPolicy, OperatingMode
 
 
@@ -50,6 +62,17 @@ class NeoInput:
     operating_mode: OperatingMode = OperatingMode.LEARN
     authority: Optional[AuthorityPolicy] = None
     proposed_changes: list["ProposedChange"] = field(default_factory=list)
+    goal: Optional[GoalSpec] = None
+    intent: Optional[IntentSpec] = None
+    constraints: list[str] = field(default_factory=list)
+    success_criteria: list[SuccessCriterion] = field(default_factory=list)
+    attempt: Optional[AttemptContext] = None
+    outcome: Optional[OutcomeContext] = None
+    progress: Optional[ProgressSignal] = None
+    trajectory: TrajectoryContext = field(default_factory=TrajectoryContext)
+    current_state: dict[str, Any] = field(default_factory=dict)
+    role: CallerRole = CallerRole.PLANNER
+    requested_output: str = "next_action"
 
 
 @dataclass
@@ -155,6 +178,9 @@ class NeoOutput:
     confidence: float
     notes: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    goal_assessment: Optional[GoalAssessment] = None
+    strategy_assessment: Optional[StrategyAssessment] = None
+    recommended_next_action: dict[str, Any] = field(default_factory=dict)
 
 
 class RegenerateStats(TypedDict):

@@ -28,6 +28,7 @@ from neo.models import (
     TaskType,
 )
 from neo.operating_mode import OperatingMode
+from neo.execution_context import CallerRole, GoalAssessment, StrategyAssessment
 
 
 class TestToolSchema:
@@ -63,6 +64,20 @@ class TestToolSchema:
         assert properties["operating_mode"]["default"] == "learn"
         assert "authority" in properties
         assert "proposed_changes" in properties
+
+    def test_schema_advertises_goal_aware_execution_envelope(self):
+        properties = tool_schema()["parameters"]["properties"]
+        for field in (
+            "goal", "intent", "constraints", "success_criteria", "attempt",
+            "outcome", "progress", "trajectory", "current_state", "role",
+            "requested_output",
+        ):
+            assert field in properties
+        assert set(properties["role"]["enum"]) == {role.value for role in CallerRole}
+        returns = tool_schema()["returns"]["properties"]
+        assert set(returns["strategy_assessment"]["properties"]["decision"]["enum"]) == {
+            "continue", "change_strategy", "stop_success", "stop_blocked",
+        }
 
     def test_schema_is_not_idempotent(self):
         # Every call should re-run the pipeline (memory updates, etc.).
@@ -134,6 +149,38 @@ class TestDictToNeoInput:
         ni = dict_to_neo_input({"prompt": "p", "operating_mode": "future-mode"})
         assert ni.operating_mode is OperatingMode.LEARN
 
+    def test_goal_aware_envelope_round_trip(self):
+        ni = dict_to_neo_input({
+            "prompt": "Tests still fail",
+            "goal": {
+                "description": "All auth tests pass",
+                "success_criteria": [{
+                    "type": "command", "command": "pytest tests/auth",
+                    "expected_exit_code": 0,
+                }],
+            },
+            "intent": {"type": "diagnose_failed_attempt"},
+            "constraints": ["Do not weaken tests"],
+            "attempt": {"summary": "Changed expiry handling"},
+            "outcome": {
+                "status": "failed",
+                "summary": "3 failures remain",
+                "lesson": "Expiry and revocation failures are distinct",
+                "disposition": "superseded",
+            },
+            "progress": {"metric": "failing_tests", "before": 11, "after": 3},
+            "trajectory": {"iteration": 4, "max_iterations": 10},
+            "role": "diagnostician",
+            "requested_output": "next_action",
+        })
+
+        assert ni.goal.description == "All auth tests pass"
+        assert ni.goal.success_criteria[0].expected_exit_code == 0
+        assert ni.intent.type == "diagnose_failed_attempt"
+        assert ni.progress.direction == "improved"
+        assert ni.outcome.lesson == "Expiry and revocation failures are distinct"
+        assert ni.role is CallerRole.DIAGNOSTICIAN
+
     def test_malformed_context_files_are_skipped(self):
         # Defensive: A2A peers aren't trusted — drop malformed entries
         # rather than raising and rejecting the whole call.
@@ -203,6 +250,9 @@ class TestNeoOutputToDict:
             confidence=0.85,
             notes="all good",
             metadata={"early_exit": True},
+            goal_assessment=GoalAssessment("in_progress", "improved", "11 -> 3"),
+            strategy_assessment=StrategyAssessment("continue", "progress observed"),
+            recommended_next_action={"description": "inspect remaining failures"},
         )
 
         d = neo_output_to_dict(output)
@@ -216,6 +266,8 @@ class TestNeoOutputToDict:
         assert decoded["code_suggestions"][0]["confidence"] == 0.91
         assert decoded["static_checks"][0]["diagnostics"][0]["code"] == "F401"
         assert decoded["metadata"]["early_exit"] is True
+        assert decoded["goal_assessment"]["status"] == "in_progress"
+        assert decoded["strategy_assessment"]["decision"] == "continue"
 
     def test_empty_output_serializes_cleanly(self):
         output = NeoOutput(

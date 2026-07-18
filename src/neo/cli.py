@@ -16,6 +16,7 @@ import logging
 import os
 import select
 import sys
+from dataclasses import asdict
 
 # Disable tokenizer parallelism warning (fastembed uses HuggingFace tokenizers)
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
@@ -37,6 +38,7 @@ from neo.models import (  # noqa: E402, F401
     ProposedChange,
 )
 from neo.operating_mode import AuthorityPolicy, OperatingMode  # noqa: E402
+from neo.execution_context import execution_fields_from_dict  # noqa: E402
 
 
 class _VerificationOnlyAdapter(LMAdapter):
@@ -812,6 +814,7 @@ def main():
                     for change in input_data.get("proposed_changes", [])
                     if isinstance(change, dict)
                 ],
+                **execution_fields_from_dict(input_data),
             )
             if not args.json:
                 _print_neo_greeting(neo_input.prompt, working_dir)
@@ -1071,6 +1074,14 @@ def main():
             "confidence": output.confidence,
             "notes": output.notes,
             "metadata": output.metadata,
+            "goal_assessment": (
+                asdict(output.goal_assessment) if output.goal_assessment else None
+            ),
+            "strategy_assessment": (
+                asdict(output.strategy_assessment)
+                if output.strategy_assessment else None
+            ),
+            "recommended_next_action": output.recommended_next_action,
         }
 
         # Add confidence interpretation for better UX

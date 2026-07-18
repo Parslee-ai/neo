@@ -12,6 +12,7 @@ from neo.memory.episodes import (
 )
 from neo.memory.models import ContextResult, Fact
 from neo.models import ContextFile, NeoInput
+from neo.execution_context import GoalSpec, IntentSpec
 
 
 class _CombinedLM:
@@ -263,3 +264,30 @@ def test_objective_credentials_are_redacted(tmp_path, monkeypatch):
     assert episode is not None
     assert secret not in episode.objective
     assert "[REDACTED]" in episode.objective
+
+
+def test_execution_envelope_is_persisted_with_explicit_inference_provenance(
+    tmp_path, monkeypatch,
+):
+    engine = NeoEngine(
+        lm_adapter=_CombinedLM(),
+        enable_persistent_memory=False,
+        codebase_root=str(tmp_path),
+    )
+    monkeypatch.setattr(engine, "_car_route_capability", lambda prompt: (False, 0, None))
+    monkeypatch.setattr(engine, "_run_static_checks", lambda suggestions, constraints=None: [])
+
+    output = engine.process(NeoInput(
+        prompt="Tests still fail",
+        goal=GoalSpec("All auth tests pass"),
+        intent=IntentSpec("diagnose_failed_attempt"),
+        current_state={"source_code": "SECRET_SOURCE_PAYLOAD"},
+    ))
+
+    episode = engine.episode_store.load(output.metadata["learning_episode_id"])
+    assert episode.schema_version == EPISODE_SCHEMA_VERSION == 3
+    assert episode.execution_context["goal"]["origin"] == "explicit"
+    assert episode.execution_context["intent"]["origin"] == "explicit"
+    assert "SECRET_SOURCE_PAYLOAD" not in json.dumps(episode.execution_context)
+    assert episode.execution_context["current_state"]["source_code"]["sha256"]
+    assert output.goal_assessment.status == "in_progress"
