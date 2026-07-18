@@ -87,7 +87,15 @@ PROTECTION_BOOST = 0.05        # Confidence boost for consistently helpful facts
 MAX_INDEPENDENT_FACTS = 50     # Cap per project to prevent bloat from active repos
 
 # Tags that protect facts from pruning/demotion (curated knowledge)
-PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
+# Facts the janitors (probation, prune, demote, evict, independent-cap) must
+# never touch. 'episode-derived'/'durable' mark facts promoted from repeated,
+# independently-verified evidence — they must survive on that provenance, not on
+# the accident of carrying success_count>=2. This is janitor protection only;
+# retrieval decay is governed separately by models._CURATED_TAGS. Intentional
+# rollback (_invalidate on repeated attributed contradiction) bypasses this.
+PROTECTED_TAGS = frozenset(
+    {"seed", "community", "synthesized", "episode-derived", "durable"}
+)
 
 # Dual-buffer consolidation (paper 2603.07670 §9.1). New non-curated
 # facts enter a "hot probation buffer" via the ``probation`` tag. They
@@ -1067,7 +1075,12 @@ class FactStore:
                         candidate.status = "rejected_by_verification"
                     else:
                         candidate.status = "supported_once"
-                        candidate.promoted_fact_id = fact_id
+                        # Invariant: promoted_fact_id is written ONLY by the
+                        # promotion path (_promote_repeatedly_supported_candidate).
+                        # Setting it here to the outcome's mutation-target fact_id
+                        # was wrong — a supported-once candidate isn't promoted —
+                        # and would mislead _apply_candidate_contradiction into
+                        # demoting an unrelated fact. Leave it "" until promotion.
                         if episode.episode_id not in candidate.supporting_episode_ids:
                             candidate.supporting_episode_ids.append(episode.episode_id)
                 elif outcome.outcome_type in (OutcomeType.MODIFIED, OutcomeType.REGRESSION):
@@ -1113,6 +1126,32 @@ class FactStore:
             "invalidation_reason": fact.invalidation_reason,
         }
 
+    def _resolve_promoted_fact_by_signature(
+        self, subject: str, body: str
+    ) -> Optional[Fact]:
+        """Find the valid episode-derived fact a candidate promoted into, keyed by
+        the same canonical signature promotion itself matches on.
+
+        Needed because ``promoted_fact_id`` is written only onto the ORIGINAL
+        supporting episodes' candidates at promotion time. A contradiction always
+        arrives on a *new* episode whose candidate has ``promoted_fact_id == ""``,
+        so resolving by signature is the only way a user correction can reach the
+        fact it was promoted into.
+        """
+        from neo.memory.generalize import generalize
+
+        signature = generalize(f"{subject} {body}")
+        if not signature:
+            return None
+        for fact in self._facts:
+            if (
+                fact.is_valid
+                and "episode-derived" in fact.tags
+                and generalize(f"{fact.subject} {fact.body}") == signature
+            ):
+                return fact
+        return None
+
     def _apply_candidate_contradiction(
         self, outcome
     ) -> tuple[Optional[Fact], dict[str, Any]]:
@@ -1134,15 +1173,22 @@ class FactStore:
             episode = episode_store.load(outcome.learning_episode_id)
             if episode is None:
                 return None, {}
-            promoted_fact_id = next((
-                candidate.promoted_fact_id
-                for candidate in episode.memory_candidates
-                if candidate.candidate_id == outcome.candidate_id
-            ), "")
+            candidate = next((
+                item for item in episode.memory_candidates
+                if item.candidate_id == outcome.candidate_id
+            ), None)
             fact = next((
                 item for item in self._facts
-                if item.id == promoted_fact_id
+                if candidate is not None and item.id == candidate.promoted_fact_id
             ), None)
+            if fact is None and candidate is not None:
+                # A correction arrives on a NEW episode whose candidate carries
+                # no promoted_fact_id; resolve the promoted fact by canonical
+                # signature so the rollback contract is not a no-op on the only
+                # path users actually exercise.
+                fact = self._resolve_promoted_fact_by_signature(
+                    candidate.subject, candidate.body
+                )
             if fact is None:
                 return None, {}
 
@@ -1265,6 +1311,24 @@ class FactStore:
             if len(supporting_ids) < 2:
                 return None
 
+            # Respect a prior rollback: if this signature was already rolled back
+            # by repeated attributed contradiction, do not resurrect it as a
+            # fresh valid fact. The invalidated fact is the retracted-signature
+            # record — purge_dead_facts exempts it, so this block is durable, not
+            # a 30-day window. Only a pattern that generalizes to a DIFFERENT
+            # signature can promote past it.
+            for existing in self._facts:
+                if (
+                    not existing.is_valid
+                    and existing.invalidation_reason == "repeated_attributed_contradiction"
+                    and generalize(f"{existing.subject} {existing.body}") == target_signature
+                ):
+                    logger.info(
+                        "Skipping re-promotion of a pattern previously rolled back "
+                        "by repeated attributed contradiction"
+                    )
+                    return None
+
             fact = self.add_fact(
                 subject=outcome.candidate_subject,
                 body=outcome.candidate_body,
@@ -1306,18 +1370,132 @@ class FactStore:
             logger.warning("Episode candidate promotion failed: %s", exc)
             return None
 
+    def _cross_project_evidence(self, target_signature: str, episodes_root: "Path"):
+        """Collect (supporting, project_ids, episode_ids) for one canonical
+        signature across every project's episodes. One supporting entry per
+        (episode, signature)."""
+        from neo.memory.episodes import LearningEpisodeStore
+        from neo.memory.generalize import generalize
+
+        supporting: list[tuple[str, Any]] = []
+        project_ids: set[str] = set()
+        for project_path in sorted(p for p in episodes_root.iterdir() if p.is_dir()):
+            episode_store = LearningEpisodeStore(project_path.name, base_dir=episodes_root)
+            for episode in episode_store.list():
+                for candidate in episode.memory_candidates:
+                    if candidate.kind != FactKind.PATTERN.value:
+                        continue
+                    if candidate.status not in {"supported_once", "durable"}:
+                        continue
+                    if generalize(f"{candidate.subject} {candidate.body}") != target_signature:
+                        continue
+                    supporting.append((episode.project_id or project_path.name, episode))
+                    project_ids.add(episode.project_id or project_path.name)
+                    break
+        episode_ids = list(dict.fromkeys(ep.episode_id for _, ep in supporting))
+        return supporting, project_ids, episode_ids
+
+    def _mint_global_fact(
+        self, target_signature: str, subject_src: str, body_src: str,
+        episodes_root: "Path", source_candidate_id: str = "",
+    ) -> Optional[Fact]:
+        """Promote one signature to global scope IF its cross-project evidence
+        meets the bar and it isn't already global. Shared by the per-request
+        gated path and the observer reconcile sweep. Returns the fact or None."""
+        import re
+        import uuid
+
+        from neo.memory.episodes import LearningEpisodeStore, MemoryMutationEvidence, redact_sensitive_text
+        from neo.memory.generalize import generalize
+
+        supporting, project_ids, episode_ids = self._cross_project_evidence(
+            target_signature, episodes_root
+        )
+        if (
+            len(project_ids) < GLOBAL_PROMOTION_MIN_PROJECTS
+            or len(episode_ids) < GLOBAL_PROMOTION_MIN_EPISODES
+        ):
+            return None
+        # Idempotency (structural, snapshot-independent): once minted, the
+        # supporting candidates carry promoted_global_fact_id ON DISK. A non-empty
+        # link on a signature-matching candidate means this signature was already
+        # promoted globally — skip. Keying on a promoted-fact-id *membership in
+        # this process's in-memory global set* would be a bug: the async observer
+        # holds a global snapshot frozen at store-init, so a fact a concurrent CLI
+        # process just sync-minted (and linked on disk) would be invisible to the
+        # observer and re-minted as a duplicate. The on-disk link is the source of
+        # truth; trust it regardless of the local snapshot. (The global fact's own
+        # text is redacted + path-stripped, so re-deriving its signature to match
+        # wouldn't work either — the link is the only reliable key.)
+        for _pid, episode in supporting:
+            for candidate in episode.memory_candidates:
+                if (
+                    candidate.promoted_global_fact_id
+                    and generalize(f"{candidate.subject} {candidate.body}") == target_signature
+                ):
+                    return None
+
+        # Global memory receives only deterministic generalized text, with
+        # path-like bracket qualifiers removed and credential redaction.
+        subject = re.sub(r"\[[^\]]+\]", "", generalize(subject_src))
+        body = re.sub(r"\[[^\]]+\]", "", generalize(body_src))
+        fact = self.add_fact(
+            subject=redact_sensitive_text(subject).strip()[:300],
+            body=redact_sensitive_text(body).strip()[:1000],
+            kind=FactKind.PATTERN,
+            scope=FactScope.GLOBAL,
+            confidence=min(0.8, 0.5 + 0.05 * len(project_ids)),
+            source_prompt="cross-project episode-derived verified outcomes",
+            tags=["episode-derived", "verified-cross-project", "durable"],
+            provenance=Provenance.OBSERVED,
+            supporting_episode_ids=episode_ids,
+            source_candidate_id=source_candidate_id or None,
+        )
+        fact.supporting_episode_ids = list(dict.fromkeys(
+            fact.supporting_episode_ids + episode_ids
+        ))
+        fact.project_id = ""
+        fact.org_id = ""
+        fact.metadata.success_count = max(
+            fact.metadata.success_count, len(fact.supporting_episode_ids)
+        )
+        fact.tags = [tag for tag in fact.tags if tag != PROBATION_TAG]
+        self.save()
+
+        after_state = self._fact_learning_state(fact)
+        for project_id, episode in supporting:
+            changed = False
+            for candidate in episode.memory_candidates:
+                if generalize(f"{candidate.subject} {candidate.body}") == target_signature:
+                    candidate.promoted_global_fact_id = fact.id
+                    changed = True
+            if changed and not any(
+                mutation.fact_id == fact.id
+                and mutation.operation == "promote_cross_project_candidate"
+                for mutation in episode.memory_mutations
+            ):
+                episode.memory_mutations.append(MemoryMutationEvidence(
+                    mutation_id=uuid.uuid4().hex,
+                    operation="promote_cross_project_candidate",
+                    fact_id=fact.id,
+                    reason=(
+                        f"verified across {len(project_ids)} projects and "
+                        f"{len(episode_ids)} episodes"
+                    ),
+                    after_state=after_state,
+                ))
+            LearningEpisodeStore(project_id, base_dir=episodes_root).save(episode)
+        return fact
+
     def _promote_cross_project_candidate(self, outcome) -> Optional[Fact]:
-        """Promote a generalized pattern globally only with cross-project evidence."""
+        """Per-request global promotion, gated by the caller on a project
+        promotion having just occurred. Handles the common symmetric case; the
+        observer reconcile sweep (``reconcile_cross_project_promotions``) covers
+        asymmetric splits where a minority project supplies the completing
+        episode and no promotion event fires."""
         if outcome.candidate_kind != FactKind.PATTERN.value or not outcome.candidate_id:
             return None
         try:
-            import re
-
-            from neo.memory.episodes import (
-                LearningEpisodeStore,
-                MemoryMutationEvidence,
-                redact_sensitive_text,
-            )
             from neo.memory.generalize import generalize
 
             episodes_root = self._episodes_dir or (Path.home() / ".neo" / "episodes")
@@ -1326,91 +1504,67 @@ class FactStore:
             target_signature = generalize(
                 f"{outcome.candidate_subject} {outcome.candidate_body}"
             )
-            supporting: list[tuple[str, Any]] = []
-            project_ids: set[str] = set()
-            for project_path in sorted(path for path in episodes_root.iterdir() if path.is_dir()):
-                episode_store = LearningEpisodeStore(
-                    project_path.name, base_dir=episodes_root
-                )
+            return self._mint_global_fact(
+                target_signature, outcome.candidate_subject, outcome.candidate_body,
+                episodes_root, source_candidate_id=outcome.candidate_id,
+            )
+        except Exception as exc:
+            logger.warning("Cross-project candidate promotion failed: %s", exc)
+            return None
+
+    def reconcile_cross_project_promotions(self) -> int:
+        """Mint global facts for signatures whose cross-project evidence meets
+        the bar but were never triggered by a per-request project promotion —
+        e.g. an asymmetric (3,1) split where the minority project supplies the
+        completing episode, generating no promotion event. This is the async
+        home the request-path gate points at; run by the observer sweep.
+        Idempotent (skips already-global signatures). Returns new global facts."""
+        try:
+            from neo.memory.episodes import LearningEpisodeStore
+            from neo.memory.generalize import generalize
+
+            episodes_root = self._episodes_dir or (Path.home() / ".neo" / "episodes")
+            if not episodes_root.exists():
+                return 0
+            # One pass: tally distinct projects/episodes per signature + keep a
+            # representative candidate. Only signatures that already clear the
+            # bar pay the expensive mint+rescan.
+            reps: dict[str, dict[str, Any]] = {}
+            for project_path in sorted(p for p in episodes_root.iterdir() if p.is_dir()):
+                episode_store = LearningEpisodeStore(project_path.name, base_dir=episodes_root)
                 for episode in episode_store.list():
+                    pid = episode.project_id or project_path.name
                     for candidate in episode.memory_candidates:
                         if candidate.kind != FactKind.PATTERN.value:
                             continue
                         if candidate.status not in {"supported_once", "durable"}:
                             continue
                         signature = generalize(f"{candidate.subject} {candidate.body}")
-                        if signature != target_signature:
-                            continue
-                        project_id = episode.project_id or project_path.name
-                        supporting.append((project_id, episode))
-                        project_ids.add(project_id)
-                        break
-
-            episode_ids = list(dict.fromkeys(
-                episode.episode_id for _, episode in supporting
-            ))
-            if (
-                len(project_ids) < GLOBAL_PROMOTION_MIN_PROJECTS
-                or len(episode_ids) < GLOBAL_PROMOTION_MIN_EPISODES
-            ):
-                return None
-
-            # Global memory receives only deterministic generalized text, with
-            # path-like bracket qualifiers removed and credential redaction.
-            subject = re.sub(r"\[[^\]]+\]", "", generalize(outcome.candidate_subject))
-            body = re.sub(r"\[[^\]]+\]", "", generalize(outcome.candidate_body))
-            fact = self.add_fact(
-                subject=redact_sensitive_text(subject).strip()[:300],
-                body=redact_sensitive_text(body).strip()[:1000],
-                kind=FactKind.PATTERN,
-                scope=FactScope.GLOBAL,
-                confidence=min(0.8, 0.5 + 0.05 * len(project_ids)),
-                source_prompt="cross-project episode-derived verified outcomes",
-                tags=["episode-derived", "verified-cross-project", "durable"],
-                provenance=Provenance.OBSERVED,
-                supporting_episode_ids=episode_ids,
-                source_candidate_id=outcome.candidate_id,
-            )
-            fact.supporting_episode_ids = list(dict.fromkeys(
-                fact.supporting_episode_ids + episode_ids
-            ))
-            fact.project_id = ""
-            fact.org_id = ""
-            fact.metadata.success_count = max(
-                fact.metadata.success_count, len(fact.supporting_episode_ids)
-            )
-            fact.tags = [tag for tag in fact.tags if tag != PROBATION_TAG]
-            self.save()
-
-            after_state = self._fact_learning_state(fact)
-            for project_id, episode in supporting:
-                changed = False
-                for candidate in episode.memory_candidates:
-                    signature = generalize(f"{candidate.subject} {candidate.body}")
-                    if signature == target_signature:
-                        candidate.promoted_global_fact_id = fact.id
-                        changed = True
-                if changed and not any(
-                    mutation.fact_id == fact.id
-                    and mutation.operation == "promote_cross_project_candidate"
-                    for mutation in episode.memory_mutations
+                        entry = reps.setdefault(signature, {
+                            "subject": candidate.subject, "body": candidate.body,
+                            "cid": candidate.candidate_id,
+                            "projects": set(), "episodes": set(),
+                        })
+                        entry["projects"].add(pid)
+                        entry["episodes"].add(episode.episode_id)
+            minted = 0
+            for signature, entry in reps.items():
+                if (
+                    len(entry["projects"]) < GLOBAL_PROMOTION_MIN_PROJECTS
+                    or len(entry["episodes"]) < GLOBAL_PROMOTION_MIN_EPISODES
                 ):
-                    import uuid
-                    episode.memory_mutations.append(MemoryMutationEvidence(
-                        mutation_id=uuid.uuid4().hex,
-                        operation="promote_cross_project_candidate",
-                        fact_id=fact.id,
-                        reason=(
-                            f"verified across {len(project_ids)} projects and "
-                            f"{len(episode_ids)} episodes"
-                        ),
-                        after_state=after_state,
-                    ))
-                LearningEpisodeStore(project_id, base_dir=episodes_root).save(episode)
-            return fact
+                    continue
+                if self._mint_global_fact(
+                    signature, entry["subject"], entry["body"],
+                    episodes_root, source_candidate_id=entry["cid"],
+                ) is not None:
+                    minted += 1
+            if minted:
+                logger.info("Reconciled %d cross-project global promotion(s)", minted)
+            return minted
         except Exception as exc:
-            logger.warning("Cross-project candidate promotion failed: %s", exc)
-            return None
+            logger.warning("Cross-project reconcile failed: %s", exc)
+            return 0
 
     def detect_implicit_feedback(self, current_request: dict, request_history: list) -> None:
         """Detect outcomes from previous session and update/create facts.
@@ -1556,10 +1710,16 @@ class FactStore:
                             outcome,
                             fact_id=promoted.id,
                             operation="promote_repeated_episode_candidate",
-                            append_verification=False,
                             after_state=self._fact_learning_state(promoted),
+                            append_verification=False,
                         )
-                    self._promote_cross_project_candidate(outcome)
+                        # Global promotion can only succeed once this project has
+                        # itself project-promoted the pattern (its contribution to
+                        # cross-project evidence). Gating the all-projects scan on
+                        # that rare event keeps it off the per-request path — it no
+                        # longer runs on every acceptance, only when THIS project's
+                        # verified evidence newly clears the project bar.
+                        self._promote_cross_project_candidate(outcome)
                     continue
 
                 # Fallback: no linked fact, create REVIEW as before
@@ -2093,6 +2253,15 @@ class FactStore:
         does. The 30-day age gate is the safety net — recently-invalidated
         facts are retained for contrast in retrieval.
 
+        **Exception:** tombstones invalidated by
+        ``repeated_attributed_contradiction`` are retained indefinitely. They
+        are the retracted-signature ledger the re-promotion guard reads
+        (``_promote_repeatedly_supported_candidate``); reaping them at 30 days
+        would let a rolled-back pattern be re-minted. They cost almost nothing —
+        ``strip_tombstone_embeddings`` has already dropped their vector — and
+        rollbacks are rare (two distinct attributed contradictions of one
+        promoted fact). The on-demand compactor honors the same exemption.
+
         Previously this additionally required the supersession chain to
         resolve to a valid successor, which silently retained every eviction
         orphan forever (they never resolve to a valid fact), letting inactive
@@ -2105,7 +2274,11 @@ class FactStore:
 
         kept, removed_ids = [], []
         for f in self._facts:
-            if f.is_valid or (now - f.metadata.last_accessed) < thirty_days:
+            if (
+                f.is_valid
+                or (now - f.metadata.last_accessed) < thirty_days
+                or f.invalidation_reason == "repeated_attributed_contradiction"
+            ):
                 kept.append(f)
             else:
                 removed_ids.append(f.id)

@@ -361,6 +361,10 @@ class Observer:
         try:
             t0 = time.time()
             count, ingested, store = self._run_project(self.codebase_root)
+            try:
+                store.reconcile_cross_project_promotions()
+            except Exception as e:
+                logger.debug("cross-project reconcile failed: %s", e)
             tick = time.time() - t0
             mined = (f"{ingested} mined" if not self._last_ingest_error
                      else f"ingest ERROR {self._last_ingest_error}")
@@ -418,13 +422,15 @@ class Observer:
         )
 
         total_synth = total_mined = errors = covered = 0
+        last_store = None
         for i, root in enumerate(batch, 1):
             if self._stop:
                 break
             label = os.path.basename(root.rstrip("/")) or root
             p0 = time.time()
             try:
-                count, mined, _store = self._run_project(root)
+                count, mined, store = self._run_project(root)
+                last_store = store
                 total_synth += count
                 total_mined += mined
                 covered += 1
@@ -444,6 +450,20 @@ class Observer:
                     file=sys.stderr, flush=True,
                 )
 
+        # Cross-project global-promotion reconcile: once per cycle, off every
+        # request path. Catches asymmetric evidence splits the request-path gate
+        # can't trigger (a minority project supplying the completing episode).
+        # Reuses a swept store — global scope is shared across all projects.
+        reconciled = 0
+        if last_store is not None and not self._stop:
+            try:
+                reconciled = last_store.reconcile_cross_project_promotions()
+            except Exception as e:
+                print(
+                    f"neo observer reconcile ERROR {type(e).__name__}: {e}",
+                    file=sys.stderr, flush=True,
+                )
+
         tick = time.time() - t0
         self._last_analysis_epoch = time.time()
         self._cycles_total += 1
@@ -451,7 +471,9 @@ class Observer:
         self._last_cycle_error = None
         summary = (
             f"swept {covered}/{len(roots)} projects: {total_synth} synthesized, "
-            f"{total_mined} mined" + (f", {errors} errors" if errors else "")
+            f"{total_mined} mined"
+            + (f", {reconciled} global-promoted" if reconciled else "")
+            + (f", {errors} errors" if errors else "")
         )
         self._recent_cycles.append({
             "timestamp": self._last_analysis_epoch,

@@ -1163,6 +1163,238 @@ class TestOutcomeLinkage:
             assert mutation.before_state["confidence"] > mutation.after_state["confidence"]
             assert mutation.after_state["is_valid"] is (index == 0)
 
+    def _promote_pattern_from_two_episodes(self, store, subject, body, prefix="accept"):
+        """Helper: promote an episode-derived PATTERN fact from two accepted episodes."""
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        episode_store = LearningEpisodeStore(store.project_id)
+        for index in range(2):
+            ep_id = f"{prefix}-{index}"
+            cand_id = f"{prefix}-cand-{index}"
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=cand_id, suggestion_id=f"{prefix}-sug-{index}",
+                subject=subject, body=body, kind="pattern",
+            ))
+            episode_store.save(episode)
+            outcome = Outcome(
+                outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
+                suggestion_id=f"{prefix}-sug-{index}", learning_episode_id=ep_id,
+                candidate_id=cand_id, candidate_subject=subject,
+                candidate_body=body, candidate_kind="pattern",
+            )
+            with patch.object(store._outcome_tracker, "detect_outcomes",
+                              return_value=([outcome], {})):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+        return episode_store
+
+    def test_corrections_on_new_episodes_roll_back_promoted_fact(self, store):
+        """C1: a correction arriving on a NEW episode (its candidate carries no
+        promoted_fact_id) must still resolve the promoted fact by canonical
+        signature and demote -> roll it back. This path was previously a no-op —
+        the fact was never found, so nothing was demoted or rolled back."""
+        from neo.memory.episodes import (
+            LearningEpisode, MemoryCandidateEvidence,
+        )
+        subject = "pattern: validate input [src/api.py]"
+        body = "Suggestion: validate input before processing"
+        episode_store = self._promote_pattern_from_two_episodes(store, subject, body)
+
+        promoted = next(f for f in store.entries if "episode-derived" in f.tags)
+        assert promoted.is_valid is True
+        original_conf = promoted.metadata.confidence
+
+        # Corrections arrive on DISTINCT NEW episodes; their candidates carry NO
+        # promoted_fact_id — the exact real-world case the old code couldn't reach.
+        for index in range(2):
+            ep_id = f"correct-{index}"
+            cand_id = f"correct-cand-{index}"
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=cand_id, suggestion_id=f"correct-sug-{index}",
+                subject=subject, body=body, kind="pattern",
+            ))
+            assert episode.memory_candidates[0].promoted_fact_id == ""  # the broken case
+            episode_store.save(episode)
+            correction = Outcome(
+                outcome_type=OutcomeType.MODIFIED, file_path="src/api.py",
+                suggestion_id=f"correct-sug-{index}", learning_episode_id=ep_id,
+                candidate_id=cand_id, candidate_subject=subject,
+                candidate_body=body, candidate_kind="pattern",
+                diff_summary="User corrected the suggestion.",
+            )
+            with patch.object(store._outcome_tracker, "detect_outcomes",
+                              return_value=([correction], {})):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+            if index == 0:
+                assert promoted.is_valid is True
+                assert promoted.metadata.confidence < original_conf
+
+        assert promoted.is_valid is False
+        assert promoted.invalidation_reason == "repeated_attributed_contradiction"
+        assert set(promoted.contradicting_episode_ids) == {"correct-0", "correct-1"}
+
+    def test_rolled_back_pattern_is_not_resurrected_by_new_acceptances(self, store):
+        """C1 secondary: once a pattern is rolled back by repeated contradiction,
+        new accepted episodes for the same signature must NOT mint a fresh valid
+        fact (which would resurrect the retracted knowledge)."""
+        subject = "pattern: validate input [src/api.py]"
+        body = "Suggestion: validate input before processing"
+        self._promote_pattern_from_two_episodes(store, subject, body, prefix="accept")
+        promoted = next(f for f in store.entries if "episode-derived" in f.tags)
+
+        # Roll it back via two corrections on new episodes.
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        episode_store = LearningEpisodeStore(store.project_id)
+        for index in range(2):
+            ep_id = f"kill-{index}"
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=f"kill-cand-{index}", suggestion_id=f"kill-sug-{index}",
+                subject=subject, body=body, kind="pattern",
+            ))
+            episode_store.save(episode)
+            correction = Outcome(
+                outcome_type=OutcomeType.MODIFIED, file_path="src/api.py",
+                suggestion_id=f"kill-sug-{index}", learning_episode_id=ep_id,
+                candidate_id=f"kill-cand-{index}", candidate_subject=subject,
+                candidate_body=body, candidate_kind="pattern",
+            )
+            with patch.object(store._outcome_tracker, "detect_outcomes",
+                              return_value=([correction], {})):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+        assert promoted.is_valid is False
+
+        valid_before = {f.id for f in store.entries if f.is_valid and "episode-derived" in f.tags}
+        # Two more acceptances for the same signature must NOT resurrect it.
+        self._promote_pattern_from_two_episodes(store, subject, body, prefix="revive")
+        valid_after = {f.id for f in store.entries if f.is_valid and "episode-derived" in f.tags}
+        assert valid_after == valid_before  # no new valid episode-derived fact
+        assert promoted.is_valid is False
+
+    def test_retracted_tombstone_survives_purge_so_block_is_durable(self, store):
+        """The retracted-signature record must outlive the 30-day purge window,
+        otherwise the re-promotion block silently expires and the pattern re-mints."""
+        subject = "pattern: validate input [src/api.py]"
+        body = "Suggestion: validate input before processing"
+        self._promote_pattern_from_two_episodes(store, subject, body, prefix="accept")
+        promoted = next(f for f in store.entries if "episode-derived" in f.tags)
+
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        episode_store = LearningEpisodeStore(store.project_id)
+        for index in range(2):
+            ep_id = f"kill-{index}"
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=f"kill-cand-{index}", suggestion_id=f"kill-sug-{index}",
+                subject=subject, body=body, kind="pattern",
+            ))
+            episode_store.save(episode)
+            correction = Outcome(
+                outcome_type=OutcomeType.MODIFIED, file_path="src/api.py",
+                suggestion_id=f"kill-sug-{index}", learning_episode_id=ep_id,
+                candidate_id=f"kill-cand-{index}", candidate_subject=subject,
+                candidate_body=body, candidate_kind="pattern",
+            )
+            with patch.object(store._outcome_tracker, "detect_outcomes",
+                              return_value=([correction], {})):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+        assert promoted.is_valid is False
+
+        # Age the tombstone well past the 30-day purge window and purge.
+        promoted.metadata.last_accessed = time.time() - 90 * 86400
+        store.purge_dead_facts()
+        survivor = next((f for f in store._facts if f.id == promoted.id), None)
+        assert survivor is not None, "retracted tombstone must survive purge"
+        assert survivor.invalidation_reason == "repeated_attributed_contradiction"
+
+    def test_durable_fact_survives_janitors_by_tag_not_success_count(self, store):
+        """T2: episode-derived/durable facts are protected by PROVENANCE (tag),
+        not by the accident of success_count>=2. Strip the implicit shield and
+        confirm the janitors still leave them alone."""
+        fact = store.add_fact(
+            subject="episode-derived verified pattern",
+            body="always validate input at the boundary",
+            kind=FactKind.PATTERN, scope=FactScope.PROJECT, confidence=0.2,
+            tags=["episode-derived", "durable"],
+        )
+        # Remove every implicit protection: zero successes, old, low confidence.
+        fact.metadata.success_count = 0
+        fact.metadata.created_at = time.time() - 60 * 86400
+        fact.metadata.confidence = 0.2
+        store.prune_stale_facts()
+        store.demote_unhelpful_facts()
+        assert fact.is_valid is True  # protected by tag, not success_count
+
+    def test_single_acceptance_leaves_promoted_fact_id_empty(self, store):
+        """T2: promoted_fact_id is written ONLY by promotion. One acceptance
+        (below the 2-episode bar) must leave it empty, not point at an unrelated
+        mutation-target fact."""
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        episode_store = LearningEpisodeStore(store.project_id)
+        ep = LearningEpisode(episode_id="solo", project_id=store.project_id)
+        ep.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id="solo-cand", suggestion_id="solo-sug",
+            subject="pattern: cache results [src/a.py]", body="memoize the call",
+            kind="pattern",
+        ))
+        episode_store.save(ep)
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED, file_path="src/a.py",
+            suggestion_id="solo-sug", learning_episode_id="solo",
+            candidate_id="solo-cand", candidate_subject="pattern: cache results [src/a.py]",
+            candidate_body="memoize the call", candidate_kind="pattern",
+        )
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=([outcome], {})):
+            store.detect_implicit_feedback({"prompt": "next"}, [])
+        cand = episode_store.load("solo").memory_candidates[0]
+        assert cand.status == "supported_once"
+        assert cand.promoted_fact_id == ""  # not promoted -> no fact id
+
+    def test_cross_project_scan_gated_on_project_promotion(self, store):
+        """T3: the all-projects cross-project scan is off the per-request path —
+        it must NOT run on an acceptance that doesn't project-promote, only when
+        this project newly clears the project bar."""
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        episode_store = LearningEpisodeStore(store.project_id)
+        subject, body = "pattern: x [a.py]", "do x safely"
+
+        def _accept(idx):
+            ep_id, cand_id, sug_id = f"g{idx}", f"g{idx}c", f"g{idx}s"
+            ep = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            ep.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=cand_id, suggestion_id=sug_id,
+                subject=subject, body=body, kind="pattern"))
+            episode_store.save(ep)
+            return Outcome(
+                outcome_type=OutcomeType.ACCEPTED, file_path="a.py",
+                suggestion_id=sug_id, learning_episode_id=ep_id, candidate_id=cand_id,
+                candidate_subject=subject, candidate_body=body, candidate_kind="pattern")
+
+        # First acceptance: not enough to promote -> no cross-project scan.
+        with patch.object(store, "_promote_cross_project_candidate") as mock_cp, \
+                patch.object(store._outcome_tracker, "detect_outcomes",
+                             return_value=([_accept(0)], {})):
+            store.detect_implicit_feedback({"prompt": "n"}, [])
+            mock_cp.assert_not_called()
+
+        # Second acceptance: project-promotes -> exactly one cross-project scan.
+        with patch.object(store, "_promote_cross_project_candidate") as mock_cp, \
+                patch.object(store._outcome_tracker, "detect_outcomes",
+                             return_value=([_accept(1)], {})):
+            store.detect_implicit_feedback({"prompt": "n"}, [])
+            mock_cp.assert_called_once()
+
     def test_later_regression_api_records_normalized_evidence_and_rolls_back(self, store):
         """Delayed failures use stable attribution rather than similarity fanout."""
         from neo.memory.episodes import (
@@ -1325,6 +1557,73 @@ class TestOutcomeLinkage:
                 store.detect_implicit_feedback({"prompt": "next"}, [])
 
         assert not [f for f in store.entries if "episode-derived" in f.tags]
+
+    def test_reconcile_catches_asymmetric_cross_project_evidence(self, tmp_path):
+        """T3: when a minority (1-episode) project supplies the episode that
+        completes the global bar, the request-path gate never fires (that project
+        doesn't project-promote), so the global fact is stranded. The observer
+        reconcile sweep mints it. Idempotent on a second run."""
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        facts_dir = tmp_path / "facts"
+        episodes_dir = tmp_path / "episodes"
+        subject = "pattern: validate input [src/api.py]"
+        body = "Validate input before processing."
+
+        def _project(name, n_accepts):
+            root = tmp_path / name
+            root.mkdir()
+            st = FactStore(codebase_root=str(root), eager_init=False,
+                           facts_dir=facts_dir, episodes_dir=episodes_dir)
+            es = LearningEpisodeStore(st.project_id, base_dir=episodes_dir)
+            for i in range(n_accepts):
+                ep_id, cid, sid = f"{name}-{i}", f"{name}-c-{i}", f"{name}-s-{i}"
+                ep = LearningEpisode(episode_id=ep_id, project_id=st.project_id)
+                ep.memory_candidates.append(MemoryCandidateEvidence(
+                    candidate_id=cid, suggestion_id=sid,
+                    subject=subject, body=body, kind="pattern"))
+                es.save(ep)
+                outcome = Outcome(
+                    outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
+                    suggestion_id=sid, learning_episode_id=ep_id, candidate_id=cid,
+                    candidate_subject=subject, candidate_body=body, candidate_kind="pattern")
+                with patch.object(st._outcome_tracker, "detect_outcomes",
+                                  return_value=([outcome], {})):
+                    st.detect_implicit_feedback({"prompt": "n"}, [])
+            return st
+
+        _project("alpha", 3)          # project-promotes, but beta is empty then
+        beta = _project("beta", 1)    # 1 episode -> supported_once, no promotion event
+
+        # Gate missed it: 4 episodes across 2 projects on disk, but no global fact.
+        assert [f for f in beta.entries if f.scope == FactScope.GLOBAL] == []
+
+        # Observer reconcile catches the stranded evidence.
+        assert beta.reconcile_cross_project_promotions() == 1
+        globals_after = [
+            f for f in beta.entries
+            if f.scope == FactScope.GLOBAL and "episode-derived" in f.tags
+        ]
+        assert len(globals_after) == 1
+        assert len(set(globals_after[0].supporting_episode_ids)) >= 4
+        # Idempotent: nothing new on a second sweep.
+        assert beta.reconcile_cross_project_promotions() == 0
+
+        # Rollback regression: if the global fact is retracted by repeated
+        # attributed contradiction, reconcile must NOT resurrect it — the
+        # supporting candidates still carry promoted_global_fact_id, so the
+        # (validity-independent) idempotency guard keeps it retracted.
+        promoted_global = globals_after[0]
+        promoted_global.is_valid = False
+        promoted_global.invalidation_reason = "repeated_attributed_contradiction"
+        beta.save()
+        assert beta.reconcile_cross_project_promotions() == 0
+        still_valid_globals = [
+            f for f in beta.entries
+            if f.is_valid and f.scope == FactScope.GLOBAL and "episode-derived" in f.tags
+        ]
+        assert still_valid_globals == []  # not resurrected
 
     def test_global_promotion_requires_four_episodes_across_two_projects(self, tmp_path):
         """One project is insufficient; cross-project evidence is generalized safely."""

@@ -235,30 +235,40 @@ class StrategyAssessment:
     reason: str
 
 
+# Honest coarse confidence bands for DERIVED (non-explicit) values. A keyword
+# heuristic cannot produce a calibrated probability, so we avoid false precision
+# like 0.78 vs 0.64 and map to a few defensible tiers. Explicit, caller-supplied
+# values use 1.0 directly (see resolve_execution_context). These are provisional
+# and never become durable policy.
+_CONF_ROLE_DERIVED = 0.9  # deterministic from an explicit caller role
+_CONF_KEYWORD = 0.5       # a lexical signal matched (test/error/regression/…)
+_CONF_NONE = 0.3          # no signal — restating the task verbatim
+
+
 def _infer_goal(task: str, error_trace: Optional[str]) -> tuple[str, float, list[str]]:
     text = f"{task}\n{error_trace or ''}".lower()
     unknowns: list[str] = []
     if "test" in text and any(token in text for token in ("fail", "error", "still")):
         unknowns.append("The exact command and exit condition that define success")
-        return "Restore the affected test suite to a passing state", 0.78, unknowns
+        return "Restore the affected test suite to a passing state", _CONF_KEYWORD, unknowns
     if any(token in text for token in ("error", "exception", "crash", "timeout")):
         unknowns.append("Whether symptom mitigation or root-cause elimination is preferred")
-        return "Resolve the reported failure without introducing regressions", 0.64, unknowns
+        return "Resolve the reported failure without introducing regressions", _CONF_KEYWORD, unknowns
     unknowns.append("The larger final state beyond the current task")
-    return task, 0.45, unknowns
+    return task, _CONF_NONE, unknowns
 
 
 def _infer_intent(task: str, error_trace: Optional[str], role: CallerRole) -> tuple[str, float]:
     text = f"{task}\n{error_trace or ''}".lower()
     if role is CallerRole.VERIFIER:
-        return "Verify the supplied attempt against the stated success criteria", 0.95
+        return "Verify the supplied attempt against the stated success criteria", _CONF_ROLE_DERIVED
     if role is CallerRole.CRITIC:
-        return "Critique the current attempt and identify the highest-value correction", 0.95
+        return "Critique the current attempt and identify the highest-value correction", _CONF_ROLE_DERIVED
     if any(token in text for token in ("still fail", "did not", "regression", "timeout")):
-        return "Diagnose why the current attempt did not produce sufficient progress", 0.86
+        return "Diagnose why the current attempt did not produce sufficient progress", _CONF_KEYWORD
     if any(token in text for token in ("error", "fail", "exception", "crash")):
-        return "Diagnose the reported failure and recommend the next action", 0.80
-    return "Produce the requested reasoning artifact", 0.55
+        return "Diagnose the reported failure and recommend the next action", _CONF_KEYWORD
+    return "Produce the requested reasoning artifact", _CONF_NONE
 
 
 def resolve_execution_context(neo_input) -> ResolvedExecutionContext:

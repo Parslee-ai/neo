@@ -71,6 +71,69 @@ def test_legacy_mutation_without_state_snapshots_loads_conservatively(tmp_path):
     assert episode.memory_mutations[0].after_state == {}
 
 
+def test_partial_nested_evidence_entries_load_conservatively(tmp_path):
+    """A verification/suggestion/candidate entry missing required fields must
+    load with conservative defaults, not quarantine the whole episode."""
+    from neo.memory.episodes import aggregate_verification_status
+
+    store = LearningEpisodeStore("project", base_dir=tmp_path)
+    store.path.mkdir(parents=True)
+    (store.path / "partial.json").write_text(json.dumps({
+        "episode_id": "partial",
+        "verification": [{"kind": "test"}],            # no verification_id, no status
+        "suggestions": [{"suggestion_id": "s1"}],       # no file_path/description/confidence
+        "memory_candidates": [{"candidate_id": "c1"}],  # no suggestion_id/subject/body/kind
+    }))
+
+    episode = store.load("partial")
+
+    assert episode is not None                          # not quarantined
+    assert episode.verification[0].kind == "test"
+    assert episode.verification[0].status == "unavailable"  # conservative
+    # Fail-closed: a status-less verification never reads as passed.
+    assert aggregate_verification_status(episode.verification) != "passed"
+    assert episode.suggestions[0].suggestion_id == "s1"
+    assert episode.suggestions[0].confidence == 0.0
+    assert episode.memory_candidates[0].candidate_id == "c1"
+
+
+def test_future_extra_fields_are_dropped(tmp_path):
+    """Unknown keys from a future schema are dropped, not raised on (which would
+    quarantine the record)."""
+    store = LearningEpisodeStore("project", base_dir=tmp_path)
+    store.path.mkdir(parents=True)
+    (store.path / "future.json").write_text(json.dumps({
+        "episode_id": "future",
+        "suggestions": [{
+            "suggestion_id": "s1", "file_path": "a.py", "description": "d",
+            "confidence": 0.5, "future_field_xyz": "ignored",
+        }],
+        "verification": [{
+            "verification_id": "v1", "kind": "test", "status": "passed",
+            "another_new_field": 42,
+        }],
+    }))
+
+    episode = store.load("future")
+
+    assert episode is not None
+    assert episode.suggestions[0].suggestion_id == "s1"
+    assert not hasattr(episode.suggestions[0], "future_field_xyz")
+    assert episode.verification[0].status == "passed"
+
+
+def test_corrupt_bucket_is_bounded(tmp_path, monkeypatch):
+    """Quarantined .corrupt-* files are capped, not accumulated indefinitely."""
+    import neo.memory.episodes as ep_mod
+    monkeypatch.setattr(ep_mod, "MAX_CORRUPT_PER_PROJECT", 3)
+    store = LearningEpisodeStore("project", base_dir=tmp_path)
+    store.path.mkdir(parents=True)
+    for i in range(6):
+        (store.path / f"bad-{i}.json").write_text("{not json")
+        assert store.load(f"bad-{i}") is None  # each load quarantines
+    assert len(list(store.path.glob("*.corrupt-*"))) <= 3
+
+
 def test_malformed_record_is_preserved_and_skipped(tmp_path):
     store = LearningEpisodeStore("project", base_dir=tmp_path)
     store.path.mkdir(parents=True)
@@ -212,6 +275,36 @@ def test_only_explicit_fact_citations_are_marked_used():
     by_id = {item.fact_id: item for item in engine.current_learning_episode.retrieved_facts}
     assert by_id["fact-used"].used_in_reasoning is True
     assert by_id["fact-only-retrieved"].used_in_reasoning is False
+
+
+def test_detectable_fact_use_accumulates_across_passes():
+    """OR-accumulate: a citation credited in an earlier reasoning pass stays
+    credited even if a later pass's artifacts don't repeat it (previously the
+    second call clobbered the first's True back to False)."""
+    from neo.models import CodeSuggestion, PlanStep, SimulationTrace
+
+    engine = NeoEngine(lm_adapter=_CombinedLM(), enable_persistent_memory=False)
+    engine.current_learning_episode = LearningEpisode()
+    facts = [Fact(id="fact-used", subject="Convention", body="Use typed IDs")]
+    context = ContextResult(valid_facts=facts, retrieval_scores={"fact-used": 0.8})
+    engine._capture_retrieval_context(context, included=True)
+
+    # Pass 1: citation present -> credited True.
+    engine._capture_detectable_fact_use(
+        [PlanStep(description="Apply", rationale="Use [fact:fact-used]")],
+        [SimulationTrace("in", "out", [])],
+        [CodeSuggestion("src/a.py", "", "Change", 0.8)],
+    )
+    evidence = engine.current_learning_episode.retrieved_facts[0]
+    assert evidence.used_in_reasoning is True
+
+    # Pass 2: no citation in this pass's artifacts -> must NOT reset to False.
+    engine._capture_detectable_fact_use(
+        [PlanStep(description="Unrelated", rationale="no citation here")],
+        [SimulationTrace("in", "out", [])],
+        [CodeSuggestion("src/b.py", "", "Other", 0.8)],
+    )
+    assert evidence.used_in_reasoning is True  # accumulated, not clobbered
 
 
 def test_failed_verification_is_associated_only_with_used_retrieval(tmp_path):

@@ -16,7 +16,7 @@ import re
 import subprocess
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,8 +24,19 @@ from neo.memory.io_utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
+# INVARIANT: any new persisted field — top-level OR on a nested evidence
+# dataclass — MUST bump this. `_coerce` drops unknown keys on load, so an older
+# reader silently rewrites a newer field away on the next save() UNLESS the
+# newer writer bumped the version (which makes older readers quarantine the
+# record as `.corrupt-*` instead — recoverable, not silently downgraded). The
+# version gate is the forward-compat mechanism; the drop is only for
+# partial/malformed records.
 EPISODE_SCHEMA_VERSION = 3
 MAX_EPISODES_PER_PROJECT = 500
+# Quarantined (``.corrupt-*``) records escape the ``*.json`` cap; bound them
+# separately so a project that periodically hits a malformed/future record
+# can't accumulate quarantine files without limit.
+MAX_CORRUPT_PER_PROJECT = 50
 
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
@@ -56,11 +67,35 @@ def redact_sensitive_text(value: str) -> str:
     return redacted
 
 
+def _coerce(dc_type, item: dict):
+    """Build an evidence dataclass from a possibly-partial or forward-version
+    dict: drop unknown keys (a future schema's extra fields) and let the
+    dataclass's own conservative defaults fill any missing ones. This is what
+    makes partial/legacy records degrade gracefully instead of raising a
+    TypeError that would quarantine the whole episode.
+
+    Dropping unknown keys is safe ONLY because a real new field bumps
+    EPISODE_SCHEMA_VERSION (see the invariant on that constant), so a forward
+    record is quarantined by the version gate rather than silently downgraded
+    here. Do not add an `_extra` passthrough bag — it would bypass
+    ``redact_sensitive_text`` and become an unredacted secrets channel."""
+    names = {f.name for f in dataclass_fields(dc_type)}
+    return dc_type(**{k: v for k, v in item.items() if k in names})
+
+
+def _coerce_list(dc_type, raw) -> list:
+    """Coerce a list of dicts into evidence dataclasses, skipping non-dict
+    entries rather than failing the whole record."""
+    if not isinstance(raw, list):
+        return []
+    return [_coerce(dc_type, item) for item in raw if isinstance(item, dict)]
+
+
 @dataclass
 class ContextSelection:
     """One repository or instruction artifact selected for the model context."""
 
-    path: str
+    path: str = ""
     content_sha256: str = ""
     line_range: Optional[tuple[int, int]] = None
     kind: str = "repository_file"
@@ -70,7 +105,7 @@ class ContextSelection:
 class RetrievedFactEvidence:
     """A fact considered during retrieval for this task."""
 
-    fact_id: str
+    fact_id: str = ""
     score: Optional[float] = None
     included_in_context: bool = False
     used_in_reasoning: Optional[bool] = None
@@ -81,10 +116,10 @@ class RetrievedFactEvidence:
 class SuggestionEvidence:
     """Privacy-conscious description of a proposed change."""
 
-    suggestion_id: str
-    file_path: str
-    description: str
-    confidence: float
+    suggestion_id: str = ""
+    file_path: str = ""
+    description: str = ""
+    confidence: float = 0.0
     diff_sha256: str = ""
     code_sha256: str = ""
 
@@ -93,9 +128,11 @@ class SuggestionEvidence:
 class VerificationEvidence:
     """Normalized check result. ``status`` never aliases skipped to passed."""
 
-    verification_id: str
-    kind: str
-    status: str  # passed | failed | warning | unavailable | skipped
+    verification_id: str = ""
+    kind: str = ""
+    # Conservative default: a partial/legacy record missing a status loads as
+    # "unavailable", which the fail-closed aggregate never treats as passed.
+    status: str = "unavailable"  # passed | failed | warning | unavailable | skipped
     tool_name: str = ""
     summary: str = ""
     diagnostics_count: int = 0
@@ -124,9 +161,9 @@ def aggregate_verification_status(evidence: list[VerificationEvidence]) -> str:
 class MemoryMutationEvidence:
     """One fact-store mutation attributable to the episode."""
 
-    mutation_id: str
-    operation: str
-    fact_id: str
+    mutation_id: str = ""
+    operation: str = ""
+    fact_id: str = ""
     reason: str = ""
     before_state: dict[str, Any] = field(default_factory=dict)
     after_state: dict[str, Any] = field(default_factory=dict)
@@ -136,11 +173,11 @@ class MemoryMutationEvidence:
 class MemoryCandidateEvidence:
     """Probationary knowledge candidate derived from one proposed suggestion."""
 
-    candidate_id: str
-    suggestion_id: str
-    subject: str
-    body: str
-    kind: str
+    candidate_id: str = ""
+    suggestion_id: str = ""
+    subject: str = ""
+    body: str = ""
+    kind: str = ""
     status: str = "observed_unverified"
     promoted_fact_id: str = ""
     promoted_global_fact_id: str = ""
@@ -198,6 +235,8 @@ class LearningEpisode:
             raise ValueError(f"unsupported learning episode schema version: {version}")
         verification = []
         for item in data.get("verification", []):
+            if not isinstance(item, dict):
+                continue
             normalized = dict(item)
             if normalized.get("kind") == "static_check":
                 normalized["kind"] = "neo_static"
@@ -207,7 +246,7 @@ class LearningEpisode:
                     if normalized.get("status") == "failed"
                     else "user_acceptance"
                 )
-            verification.append(VerificationEvidence(**normalized))
+            verification.append(_coerce(VerificationEvidence, normalized))
         return cls(
             episode_id=str(data.get("episode_id") or uuid.uuid4().hex),
             session_id=str(data.get("session_id") or uuid.uuid4().hex),
@@ -220,8 +259,8 @@ class LearningEpisode:
             repository_root=str(data.get("repository_root", "")),
             repository_revision=str(data.get("repository_revision", "")),
             repository_dirty=data.get("repository_dirty"),
-            context_selection=[ContextSelection(**item) for item in data.get("context_selection", [])],
-            retrieved_facts=[RetrievedFactEvidence(**item) for item in data.get("retrieved_facts", [])],
+            context_selection=_coerce_list(ContextSelection, data.get("context_selection", [])),
+            retrieved_facts=_coerce_list(RetrievedFactEvidence, data.get("retrieved_facts", [])),
             reasoning_mode=str(data.get("reasoning_mode", "")),
             reasoning_reason=str(data.get("reasoning_reason", "")),
             provider=str(data.get("provider", "")),
@@ -229,13 +268,13 @@ class LearningEpisode:
             operating_mode=str(data.get("operating_mode", "learn")),
             authority=dict(data.get("authority", {})),
             execution_context=dict(data.get("execution_context", {})),
-            suggestions=[SuggestionEvidence(**item) for item in data.get("suggestions", [])],
+            suggestions=_coerce_list(SuggestionEvidence, data.get("suggestions", [])),
             applied_actions=list(data.get("applied_actions", [])),
             verification=verification,
             final_outcome=str(data.get("final_outcome", "pending")),
             outcome_details=dict(data.get("outcome_details", {})),
-            memory_mutations=[MemoryMutationEvidence(**item) for item in data.get("memory_mutations", [])],
-            memory_candidates=[MemoryCandidateEvidence(**item) for item in data.get("memory_candidates", [])],
+            memory_mutations=_coerce_list(MemoryMutationEvidence, data.get("memory_mutations", [])),
+            memory_candidates=_coerce_list(MemoryCandidateEvidence, data.get("memory_candidates", [])),
         )
 
 
@@ -280,11 +319,16 @@ class LearningEpisodeStore:
         return episodes
 
     def _enforce_limit(self) -> None:
-        records = sorted(
-            self.path.glob("*.json"),
-            key=lambda item: item.stat().st_mtime_ns,
-            reverse=True,
-        )
+        # Called on every save. The stat()+sort of up to 500 files is the
+        # dominant per-save cost, but trimming is only needed when we're
+        # actually over the cap (the rare case). Count directory entries first
+        # (one readdir pass, no per-file stat) and bail early when under the
+        # limit, so the common save pays O(n) readdir instead of O(n log n)
+        # stat+sort.
+        paths = list(self.path.glob("*.json"))
+        if len(paths) <= MAX_EPISODES_PER_PROJECT:
+            return
+        records = sorted(paths, key=lambda item: item.stat().st_mtime_ns, reverse=True)
         for stale in records[MAX_EPISODES_PER_PROJECT:]:
             try:
                 stale.unlink()
@@ -295,6 +339,20 @@ class LearningEpisodeStore:
     def _preserve_corrupt(path: Path) -> None:
         try:
             path.rename(path.with_name(f"{path.name}.corrupt-{time.time_ns()}"))
+        except OSError:
+            pass
+        # Bound the quarantine bucket (rare path — only on a malformed record).
+        try:
+            corrupt = sorted(
+                path.parent.glob("*.corrupt-*"),
+                key=lambda item: item.stat().st_mtime_ns,
+                reverse=True,
+            )
+            for stale in corrupt[MAX_CORRUPT_PER_PROJECT:]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
         except OSError:
             pass
 

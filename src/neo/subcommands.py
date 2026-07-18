@@ -279,7 +279,12 @@ def _compact_fact_file_locked(path: Path, *, max_invalid_age_days: int, dry_run:
             age = now - float(last_accessed)
         except (TypeError, ValueError):
             age = 0
-        if not is_valid and age >= cutoff:
+        # Retracted-signature ledger: tombstones invalidated by repeated
+        # attributed contradiction are kept indefinitely so a rolled-back
+        # pattern can't be re-minted after the 30-day window. Mirrors
+        # FactStore.purge_dead_facts.
+        retracted = fact.get("invalidation_reason") == "repeated_attributed_contradiction"
+        if not is_valid and age >= cutoff and not retracted:
             removed += 1
             continue
         # Retained tombstone (invalid but too young to purge): its embedding is

@@ -50,6 +50,28 @@ def test_missing_goal_and_intent_are_provisional_and_expose_unknowns():
     assert "inferred" in context.prompt_section()
 
 
+def test_inferred_confidences_are_honest_coarse_bands():
+    """Inferred (non-explicit) confidences must come from a small honest tier
+    set, not fabricated precision like 0.78/0.64 — a keyword heuristic can't
+    produce a calibrated probability."""
+    from neo.execution_context import (
+        _CONF_KEYWORD, _CONF_NONE, _CONF_ROLE_DERIVED,
+    )
+    bands = {_CONF_ROLE_DERIVED, _CONF_KEYWORD, _CONF_NONE}
+    for prompt in ("tests still failing", "got a crash", "refactor the parser"):
+        ctx = resolve_execution_context(NeoInput(prompt=prompt))
+        if ctx.goal.origin == "inferred":
+            assert ctx.goal.confidence in bands
+        if ctx.intent.origin == "inferred":
+            assert ctx.intent.confidence in bands
+    # A verifier role yields the deterministic role-derived tier, not a guess.
+    verifier = resolve_execution_context(
+        NeoInput(prompt="check this", role=CallerRole.VERIFIER)
+    )
+    if verifier.intent.origin == "inferred":
+        assert verifier.intent.confidence == _CONF_ROLE_DERIVED
+
+
 def test_identical_symptom_produces_goal_conditioned_retrieval_queries():
     symptom = "Error: database write timeout"
     restore = resolve_execution_context(NeoInput(

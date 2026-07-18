@@ -354,10 +354,13 @@ class NeoEngine:
         ]
         text = "\n".join(str(item) for item in artifacts if item)
         for evidence in episode.retrieved_facts:
-            evidence.used_in_reasoning = (
-                evidence.included_in_context
-                and f"[fact:{evidence.fact_id}]" in text
-            )
+            if evidence.included_in_context and f"[fact:{evidence.fact_id}]" in text:
+                # Sticky: OR-accumulate across reasoning passes. A citation that
+                # survived into an earlier pass stays credited even if a later
+                # pass's artifact set doesn't repeat it — never clobber True.
+                evidence.used_in_reasoning = True
+            elif evidence.used_in_reasoning is not True:
+                evidence.used_in_reasoning = False
 
     def _log_action(self, action: str, signature: str) -> None:
         """Append an action to the loop-detection log.
@@ -942,6 +945,28 @@ class NeoEngine:
         metadata["learning_episode_id"] = episode.episode_id
         metadata["learning_task_id"] = episode.task_id
         metadata["suggestion_ids"] = suggestion_ids
+
+        # Citation-survival instrumentation. The cited-only credit model and the
+        # cross-project global-promotion gate both hinge on a retrieved fact's
+        # [fact:<id>] marker actually surviving into reasoning (used_in_reasoning).
+        # If production LLMs rarely echo the markers, that gate is theoretically
+        # correct but practically dead — so emit the counts to ~/.neo/metrics.jsonl
+        # and let the real-world survival rate be measured before it's trusted.
+        try:
+            from neo.memory.metrics import record as record_memory_metric
+            included = [e for e in episode.retrieved_facts if e.included_in_context]
+            used = [e for e in included if e.used_in_reasoning is True]
+            record_memory_metric(
+                "citation_survival",
+                retrieved=len(episode.retrieved_facts),
+                included=len(included),
+                used=len(used),
+                provider=episode.provider or "",
+                model=episode.model or "",
+            )
+        except Exception:
+            pass  # instrumentation is never load-bearing
+
         try:
             self.episode_store.save(episode)
         except Exception as exc:
@@ -1915,7 +1940,7 @@ RULES:
     ) -> dict[str, str]:
         """Build file_path -> fact_id mapping for outcome linkage."""
         if fact is None:
-            logger.warning("_build_suggestion_fact_ids: fact is None, no linkage possible")
+            logger.debug("_build_suggestion_fact_ids: fact is None, no linkage possible")
             return {}
         ids: dict[str, str] = {}
         for s in code_suggestions:
