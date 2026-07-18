@@ -87,15 +87,16 @@ PROTECTION_BOOST = 0.05        # Confidence boost for consistently helpful facts
 MAX_INDEPENDENT_FACTS = 50     # Cap per project to prevent bloat from active repos
 
 # Tags that protect facts from pruning/demotion (curated knowledge)
-# Facts the janitors (probation, prune, demote, evict, independent-cap) must
-# never touch. 'episode-derived'/'durable' mark facts promoted from repeated,
-# independently-verified evidence — they must survive on that provenance, not on
-# the accident of carrying success_count>=2. This is janitor protection only;
-# retrieval decay is governed separately by models._CURATED_TAGS. Intentional
-# rollback (_invalidate on repeated attributed contradiction) bypasses this.
-PROTECTED_TAGS = frozenset(
-    {"seed", "community", "synthesized", "episode-derived", "durable"}
-)
+# Tag-based janitor immunity for TRUSTED-INTERNAL provenance only: seed corpus,
+# community feed, synthesis output. These tags are written solely by neo's own
+# ingesters, so keying on the string is safe. Promoted (episode-derived) facts
+# are NOT protected by a tag — a tag is forgeable, and a future importer could
+# attach 'durable' to mint permanent janitor-immunity outside the promotion
+# path. They are protected structurally instead, via non-empty
+# supporting_episode_ids (set only at promotion); see `_is_protected`. Janitor
+# protection only — retrieval decay is governed separately by
+# models._CURATED_TAGS; intentional rollback bypasses this.
+PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 
 # Dual-buffer consolidation (paper 2603.07670 §9.1). New non-curated
 # facts enter a "hot probation buffer" via the ``probation`` tag. They
@@ -406,6 +407,7 @@ class FactStore:
             kind in (FactKind.CONSTRAINT, FactKind.ARCHITECTURE)
             or prov_value == Provenance.STRUCTURAL.value
             or bool(PROTECTED_TAGS & set(initial_tags))
+            or bool(supporting_episode_ids)  # promoted facts are already vetted
         )
         if not is_curated and PROBATION_TAG not in initial_tags:
             initial_tags.append(PROBATION_TAG)
@@ -1144,11 +1146,15 @@ class FactStore:
         if not signature:
             return None
         for fact in self._facts:
-            if (
-                fact.is_valid
-                and "episode-derived" in fact.tags
-                and generalize(f"{fact.subject} {fact.body}") == signature
-            ):
+            if not (fact.is_valid and "episode-derived" in fact.tags):
+                continue
+            # Prefer the signature frozen at mint; recompute only for facts
+            # promoted before canonical_signature was stored (back-compat), so a
+            # later generalize() change can't orphan already-promoted facts.
+            fact_signature = fact.canonical_signature or generalize(
+                f"{fact.subject} {fact.body}"
+            )
+            if fact_signature == signature:
                 return fact
         return None
 
@@ -1318,10 +1324,13 @@ class FactStore:
             # a 30-day window. Only a pattern that generalizes to a DIFFERENT
             # signature can promote past it.
             for existing in self._facts:
+                existing_signature = existing.canonical_signature or generalize(
+                    f"{existing.subject} {existing.body}"
+                )
                 if (
                     not existing.is_valid
                     and existing.invalidation_reason == "repeated_attributed_contradiction"
-                    and generalize(f"{existing.subject} {existing.body}") == target_signature
+                    and existing_signature == target_signature
                 ):
                     logger.info(
                         "Skipping re-promotion of a pattern previously rolled back "
@@ -1350,6 +1359,7 @@ class FactStore:
             fact.tags = [tag for tag in fact.tags if tag != PROBATION_TAG]
             if "durable" not in fact.tags:
                 fact.tags.append("durable")
+            fact.canonical_signature = target_signature  # frozen for rollback-resolve
             self.save()
 
             for episode_id in supporting_ids:
@@ -1460,6 +1470,7 @@ class FactStore:
             fact.metadata.success_count, len(fact.supporting_episode_ids)
         )
         fact.tags = [tag for tag in fact.tags if tag != PROBATION_TAG]
+        fact.canonical_signature = target_signature  # frozen for rollback-resolve
         self.save()
 
         after_state = self._fact_learning_state(fact)
@@ -1512,6 +1523,49 @@ class FactStore:
             logger.warning("Cross-project candidate promotion failed: %s", exc)
             return None
 
+    def _dedup_global_signatures(self) -> int:
+        """Collapse valid global episode-derived facts that share a canonical
+        signature. This is the durable fix for the narrow concurrency window
+        where the observer and a request-path process mint the SAME signature
+        before either sees the other's write: merge-on-save reconciles by
+        fact.id, not signature, so both distinct-id facts survive. Keep the
+        richest (most supporting episodes), fold the others' episodes into it,
+        and supersede+invalidate the duplicates. Keys on canonical_signature
+        (set at mint since T6), so pre-T6 facts without one are left alone.
+        Returns the number collapsed."""
+        groups: dict[str, list[Fact]] = {}
+        for f in self._facts:
+            if (
+                f.is_valid and f.scope == FactScope.GLOBAL
+                and "episode-derived" in f.tags and f.canonical_signature
+            ):
+                groups.setdefault(f.canonical_signature, []).append(f)
+        collapsed = 0
+        for facts in groups.values():
+            if len(facts) < 2:
+                continue
+            facts.sort(
+                key=lambda x: (
+                    len(set(x.supporting_episode_ids)), x.metadata.confidence, x.id
+                ),
+                reverse=True,
+            )
+            keeper = facts[0]
+            for dup in facts[1:]:
+                keeper.supporting_episode_ids = list(dict.fromkeys(
+                    keeper.supporting_episode_ids + dup.supporting_episode_ids
+                ))
+                dup.superseded_by = keeper.id
+                self._invalidate(dup, cascade=False)
+                collapsed += 1
+            keeper.metadata.success_count = max(
+                keeper.metadata.success_count, len(keeper.supporting_episode_ids)
+            )
+        if collapsed:
+            self.save()
+            logger.info("Collapsed %d duplicate global-signature fact(s)", collapsed)
+        return collapsed
+
     def reconcile_cross_project_promotions(self) -> int:
         """Mint global facts for signatures whose cross-project evidence meets
         the bar but were never triggered by a per-request project promotion —
@@ -1526,6 +1580,9 @@ class FactStore:
             episodes_root = self._episodes_dir or (Path.home() / ".neo" / "episodes")
             if not episodes_root.exists():
                 return 0
+            # Heal any duplicate global facts a concurrent mint left behind
+            # before deciding what still needs promoting.
+            self._dedup_global_signatures()
             # One pass: tally distinct projects/episodes per signature + keep a
             # representative candidate. Only signatures that already clear the
             # bar pay the expensive mint+rescan.
@@ -1543,12 +1600,19 @@ class FactStore:
                         entry = reps.setdefault(signature, {
                             "subject": candidate.subject, "body": candidate.body,
                             "cid": candidate.candidate_id,
-                            "projects": set(), "episodes": set(),
+                            "projects": set(), "episodes": set(), "linked": False,
                         })
                         entry["projects"].add(pid)
                         entry["episodes"].add(episode.episode_id)
+                        if candidate.promoted_global_fact_id:
+                            entry["linked"] = True
             minted = 0
             for signature, entry in reps.items():
+                # Already promoted (a supporting candidate carries the global
+                # link): skip without paying the full mint+rescan just to
+                # conclude "skip". Cheap short-circuit from the tally.
+                if entry["linked"]:
+                    continue
                 if (
                     len(entry["projects"]) < GLOBAL_PROMOTION_MIN_PROJECTS
                     or len(entry["episodes"]) < GLOBAL_PROMOTION_MIN_EPISODES
@@ -2036,9 +2100,6 @@ class FactStore:
             return 0
 
         scoped = [f for f in self._facts if f.scope == scope and f.is_valid]
-        excess = len(scoped) - limit
-        if excess <= 0:
-            return 0
 
         def _eviction_score(fact: Fact) -> float:
             """Lower score = evict first."""
@@ -2048,11 +2109,20 @@ class FactStore:
                 base = base * 0.5 + (fact.metadata.success_count / total) * 0.5
             return base
 
-        # Never evict constraints or synthesized archetypes
+        # Never evict constraints or protected (curated + promoted) facts.
         evictable = [
             f for f in scoped
-            if f.kind != FactKind.CONSTRAINT and not (PROTECTED_TAGS & set(f.tags))
+            if f.kind != FactKind.CONSTRAINT and not self._is_protected(f)
         ]
+        # Cap the EVICTABLE (ordinary) working set at the limit — protected facts
+        # are durable extra storage and do not consume the ordinary budget. This
+        # fixes two flanks of counting protected facts toward the limit: ordinary
+        # facts being squeezed as durable knowledge grows, and the scope being
+        # pinned permanently over-limit once protected facts alone exceed it.
+        excess = len(evictable) - limit
+        if excess <= 0:
+            return 0
+
         evictable.sort(key=_eviction_score)
 
         evicted = 0
@@ -2234,6 +2304,15 @@ class FactStore:
             om.confidence = max(om.confidence, dm.confidence)
         return ours
 
+    @staticmethod
+    def _is_protected(fact: Fact) -> bool:
+        """Janitor immunity. Trusted-internal provenance is tag-based
+        (PROTECTED_TAGS: seed/community/synthesized); promotion provenance is
+        STRUCTURAL — a non-empty ``supporting_episode_ids``, which only the
+        promotion path sets, so it can't be forged by an importer attaching a
+        'durable' string tag."""
+        return bool(PROTECTED_TAGS & set(fact.tags)) or bool(fact.supporting_episode_ids)
+
     def purge_dead_facts(self, save: bool = True) -> int:
         """Remove invalid facts that have gone cold (untouched 30+ days).
 
@@ -2356,8 +2435,8 @@ class FactStore:
                 continue
             if fact.metadata.success_count > 0:
                 continue
-            # Curated facts (seed, community, synthesized) are protected
-            if PROTECTED_TAGS & set(fact.tags):
+            # Trusted-internal (tag) or promoted (structural) facts are protected
+            if self._is_protected(fact):
                 continue
 
             is_independent = "independent" in fact.tags
@@ -2411,8 +2490,8 @@ class FactStore:
                 continue
             if fact.kind == FactKind.CONSTRAINT:
                 continue
-            # Curated facts (seed, community, synthesized) are protected
-            if PROTECTED_TAGS & set(fact.tags):
+            # Trusted-internal (tag) or promoted (structural) facts are protected
+            if self._is_protected(fact):
                 continue
             if (now - fact.metadata.created_at) < min_age:
                 continue
@@ -2479,7 +2558,7 @@ class FactStore:
         indep = [
             f for f in self._facts
             if f.is_valid and "independent" in f.tags
-            and not (PROTECTED_TAGS & set(f.tags))
+            and not self._is_protected(f)
         ]
         if len(indep) <= MAX_INDEPENDENT_FACTS:
             return

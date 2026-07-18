@@ -1189,6 +1189,28 @@ class TestOutcomeLinkage:
                 store.detect_implicit_feedback({"prompt": "next"}, [])
         return episode_store
 
+    def test_canonical_signature_frozen_survives_text_drift(self, store):
+        """T6: a promoted fact stores its canonical signature at mint, and
+        rollback-resolve prefers it — so a later generalize() change (simulated
+        here by mutating the fact's text) can't orphan the fact on the rollback
+        path."""
+        subject = "pattern: validate input [src/api.py]"
+        body = "Suggestion: validate input before processing"
+        self._promote_pattern_from_two_episodes(store, subject, body)
+        promoted = next(f for f in store.entries if "episode-derived" in f.tags)
+        assert promoted.canonical_signature  # frozen at mint
+        frozen = promoted.canonical_signature
+
+        # Simulate generalize() drift: the fact's live text now generalizes
+        # somewhere else, so a recompute would miss it. The frozen signature must
+        # still resolve it.
+        promoted.subject = "completely unrelated wording that generalizes elsewhere"
+        promoted.body = "nothing to do with the original"
+        assert promoted.canonical_signature == frozen
+
+        resolved = store._resolve_promoted_fact_by_signature(subject, body)
+        assert resolved is promoted  # found via the frozen signature, not recompute
+
     def test_corrections_on_new_episodes_roll_back_promoted_fact(self, store):
         """C1: a correction arriving on a NEW episode (its candidate carries no
         promoted_fact_id) must still resolve the promoted fact by canonical
@@ -1313,23 +1335,93 @@ class TestOutcomeLinkage:
         assert survivor is not None, "retracted tombstone must survive purge"
         assert survivor.invalidation_reason == "repeated_attributed_contradiction"
 
-    def test_durable_fact_survives_janitors_by_tag_not_success_count(self, store):
-        """T2: episode-derived/durable facts are protected by PROVENANCE (tag),
-        not by the accident of success_count>=2. Strip the implicit shield and
-        confirm the janitors still leave them alone."""
-        fact = store.add_fact(
+    def test_durable_fact_protected_by_structure_not_forgeable_tag(self, store):
+        """T7: promoted facts survive the janitors on STRUCTURAL provenance
+        (supporting_episode_ids, set only at promotion), NOT on the 'durable'
+        tag — which a future importer could forge to mint permanent immunity."""
+        # Genuinely promoted (carries supporting_episode_ids) -> protected.
+        promoted = store.add_fact(
             subject="episode-derived verified pattern",
             body="always validate input at the boundary",
             kind=FactKind.PATTERN, scope=FactScope.PROJECT, confidence=0.2,
             tags=["episode-derived", "durable"],
+            supporting_episode_ids=["ep-1", "ep-2"],
         )
-        # Remove every implicit protection: zero successes, old, low confidence.
-        fact.metadata.success_count = 0
-        fact.metadata.created_at = time.time() - 60 * 86400
-        fact.metadata.confidence = 0.2
+        promoted.metadata.success_count = 0
+        promoted.metadata.created_at = time.time() - 60 * 86400
+        promoted.metadata.confidence = 0.2
+
+        # Same tags, but NO promotion provenance -> the forgeable case, NOT shielded.
+        forged = store.add_fact(
+            subject="forged durable claim",
+            body="just attach the durable tag and survive forever",
+            kind=FactKind.PATTERN, scope=FactScope.PROJECT, confidence=0.2,
+            tags=["episode-derived", "durable"],
+        )
+        forged.metadata.success_count = 0
+        forged.metadata.created_at = time.time() - 60 * 86400
+        forged.metadata.confidence = 0.2
+
         store.prune_stale_facts()
         store.demote_unhelpful_facts()
-        assert fact.is_valid is True  # protected by tag, not success_count
+
+        assert promoted.is_valid is True   # protected by structure
+        assert forged.is_valid is False    # tag alone does not shield
+
+    def test_protected_facts_do_not_consume_the_eviction_budget(self, store):
+        """T8: durable/protected facts are durable EXTRA storage — they don't
+        count against the ordinary eviction budget, so ordinary facts keep their
+        full limit and the scope isn't pinned over-limit by protected growth."""
+        from neo.memory.store import SCOPE_LIMITS
+        limit = SCOPE_LIMITS[FactScope.SESSION.value]
+
+        protected = []
+        for i in range(5):
+            p = Fact(id=f"prot{i}", subject=f"promoted {i}", body="v",
+                     kind=FactKind.PATTERN, scope=FactScope.SESSION,
+                     supporting_episode_ids=[f"e{i}a", f"e{i}b"],
+                     metadata=FactMetadata(confidence=0.3))
+            store._facts.append(p)
+            protected.append(p)
+        for i in range(limit):  # ordinary facts exactly at the limit
+            store._facts.append(Fact(
+                id=f"ord{i}", subject=f"ordinary {i}", body="b",
+                kind=FactKind.PATTERN, scope=FactScope.SESSION,
+                metadata=FactMetadata(confidence=0.5)))
+
+        store._enforce_scope_limit(FactScope.SESSION)
+
+        # All protected survive, and ordinary facts kept their full budget — the
+        # 5 protected facts did NOT force 5 ordinary evictions (the old bug).
+        assert all(p.is_valid for p in protected)
+        ordinary_valid = [
+            f for f in store._facts
+            if f.is_valid and f.scope == FactScope.SESSION and not store._is_protected(f)
+        ]
+        assert len(ordinary_valid) == limit
+
+    def test_dedup_collapses_duplicate_global_signatures(self, store):
+        """T9: two global facts minted for the same canonical signature (the
+        concurrency window merge-on-save can't dedup by id) are collapsed — the
+        richest kept, the duplicate superseded + invalidated, episodes merged."""
+        sig = "validate input signature"
+        common = dict(
+            subject="validate input", body="do it", kind=FactKind.PATTERN,
+            scope=FactScope.GLOBAL, tags=["episode-derived", "durable"],
+            canonical_signature=sig,
+        )
+        a = Fact(id="ga", supporting_episode_ids=["e1", "e2"],
+                 metadata=FactMetadata(confidence=0.6), **common)
+        b = Fact(id="gb", supporting_episode_ids=["e3", "e4", "e5"],
+                 metadata=FactMetadata(confidence=0.6), **common)
+        store._facts.extend([a, b])
+
+        assert store._dedup_global_signatures() == 1
+        # b has more supporting episodes -> kept; a superseded + invalidated.
+        assert b.is_valid is True and a.is_valid is False
+        assert a.superseded_by == "gb"
+        assert set(b.supporting_episode_ids) == {"e1", "e2", "e3", "e4", "e5"}
+        assert store._dedup_global_signatures() == 0  # idempotent
 
     def test_single_acceptance_leaves_promoted_fact_id_empty(self, store):
         """T2: promoted_fact_id is written ONLY by promotion. One acceptance

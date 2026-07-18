@@ -307,6 +307,70 @@ def test_detectable_fact_use_accumulates_across_passes():
     assert evidence.used_in_reasoning is True  # accumulated, not clobbered
 
 
+def test_structured_facts_used_self_report_credits_fact():
+    """T10: a 'Facts used: [id]' self-report credits the fact even when the
+    inline [fact:id] marker is absent — the primary detection signal, since
+    production LLMs rarely echo the machine marker."""
+    from neo.models import CodeSuggestion, PlanStep, SimulationTrace
+
+    engine = NeoEngine(lm_adapter=_CombinedLM(), enable_persistent_memory=False)
+    engine.current_learning_episode = LearningEpisode()
+    facts = [Fact(id="fact-x", subject="Convention", body="Use typed IDs")]
+    engine._capture_retrieval_context(
+        ContextResult(valid_facts=facts, retrieval_scores={"fact-x": 0.8}), included=True)
+    engine._capture_detectable_fact_use(
+        [PlanStep(description="Apply it", rationale="Applied. Facts used: [fact-x]")],
+        [SimulationTrace("in", "out", [])],
+        [CodeSuggestion("src/a.py", "", "Change", 0.8)],
+    )
+    assert engine.current_learning_episode.retrieved_facts[0].used_in_reasoning is True
+
+
+def test_subject_overlap_credits_used_fact_without_marker():
+    """T10: conservative subject overlap credits a fact the reasoning clearly
+    used, and leaves an unrelated retrieved fact uncredited."""
+    from neo.models import CodeSuggestion, PlanStep, SimulationTrace
+
+    engine = NeoEngine(lm_adapter=_CombinedLM(), enable_persistent_memory=False)
+    engine.current_learning_episode = LearningEpisode()
+    engine._retrieved_fact_texts = {}
+    facts = [
+        Fact(id="used", subject="validate credentials before dispatch", body="x"),
+        Fact(id="unrelated", subject="rotate encryption keys quarterly", body="y"),
+    ]
+    engine._capture_retrieval_context(
+        ContextResult(valid_facts=facts,
+                      retrieval_scores={"used": 0.8, "unrelated": 0.8}), included=True)
+    engine._capture_detectable_fact_use(
+        [PlanStep(description="validate credentials before dispatch",
+                  rationale="validate the credentials on dispatch")],
+        [SimulationTrace("in", "out", [])],
+        [CodeSuggestion("src/a.py", "", "add credential validation before dispatch", 0.8)],
+    )
+    by_id = {e.fact_id: e for e in engine.current_learning_episode.retrieved_facts}
+    assert by_id["used"].used_in_reasoning is True
+    assert by_id["unrelated"].used_in_reasoning is False
+
+
+def test_overlap_ignores_trivial_single_token_subject():
+    """T10: overlap requires >=2 significant tokens, so a one-word subject can't
+    fabricate use from an incidental word match."""
+    from neo.models import CodeSuggestion, PlanStep, SimulationTrace
+
+    engine = NeoEngine(lm_adapter=_CombinedLM(), enable_persistent_memory=False)
+    engine.current_learning_episode = LearningEpisode()
+    engine._retrieved_fact_texts = {}
+    facts = [Fact(id="trivial", subject="Testing", body="x")]
+    engine._capture_retrieval_context(
+        ContextResult(valid_facts=facts, retrieval_scores={"trivial": 0.8}), included=True)
+    engine._capture_detectable_fact_use(
+        [PlanStep(description="testing testing", rationale="all about testing")],
+        [SimulationTrace("in", "out", [])],
+        [CodeSuggestion("a.py", "", "testing", 0.8)],
+    )
+    assert engine.current_learning_episode.retrieved_facts[0].used_in_reasoning is False
+
+
 def test_failed_verification_is_associated_only_with_used_retrieval(tmp_path):
     from neo.memory.episodes import RetrievedFactEvidence
     from neo.models import StaticCheckResult

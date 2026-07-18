@@ -409,6 +409,12 @@ class Fact:
     # Evidence-based invalidation is distinct from semantic supersession: a
     # harmful fact may be rolled back without a replacement fact existing.
     invalidation_reason: Optional[str] = None
+    # Canonical signature frozen at promotion time. Promotion, rollback-resolve,
+    # and the re-promotion guard all key on generalize()-normalized text; storing
+    # it here (rather than recomputing) keeps those paths reachable if generalize()
+    # ever changes — a mint-time-v1 fact stays resolvable under v2. Empty for
+    # non-promoted facts.
+    canonical_signature: str = ""
 
     def size_hint(self) -> int:
         """Approximate token count. Uses len//4 heuristic — not precise, just monotonic."""
@@ -447,6 +453,7 @@ class Fact:
             "contradicting_episode_ids": self.contradicting_episode_ids,
             "source_candidate_id": self.source_candidate_id,
             "invalidation_reason": self.invalidation_reason,
+            "canonical_signature": self.canonical_signature,
         }
         if self.embedding is not None:
             data["embedding"] = self.embedding.tolist()
@@ -488,6 +495,7 @@ class Fact:
             contradicting_episode_ids=data.get("contradicting_episode_ids", []),
             source_candidate_id=data.get("source_candidate_id"),
             invalidation_reason=data.get("invalidation_reason"),
+            canonical_signature=data.get("canonical_signature", ""),
         )
 
 

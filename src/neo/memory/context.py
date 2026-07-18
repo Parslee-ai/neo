@@ -193,8 +193,10 @@ class ContextAssembler:
         if ctx.valid_facts:
             lines = [
                 "## Relevant Knowledge",
-                "When a fact materially influences the answer, preserve its "
-                "[fact:<id>] citation in the rationale or suggestion description.",
+                "When a fact materially influences the answer, cite its "
+                "[fact:<id>] inline AND list every id you used on a final line "
+                "exactly as `Facts used: [<id>, <id>]` (use `Facts used: []` if "
+                "none). This attribution is how neo learns which knowledge helps.",
             ]
             for fact in ctx.valid_facts:
                 conf = fact.metadata.confidence

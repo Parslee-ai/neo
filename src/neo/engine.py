@@ -216,6 +216,11 @@ class NeoEngine:
 
     def _begin_learning_episode(self, neo_input: NeoInput):
         """Create the in-memory evidence record for one request."""
+        # Transient per-request map of retrieved fact_id -> subject text, used
+        # by _capture_detectable_fact_use for overlap-based use-detection. Not
+        # persisted (keeps the episode ledger lean); reset each request.
+        self._retrieved_fact_texts: dict[str, str] = {}
+        self._use_signal_counts: dict[str, int] = {}
         from neo.agent_context import discover as discover_agent_docs
         from neo.memory.episodes import (
             ContextSelection,
@@ -340,9 +345,55 @@ class NeoEngine:
             elif score is not None:
                 item.score = score
             item.included_in_context = item.included_in_context or included
+            # Stash the subject text (transient) for overlap use-detection.
+            if getattr(self, "_retrieved_fact_texts", None) is not None:
+                self._retrieved_fact_texts[fact.id] = fact.subject or ""
+
+    _FACTS_USED_RE = re.compile(r"facts?\s+used\s*[:=]\s*\[([^\]]*)\]", re.IGNORECASE)
+    # Generic subject tokens that must not, on their own, imply fact use.
+    _OVERLAP_STOPWORDS = frozenset({
+        "pattern", "fact", "code", "test", "tests", "file", "files", "function",
+        "error", "errors", "using", "should", "avoid", "prefer", "always", "never",
+    })
+
+    @classmethod
+    def _parse_facts_used(cls, text: str) -> set[str]:
+        """Extract fact ids from a structured 'Facts used: [id, id]' self-report —
+        far more reliable than a stylistic inline marker (LLMs honor an explicit
+        obligation better than a `[fact:id]` convention buried in prose)."""
+        ids: set[str] = set()
+        for match in cls._FACTS_USED_RE.finditer(text):
+            for token in re.split(r"[,\s]+", match.group(1)):
+                token = token.strip().strip("\"'`").replace("fact:", "")
+                if token:
+                    ids.add(token)
+        return ids
+
+    @classmethod
+    def _subject_overlaps(cls, subject: str, lower_text: str) -> bool:
+        """Conservative corroborating signal: the fact's distinctive subject
+        wording substantially appears in the reasoning. Requires >=2 significant
+        (>3 char, non-stopword) tokens and >=70% present, so trivial word
+        matches can't fabricate use. Never the sole basis for durable promotion
+        — that runs on git-attributed acceptance, not this signal."""
+        tokens = [
+            t for t in re.findall(r"[a-z0-9_]+", subject.lower())
+            if len(t) > 3 and t not in cls._OVERLAP_STOPWORDS
+        ]
+        if len(tokens) < 2:
+            return False
+        present = sum(1 for t in tokens if t in lower_text)
+        return present / len(tokens) >= 0.7
 
     def _capture_detectable_fact_use(self, plan, simulations, suggestions) -> None:
-        """Mark facts only when their stable citation survives into reasoning output."""
+        """Credit a retrieved fact as used when its influence is DETECTABLE by any
+        of three signals: a surviving ``[fact:<id>]`` marker, a structured
+        ``Facts used: [...]`` self-report, or conservative subject overlap.
+        Production LLMs rarely echo the machine marker (measured
+        citation_survival ~0), so the added signals keep the retrieved-fact
+        reinforcement path from being inert — WITHOUT loosening the cited-only
+        credit model into an every-included-fact correlation flood the design
+        deliberately rejects."""
         episode = self.current_learning_episode
         if episode is None or not episode.retrieved_facts:
             return
@@ -353,14 +404,36 @@ class NeoEngine:
             *(suggestion.description for suggestion in suggestions),
         ]
         text = "\n".join(str(item) for item in artifacts if item)
+        lower_text = text.lower()
+        self_reported = self._parse_facts_used(text)
+        subjects = getattr(self, "_retrieved_fact_texts", {}) or {}
+        # Per-signal tallies so the citation_survival metric can report which of
+        # the three signals actually fired — without that split we can't tell
+        # whether the reliable self-report is carrying the path or the softer
+        # overlap is the only thing keeping it alive (which decides overlap's
+        # future). A fact matched by two signals counts in both.
+        signals = {"by_marker": 0, "by_self_report": 0, "by_overlap": 0}
         for evidence in episode.retrieved_facts:
-            if evidence.included_in_context and f"[fact:{evidence.fact_id}]" in text:
-                # Sticky: OR-accumulate across reasoning passes. A citation that
-                # survived into an earlier pass stays credited even if a later
-                # pass's artifact set doesn't repeat it — never clobber True.
+            fid = evidence.fact_id
+            if not evidence.included_in_context:
+                if evidence.used_in_reasoning is not True:
+                    evidence.used_in_reasoning = False
+                continue
+            by_marker = f"[fact:{fid}]" in text
+            by_self_report = fid in self_reported
+            by_overlap = self._subject_overlaps(subjects.get(fid, ""), lower_text)
+            if by_marker:
+                signals["by_marker"] += 1
+            if by_self_report:
+                signals["by_self_report"] += 1
+            if by_overlap:
+                signals["by_overlap"] += 1
+            if by_marker or by_self_report or by_overlap:
+                # Sticky OR-accumulate across reasoning passes — never clobber True.
                 evidence.used_in_reasoning = True
             elif evidence.used_in_reasoning is not True:
                 evidence.used_in_reasoning = False
+        self._use_signal_counts = signals
 
     def _log_action(self, action: str, signature: str) -> None:
         """Append an action to the loop-detection log.
@@ -956,11 +1029,18 @@ class NeoEngine:
             from neo.memory.metrics import record as record_memory_metric
             included = [e for e in episode.retrieved_facts if e.included_in_context]
             used = [e for e in included if e.used_in_reasoning is True]
+            sig = getattr(self, "_use_signal_counts", {}) or {}
             record_memory_metric(
                 "citation_survival",
                 retrieved=len(episode.retrieved_facts),
                 included=len(included),
                 used=len(used),
+                # Per-signal breakdown (may overlap): which detector actually
+                # fired. Lets us measure whether the reliable self-report is
+                # carrying the path or the softer overlap is doing the work.
+                by_marker=sig.get("by_marker", 0),
+                by_self_report=sig.get("by_self_report", 0),
+                by_overlap=sig.get("by_overlap", 0),
                 provider=episode.provider or "",
                 model=episode.model or "",
             )
