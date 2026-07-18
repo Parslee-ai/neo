@@ -592,6 +592,123 @@ class TestBuildContext:
         assert len(ctx.valid_facts) == 1
 
 
+class TestStripTombstoneEmbeddings:
+    def test_strips_embedding_from_invalid_fact(self, store):
+        """Invalid facts should lose their embedding (dead weight); valid keep it."""
+        emb = np.random.randn(768).astype(np.float32)
+        dead = Fact(id="dead", subject="Dead", body="B", is_valid=False,
+                    embedding=emb.copy(), metadata=FactMetadata())
+        live = Fact(id="live", subject="Live", body="B", is_valid=True,
+                    embedding=emb.copy(), metadata=FactMetadata())
+        store._facts.extend([dead, live])
+
+        assert store.strip_tombstone_embeddings() == 1
+        assert dead.embedding is None
+        assert live.embedding is not None
+
+    def test_idempotent(self, store):
+        """Second run strips nothing — no embedding left on tombstones."""
+        dead = Fact(id="dead", subject="Dead", body="B", is_valid=False,
+                    embedding=np.random.randn(768).astype(np.float32),
+                    metadata=FactMetadata())
+        store._facts.append(dead)
+        assert store.strip_tombstone_embeddings() == 1
+        assert store.strip_tombstone_embeddings() == 0
+
+    def test_survives_save_reload(self, store):
+        """A stripped tombstone reloads with embedding None (key omitted on disk)."""
+        dead = Fact(id="dead", subject="Dead", body="B", is_valid=False,
+                    scope=FactScope.PROJECT, org_id="testorg",
+                    project_id="testproj1234",
+                    embedding=np.random.randn(768).astype(np.float32),
+                    metadata=FactMetadata())
+        store._facts.append(dead)
+        store.strip_tombstone_embeddings()
+        store.load()
+        reloaded = [f for f in store._facts if f.id == "dead"]
+        assert reloaded and reloaded[0].embedding is None
+
+    def test_save_false_defers_persist_but_mutates(self, store):
+        """save=False strips in-memory and returns the count, but does not save —
+        lets the cold-start chain collapse four janitor saves into one."""
+        dead = Fact(id="dead", subject="Dead", body="B", is_valid=False,
+                    embedding=np.random.randn(768).astype(np.float32),
+                    metadata=FactMetadata())
+        store._facts.append(dead)
+        with patch.object(store, "save") as mock_save:
+            assert store.strip_tombstone_embeddings(save=False) == 1
+        assert dead.embedding is None      # mutated in memory
+        mock_save.assert_not_called()      # but not persisted
+
+
+class TestInvalidate:
+    def test_strips_embedding_and_cascades(self, store):
+        """_invalidate marks invalid, drops the vector, and flags dependents."""
+        parent = Fact(id="p", subject="Parent", body="B", is_valid=True,
+                      embedding=np.random.randn(768).astype(np.float32),
+                      metadata=FactMetadata())
+        child = Fact(id="c", subject="Child", body="B", is_valid=True,
+                     depends_on=["p"], metadata=FactMetadata())
+        store._facts.extend([parent, child])
+
+        store._invalidate(parent)
+
+        assert parent.is_valid is False
+        assert parent.embedding is None
+        assert child.needs_review is True
+
+    def test_cascade_false_skips_dependents(self, store):
+        """cascade=False (the independent-fact cap) strips but doesn't flag."""
+        parent = Fact(id="p", subject="Parent", body="B", is_valid=True,
+                      embedding=np.random.randn(768).astype(np.float32),
+                      metadata=FactMetadata())
+        child = Fact(id="c", subject="Child", body="B", is_valid=True,
+                     depends_on=["p"], metadata=FactMetadata())
+        store._facts.extend([parent, child])
+
+        store._invalidate(parent, cascade=False)
+
+        assert parent.is_valid is False
+        assert parent.embedding is None
+        assert child.needs_review is False
+
+    def test_supersede_strips_old_embedding_and_keeps_pointer(self, store):
+        """_supersede routes through _invalidate: old fact loses its vector but
+        keeps the superseded_by pointer for chain integrity."""
+        old = Fact(id="old", subject="Old", body="B", is_valid=True,
+                   embedding=np.random.randn(768).astype(np.float32),
+                   metadata=FactMetadata())
+        new = Fact(id="new", subject="New", body="B", metadata=FactMetadata())
+        store._facts.append(old)
+
+        store._supersede(old, new)
+
+        assert old.is_valid is False
+        assert old.embedding is None
+        assert old.superseded_by == "new"
+
+
+class TestJanitorSaveDeferral:
+    def test_purge_records_deletions_when_save_deferred(self, store):
+        """purge(save=False) must still record _deleted_ids so a later trailing
+        save() flushes them (else merge-on-save could resurrect the tombstone)."""
+        orphan = Fact(id="orph", subject="Orphan", body="B", is_valid=False,
+                      metadata=FactMetadata(last_accessed=time.time() - 90 * 86400))
+        store._facts.append(orphan)
+        with patch.object(store, "save") as mock_save:
+            assert store.purge_dead_facts(save=False) == 1
+        assert "orph" in store._deleted_ids   # recorded for the trailing flush
+        mock_save.assert_not_called()
+
+    def test_all_four_janitors_accept_save_flag(self, store):
+        """Signature guard: every chained janitor takes save= and defaults True."""
+        import inspect
+        for name in ("prune_stale_facts", "demote_unhelpful_facts",
+                     "purge_dead_facts", "strip_tombstone_embeddings"):
+            sig = inspect.signature(getattr(store, name))
+            assert sig.parameters["save"].default is True
+
+
 class TestPurgeDeadFacts:
     def test_purges_superseded_with_valid_successor(self, store):
         """Invalid facts whose chain resolves to a valid fact should be purged."""

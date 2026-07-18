@@ -7,6 +7,7 @@ construct, prompt, etc.) and their supporting utilities.
 Split from cli.py for modularity.
 """
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -234,7 +235,25 @@ def _linked_feedback_projects(*, include_fallback: bool = False) -> list[tuple[s
 
 
 def _compact_fact_file(path: Path, *, max_invalid_age_days: int = 30, dry_run: bool = False) -> dict:
-    """Drop old invalid facts from one scoped fact JSON file."""
+    """Drop old invalid facts (and strip retained tombstones' embeddings) from
+    one scoped fact JSON file.
+
+    Serializes the read-modify-write under the same sidecar ``<file>.lock`` that
+    ``FactStore.save`` holds, so a concurrent observer/request-path save can't be
+    clobbered — this compactor is an out-of-class writer, and stripping now makes
+    it write on nearly every run instead of rarely. Dry-run takes no lock (it
+    never writes).
+    """
+    from neo.memory.store import scope_file_lock
+
+    lock = contextlib.nullcontext() if dry_run else scope_file_lock(path)
+    with lock:
+        return _compact_fact_file_locked(
+            path, max_invalid_age_days=max_invalid_age_days, dry_run=dry_run
+        )
+
+
+def _compact_fact_file_locked(path: Path, *, max_invalid_age_days: int, dry_run: bool) -> dict:
     try:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
@@ -248,6 +267,7 @@ def _compact_fact_file(path: Path, *, max_invalid_age_days: int = 30, dry_run: b
     cutoff = max(0, max_invalid_age_days) * 86400
     kept = []
     removed = 0
+    stripped = 0
     for fact in facts:
         if not isinstance(fact, dict):
             kept.append(fact)
@@ -262,9 +282,16 @@ def _compact_fact_file(path: Path, *, max_invalid_age_days: int = 30, dry_run: b
         if not is_valid and age >= cutoff:
             removed += 1
             continue
+        # Retained tombstone (invalid but too young to purge): its embedding is
+        # dead weight — invalid facts are never retrieved or deduped — so drop
+        # the ~24 KB vector while keeping the row for supersession/audit. Mirrors
+        # FactStore.strip_tombstone_embeddings on the cold-start path.
+        if not is_valid and fact.get("embedding") is not None:
+            fact = {k: v for k, v in fact.items() if k != "embedding"}
+            stripped += 1
         kept.append(fact)
 
-    if removed and not dry_run:
+    if (removed or stripped) and not dry_run:
         updated = dict(data)
         updated["facts"] = kept
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -276,6 +303,7 @@ def _compact_fact_file(path: Path, *, max_invalid_age_days: int = 30, dry_run: b
         "path": str(path),
         "total": len(facts),
         "removed": removed,
+        "stripped": stripped,
         "remaining": len(kept),
     }
 
@@ -651,7 +679,7 @@ def handle_memory(args):
         if limit is not None:
             files = files[:limit]
 
-        totals = {"files": 0, "removed": 0, "errors": 0}
+        totals = {"files": 0, "removed": 0, "stripped": 0, "errors": 0}
         for path in files:
             totals["files"] += 1
             stats = _compact_fact_file(
@@ -664,14 +692,21 @@ def handle_memory(args):
                 print(f"[Neo] prune error {path}: {stats.get('error')}", file=sys.stderr)
                 continue
             removed = int(stats.get("removed", 0))
+            stripped = int(stats.get("stripped", 0))
             totals["removed"] += removed
-            if removed or getattr(args, "verbose", False):
+            totals["stripped"] += stripped
+            if removed or stripped or getattr(args, "verbose", False):
                 mode = "would remove" if getattr(args, "dry_run", False) else "removed"
-                print(f"[Neo] {mode} {removed} old invalid fact(s) from {path.name}")
+                detail = f"{mode} {removed} old invalid fact(s)"
+                if stripped:
+                    verb = "would strip" if getattr(args, "dry_run", False) else "stripped"
+                    detail += f", {verb} {stripped} tombstone embedding(s)"
+                print(f"[Neo] {detail} from {path.name}")
 
         mode = "dry run" if getattr(args, "dry_run", False) else "prune"
         print(
-            f"[Neo] memory {mode}: {totals['removed']} old invalid fact(s) "
+            f"[Neo] memory {mode}: {totals['removed']} old invalid fact(s) removed, "
+            f"{totals['stripped']} tombstone embedding(s) stripped "
             f"across {totals['files']} file(s)"
         )
         if totals["errors"]:

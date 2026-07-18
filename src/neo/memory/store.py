@@ -117,6 +117,42 @@ FACTS_DIR = Path.home() / ".neo" / "facts"
 FASTEMBED_CACHE_DIR = Path.home() / ".cache" / "neo" / "fastembed"
 
 
+@contextlib.contextmanager
+def scope_file_lock(path: "Path"):
+    """Exclusive cross-process lock for a scope file's read-modify-write.
+
+    Locks a sidecar ``<file>.lock`` (never the data file itself — that gets
+    atomically replaced by the writer, which would drop a lock held on the
+    original inode). Best-effort: if ``fcntl`` is unavailable or locking fails,
+    proceeds unlocked (degrades to the prior behavior) rather than blocking.
+
+    Module-level so any writer that does its own read-modify-write on a fact
+    file — ``FactStore.save`` and the ``neo memory prune`` compactor alike —
+    serializes through the identical lock rather than each rolling its own.
+    """
+    if fcntl is None:
+        yield
+        return
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    fd = None
+    try:
+        fd = open(lock_path, "a")  # 'a': never truncate; content is unused
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+    except OSError as e:
+        logger.debug(f"scope file lock unavailable for {path.name}: {e}")
+        if fd is not None:
+            fd.close()
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+
 class FactStore:
     """Scoped fact store with supersession-based knowledge management.
 
@@ -220,9 +256,14 @@ class FactStore:
         # ran inside detect_implicit_feedback, so inactive projects accumulated
         # stale REVIEW facts indefinitely.
         try:
-            self.prune_stale_facts()
-            self.demote_unhelpful_facts()
-            self.purge_dead_facts()
+            # Defer each step's save and flush once at the end — a cold start on
+            # a multi-MB fact file otherwise pays 4 full merge-on-save rewrites.
+            changed = self.prune_stale_facts(save=False)
+            changed += self.demote_unhelpful_facts(save=False)
+            changed += self.purge_dead_facts(save=False)
+            changed += self.strip_tombstone_embeddings(save=False)
+            if changed:
+                self.save()
         except Exception as e:
             logger.warning(f"Lifecycle maintenance on init failed (non-fatal): {e}")
 
@@ -1005,11 +1046,16 @@ class FactStore:
         if outcomes:
             modified = sum(1 for o in outcomes if o.outcome_type == OutcomeType.MODIFIED)
             logger.info(f"Processed {len(outcomes)} outcome(s): modified={modified}")
-            # Chain maintenance: synthesize -> prune stale -> demote unhelpful -> purge dead
+            # Chain maintenance: synthesize -> prune stale -> demote unhelpful
+            # -> purge dead -> strip tombstone embeddings. The four janitors
+            # defer their saves and flush once here.
             self.synthesize_reviews()
-            self.prune_stale_facts()
-            self.demote_unhelpful_facts()
-            self.purge_dead_facts()
+            changed = self.prune_stale_facts(save=False)
+            changed += self.demote_unhelpful_facts(save=False)
+            changed += self.purge_dead_facts(save=False)
+            changed += self.strip_tombstone_embeddings(save=False)
+            if changed:
+                self.save()
 
         # Extract prevention patterns from corrections
         modified_outcomes = [o for o in outcomes if o.outcome_type == OutcomeType.MODIFIED]
@@ -1228,8 +1274,7 @@ class FactStore:
 
         evicted = 0
         for fact in evictable[:excess]:
-            fact.is_valid = False
-            self._cascade_needs_review(fact.id)
+            self._invalidate(fact)
             evicted += 1
 
         if evicted:
@@ -1305,37 +1350,15 @@ class FactStore:
                 if mt is not None:
                     self._scope_mtimes[str(path)] = mt
 
-    @contextlib.contextmanager
     def _scope_file_lock(self, path: "Path"):
         """Exclusive cross-process lock for a scope file's read-modify-write.
 
-        Locks a sidecar ``<file>.lock`` (never the data file itself — that gets
-        atomically replaced by ``_save_file``, which would drop a lock held on
-        the original inode). Best-effort: if ``fcntl`` is unavailable or locking
-        fails, proceeds unlocked (degrades to the prior merge-on-save behavior)
-        rather than blocking a save.
+        Thin instance-level alias for the module-level :func:`scope_file_lock`
+        so out-of-class writers (the ``neo memory prune`` compactor) serialize
+        against ``FactStore.save()`` through the *same* sidecar lock — one
+        locking contract, no divergence.
         """
-        if fcntl is None:
-            yield
-            return
-        lock_path = path.with_suffix(path.suffix + ".lock")
-        fd = None
-        try:
-            fd = open(lock_path, "a")  # 'a': never truncate; content is unused
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
-        except OSError as e:
-            logger.debug(f"scope file lock unavailable for {path.name}: {e}")
-            if fd is not None:
-                fd.close()
-            yield
-            return
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-            finally:
-                fd.close()
+        return scope_file_lock(path)
 
     @staticmethod
     def _file_mtime(path: "Path") -> Optional[int]:
@@ -1425,7 +1448,7 @@ class FactStore:
             om.confidence = max(om.confidence, dm.confidence)
         return ours
 
-    def purge_dead_facts(self) -> int:
+    def purge_dead_facts(self, save: bool = True) -> int:
         """Remove invalid facts that have gone cold (untouched 30+ days).
 
         Any fact that is invalid AND hasn't been accessed in 30+ days is
@@ -1464,13 +1487,55 @@ class FactStore:
         if purged:
             self._facts = kept
             # Record physical deletions so the merge-on-save can't resurrect
-            # them from another process's stale copy on disk.
+            # them from another process's stale copy on disk. Recorded even when
+            # save is deferred, so the caller's single trailing save() flushes them.
             self._deleted_ids.update(removed_ids)
-            self.save()
+            if save:
+                self.save()
             logger.info(f"Purged {purged} dead invalid facts")
         return purged
 
-    def prune_stale_facts(self) -> int:
+    def strip_tombstone_embeddings(self, save: bool = True) -> int:
+        """Drop the 768-dim embedding from invalidated facts.
+
+        An invalid fact is never retrieved, deduped against, or clustered —
+        every such path pre-filters ``is_valid`` — yet ``purge_dead_facts``
+        retains it up to 30 days for supersession-chain integrity, audit, and
+        merge-on-save conflict resolution. During that window the fact's
+        embedding is ~24 KB of JSON per fact; on an active repo the tombstone
+        backlog is the overwhelming bulk of the fact file (embeddings on dead
+        rows nobody reads). Stripping it preserves every field retrieval and
+        merge actually touch while reclaiming ~95% of a tombstone's on-disk
+        size.
+
+        Safe because invalidation is terminal: no path revives a fact to valid
+        (validity is one-way; the merge-on-save reconciler returns OURS
+        outright when we hold it invalid), so the vector is never needed again.
+        If some future code ever did need it, ``embed_text()`` re-derives it
+        deterministically — but note no current command re-embeds existing
+        facts (``--regenerate-embeddings`` targets the legacy ReasoningMemory
+        cache, not FactStore facts), so this strip is one-way in practice.
+
+        Not globally atomic across processes: a peer that still holds this fact
+        valid-with-embedding in memory re-writes the vector on its next
+        ``save()`` (the reconciler keeps OURS). It self-heals — every cold
+        start and ``detect_implicit_feedback`` re-runs this strip — same
+        eventual-consistency class as a peer's un-propagated invalidation.
+
+        Idempotent. Returns the number of facts stripped.
+        """
+        stripped = 0
+        for fact in self._facts:
+            if not fact.is_valid and fact.embedding is not None:
+                fact.embedding = None
+                stripped += 1
+        if stripped:
+            if save:
+                self.save()
+            logger.info(f"Stripped embeddings from {stripped} tombstone(s)")
+        return stripped
+
+    def prune_stale_facts(self, save: bool = True) -> int:
         """Remove valid-but-useless facts: low confidence, zero successes, old enough.
 
         Targets noise that was never validated. Does NOT touch CONSTRAINT facts
@@ -1518,16 +1583,16 @@ class FactStore:
             if (now - fact.metadata.created_at) < stale_age:
                 continue
 
-            fact.is_valid = False
-            self._cascade_needs_review(fact.id)
+            self._invalidate(fact)
             pruned += 1
 
         if pruned:
-            self.save()
+            if save:
+                self.save()
             logger.info(f"Pruned {pruned} stale unvalidated fact(s)")
         return pruned
 
-    def demote_unhelpful_facts(self) -> int:
+    def demote_unhelpful_facts(self, save: bool = True) -> int:
         """Demote or prune facts that are retrieved but never lead to accepted suggestions.
 
         Two tiers:
@@ -1561,8 +1626,7 @@ class FactStore:
             if success == 0:
                 if access >= DEMOTION_PRUNE_ACCESS:
                     # Hard prune: accessed 10+ times, never helpful
-                    fact.is_valid = False
-                    self._cascade_needs_review(fact.id)
+                    self._invalidate(fact)
                     affected += 1
                 else:
                     # Soft demotion: reduce confidence
@@ -1579,7 +1643,8 @@ class FactStore:
                     affected += 1
 
         if affected:
-            self.save()
+            if save:
+                self.save()
             logger.info(f"Demote/protect cycle affected {affected} fact(s)")
         return affected
 
@@ -1622,7 +1687,9 @@ class FactStore:
         indep.sort(key=lambda f: f.metadata.created_at, reverse=True)
         pruned = 0
         for f in indep[MAX_INDEPENDENT_FACTS:]:
-            f.is_valid = False
+            # cascade=False preserves the cap's prior behavior: independent
+            # facts are observation noise with no dependents worth flagging.
+            self._invalidate(f, cascade=False)
             pruned += 1
         if pruned:
             if save:
@@ -1780,7 +1847,9 @@ class FactStore:
         is_valid flag still gates retrieval; event_time_end is for callers
         who want to ask "what was true at time T?" without losing history.
         """
-        old.is_valid = False
+        # Invalidate + strip + cascade dependents. superseded_by / event_time_end
+        # are supersession-specific and set here, not in _invalidate.
+        self._invalidate(old)
         old.superseded_by = new.id
         new.supersedes = old.id
 
@@ -1792,10 +1861,29 @@ class FactStore:
         if old.metadata.event_time_end is None:
             old.metadata.event_time_end = new.metadata.effective_event_time
 
-        # Cascade: mark dependents as needing review
-        self._cascade_needs_review(old.id)
-
         logger.info(f"Superseded fact '{old.subject[:40]}' with '{new.subject[:40]}'")
+
+    def _invalidate(self, fact: Fact, *, cascade: bool = True) -> None:
+        """Single choke point for marking a fact invalid.
+
+        Sets ``is_valid = False`` and drops the embedding at the transition: a
+        tombstone is never retrieved, deduped, or clustered (all such paths
+        pre-filter ``is_valid``), so its 768-dim vector is immediately dead
+        weight. Stripping here keeps bloat from accumulating between the
+        periodic ``strip_tombstone_embeddings`` sweeps, which now only backfill
+        tombstones created off this path — an ingester superseding a fact, or a
+        peer process's still-embedded copy reconciled in.
+
+        Cascades ``needs_review`` to dependents unless ``cascade=False``. The
+        independent-fact cap opts out (observation noise, no dependents worth
+        flagging) — matching its prior behavior exactly. Supersession-specific
+        state (``superseded_by``, ``event_time_end``) stays at the call site;
+        this owns only the invalidate + strip + cascade triple. Idempotent.
+        """
+        fact.is_valid = False
+        fact.embedding = None
+        if cascade:
+            self._cascade_needs_review(fact.id)
 
     def _cascade_needs_review(self, superseded_id: str) -> None:
         """Mark facts that depend on a superseded fact as needing review."""
@@ -2217,9 +2305,8 @@ class FactStore:
 
         # Supersede all source facts and cascade dependency reviews
         for fact in cluster:
-            fact.is_valid = False
+            self._invalidate(fact)
             fact.superseded_by = new_fact.id
-            self._cascade_needs_review(fact.id)
 
         return new_fact
 
