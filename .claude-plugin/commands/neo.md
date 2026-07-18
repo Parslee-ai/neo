@@ -32,6 +32,9 @@ Neo will:
 3. Generate solutions with confidence scores
 4. Provide actionable recommendations
 
+This command uses `advise` mode. It reads and retrieves memory but does not create
+learning candidates, modify repository files, or execute commands.
+
 ## Parameters
 
 - `<question>` - Your question or task description (required)

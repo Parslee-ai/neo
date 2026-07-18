@@ -4,9 +4,9 @@
 
 # Neo
 
-> A self-improving code reasoning engine that learns from experience using persistent semantic memory. Neo uses multi-agent reasoning to analyze code, generate solutions, and continuously improve through feedback loops.
+> An evidence-learning code reasoning engine with explicit operating modes. Neo uses persistent semantic memory to improve from verified experience without silently gaining repository authority.
 
-- **Fact-Based Memory**: Learns from every solution attempt using a scoped, supersession-based fact store
+- **Fact-Based Memory**: Derives scoped, reversible knowledge from attributed and repeatedly verified outcomes—not from generation alone
 - **Semantic Retrieval**: Vector search finds relevant facts via Jina Code embeddings
 - **Code-First Generation**: No diff parsing failures
 - **Local Storage**: Privacy-first JSON storage in ~/.neo/facts/ directory
@@ -25,7 +25,7 @@ If you've been Vibe Coding, then Vibe Planning, then Context Engineering, and on
 
 Worse, your speedy AI Code Assistant sometimes goes rogue and overwrites key code in a project, or writes redundant code even after just reading documentation and the source code, or violates your project's patterns and design philosophy....  _It can be infuriating._  Why doesn't the model remember?  Why doesn't it learn?  Why can't it keep the context of the code patterns and tech stack? ... -> This is what Neo is designed to solve.  
 
-Neo is **_the missing context layer_** for AI Code Assistants.  It learns from every solution attempt, using vector embeddings to retrieve relevant patterns for new problems.  It then applies the learned patterns to generate solutions, and continuously improves through feedback loops.
+Neo is **_the missing context layer_** for AI Code Assistants. It retrieves relevant verified patterns, records suggestions as evidence candidates, and promotes knowledge only after attributed support. Repository writes and execution are separate, explicit host-granted capabilities.
 
 
 # Table of Contents
@@ -546,10 +546,42 @@ neo --version
 neo car status
 ```
 
+### Operating Modes
+
+```bash
+# Read-only analysis; retrieves memory but does not learn
+neo --mode advise "review the authorization flow"
+
+# Produce applicable change artifacts without applying them or learning
+neo --mode patch "add validation to the endpoint"
+
+# Backward-compatible default: read-only repository reasoning plus evidence learning
+neo --mode learn "fix the validation bug"
+
+# VERIFY is JSON/A2A-only because it requires caller-provided change content
+echo '{"prompt":"verify","operating_mode":"verify","proposed_changes":[{"file_path":"src/app.py","code_block":"value = 1"}]}' | neo --json
+```
+
+`agent` is not a synonym for unrestricted autonomy. It requires an explicit
+workspace-rooted authority policy and a host-provided execution adapter. Neo has
+no built-in shell or repository executor, never invokes generated command
+strings, and the standalone CLI fails closed for `agent`. See the
+[operating-mode contract](docs/solutions/operating-modes.md).
+
 
 ### Memory Maintenance
 
 ```bash
+# Explain why a fact exists and how evidence changed it (no LM call)
+neo memory explain <fact-id-or-prefix>
+
+# Machine-readable causal history
+neo memory explain <fact-id-or-prefix> --json
+
+# Reproduce evidence-learning quality and safety claims without an LM
+neo memory evaluate-learning
+neo memory evaluate-learning --json
+
 # Compact fact files by dropping old invalid tombstones (default: > 30 days since last access)
 neo memory prune
 
@@ -561,6 +593,17 @@ neo memory prune --dry-run --max-invalid-age-days 14
 ```
 
 Use `prune` when a `~/.neo/facts/facts_project_*.json` file grows much larger than its 500-valid-fact cap — that gap is tombstone bloat from supersession. Defaults are conservative; raising `--max-invalid-age-days` is safe, lowering it past ~7 may evict tombstones still referenced by recent supersession chains.
+
+`memory explain` is read-only and works for current facts and retained tombstones. It joins
+the fact with local learning episodes to show supporting and contradicting evidence,
+retrieval scores and context inclusion, confidence/effectiveness mutations, rollback
+reasons, and the supersession chain. It never initializes embeddings or calls an LM.
+
+`memory evaluate-learning` runs the versioned repeated-task corpus against
+memory-disabled, legacy immediate-memory, and evidence-driven policies. It reports
+quality, harmful-memory, unsupported-promotion, repeat-error, isolation, latency,
+model-call, and token metrics, and exits nonzero if any safety scenario or threshold
+fails. See [the evaluation contract](docs/solutions/evidence-learning-evaluation.md).
 
 
 ### Timeout Requirements
@@ -678,7 +721,7 @@ Neo uses a **scoped, supersession-based fact store** with **Jina Code v2** embed
 
 Neo generates structured outputs with executable code and planning artifacts:
 
-**CodeSuggestion** - Executable code with actionable metadata:
+**CodeSuggestion** - Applicable code artifacts with advisory execution metadata:
 ```python
 @dataclass
 class CodeSuggestion:
@@ -690,7 +733,7 @@ class CodeSuggestion:
     confidence: float
     tradeoffs: list[str]
 
-    # Executable artifacts (v0.8.0+)
+    # Applicable/advisory artifacts (never executed without a host authority adapter)
     patch_content: str = ""            # Full unified diff content
     apply_command: str = ""            # Shell command to apply (advisory)
     rollback_command: str = ""         # Shell command to undo (advisory)
@@ -764,7 +807,8 @@ After each Neo run, the next invocation diffs your repo against the suggestions 
 |-------------|--------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
 | ACCEPTED    | Code-block overlap ≥ 0.8 (modern path) or unified-diff overlap > 0.3 (legacy path) | linked fact conf +0.2 ± arch_mod, success_count +1, effectiveness "better"          |
 | MODIFIED    | User changed the file differently                                        | linked fact conf −0.2 ± arch_mod (floored at 0.1) + new REVIEW at conf 0.4          |
-| UNVERIFIED  | File touched but suggestion had no diff to compare                       | linked fact conf +0.1 ± arch_mod, success_count +1 (no REVIEW)                      |
+| REGRESSION  | Later evidence identifies an accepted suggestion by episode + suggestion ID | derived fact conf −0.2; repeated independent contradictions roll it back          |
+| UNVERIFIED  | File touched but suggestion had no diff to compare                       | evidence retained in the learning episode; no confidence or success mutation         |
 | INDEPENDENT | File touched, never suggested by Neo                                     | new REVIEW at conf 0.2; capped 5/session, 50/project                                |
 
 

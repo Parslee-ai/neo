@@ -14,7 +14,7 @@ When the user invokes this skill (`$neo-review <file or module>`), do the follow
 3. **Invoke Neo with a review-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo <<'QUERY'
+   neo --mode advise <<'QUERY'
    Review the following code for: security vulnerabilities, edge cases, error handling, performance issues. Provide concrete suggestions with confidence scores.
 
    <paste relevant code or summarize what you read>

@@ -34,6 +34,9 @@ Neo will:
 
 ## Parameters
 
+This command uses read-only `advise` mode. Suggested benchmarks and commands are
+advisory and are never executed by Neo.
+
 - `<target>` - File path or function name (required)
 
 Optionally include performance requirements (e.g., "needs <2s for 10k records")

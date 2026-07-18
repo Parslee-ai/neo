@@ -5,6 +5,7 @@ LM Adapter implementations for OpenAI, Anthropic, and local models.
 import os
 import json
 import logging
+import re
 import subprocess
 import tempfile
 import threading
@@ -964,6 +965,30 @@ def _apply_car_daemon_timeout_default() -> None:
     os.environ.setdefault("CAR_DAEMON_TIMEOUT", str(_CAR_DAEMON_TIMEOUT_DEFAULT_S))
 
 
+def _model_pin_honored(requested: str, used: str) -> bool:
+    """Whether CAR's ``model_used`` plausibly satisfies an explicit ``model`` pin.
+
+    CAR expands a logical pin to a concrete deployment (a version/date suffix),
+    so we accept when either name contains the other after stripping
+    non-alphanumerics. A wholly unrelated ``used`` — e.g. a pin of
+    ``nonexistent-model-id-xyz`` silently routed to the ``apple-foundation``
+    fallback — means CAR ignored the pin; the caller should fail fast rather
+    than run against the wrong model.
+
+    Known limitation: a CAR-internal *alias* that resolves to an unrelated
+    concrete name would false-positive here. neo pins concrete model names, and
+    router mode (``model=None``) skips this check entirely, so that path isn't
+    exercised in practice.
+    """
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    r, u = _norm(requested), _norm(used)
+    if not r or not u:
+        return True  # nothing comparable — don't block
+    return r in u or u in r
+
+
 class CarAdapter(LMAdapter):
     """Route Neo's outbound inference through CAR's unified inference layer.
 
@@ -1114,6 +1139,20 @@ class CarAdapter(LMAdapter):
             )
         except Exception:
             pass  # Metrics are never load-bearing.
+
+        # Fail fast on a silently-substituted model. When a specific model is
+        # pinned but CAR can't honor it (unknown/unavailable id), the router
+        # falls back to a default instead of erroring — so a typo'd or retired
+        # pin would run against the wrong model unnoticed. Router mode
+        # (model=None) intentionally skips this.
+        model_used = result.get("model_used") or ""
+        if self.model and model_used and not _model_pin_honored(self.model, model_used):
+            raise RuntimeError(
+                f"CAR did not honor pinned model '{self.model}': it routed to "
+                f"'{model_used}' instead. Unknown or unavailable model ids "
+                f"silently fall back to a default — pin a model CAR knows, or "
+                f"use router mode (model=None)."
+            )
 
         return result.get("text", "")
 

@@ -113,23 +113,26 @@ def _store_engine():
     return e, store, ni, plan, code
 
 
-def test_fast_path_facts_have_no_provenance_tags():
+def test_fast_path_creates_unverified_candidate_not_fact():
+    from neo.memory.episodes import LearningEpisode
     e, store, ni, plan, code = _store_engine()
+    e.current_learning_episode = LearningEpisode()
     e.last_deliberation = None
     e._store_reasoning(ni, plan, code, 0.8, {})
-    assert "multi-agent" not in store.added[-1]["tags"]
-    assert "probation" not in store.added[-1]["tags"]
+    assert store.added == []
+    assert len(e.current_learning_episode.memory_candidates) == 1
+    assert e.current_learning_episode.memory_candidates[0].status == "observed_unverified"
 
 
-def test_deliberated_facts_get_provenance_and_probation():
+def test_deliberated_output_also_stays_unverified_candidate():
+    from neo.memory.episodes import LearningEpisode
     from neo.multi_agent import DeliberationResult
     e, store, ni, plan, code = _store_engine()
+    e.current_learning_episode = LearningEpisode()
     e.last_deliberation = DeliberationResult(
         plan=[], simulation_traces=[], code_suggestions=[],
         confidence=0.7, consensus=0.8, rounds=0,
     )
     e._store_reasoning(ni, plan, code, 0.7, {})
-    tags = store.added[-1]["tags"]
-    assert "multi-agent" in tags and "probation" in tags
-    # confidence stored is the consensus-based value passed in, not self-report
-    assert store.added[-1]["confidence"] == 0.7
+    assert store.added == []
+    assert len(e.current_learning_episode.memory_candidates) == 1

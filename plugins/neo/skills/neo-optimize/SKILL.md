@@ -14,7 +14,7 @@ When the user invokes this skill (`$neo-optimize <target>`), do the following:
 3. **Invoke Neo with an optimization-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo <<'QUERY'
+   neo --mode advise <<'QUERY'
    Suggest optimizations for the following code. Focus on: algorithmic improvements (lower asymptotic complexity), redundant computation, allocation in hot loops, IO batching opportunities. Skip micro-style changes.
 
    <paste current implementation + relevant callers>

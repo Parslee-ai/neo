@@ -79,6 +79,10 @@ class TestFact:
             metadata=FactMetadata(confidence=0.9),
             embedding=embedding,
             tags=["python", "architecture"],
+            supporting_episode_ids=["support-1"],
+            contradicting_episode_ids=["conflict-1"],
+            source_candidate_id="candidate-1",
+            invalidation_reason="repeated_attributed_contradiction",
         )
         d = fact.to_dict()
         restored = Fact.from_dict(d)
@@ -97,6 +101,10 @@ class TestFact:
         assert restored.needs_review is False
         assert restored.metadata.confidence == 0.9
         assert restored.tags == ["python", "architecture"]
+        assert restored.supporting_episode_ids == ["support-1"]
+        assert restored.contradicting_episode_ids == ["conflict-1"]
+        assert restored.source_candidate_id == "candidate-1"
+        assert restored.invalidation_reason == "repeated_attributed_contradiction"
         np.testing.assert_array_almost_equal(restored.embedding, embedding, decimal=5)
 
     def test_to_dict_no_embedding(self):
@@ -125,6 +133,7 @@ class TestFact:
         assert fact.depends_on == []
         assert fact.tags == []
         assert fact.domain is None
+        assert fact.invalidation_reason is None
 
     def test_domain_roundtrip(self):
         fact = Fact(subject="prefer pytest", body="...", domain="testing")

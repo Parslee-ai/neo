@@ -34,6 +34,9 @@ Neo will:
 
 ## Parameters
 
+This command uses `advise` mode. Architecture guidance is not automatically
+promoted into policy or durable architecture memory.
+
 - `<question>` - Your architectural question (required)
 
 Include constraints: scalability needs, team size, infrastructure, timeline

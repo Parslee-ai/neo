@@ -27,6 +27,7 @@ from neo.models import (
     StaticCheckResult,
     TaskType,
 )
+from neo.operating_mode import OperatingMode
 
 
 class TestToolSchema:
@@ -54,6 +55,15 @@ class TestToolSchema:
         assert set(item["required"]) == {"path", "content"}
         assert item["properties"]["line_range"]["minItems"] == 2
 
+    def test_schema_advertises_operating_modes_and_authority(self):
+        properties = tool_schema()["parameters"]["properties"]
+        assert set(properties["operating_mode"]["enum"]) == {
+            mode.value for mode in OperatingMode
+        }
+        assert properties["operating_mode"]["default"] == "learn"
+        assert "authority" in properties
+        assert "proposed_changes" in properties
+
     def test_schema_is_not_idempotent(self):
         # Every call should re-run the pipeline (memory updates, etc.).
         # If we ever mark it idempotent, the daemon would cache results.
@@ -69,6 +79,7 @@ class TestDictToNeoInput:
         assert ni.prompt == "hello"
         assert ni.task_type is None
         assert ni.context_files == []
+        assert ni.operating_mode is OperatingMode.LEARN
 
     def test_full_payload(self):
         ni = dict_to_neo_input({
@@ -96,6 +107,32 @@ class TestDictToNeoInput:
         # Neo build should still get a response, not a crash.
         ni = dict_to_neo_input({"prompt": "p", "task_type": "future-variant"})
         assert ni.task_type is None
+
+    def test_verify_and_agent_fields_round_trip(self):
+        ni = dict_to_neo_input({
+            "prompt": "verify",
+            "operating_mode": "verify",
+            "proposed_changes": [{
+                "file_path": "src/app.py",
+                "code_block": "value = 1",
+            }],
+            "authority": {
+                "workspace_root": "/repo",
+                "allowed_write_paths": ["src/**", 42],
+                "allowed_commands": ["pytest", None],
+                "allow_learning": False,
+            },
+        })
+
+        assert ni.operating_mode is OperatingMode.VERIFY
+        assert ni.proposed_changes[0].file_path == "src/app.py"
+        assert ni.authority.allowed_write_paths == ["src/**"]
+        assert ni.authority.allowed_commands == ["pytest"]
+        assert ni.authority.allow_learning is False
+
+    def test_unknown_operating_mode_falls_back_to_compatible_learn(self):
+        ni = dict_to_neo_input({"prompt": "p", "operating_mode": "future-mode"})
+        assert ni.operating_mode is OperatingMode.LEARN
 
     def test_malformed_context_files_are_skipped(self):
         # Defensive: A2A peers aren't trusted — drop malformed entries

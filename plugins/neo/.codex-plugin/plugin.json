@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "Neo",
     "shortDescription": "Semantic reasoning with persistent memory",
-    "longDescription": "Neo is a read-only reasoning helper that suggests solutions via multi-agent reasoning (MapCoder/CodeSim style) over a persistent semantic memory of your codebase. Skills wrap the local `neo` CLI to give Codex one-shot access to its plan/simulate/code pipeline. Requires the neo CLI installed locally (`pip install neo-reasoner[openai]`).",
+    "longDescription": "Neo is a mode-explicit reasoning helper. Codex skills use read-only `advise` by default and `learn` only for deliberate pattern evidence. `agent` requires explicit workspace authority plus a host executor; Neo never executes generated shell commands. Requires the neo CLI installed locally (`pip install neo-reasoner[openai]`).",
     "developerName": "Parslee AI",
     "category": "Productivity",
     "capabilities": ["Read"]

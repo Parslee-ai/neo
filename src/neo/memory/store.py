@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import shutil
 import time
 from collections import Counter, OrderedDict
@@ -96,6 +97,8 @@ PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 PROBATION_TAG = "probation"
 PROBATION_AGE_DAYS = 3
 PROBATION_PROMOTE_ACCESS = 2  # accesses needed to promote out of probation
+GLOBAL_PROMOTION_MIN_PROJECTS = 2
+GLOBAL_PROMOTION_MIN_EPISODES = 4
 
 # Try importing fastembed
 try:
@@ -153,6 +156,61 @@ def scope_file_lock(path: "Path"):
             fd.close()
 
 
+def build_resilient_embedder(
+    model_name: str = "jinaai/jina-embeddings-v2-base-code",
+    cache_dir: Optional[Path] = None,
+    log_prefix: str = "",
+):
+    """Build a fastembed ``TextEmbedding`` pinned to a stable cache dir, healing
+    a stale cache. Returns the embedder, or ``None`` if fastembed is
+    unavailable or init fails after one recovery attempt.
+
+    The cache is pinned under ``~/.cache/neo`` rather than fastembed's default,
+    which on macOS lands in ``$TMPDIR`` and gets swept — leaving the manifest
+    pointing at a missing ``model.onnx`` so ``TextEmbedding(...)`` raises
+    ``NO_SUCHFILE``. On that specific failure we nuke the snapshot and
+    re-download once; a second failure means something else (network/disk/ONNX
+    init) and we give up. Single source of truth for the FactStore and the
+    legacy ReasoningMemory embedders — both previously rolled their own init,
+    and ReasoningMemory's used no pinned cache_dir (the recurring eviction).
+
+    ``NEO_FASTEMBED_CACHE_DIR`` overrides the location (resolved at call time,
+    not import). This is a cache-path knob, not a behavior toggle — it exists so
+    a process with an isolated ``$HOME`` (the test harness) can point at the
+    real, already-downloaded model instead of re-fetching ~400 MB.
+    """
+    if not FASTEMBED_AVAILABLE:
+        return None
+    if cache_dir is None:
+        _env = os.environ.get("NEO_FASTEMBED_CACHE_DIR")
+        cache_dir = Path(_env) if _env else FASTEMBED_CACHE_DIR
+    p = f"{log_prefix}: " if log_prefix else ""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        emb = TextEmbedding(model_name=model_name, cache_dir=str(cache_dir))
+        logger.info("%sembedder initialized (%s)", p, model_name)
+        return emb
+    except Exception as e:
+        msg = str(e)
+        if "NO_SUCHFILE" in msg or "model.onnx" in msg:
+            logger.warning(
+                "%sembedder cache appears stale (%s); clearing and re-downloading", p, e
+            )
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                emb = TextEmbedding(model_name=model_name, cache_dir=str(cache_dir))
+                logger.info("%sembedder re-downloaded successfully", p)
+                return emb
+            except Exception as e2:
+                logger.warning(
+                    "%sfailed to initialize embedder after cache reset: %s", p, e2
+                )
+                return None
+        logger.warning("%sfailed to initialize embedder: %s", p, e)
+        return None
+
+
 class FactStore:
     """Scoped fact store with supersession-based knowledge management.
 
@@ -174,20 +232,26 @@ class FactStore:
         config: Optional[Any] = None,
         lm_adapter: Optional[Any] = None,
         eager_init: bool = True,
+        facts_dir: Optional[Path] = None,
+        episodes_dir: Optional[Path] = None,
+        emit_metrics: bool = True,
     ):
         self.codebase_root = codebase_root
         self._config = config
         self._lm_adapter = lm_adapter
+        self._facts_dir = facts_dir or FACTS_DIR
+        self._episodes_dir = episodes_dir
+        self._emit_metrics = emit_metrics
 
         # Detect org and project
         self.org_id, self.project_id = detect_org_and_project(codebase_root)
         logger.info(f"FactStore: org={self.org_id}, project={self.project_id[:8] if self.project_id else 'none'}")
 
         # Storage paths
-        FACTS_DIR.mkdir(parents=True, exist_ok=True)
-        self._global_path = FACTS_DIR / "facts_global.json"
-        self._org_path = FACTS_DIR / f"facts_org_{self.org_id}.json" if self.org_id != "unknown" else None
-        self._project_path = FACTS_DIR / f"facts_project_{self.project_id}.json" if self.project_id else None
+        self._facts_dir.mkdir(parents=True, exist_ok=True)
+        self._global_path = self._facts_dir / "facts_global.json"
+        self._org_path = self._facts_dir / f"facts_org_{self.org_id}.json" if self.org_id != "unknown" else None
+        self._project_path = self._facts_dir / f"facts_project_{self.project_id}.json" if self.project_id else None
 
         # Rename fact + watermark files written under the pre-remote-hash
         # project ID. Runs once per project; no-op when the legacy ID equals
@@ -272,48 +336,16 @@ class FactStore:
         if self._embedder_initialized:
             return
         self._embedder_initialized = True
-        if not FASTEMBED_AVAILABLE:
-            return
-        FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            self._embedder = TextEmbedding(
-                model_name="jinaai/jina-embeddings-v2-base-code",
-                cache_dir=str(FASTEMBED_CACHE_DIR),
-            )
-            logger.info("FactStore: Jina Code v2 embeddings initialized")
-        except Exception as e:
-            # Recover from a stale local cache: if fastembed's
-            # manifest points at a missing `model.onnx` (typical
-            # after a `$TMPDIR` sweep on macOS), nuke the
-            # snapshot dir and let fastembed re-download. Only
-            # retry once — a second failure means something else
-            # is wrong (network, disk, transient ONNX init bug).
-            msg = str(e)
-            if "NO_SUCHFILE" in msg or "model.onnx" in msg:
-                logger.warning(
-                    "FactStore: embedder cache appears stale "
-                    "(%s); clearing and re-downloading", e
-                )
-                shutil.rmtree(FASTEMBED_CACHE_DIR, ignore_errors=True)
-                FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                try:
-                    self._embedder = TextEmbedding(
-                        model_name="jinaai/jina-embeddings-v2-base-code",
-                        cache_dir=str(FASTEMBED_CACHE_DIR),
-                    )
-                    logger.info("FactStore: embedder re-downloaded successfully")
-                    return
-                except Exception as e2:
-                    logger.warning(
-                        "FactStore: Failed to initialize embedder "
-                        "after cache reset: %s", e2
-                    )
-                    return
-            logger.warning(f"FactStore: Failed to initialize embedder: {e}")
+        self._embedder = build_resilient_embedder(log_prefix="FactStore")
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
+
+    def _record_metric(self, event: str, **fields: Any) -> None:
+        """Emit normal telemetry unless an isolated caller explicitly opts out."""
+        if self._emit_metrics:
+            metrics_record(event, **fields)
 
     def add_fact(
         self,
@@ -330,6 +362,9 @@ class FactStore:
         retrieval_text: Optional[str] = None,
         context_text: Optional[str] = None,
         domain: str = "",
+        supporting_episode_ids: Optional[list[str]] = None,
+        contradicting_episode_ids: Optional[list[str]] = None,
+        source_candidate_id: Optional[str] = None,
     ) -> Fact:
         """Add a new fact to the store.
 
@@ -384,6 +419,9 @@ class FactStore:
             retrieval_text=retrieval_text,
             context_text=context_text,
             domain=domain or None,
+            supporting_episode_ids=list(supporting_episode_ids or []),
+            contradicting_episode_ids=list(contradicting_episode_ids or []),
+            source_candidate_id=source_candidate_id,
         )
 
         # Pre-write dedup: filter -> canonicalize -> exact-match check.
@@ -399,7 +437,7 @@ class FactStore:
             existing.metadata.access_count += 1
             existing.metadata.last_accessed = time.time()
             self.save()
-            metrics_record(
+            self._record_metric(
                 "add_fact",
                 kind=existing.kind.value,
                 scope=existing.scope.value,
@@ -421,7 +459,7 @@ class FactStore:
         self._facts.append(fact)
         self._enforce_scope_limit(fact.scope)
         self.save()
-        metrics_record(
+        self._record_metric(
             "add_fact",
             kind=fact.kind.value,
             scope=fact.scope.value,
@@ -471,7 +509,7 @@ class FactStore:
                     merged[fact.id] = (fact, fact.metadata.confidence)
         merged_facts = [v[0] for v in merged.values()]
         merged_facts.sort(key=lambda f: rank_score(f, 1.0), reverse=True)
-        metrics_record(
+        self._record_metric(
             "retrieve",
             path="retrieve_relevant.multi",
             shape=shape.value,
@@ -546,7 +584,7 @@ class FactStore:
             if domain is not None:
                 valid_facts = [f for f in valid_facts if f.domain == domain]
             if not valid_facts:
-                metrics_record(
+                self._record_metric(
                     "retrieve",
                     path="retrieve_relevant",
                     k_requested=k,
@@ -606,7 +644,7 @@ class FactStore:
         results = self._expand_episode_neighbors(results)
 
         chosen_scores = [s for _, _, s in chosen]
-        metrics_record(
+        self._record_metric(
             "retrieve",
             path="retrieve_relevant",
             k_requested=k,
@@ -699,7 +737,7 @@ class FactStore:
         for fact in result.valid_facts:
             self._mark_retrieved(fact, now)
 
-        metrics_record(
+        self._record_metric(
             "retrieve",
             path="build_context",
             k_requested=k,
@@ -813,6 +851,7 @@ class FactStore:
         suggestions: list,
         prompt: str,
         suggestion_fact_ids: Optional[dict[str, str]] = None,
+        **episode_attribution: Any,
     ) -> None:
         """Persist current session for outcome detection on next invocation.
 
@@ -822,7 +861,9 @@ class FactStore:
             suggestion_fact_ids: Mapping of file_path -> fact_id for outcome linkage.
         """
         try:
-            self._outcome_tracker.save_session(suggestions, prompt, suggestion_fact_ids)
+            self._outcome_tracker.save_session(
+                suggestions, prompt, suggestion_fact_ids, **episode_attribution
+            )
         except Exception as e:
             logger.warning(f"Session save failed: {e}")
 
@@ -864,6 +905,436 @@ class FactStore:
         reference_quality = max(50.0, capacity * 0.2)
 
         return 1.0 - 1.0 / (1.0 + total_quality / reference_quality)
+
+    def _record_attributed_episode_outcome(
+        self, outcome, *, fact_id: str = "", operation: str = "",
+        append_verification: bool = True,
+        before_state: Optional[dict[str, Any]] = None,
+        after_state: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Attach downstream evidence to its LearningEpisode without an LLM call."""
+        if not outcome.learning_episode_id:
+            return
+        try:
+            import uuid
+
+            from neo.memory.episodes import (
+                LearningEpisodeStore,
+                MemoryMutationEvidence,
+                VerificationEvidence,
+                content_hash,
+                redact_sensitive_text,
+            )
+
+            episode_store = LearningEpisodeStore(
+                self.project_id or "unscoped", base_dir=self._episodes_dir
+            )
+            episode = episode_store.load(outcome.learning_episode_id)
+            if episode is None:
+                return
+
+            status_map = {
+                OutcomeType.ACCEPTED: "passed",
+                OutcomeType.MODIFIED: "failed",
+                OutcomeType.REGRESSION: "failed",
+                OutcomeType.UNVERIFIED: "skipped",
+                OutcomeType.INDEPENDENT: "skipped",
+            }
+            if append_verification:
+                episode.verification.append(VerificationEvidence(
+                    verification_id=uuid.uuid4().hex,
+                    kind=(
+                        "later_regression"
+                        if outcome.outcome_type == OutcomeType.REGRESSION
+                        else "user_modification"
+                        if outcome.outcome_type == OutcomeType.MODIFIED
+                        else "user_acceptance"
+                    ),
+                    status=status_map.get(outcome.outcome_type, "skipped"),
+                    tool_name=(
+                        "regression_reporter"
+                        if outcome.outcome_type == OutcomeType.REGRESSION
+                        else "git_diff_attribution"
+                    ),
+                    summary=outcome.outcome_type.value,
+                    repository_revision=outcome.repository_revision,
+                ))
+            episode.final_outcome = outcome.outcome_type.value
+            episode.outcome_details.update({
+                "suggestion_id": outcome.suggestion_id,
+                "file_path": outcome.file_path,
+                "repository_revision": outcome.repository_revision,
+            })
+            if outcome.outcome_type == OutcomeType.REGRESSION and outcome.diff_summary:
+                episode.outcome_details.update({
+                    "evidence_summary": redact_sensitive_text(outcome.diff_summary)[:500],
+                    "evidence_sha256": content_hash(outcome.diff_summary),
+                })
+
+            deterministic_failure = any(
+                evidence.status == "failed"
+                and evidence.kind not in {
+                    "user_acceptance", "user_modification", "later_regression",
+                }
+                for evidence in episode.verification
+            )
+
+            for candidate in episode.memory_candidates:
+                if candidate.candidate_id != outcome.candidate_id:
+                    continue
+                if outcome.outcome_type == OutcomeType.ACCEPTED:
+                    # User acceptance is useful evidence, but it must not
+                    # erase a deterministic failure recorded earlier in the
+                    # same episode. Keep the contradiction inspectable and
+                    # ineligible for durable promotion.
+                    if deterministic_failure:
+                        candidate.status = "rejected_by_verification"
+                    else:
+                        candidate.status = "supported_once"
+                        candidate.promoted_fact_id = fact_id
+                        if episode.episode_id not in candidate.supporting_episode_ids:
+                            candidate.supporting_episode_ids.append(episode.episode_id)
+                elif outcome.outcome_type in (OutcomeType.MODIFIED, OutcomeType.REGRESSION):
+                    candidate.status = "contradicted"
+                    if episode.episode_id not in candidate.contradicting_episode_ids:
+                        candidate.contradicting_episode_ids.append(episode.episode_id)
+                elif outcome.outcome_type == OutcomeType.UNVERIFIED:
+                    candidate.status = "unverified"
+
+            association = outcome.outcome_type.value
+            attributed = set(outcome.retrieved_fact_ids)
+            used = set(outcome.used_fact_ids)
+            for evidence in episode.retrieved_facts:
+                if evidence.fact_id in attributed:
+                    evidence.outcome_association = (
+                        association
+                        if evidence.fact_id in used
+                        else f"retrieved_only:{association}"
+                    )
+
+            if fact_id and operation:
+                episode.memory_mutations.append(MemoryMutationEvidence(
+                    mutation_id=uuid.uuid4().hex,
+                    operation=operation,
+                    fact_id=fact_id,
+                    reason=f"attributed {outcome.outcome_type.value} outcome",
+                    before_state=dict(before_state or {}),
+                    after_state=dict(after_state or {}),
+                ))
+            episode_store.save(episode)
+        except Exception as exc:
+            logger.warning("Failed to update attributed learning episode: %s", exc)
+
+    @staticmethod
+    def _fact_learning_state(fact: Fact) -> dict[str, Any]:
+        """Small deterministic snapshot used in the causal mutation ledger."""
+        return {
+            "confidence": fact.metadata.confidence,
+            "success_count": fact.metadata.success_count,
+            "effectiveness_c": fact.metadata.effectiveness_c,
+            "effectiveness_n": fact.metadata.effectiveness_n,
+            "is_valid": fact.is_valid,
+            "invalidation_reason": fact.invalidation_reason,
+        }
+
+    def _apply_candidate_contradiction(
+        self, outcome
+    ) -> tuple[Optional[Fact], dict[str, Any]]:
+        """Demote only the durable fact derived from the contradicted candidate.
+
+        A single attributed correction reduces trust. Two independent source
+        episodes contradicting the same promoted fact roll it back by
+        invalidating it without inventing a replacement. Episode and fact
+        links remain intact for local explanation and future reconsideration.
+        """
+        if not outcome.learning_episode_id or not outcome.candidate_id:
+            return None, {}
+        try:
+            from neo.memory.episodes import LearningEpisodeStore
+
+            episode_store = LearningEpisodeStore(
+                self.project_id or "unscoped", base_dir=self._episodes_dir
+            )
+            episode = episode_store.load(outcome.learning_episode_id)
+            if episode is None:
+                return None, {}
+            promoted_fact_id = next((
+                candidate.promoted_fact_id
+                for candidate in episode.memory_candidates
+                if candidate.candidate_id == outcome.candidate_id
+            ), "")
+            fact = next((
+                item for item in self._facts
+                if item.id == promoted_fact_id
+            ), None)
+            if fact is None:
+                return None, {}
+
+            episode_id = episode.episode_id
+            if episode_id in fact.contradicting_episode_ids:
+                return fact, self._fact_learning_state(fact)
+            before_state = self._fact_learning_state(fact)
+            fact.contradicting_episode_ids.append(episode_id)
+            fact.metadata.confidence = max(0.1, fact.metadata.confidence - 0.2)
+            update_effectiveness(fact, outcome="worse")
+            fact.metadata.last_accessed = time.time()
+
+            if len(fact.contradicting_episode_ids) >= 2 and fact.is_valid:
+                fact.invalidation_reason = "repeated_attributed_contradiction"
+                self._invalidate(fact)
+            self.save()
+            return fact, before_state
+        except Exception as exc:
+            logger.warning("Failed to apply attributed candidate contradiction: %s", exc)
+            return None, {}
+
+    def record_later_regression(
+        self,
+        *,
+        learning_episode_id: str,
+        suggestion_id: str,
+        summary: str,
+        repository_revision: str = "",
+    ) -> Optional[Fact]:
+        """Record delayed deterministic failure against one attributed suggestion.
+
+        This deliberately requires stable episode and suggestion identifiers;
+        callers cannot penalize all retrieved facts or infer attribution from
+        topic similarity. It performs no LLM call.
+        """
+        try:
+            from neo.memory.episodes import LearningEpisodeStore
+            from neo.memory.outcomes import Outcome
+
+            episode_store = LearningEpisodeStore(
+                self.project_id or "unscoped", base_dir=self._episodes_dir
+            )
+            episode = episode_store.load(learning_episode_id)
+            if episode is None:
+                return None
+            candidate = next((
+                item for item in episode.memory_candidates
+                if item.suggestion_id == suggestion_id
+            ), None)
+            suggestion = next((
+                item for item in episode.suggestions
+                if item.suggestion_id == suggestion_id
+            ), None)
+            if candidate is None:
+                return None
+
+            outcome = Outcome(
+                outcome_type=OutcomeType.REGRESSION,
+                file_path=suggestion.file_path if suggestion is not None else "",
+                diff_summary=summary,
+                suggestion_description=(
+                    suggestion.description if suggestion is not None else candidate.body
+                ),
+                suggestion_id=suggestion_id,
+                learning_episode_id=learning_episode_id,
+                repository_revision=repository_revision,
+                retrieved_fact_ids=[item.fact_id for item in episode.retrieved_facts],
+                candidate_id=candidate.candidate_id,
+                candidate_subject=candidate.subject,
+                candidate_body=candidate.body,
+                candidate_kind=candidate.kind,
+            )
+            self._record_attributed_episode_outcome(outcome)
+            fact, before_state = self._apply_candidate_contradiction(outcome)
+            if fact is not None:
+                self._record_attributed_episode_outcome(
+                    outcome,
+                    fact_id=fact.id,
+                    operation=(
+                        "rollback_regressed_fact"
+                        if not fact.is_valid
+                        else "demote_regressed_fact"
+                    ),
+                    append_verification=False,
+                    before_state=before_state,
+                    after_state=self._fact_learning_state(fact),
+                )
+            return fact
+        except Exception as exc:
+            logger.warning("Failed to record later regression: %s", exc)
+            return None
+
+    def _promote_repeatedly_supported_candidate(self, outcome) -> Optional[Fact]:
+        """Promote only repeated, independently accepted ordinary patterns."""
+        if outcome.candidate_kind != FactKind.PATTERN.value or not outcome.candidate_id:
+            return None
+        try:
+            from neo.memory.episodes import LearningEpisodeStore
+            from neo.memory.generalize import generalize
+
+            episode_store = LearningEpisodeStore(
+                self.project_id or "unscoped", base_dir=self._episodes_dir
+            )
+            target_signature = generalize(
+                f"{outcome.candidate_subject} {outcome.candidate_body}"
+            )
+            supporting_ids: list[str] = []
+            for episode in episode_store.list():
+                for candidate in episode.memory_candidates:
+                    if candidate.kind != FactKind.PATTERN.value:
+                        continue
+                    if candidate.status not in {"supported_once", "durable"}:
+                        continue
+                    signature = generalize(f"{candidate.subject} {candidate.body}")
+                    if signature == target_signature:
+                        supporting_ids.append(episode.episode_id)
+                        break
+
+            supporting_ids = list(dict.fromkeys(supporting_ids))
+            if len(supporting_ids) < 2:
+                return None
+
+            fact = self.add_fact(
+                subject=outcome.candidate_subject,
+                body=outcome.candidate_body,
+                kind=FactKind.PATTERN,
+                scope=FactScope.PROJECT,
+                confidence=min(0.75, 0.4 + 0.1 * len(supporting_ids)),
+                source_prompt="episode-derived repeated verified outcomes",
+                tags=["episode-derived", "verified-repeated"],
+                provenance=Provenance.OBSERVED,
+                supporting_episode_ids=supporting_ids,
+                source_candidate_id=outcome.candidate_id,
+            )
+            fact.supporting_episode_ids = list(dict.fromkeys(
+                fact.supporting_episode_ids + supporting_ids
+            ))
+            fact.metadata.success_count = max(
+                fact.metadata.success_count, len(fact.supporting_episode_ids)
+            )
+            fact.tags = [tag for tag in fact.tags if tag != PROBATION_TAG]
+            if "durable" not in fact.tags:
+                fact.tags.append("durable")
+            self.save()
+
+            for episode_id in supporting_ids:
+                episode = episode_store.load(episode_id)
+                if episode is None:
+                    continue
+                changed = False
+                for candidate in episode.memory_candidates:
+                    signature = generalize(f"{candidate.subject} {candidate.body}")
+                    if signature == target_signature:
+                        candidate.status = "durable"
+                        candidate.promoted_fact_id = fact.id
+                        changed = True
+                if changed:
+                    episode_store.save(episode)
+            return fact
+        except Exception as exc:
+            logger.warning("Episode candidate promotion failed: %s", exc)
+            return None
+
+    def _promote_cross_project_candidate(self, outcome) -> Optional[Fact]:
+        """Promote a generalized pattern globally only with cross-project evidence."""
+        if outcome.candidate_kind != FactKind.PATTERN.value or not outcome.candidate_id:
+            return None
+        try:
+            import re
+
+            from neo.memory.episodes import (
+                LearningEpisodeStore,
+                MemoryMutationEvidence,
+                redact_sensitive_text,
+            )
+            from neo.memory.generalize import generalize
+
+            episodes_root = self._episodes_dir or (Path.home() / ".neo" / "episodes")
+            if not episodes_root.exists():
+                return None
+            target_signature = generalize(
+                f"{outcome.candidate_subject} {outcome.candidate_body}"
+            )
+            supporting: list[tuple[str, Any]] = []
+            project_ids: set[str] = set()
+            for project_path in sorted(path for path in episodes_root.iterdir() if path.is_dir()):
+                episode_store = LearningEpisodeStore(
+                    project_path.name, base_dir=episodes_root
+                )
+                for episode in episode_store.list():
+                    for candidate in episode.memory_candidates:
+                        if candidate.kind != FactKind.PATTERN.value:
+                            continue
+                        if candidate.status not in {"supported_once", "durable"}:
+                            continue
+                        signature = generalize(f"{candidate.subject} {candidate.body}")
+                        if signature != target_signature:
+                            continue
+                        project_id = episode.project_id or project_path.name
+                        supporting.append((project_id, episode))
+                        project_ids.add(project_id)
+                        break
+
+            episode_ids = list(dict.fromkeys(
+                episode.episode_id for _, episode in supporting
+            ))
+            if (
+                len(project_ids) < GLOBAL_PROMOTION_MIN_PROJECTS
+                or len(episode_ids) < GLOBAL_PROMOTION_MIN_EPISODES
+            ):
+                return None
+
+            # Global memory receives only deterministic generalized text, with
+            # path-like bracket qualifiers removed and credential redaction.
+            subject = re.sub(r"\[[^\]]+\]", "", generalize(outcome.candidate_subject))
+            body = re.sub(r"\[[^\]]+\]", "", generalize(outcome.candidate_body))
+            fact = self.add_fact(
+                subject=redact_sensitive_text(subject).strip()[:300],
+                body=redact_sensitive_text(body).strip()[:1000],
+                kind=FactKind.PATTERN,
+                scope=FactScope.GLOBAL,
+                confidence=min(0.8, 0.5 + 0.05 * len(project_ids)),
+                source_prompt="cross-project episode-derived verified outcomes",
+                tags=["episode-derived", "verified-cross-project", "durable"],
+                provenance=Provenance.OBSERVED,
+                supporting_episode_ids=episode_ids,
+                source_candidate_id=outcome.candidate_id,
+            )
+            fact.supporting_episode_ids = list(dict.fromkeys(
+                fact.supporting_episode_ids + episode_ids
+            ))
+            fact.project_id = ""
+            fact.org_id = ""
+            fact.metadata.success_count = max(
+                fact.metadata.success_count, len(fact.supporting_episode_ids)
+            )
+            fact.tags = [tag for tag in fact.tags if tag != PROBATION_TAG]
+            self.save()
+
+            after_state = self._fact_learning_state(fact)
+            for project_id, episode in supporting:
+                changed = False
+                for candidate in episode.memory_candidates:
+                    signature = generalize(f"{candidate.subject} {candidate.body}")
+                    if signature == target_signature:
+                        candidate.promoted_global_fact_id = fact.id
+                        changed = True
+                if changed and not any(
+                    mutation.fact_id == fact.id
+                    and mutation.operation == "promote_cross_project_candidate"
+                    for mutation in episode.memory_mutations
+                ):
+                    import uuid
+                    episode.memory_mutations.append(MemoryMutationEvidence(
+                        mutation_id=uuid.uuid4().hex,
+                        operation="promote_cross_project_candidate",
+                        fact_id=fact.id,
+                        reason=(
+                            f"verified across {len(project_ids)} projects and "
+                            f"{len(episode_ids)} episodes"
+                        ),
+                        after_state=after_state,
+                    ))
+                LearningEpisodeStore(project_id, base_dir=episodes_root).save(episode)
+            return fact
+        except Exception as exc:
+            logger.warning("Cross-project candidate promotion failed: %s", exc)
+            return None
 
     def detect_implicit_feedback(self, current_request: dict, request_history: list) -> None:
         """Detect outcomes from previous session and update/create facts.
@@ -931,7 +1402,43 @@ class FactStore:
                 fid = normalized_fact_ids.get("/" + file_path)
             return fid
 
+        def _apply_used_fact_feedback(outcome) -> None:
+            """Apply bounded credit only to facts explicitly cited in reasoning."""
+            if outcome.outcome_type not in {
+                OutcomeType.ACCEPTED, OutcomeType.MODIFIED, OutcomeType.REGRESSION,
+            }:
+                return
+            linked_ids = set(normalized_fact_ids.values())
+            for fact_id in dict.fromkeys(outcome.used_fact_ids):
+                if fact_id in linked_ids or fact_id in touched_fact_ids:
+                    continue
+                fact = facts_by_id.get(fact_id)
+                if fact is None or not fact.is_valid:
+                    continue
+                before_state = self._fact_learning_state(fact)
+                if outcome.outcome_type == OutcomeType.ACCEPTED:
+                    fact.metadata.success_count += 1
+                    update_effectiveness(fact, outcome="better")
+                    operation = "credit_used_retrieved_fact"
+                else:
+                    fact.metadata.confidence = max(
+                        0.1, fact.metadata.confidence - 0.05
+                    )
+                    update_effectiveness(fact, outcome="worse")
+                    operation = "demote_used_retrieved_fact"
+                fact.metadata.last_accessed = time.time()
+                touched_fact_ids.add(fact.id)
+                self._record_attributed_episode_outcome(
+                    outcome,
+                    fact_id=fact.id,
+                    operation=operation,
+                    append_verification=False,
+                    before_state=before_state,
+                    after_state=self._fact_learning_state(fact),
+                )
+
         for outcome in outcomes:
+            _apply_used_fact_feedback(outcome)
             if outcome.outcome_type == OutcomeType.ACCEPTED:
                 # Try to link back to the original suggestion fact
                 fact_id = _lookup_fact_id(outcome.file_path)
@@ -944,6 +1451,7 @@ class FactStore:
                     # Base +0.2; modulated by arch delta so a session that
                     # regressed structure earns less trust than one that didn't.
                     boost = max(-0.05, 0.2 + arch_mod)
+                    before_state = self._fact_learning_state(original_fact)
                     original_fact.metadata.confidence = min(
                         1.0, max(0.0, original_fact.metadata.confidence + boost)
                     )
@@ -952,6 +1460,30 @@ class FactStore:
                     original_fact.metadata.last_accessed = time.time()
                     touched_fact_ids.add(original_fact.id)
                     linked_count += 1
+                    self._record_attributed_episode_outcome(
+                        outcome,
+                        fact_id=original_fact.id,
+                        operation="reinforce_legacy_fact",
+                        before_state=before_state,
+                        after_state=self._fact_learning_state(original_fact),
+                    )
+                    continue
+
+                if outcome.candidate_id:
+                    # First acceptance supports the episode candidate but does
+                    # not create a Fact. Only a second independent accepted
+                    # episode can promote an ordinary pattern.
+                    self._record_attributed_episode_outcome(outcome)
+                    promoted = self._promote_repeatedly_supported_candidate(outcome)
+                    if promoted is not None:
+                        self._record_attributed_episode_outcome(
+                            outcome,
+                            fact_id=promoted.id,
+                            operation="promote_repeated_episode_candidate",
+                            append_verification=False,
+                            after_state=self._fact_learning_state(promoted),
+                        )
+                    self._promote_cross_project_candidate(outcome)
                     continue
 
                 # Fallback: no linked fact, create REVIEW as before
@@ -966,9 +1498,10 @@ class FactStore:
                 body = "\n".join(body_parts)
                 tags = ["outcome", "accepted"]
                 confidence = min(1.0, max(0.0, outcome.suggestion_confidence + 0.1 + arch_mod))
-            elif outcome.outcome_type == OutcomeType.MODIFIED:
+            elif outcome.outcome_type in (OutcomeType.MODIFIED, OutcomeType.REGRESSION):
                 # User corrected neo's suggestion - learn from the correction
-                subject = f"outcome:modified {outcome.file_path}"
+                outcome_label = outcome.outcome_type.value
+                subject = f"outcome:{outcome_label} {outcome.file_path}"
                 body_parts = [
                     f"User modified neo's suggestion for {outcome.file_path}.",
                     f"Original suggestion: {outcome.suggestion_description}",
@@ -977,7 +1510,7 @@ class FactStore:
                 if outcome.diff_summary:
                     body_parts.append(f"What user actually did:\n{outcome.diff_summary}")
                 body = "\n".join(body_parts)
-                tags = ["outcome", "modified"]
+                tags = ["outcome", outcome_label]
                 confidence = 0.4
 
                 # Demote the original suggestion fact since it was corrected.
@@ -991,6 +1524,7 @@ class FactStore:
                     if original_fact.id in touched_fact_ids:
                         continue  # fan-out dedup: skip duplicate demote + REVIEW
                     penalty = min(-0.05, -0.2 + arch_mod)
+                    before_state = self._fact_learning_state(original_fact)
                     original_fact.metadata.confidence = max(
                         0.1, original_fact.metadata.confidence + penalty
                     )
@@ -998,25 +1532,35 @@ class FactStore:
                     original_fact.metadata.last_accessed = time.time()
                     touched_fact_ids.add(original_fact.id)
                     linked_count += 1
-            elif outcome.outcome_type == OutcomeType.UNVERIFIED:
-                # Suggested file changed, but no diff to compare — weak signal.
-                # Only update linked fact; never create standalone REVIEW.
-                fact_id = _lookup_fact_id(outcome.file_path)
-                original_fact = facts_by_id.get(fact_id) if fact_id else None
-                if (
-                    original_fact and original_fact.is_valid
-                    and original_fact.id not in touched_fact_ids
-                ):
-                    boost = max(-0.05, 0.1 + arch_mod)
-                    original_fact.metadata.confidence = min(
-                        1.0, max(0.0, original_fact.metadata.confidence + boost)
+                    self._record_attributed_episode_outcome(
+                        outcome,
+                        fact_id=original_fact.id,
+                        operation="demote_legacy_fact",
+                        before_state=before_state,
+                        after_state=self._fact_learning_state(original_fact),
                     )
-                    original_fact.metadata.success_count += 1
-                    update_effectiveness(original_fact, outcome="better")
-                    original_fact.metadata.last_accessed = time.time()
-                    touched_fact_ids.add(original_fact.id)
-                    linked_count += 1
-                continue  # Never create a REVIEW fact for unverified outcomes
+                else:
+                    self._record_attributed_episode_outcome(outcome)
+                    contradicted_fact, before_state = self._apply_candidate_contradiction(outcome)
+                    if contradicted_fact is not None:
+                        operation = (
+                            "rollback_contradicted_fact"
+                            if not contradicted_fact.is_valid
+                            else "demote_contradicted_fact"
+                        )
+                        self._record_attributed_episode_outcome(
+                            outcome,
+                            fact_id=contradicted_fact.id,
+                            operation=operation,
+                            append_verification=False,
+                            before_state=before_state,
+                            after_state=self._fact_learning_state(contradicted_fact),
+                        )
+            elif outcome.outcome_type == OutcomeType.UNVERIFIED:
+                # Absence of verification is not success. Preserve the
+                # evidence in the episode but never mutate FactStore.
+                self._record_attributed_episode_outcome(outcome)
+                continue
             elif outcome.outcome_type == OutcomeType.INDEPENDENT:
                 subject = f"outcome:independent {outcome.file_path}"
                 body_parts = [f"User changed {outcome.file_path} (not suggested by neo)."]
@@ -1038,6 +1582,14 @@ class FactStore:
                 confidence=confidence,
                 source_prompt=current_request.get("prompt", "")[:200],
                 tags=tags,
+                provenance=Provenance.OBSERVED,
+                contradicting_episode_ids=(
+                    [outcome.learning_episode_id]
+                    if outcome.outcome_type in (OutcomeType.MODIFIED, OutcomeType.REGRESSION)
+                    and outcome.learning_episode_id
+                    else []
+                ),
+                source_candidate_id=outcome.candidate_id or None,
             )
 
         if linked_count:
@@ -1045,7 +1597,11 @@ class FactStore:
             logger.info(f"Boosted/demoted {linked_count} original fact(s) from outcomes")
         if outcomes:
             modified = sum(1 for o in outcomes if o.outcome_type == OutcomeType.MODIFIED)
-            logger.info(f"Processed {len(outcomes)} outcome(s): modified={modified}")
+            regressions = sum(1 for o in outcomes if o.outcome_type == OutcomeType.REGRESSION)
+            logger.info(
+                f"Processed {len(outcomes)} outcome(s): "
+                f"modified={modified}, regressions={regressions}"
+            )
             # Chain maintenance: synthesize -> prune stale -> demote unhelpful
             # -> purge dead -> strip tombstone embeddings. The four janitors
             # defer their saves and flush once here.
@@ -1127,6 +1683,7 @@ class FactStore:
             "accepted": 0,
             "modified": 0,
             "unverified": 0,
+            "recorded_without_update": 0,
             "skipped_unlinked": 0,
             "skipped_independent": 0,
             "dry_run": dry_run,
@@ -1154,15 +1711,10 @@ class FactStore:
                     original_fact.metadata.last_accessed = time.time()
             elif outcome.outcome_type == OutcomeType.UNVERIFIED:
                 stats["unverified"] += 1
-                stats["linked_updates"] += 1
-                if not dry_run:
-                    original_fact.metadata.confidence = min(
-                        1.0, max(0.0, original_fact.metadata.confidence + 0.1)
-                    )
-                    original_fact.metadata.success_count += 1
-                    update_effectiveness(original_fact, outcome="better")
-                    original_fact.metadata.last_accessed = time.time()
-            elif outcome.outcome_type == OutcomeType.MODIFIED:
+                # Missing evidence is not a successful outcome. Replays must
+                # preserve the same invariant as the live feedback path.
+                stats["recorded_without_update"] += 1
+            elif outcome.outcome_type in (OutcomeType.MODIFIED, OutcomeType.REGRESSION):
                 stats["modified"] += 1
                 stats["linked_updates"] += 1
                 if not dry_run:
@@ -1172,40 +1724,35 @@ class FactStore:
                     update_effectiveness(original_fact, outcome="worse")
                     original_fact.metadata.last_accessed = time.time()
 
-        if not dry_run and stats["linked_updates"]:
-            self.save()
+        if not dry_run and (stats["linked_updates"] or stats["recorded_without_update"]):
+            if stats["linked_updates"]:
+                self.save()
             self._outcome_tracker._clear_session_log()
 
         return stats
 
     def apply_mined_outcomes(self, fact_ids: list[str]) -> int:
-        """Weakly reinforce facts linked to transcript-mined suggestion matches.
+        """Record topic recurrence without changing fact authority.
 
-        ``fact_ids`` come from ``TranscriptIngester.mine_suggestion_outcomes``,
-        which correlates a past suggestion to a later episode by *topic
-        similarity* — evidence the suggestion's area recurred in subsequent work,
-        not verified diff-overlap acceptance. So each match earns the same weak
-        delta neo gives its other non-git signals (UNVERIFIED): +0.1 confidence
-        and a success_count bump — enough to promote a fact off probation —
-        never the strong +0.2 the git matcher reserves for proven acceptance.
-        The ledger records the suggestion→fact link directly, so this applies by
-        fact_id without the path lookup ``detect_implicit_feedback`` needs.
-        Returns the number of facts updated.
+        Transcript correlation proves only that a topic recurred, not that the
+        earlier suggestion was correct or applied. Preserve the compatibility
+        return count and structured observability, but never change confidence,
+        success, effectiveness, access, probation, or validity.
         """
         by_id = {f.id: f for f in self._facts}
-        applied = 0
+        observed = 0
         for fid in fact_ids:
             fact = by_id.get(fid)
             if fact is None or not fact.is_valid:
                 continue
-            fact.metadata.confidence = min(1.0, fact.metadata.confidence + 0.1)
-            fact.metadata.success_count += 1
-            update_effectiveness(fact, outcome="better")
-            fact.metadata.last_accessed = time.time()
-            applied += 1
-        if applied:
-            self.save()
-        return applied
+            self._record_metric(
+                "topic_recurrence",
+                fact_id=fact.id,
+                project_id=self.project_id,
+                authority="observation_only",
+            )
+            observed += 1
+        return observed
 
     @property
     def entries(self) -> list[Fact]:
@@ -1274,7 +1821,10 @@ class FactStore:
 
         evicted = 0
         for fact in evictable[:excess]:
-            self._invalidate(fact)
+            # cascade=False: eviction-for-capacity isn't supersession-by-a-
+            # better-fact, and evicted low-quality facts rarely carry
+            # dependents, so flagging needs_review here is near-pure noise.
+            self._invalidate(fact, cascade=False)
             evicted += 1
 
         if evicted:
@@ -1885,6 +2435,21 @@ class FactStore:
         if cascade:
             self._cascade_needs_review(fact.id)
 
+    @staticmethod
+    def _strip_ingester_tombstones(superseded_facts: list) -> None:
+        """Drop embeddings from facts an ingester just superseded.
+
+        Ingesters (seed/community/constraints/claude-memory) live in their own
+        classes and invalidate curated facts directly, off the ``_invalidate``
+        choke point — so they don't strip. Nulling here, before the consuming
+        method's ``save()``, avoids writing the embedding out only for the
+        cold-start ``strip_tombstone_embeddings`` to null it moments later in
+        the same ``initialize()``. Cascade is intentionally NOT done (curated
+        supersession never flagged dependents; preserved behavior).
+        """
+        for fact in superseded_facts:
+            fact.embedding = None
+
     def _cascade_needs_review(self, superseded_id: str) -> None:
         """Mark facts that depend on a superseded fact as needing review."""
         for fact in self._facts:
@@ -1956,6 +2521,7 @@ class FactStore:
                     embed_text = f"{fact.subject} {fact.body}"
                     fact.embedding = self._embed_text(embed_text)
 
+            self._strip_ingester_tombstones(superseded_facts)
             self._facts.extend(new_facts)
             self.save()
             logger.info(
@@ -1982,6 +2548,7 @@ class FactStore:
                         embed_text = f"{fact.subject} {fact.body}"
                         fact.embedding = self._embed_text(embed_text)
 
+                self._strip_ingester_tombstones(superseded_facts)
                 self._facts.extend(new_facts)
                 self.save()
                 logger.info(
@@ -2016,6 +2583,7 @@ class FactStore:
                     embed_text = f"{fact.subject} {fact.body}"
                     fact.embedding = self._embed_text(embed_text)
 
+            self._strip_ingester_tombstones(superseded_facts)
             self._facts.extend(new_facts)
             self.save()
             logger.info(
@@ -2042,6 +2610,7 @@ class FactStore:
                     embed_text = f"{fact.subject} {fact.body}"
                     fact.embedding = self._embed_text(embed_text)
 
+            self._strip_ingester_tombstones(superseded_facts)
             self._facts.extend(new_facts)
             self.save()
             logger.info(
@@ -2483,8 +3052,8 @@ class FactStore:
         if not legacy_id or legacy_id == self.project_id:
             return
 
-        legacy_facts = FACTS_DIR / f"facts_project_{legacy_id}.json"
-        new_facts = FACTS_DIR / f"facts_project_{self.project_id}.json"
+        legacy_facts = self._facts_dir / f"facts_project_{legacy_id}.json"
+        new_facts = self._facts_dir / f"facts_project_{self.project_id}.json"
         if legacy_facts.exists() and not new_facts.exists():
             try:
                 legacy_facts.rename(new_facts)
@@ -2495,8 +3064,8 @@ class FactStore:
             except OSError as e:
                 logger.warning(f"Legacy fact-file rename failed (non-fatal): {e}")
 
-        legacy_wm = FACTS_DIR / f"synthesis_watermark_{legacy_id}.json"
-        new_wm = FACTS_DIR / f"synthesis_watermark_{self.project_id}.json"
+        legacy_wm = self._facts_dir / f"synthesis_watermark_{legacy_id}.json"
+        new_wm = self._facts_dir / f"synthesis_watermark_{self.project_id}.json"
         if legacy_wm.exists() and not new_wm.exists():
             try:
                 legacy_wm.rename(new_wm)

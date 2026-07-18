@@ -24,9 +24,10 @@ try:
 except ImportError:
     FAISS_AVAILABLE = False
 
-# Import fastembed for local embeddings (reuse from persistent_reasoning)
+# Probe fastembed availability; the embedder is built via
+# store.build_resilient_embedder (pinned, self-healing cache).
 try:
-    from fastembed import TextEmbedding
+    import fastembed  # noqa: F401 — availability probe only
     FASTEMBED_AVAILABLE = True
 except ImportError:
     FASTEMBED_AVAILABLE = False
@@ -305,14 +306,11 @@ class ConstructIndex:
         self.embedding_model = ""
 
         if FASTEMBED_AVAILABLE:
-            try:
-                # Use same model as persistent_reasoning for consistency
-                self.embedder = TextEmbedding(model_name="jinaai/jina-embeddings-v2-base-code")
+            from neo.memory.store import build_resilient_embedder
+            self.embedder = build_resilient_embedder(log_prefix="Construct index")
+            if self.embedder:
                 self.embedding_dim = 768  # Jina code model dimension
                 self.embedding_model = "jinaai/jina-embeddings-v2-base-code"
-                logger.info("Construct index using local embeddings (jina-embeddings-v2-base-code)")
-            except Exception as e:
-                logger.warning(f"Failed to initialize embedder: {e}")
 
         if not self.embedder:
             logger.warning("No embedding model available. Semantic search will be unavailable.")

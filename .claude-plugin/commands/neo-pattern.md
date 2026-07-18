@@ -32,6 +32,9 @@ Neo will:
 3. Search memory for similar patterns
 4. Suggest improvements or alternative patterns with confidence scores
 
+This command uses explicit `learn` mode. The result is recorded only as an
+episode candidate and requires independent verified support before promotion.
+
 ## Parameters
 
 - `<target>` - Code area or pattern type (required)

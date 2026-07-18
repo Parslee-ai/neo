@@ -652,6 +652,137 @@ def _handle_issues(args) -> None:
         print()
 
 
+def _handle_explain(args) -> None:
+    """Render one fact's persisted causal chain without initializing an LM."""
+    from neo.config import NeoConfig
+    from neo.memory.episodes import LearningEpisodeStore
+    from neo.memory.explain import (
+        FactLookupError,
+        LearningEpisodeCatalog,
+        explain_fact,
+        resolve_fact,
+    )
+    from neo.memory.models import FactScope
+    from neo.memory.store import FactStore
+
+    root = getattr(args, "cwd", None) or os.getcwd()
+    store = FactStore(
+        codebase_root=root,
+        config=NeoConfig.load(),
+        eager_init=False,
+    )
+    try:
+        fact = resolve_fact(store.entries, getattr(args, "fact_id", ""))
+        episode_source = (
+            LearningEpisodeCatalog(Path.home() / ".neo" / "episodes")
+            if fact.scope == FactScope.GLOBAL
+            else LearningEpisodeStore(store.project_id or "unscoped")
+        )
+        explanation = explain_fact(
+            store.entries,
+            fact.id,
+            episode_store=episode_source,
+        )
+    except FactLookupError as exc:
+        print(f"[Neo] memory explain: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    if getattr(args, "json", False):
+        print(json.dumps(explanation, indent=2, sort_keys=True))
+        return
+
+    fact = explanation["fact"]
+    state = "valid" if fact["is_valid"] else "invalid"
+    print(f"[Neo] fact {fact['id']} — {state}")
+    print(f"  {fact['subject']}")
+    print(
+        f"  {fact['kind']} / {fact['scope']} · confidence={fact['confidence']:.2f} "
+        f"· successes={fact['success_count']} · effectiveness={fact['effectiveness']:.2f}"
+    )
+    print(f"  provenance={fact['provenance']} candidate={fact['source_candidate_id'] or '-'}")
+    if fact["invalidation_reason"]:
+        print(f"  invalidation={fact['invalidation_reason']}")
+
+    print(f"\nSupporting evidence ({len(explanation['supporting_evidence'])})")
+    for item in explanation["supporting_evidence"]:
+        if item.get("missing"):
+            print(f"  {item['episode_id']} · missing local episode")
+        else:
+            print(
+                f"  {item['episode_id']} · {item['final_outcome']} "
+                f"· revision={item['repository_revision'] or '-'}"
+            )
+
+    print(f"\nContradicting evidence ({len(explanation['contradicting_evidence'])})")
+    for item in explanation["contradicting_evidence"]:
+        if item.get("missing"):
+            print(f"  {item['episode_id']} · missing local episode")
+        else:
+            print(
+                f"  {item['episode_id']} · {item['final_outcome']} "
+                f"· revision={item['repository_revision'] or '-'}"
+            )
+
+    print(f"\nRetrieval history ({len(explanation['retrieval_history'])})")
+    for item in explanation["retrieval_history"]:
+        score = "?" if item["score"] is None else f"{item['score']:.4f}"
+        print(
+            f"  {item['episode_id']} · score={score} · "
+            f"included={str(item['included_in_context']).lower()} · "
+            f"outcome={item['outcome_association'] or '-'}"
+        )
+
+    print(f"\nMemory mutations ({len(explanation['mutation_history'])})")
+    for item in explanation["mutation_history"]:
+        before = item["before_state"]
+        after = item["after_state"]
+        transition = ""
+        if before or after:
+            transition = f" · {before or '{}'} -> {after or '{}'}"
+        print(f"  {item['episode_id']} · {item['operation']}{transition}")
+
+    previous = explanation["supersession"]["previous"]
+    replacements = explanation["supersession"]["replacements"]
+    print(f"\nSupersession · previous={len(previous)} replacements={len(replacements)}")
+
+
+def _handle_evaluate_learning(args) -> None:
+    """Run and render the deterministic learning-loop acceptance benchmark."""
+    from neo.memory.evaluation import run_learning_evaluation
+
+    corpus = Path(args.corpus).resolve() if getattr(args, "corpus", None) else None
+    workspace = (
+        Path(args.workspace).resolve() if getattr(args, "workspace", None) else None
+    )
+    report = run_learning_evaluation(corpus_path=corpus, workspace=workspace)
+    payload = report.to_dict()
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        status = "PASS" if report.accepted else "FAIL"
+        print(f"[Neo] evidence-learning evaluation — {status}")
+        print(f"  benchmark={report.benchmark_id}")
+        for mode in report.modes:
+            metrics = mode.metrics
+            print(
+                f"  {mode.mode}: success={metrics.task_success_rate:.2f} "
+                f"adherence={metrics.constraint_adherence:.2f} "
+                f"precision={metrics.retrieval_precision:.2f} "
+                f"harmful={metrics.harmful_memory_rate:.2f} "
+                f"unsupported={metrics.unsupported_promotion_rate:.2f} "
+                f"repeat-error={metrics.repeat_error_rate:.2f} "
+                f"latency={metrics.latency_ms:.1f}ms "
+                f"model-calls={metrics.model_calls} tokens={metrics.token_usage}"
+            )
+        for scenario in report.modes[-1].scenarios:
+            marker = "PASS" if scenario.passed else "FAIL"
+            print(f"    [{marker}] {scenario.id}")
+        for failure in report.acceptance_failures:
+            print(f"  failure: {failure}")
+    if not report.accepted:
+        raise SystemExit(1)
+
+
 def handle_memory(args):
     """Memory maintenance subcommands."""
     action = getattr(args, "memory_action", None)
@@ -669,6 +800,12 @@ def handle_memory(args):
         return
     if action == "import":
         _handle_import(args)
+        return
+    if action == "explain":
+        _handle_explain(args)
+        return
+    if action == "evaluate-learning":
+        _handle_evaluate_learning(args)
         return
     if action == "prune":
         files = _fact_files_for_prune(
@@ -714,7 +851,11 @@ def handle_memory(args):
         return
 
     if action != "replay-feedback":
-        print("Usage: neo memory {replay-feedback|prune|observer|issues|rules|audit|import} ...")
+        print(
+            "Usage: neo memory "
+            "{replay-feedback|prune|observer|issues|rules|audit|import|explain|"
+            "evaluate-learning} ..."
+        )
         return
 
     from neo.config import NeoConfig
@@ -808,7 +949,17 @@ INPUT FORMAT (via stdin):
       "error_trace": "string (optional)",
       "recent_commands": ["cmd1", "cmd2"],
       "safe_read_paths": ["*.py", "*.js"],
-      "working_directory": "/path/to/project"
+      "working_directory": "/path/to/project",
+      "operating_mode": "advise|patch|verify|learn|agent",
+      "proposed_changes": [
+        {"file_path": "src/app.py", "unified_diff": "...", "code_block": "..."}
+      ],
+      "authority": {
+        "workspace_root": "/path/to/project",
+        "allowed_write_paths": ["src/**"],
+        "allowed_commands": [],
+        "allow_learning": false
+      }
     }
 
 ENVIRONMENT VARIABLES:

@@ -34,7 +34,19 @@ logger = logging.getLogger(__name__)
 from neo.models import (  # noqa: E402, F401
     TaskType, ContextFile, NeoInput, PlanStep, SimulationTrace,
     CodeSuggestion, StaticCheckResult, NeoOutput, RegenerateStats, LMAdapter,
+    ProposedChange,
 )
+from neo.operating_mode import AuthorityPolicy, OperatingMode  # noqa: E402
+
+
+class _VerificationOnlyAdapter(LMAdapter):
+    """Sentinel proving VERIFY mode cannot accidentally invoke inference."""
+
+    def generate(self, messages, **kwargs):
+        raise RuntimeError("VERIFY mode attempted an unexpected LM call")
+
+    def name(self):
+        return "verification-only/no-model"
 from neo.engine import NeoEngine  # noqa: E402, F401
 from neo.subcommands import (  # noqa: E402, F401
     show_version, show_help, _interpret_confidence, _restore_from_backup,
@@ -68,6 +80,24 @@ def parse_args():
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
     global_parser.add_argument('--deep', action='store_true', help='Force multi-agent deliberation (needs CAR + a diverse model pool; degrades to a high-effort single pass otherwise)')
+    global_parser.add_argument(
+        '--mode',
+        choices=[mode.value for mode in OperatingMode],
+        default=OperatingMode.LEARN.value,
+        help='Operating mode: advise, patch, verify, learn (default), or agent',
+    )
+    global_parser.add_argument(
+        '--allow-write-path',
+        action='append',
+        default=[],
+        help='Agent-only workspace-relative write glob; repeat for multiple paths',
+    )
+    global_parser.add_argument(
+        '--allow-command',
+        action='append',
+        default=[],
+        help='Agent-only exact command grant for a host execution adapter',
+    )
     global_parser.add_argument('--fast', action='store_true', help='Force the fast single-call path (skip multi-agent deliberation)')
 
     # Detect if 'contribute' subcommand is being used
@@ -280,6 +310,25 @@ def parse_args():
             help='Initial confidence for imported facts (default: 0.4)',
         )
         import_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
+
+        explain_p = subparsers.add_parser(
+            'explain',
+            help='Explain a fact\'s provenance and learning history without an LM call',
+        )
+        explain_p.add_argument('fact_id', help='Full fact ID or unambiguous ID prefix')
+        explain_p.add_argument('--json', action='store_true', help='Emit the explanation as JSON')
+        explain_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
+
+        evaluate_p = subparsers.add_parser(
+            'evaluate-learning',
+            help='Run the deterministic evidence-learning benchmark and safety gates',
+        )
+        evaluate_p.add_argument('--json', action='store_true', help='Emit the report as JSON')
+        evaluate_p.add_argument('--corpus', help='Override the versioned benchmark corpus path')
+        evaluate_p.add_argument(
+            '--workspace',
+            help='Retain isolated benchmark facts and episodes under this directory',
+        )
 
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
@@ -507,7 +556,10 @@ def main():
     if not (
         (hasattr(args, 'version') and args.version)
         or (hasattr(args, 'config') and args.config)
-        or (getattr(args, 'memory_action', None) == 'observer')
+        or (
+            getattr(args, 'memory_action', None)
+            in {'observer', 'explain', 'evaluate-learning', 'issues', 'rules', 'audit'}
+        )
     ):
         try:
             from neo.memory.observer import maybe_autostart_observer
@@ -717,6 +769,27 @@ def main():
         try:
             input_data = json.loads(_read_stdin_guarded())
             working_dir = input_data.get("working_directory") or args.cwd or os.getcwd()
+            try:
+                operating_mode = OperatingMode(
+                    input_data.get("operating_mode", input_data.get("mode", args.mode))
+                )
+            except ValueError as exc:
+                raise ValueError(f"unknown operating mode: {input_data.get('operating_mode')}") from exc
+            raw_authority = input_data.get("authority")
+            authority = None
+            if isinstance(raw_authority, dict):
+                authority = AuthorityPolicy(
+                    workspace_root=str(raw_authority.get("workspace_root", working_dir)),
+                    allowed_write_paths=[
+                        item for item in raw_authority.get("allowed_write_paths", [])
+                        if isinstance(item, str)
+                    ],
+                    allowed_commands=[
+                        item for item in raw_authority.get("allowed_commands", [])
+                        if isinstance(item, str)
+                    ],
+                    allow_learning=bool(raw_authority.get("allow_learning", True)),
+                )
             neo_input = NeoInput(
                 prompt=input_data["prompt"],
                 task_type=TaskType(input_data.get("task_type", "feature")),
@@ -727,6 +800,18 @@ def main():
                 recent_commands=input_data.get("recent_commands", []),
                 safe_read_paths=input_data.get("safe_read_paths", []),
                 working_directory=working_dir,
+                operating_mode=operating_mode,
+                authority=authority,
+                proposed_changes=[
+                    ProposedChange(
+                        file_path=str(change.get("file_path", "")),
+                        description=str(change.get("description", "caller-provided change")),
+                        unified_diff=str(change.get("unified_diff", "")),
+                        code_block=str(change.get("code_block", "")),
+                    )
+                    for change in input_data.get("proposed_changes", [])
+                    if isinstance(change, dict)
+                ],
             )
             if not args.json:
                 _print_neo_greeting(neo_input.prompt, working_dir)
@@ -745,6 +830,16 @@ def main():
             context_files=[],
             working_directory=working_dir,
             safe_read_paths=[working_dir],
+            operating_mode=OperatingMode(args.mode),
+            authority=(
+                AuthorityPolicy(
+                    workspace_root=working_dir,
+                    allowed_write_paths=list(args.allow_write_path),
+                    allowed_commands=list(args.allow_command),
+                )
+                if args.allow_write_path or args.allow_command
+                else None
+            ),
         )
         if not args.dry_run:
             _print_neo_greeting(prompt, working_dir)
@@ -804,6 +899,16 @@ def main():
             print(f"\nPrompt: {prompt[:200]}...\n", file=sys.stderr)
             sys.exit(0)
 
+    if neo_input.operating_mode is OperatingMode.AGENT:
+        print(json.dumps({
+            "error": "AgentExecutorUnavailable",
+            "message": (
+                "Standalone Neo has no built-in executor. Agent mode requires "
+                "an embedding host to provide an execution adapter and explicit authority."
+            ),
+        }, indent=2))
+        sys.exit(1)
+
     # Initialize adapter from environment
     # NO STUBS OR FALLBACKS - require real configuration
     from neo.adapters import resolve_adapter
@@ -826,7 +931,11 @@ def main():
                 if cfg_level is not None:
                     logging.getLogger().setLevel(cfg_level)
 
-        adapter = resolve_adapter(config)
+        adapter = (
+            _VerificationOnlyAdapter()
+            if neo_input.operating_mode is OperatingMode.VERIFY
+            else resolve_adapter(config)
+        )
     except Exception as e:
         error_output = {
             "error": f"Failed to initialize LM adapter: {e}",

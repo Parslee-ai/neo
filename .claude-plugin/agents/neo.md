@@ -38,7 +38,7 @@ Use the Neo agent for:
 The Neo agent will:
 1. Gather relevant codebase context using Read, Grep, Glob tools
 2. Formulate a detailed query with context
-3. Execute Neo CLI with proper timeout (600s)
+3. Execute Neo CLI with proper timeout (600s), using `neo --mode advise` by default
 4. Parse Neo's multi-agent reasoning output
 5. Present actionable recommendations with confidence scores
 
@@ -59,4 +59,4 @@ Use the Neo agent to debug this race condition in the task processor.
 - Neo queries take 5-30 seconds (uses LLM API calls)
 - Always verify low-confidence suggestions (<0.7)
 - Provide rich context for better results
-- Neo learns from feedback over time
+- Ordinary analysis is explicit `advise` and does not mutate durable memory. Use `learn` only when the user intends to record evidence; never request `agent` without explicit workspace authority and a host executor.

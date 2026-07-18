@@ -14,7 +14,7 @@ When the user invokes this skill (`$neo-architect <question>`), do the following
 3. **Invoke Neo with an architecture-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo <<'QUERY'
+   neo --mode advise <<'QUERY'
    Architectural decision: <restate the question with constraints>.
 
    Current state of the codebase:
@@ -30,5 +30,5 @@ When the user invokes this skill (`$neo-architect <question>`), do the following
 
 ## Notes
 
-- Architecture decisions are where Neo's persistent memory pays off most. The same question asked across multiple projects gradually accumulates trade-off learnings.
+- This skill uses `advise`; architecture guidance is never promoted automatically. Deliberate policy learning requires explicit `learn` mode and stronger evidence.
 - Neo will not recommend "it depends" — it picks a default and explains the trade-off. If the user wants ambiguity preserved, ask them to phrase the question as "what are the trade-offs of X vs Y?" rather than "should I do X or Y?".

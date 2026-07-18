@@ -48,6 +48,22 @@ def _stub_registry(monkeypatch, run_overrides: dict):
 
 
 class TestDispatch:
+    def test_missing_enabled_tool_is_explicitly_unavailable(self, monkeypatch):
+        monkeypatch.setattr("neo.static_analysis.detect_available_tools", set)
+
+        results = run_static_checks(
+            [_suggestion("foo.py")],
+            enable_ruff=True,
+            enable_pyright=False,
+            enable_mypy=False,
+            enable_eslint=False,
+        )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "ruff"
+        assert results[0].kind == "lint"
+        assert results[0].status == "unavailable"
+
     def test_unsupported_extension_skipped(self, monkeypatch):
         # Files with extensions no checker claims (e.g. .rs today) produce
         # no results, even with every checker enabled and a stub installed.

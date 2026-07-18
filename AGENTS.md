@@ -46,6 +46,15 @@
     conflicts, and MEMORY.md index drift. `neo memory import [--dry-run]` ingests a peer
     tool's memory files into neo's store as REVIEW facts on probation (trust-first;
     `imported:claude-memory` tag, content-hash watermark for idempotency).
+    `neo memory explain <fact-id-or-prefix> [--json]` is a deterministic, read-only join
+    across FactStore and the learning-episode ledger: provenance, supporting/conflicting
+    outcomes, retrieval/context use, metric mutations, rollback, and supersession; it
+    initializes neither embeddings nor an LM.
+  - Evaluation: `neo memory evaluate-learning [--json] [--workspace PATH]` runs the
+    versioned `benchmarks/learning_loop_v1.json` corpus against memory-disabled,
+    legacy-immediate, and evidence-driven policies. All ten causal/safety scenarios,
+    zero harmful/unsupported/repeat-error/leakage thresholds, a 500 ms local latency
+    cap, zero model calls/tokens, and primary-quality improvement are hard gates.
     (`neo/memory/issues.py`, `neo/memory/rulesync.py`, `neo/memory/memaudit.py`,
     `neo/memory/memimport.py`)
 - Domain tags (`Fact.domain`, `memory.models.SUGGESTED_DOMAINS`): optional free-form
@@ -54,11 +63,15 @@
   suggested vocabulary, but any string is valid. `retrieve_relevant(..., domain=...)`
   filters by exact match; `domain=None` returns all facts including unset ones.
 - Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`, ~`store.py:806-900`):
-  ACCEPTED/MODIFIED/UNVERIFIED act on the linked original fact when present —
-  confidence +0.2 / −0.2 / +0.1 (all ±arch_mod), and bump `success_count` (except
-  MODIFIED). MODIFIED also writes a REVIEW at confidence 0.4; ACCEPTED falls back to a
-  REVIEW (`suggestion_confidence + 0.1`) when no link is found; UNVERIFIED never creates
-  a REVIEW. INDEPENDENT writes a REVIEW at confidence 0.2. **Footgun**: if you add a new
+  ACCEPTED/MODIFIED act on a linked legacy fact with confidence +0.2 / −0.2
+  (±arch_mod); ACCEPTED bumps `success_count`. New suggestions remain episode-local
+  candidates until independently accepted twice; deterministic verification failure
+  blocks promotion. MODIFIED also writes a REVIEW at confidence 0.4; ACCEPTED falls back
+  to a REVIEW (`suggestion_confidence + 0.1`) only for legacy unattributed sessions.
+  UNVERIFIED is recorded but never changes confidence or success. INDEPENDENT writes a
+  REVIEW at confidence 0.2. REGRESSION is an explicitly attributed delayed failure;
+  two distinct contradicting source episodes roll back their promoted fact without
+  penalizing unrelated retrieved facts. **Footgun**: if you add a new
   `OutcomeType`, update both `outcomes.py` and `store.detect_implicit_feedback`.
 - Retrieval: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f
   + provenance_bonus`. `memory.models.rank_score` is the single source of truth — if you
@@ -133,4 +146,10 @@
   [Parslee-ai/car-releases#52](https://github.com/Parslee-ai/car-releases/issues/52)
   (`route_model` is cost-biased for "simple" prompts and ranks `gpt-5.3-codex`/`o3`
   behind `gpt-4.1-mini`). If that upstream lands, revisit the default.
+- Operating modes (`neo.operating_mode`): standalone defaults to `learn` for backward
+  compatibility (repository read-only, evidence learning enabled). `advise` and `patch`
+  retrieve memory but never detect outcomes/create candidates; `verify` requires
+  caller-provided changes and makes zero LM calls; `agent` requires explicit
+  workspace-relative write globs plus a host `ExecutionAdapter`. Neo never executes
+  generated command strings, and standalone/CAR-without-executor fail closed.
 - When creating a pull request, always use the PR template included in the repo.

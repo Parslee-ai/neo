@@ -28,6 +28,11 @@ class FakeRuntime:
 
     def __init__(self, response: dict | str | None = None, raise_on: str | None = None):
         self.calls: list[tuple[str, dict]] = []
+        # For the built-in default response, echo a pinned model into
+        # ``model_used`` to mimic CAR honoring an available pin — otherwise the
+        # adapter's silent-substitution guard would (correctly) reject the
+        # mismatch. Explicit response dicts are returned verbatim.
+        self._echo_pin = response is None
         self._response = response if response is not None else {
             "text": "ok",
             "model_used": "gpt-4.1-mini",
@@ -50,7 +55,10 @@ class FakeRuntime:
             raise RuntimeError(f"FakeRuntime raised on: {self._raise_on}")
         if isinstance(self._response, str):
             return self._response
-        return json.dumps(self._response)
+        resp = self._response
+        if self._echo_pin and kwargs.get("model"):
+            resp = {**resp, "model_used": kwargs["model"]}
+        return json.dumps(resp)
 
 
 @pytest.fixture(autouse=True)
@@ -164,6 +172,37 @@ def test_generate_pins_model_when_set():
     _, kwargs = rt.calls[0]
     assert kwargs["model"] == "Qwen3-4B"
     assert kwargs["max_tokens"] == 512
+
+
+def test_generate_accepts_version_expanded_pin():
+    """A pin honored as a concrete deployment (version/date suffix) is fine."""
+    rt = FakeRuntime({"text": "ok", "model_used": "gpt-5.5-2025-10", "usage": {}})
+    adapter = CarAdapter(model="gpt-5.5", runtime=rt)
+    assert adapter.generate([{"role": "user", "content": "hi"}]) == "ok"
+
+
+def test_generate_raises_on_silent_model_substitution():
+    """A pin routed to an unrelated fallback must fail fast, naming the pin."""
+    rt = FakeRuntime({"text": "ok", "model_used": "apple-foundation", "usage": {}})
+    adapter = CarAdapter(model="Qwen3-4B", runtime=rt)
+    with pytest.raises(RuntimeError, match="Qwen3-4B"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
+def test_generate_router_mode_skips_substitution_guard():
+    """Router mode (model=None) never enforces a pin, whatever CAR routes to."""
+    rt = FakeRuntime({"text": "ok", "model_used": "apple-foundation", "usage": {}})
+    adapter = CarAdapter(runtime=rt)  # model=None
+    assert adapter.generate([{"role": "user", "content": "hi"}]) == "ok"
+
+
+def test_model_pin_honored_helper():
+    from neo.adapters import _model_pin_honored
+    assert _model_pin_honored("gpt-5.5", "gpt-5.5-2025-10")   # version expansion
+    assert _model_pin_honored("claude-opus-4-8", "claude-opus-4-8-20251101")
+    assert not _model_pin_honored("Qwen3-4B", "apple-foundation")  # fallback
+    assert not _model_pin_honored("nonexistent-xyz", "gpt-4.1-mini")
+    assert _model_pin_honored("gpt-5.5", "")  # nothing to compare — permit
 
 
 def test_generate_passes_intent_hint_as_intent_json():

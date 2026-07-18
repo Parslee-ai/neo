@@ -14,7 +14,7 @@ When the user invokes this skill (`$neo-debug <bug description>`), do the follow
 3. **Invoke Neo with a debug-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo <<'QUERY'
+   neo --mode advise <<'QUERY'
    Debug this issue: <user's description>
 
    Symptoms: <what happens>

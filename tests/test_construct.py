@@ -321,7 +321,7 @@ class TestConstructIndex:
     def test_construct_search_relevance_ordering(self, temp_construct_dir):
         """Test that search results are ordered by relevance."""
         # Mock the embedder
-        with patch('neo.construct.TextEmbedding') as mock_embedder_class:
+        with patch('neo.memory.store.build_resilient_embedder') as mock_embedder_class:
             mock_embedder = MagicMock()
             # Return different embeddings for different queries
             def embed_side_effect(texts):
@@ -347,7 +347,7 @@ class TestConstructIndex:
     @patch('neo.construct.FAISS_AVAILABLE', True)
     def test_construct_index_build_performance(self, temp_construct_dir):
         """Test that index builds in reasonable time (<5s for test patterns)."""
-        with patch('neo.construct.TextEmbedding') as mock_embedder_class:
+        with patch('neo.memory.store.build_resilient_embedder') as mock_embedder_class:
             mock_embedder = MagicMock()
             mock_embedder.embed = MagicMock(return_value=[[0.5] * 768])
             mock_embedder_class.return_value = mock_embedder
@@ -366,7 +366,7 @@ class TestConstructIndex:
     @patch('neo.construct.FAISS_AVAILABLE', True)
     def test_construct_search_performance(self, temp_construct_dir):
         """Test that search completes in <100ms with warm cache."""
-        with patch('neo.construct.TextEmbedding') as mock_embedder_class:
+        with patch('neo.memory.store.build_resilient_embedder') as mock_embedder_class:
             mock_embedder = MagicMock()
             mock_embedder.embed = MagicMock(return_value=[[0.5] * 768])
             mock_embedder_class.return_value = mock_embedder
@@ -514,7 +514,7 @@ class TestIndexFreshness:
     @patch('neo.construct.FAISS_AVAILABLE', True)
     def test_construct_index_respects_pattern_file_changes(self, temp_construct_dir):
         """Test that index rebuilds when pattern file is modified after index creation."""
-        with patch('neo.construct.TextEmbedding') as mock_embedder_class:
+        with patch('neo.memory.store.build_resilient_embedder') as mock_embedder_class:
             mock_embedder = MagicMock()
             mock_embedder.embed = MagicMock(return_value=[[0.5] * 768])
             mock_embedder_class.return_value = mock_embedder
@@ -545,7 +545,7 @@ class TestIndexFreshness:
     @patch('neo.construct.FAISS_AVAILABLE', True)
     def test_construct_index_skips_when_fresh(self, temp_construct_dir):
         """Test that index is skipped when all patterns are older than index."""
-        with patch('neo.construct.TextEmbedding') as mock_embedder_class:
+        with patch('neo.memory.store.build_resilient_embedder') as mock_embedder_class:
             mock_embedder = MagicMock()
             mock_embedder.embed = MagicMock(return_value=[[0.5] * 768])
             mock_embedder_class.return_value = mock_embedder

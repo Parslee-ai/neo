@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from neo.models import (
+    AppliedAction,
     CodeSuggestion,
     ContextFile,
     LMAdapter,
@@ -27,6 +28,12 @@ from neo.models import (
     SimulationTrace,
     StaticCheckResult,
     TaskType,
+)
+from neo.operating_mode import (
+    ExecutionAdapter,
+    ModeValidationError,
+    OperatingMode,
+    validate_agent_authority,
 )
 
 from neo.pattern_extraction import generate_prevention_warnings, get_library
@@ -67,6 +74,7 @@ class NeoEngine:
         enable_persistent_memory: bool = True,  # Persistent learning enabled by default
         codebase_root: Optional[str] = None,  # Root directory of the codebase being analyzed
         config: Optional[Any] = None,  # NeoConfig instance
+        execution_adapter: Optional[ExecutionAdapter] = None,
     ):
         self.lm = lm_adapter
         self.exemplar_index = exemplar_index
@@ -74,6 +82,7 @@ class NeoEngine:
         self.enable_persistent_memory = enable_persistent_memory
         self.codebase_root = codebase_root
         self.config = config  # NeoConfig | None (kept for downstream lookups like reasoning_effort_cap)
+        self.execution_adapter = execution_adapter
 
         # Load beat deck for personality templates (no LLM call)
         self.beat_deck = self._load_beat_deck()
@@ -125,6 +134,17 @@ class NeoEngine:
         # overseer check function spawned in process().
         self.action_log: deque = deque(maxlen=64)
 
+        # Evidence ledger is separate from durable facts. It exists even when
+        # persistent memory is disabled so every coding session can be traced.
+        from neo.memory.episodes import LearningEpisodeStore
+        if self.fact_store is not None:
+            episode_project_id = self.fact_store.project_id or "unscoped"
+        else:
+            from neo.memory.scope import detect_org_and_project
+            _, episode_project_id = detect_org_and_project(codebase_root)
+        self.episode_store = LearningEpisodeStore(episode_project_id or "unscoped")
+        self.current_learning_episode = None
+
     def process(self, neo_input: NeoInput) -> NeoOutput:
         """
         Main entry point: process input and return structured output.
@@ -140,9 +160,12 @@ class NeoEngine:
         8. Store reasoning in persistent memory
         9. Return structured output
         """
+        self._validate_operating_mode(neo_input)
         self.context = neo_input
         start_time = time.time()
         self.action_log.clear()
+        self.last_applied_actions: list[AppliedAction] = []
+        self.current_learning_episode = self._begin_learning_episode(neo_input)
 
         # Spawn the loop-detection watchdog for this run (G3 wire-up).
         # The overseer ticks on a deterministic schedule and emits
@@ -161,9 +184,126 @@ class NeoEngine:
 
         try:
             return self._process_inner(neo_input, start_time)
+        except Exception as exc:
+            episode = self.current_learning_episode
+            if episode is not None:
+                episode.completed_at = time.time()
+                episode.final_outcome = "engine_error"
+                episode.outcome_details = {"error_type": type(exc).__name__}
+                try:
+                    self.episode_store.save(episode)
+                except Exception as save_exc:
+                    logger.debug("learning episode error-save failed: %s", save_exc)
+            raise
         finally:
             overseer.stop()
             self._log_action("process.end", "")
+
+    def _begin_learning_episode(self, neo_input: NeoInput):
+        """Create the in-memory evidence record for one request."""
+        from neo.agent_context import discover as discover_agent_docs
+        from neo.memory.episodes import (
+            ContextSelection,
+            LearningEpisode,
+            content_hash,
+            redact_sensitive_text,
+            repository_state,
+        )
+
+        revision, dirty = repository_state(self.codebase_root)
+        context_selection = [
+            ContextSelection(
+                path=f.path,
+                content_sha256=content_hash(f.content or ""),
+                line_range=f.line_range,
+                kind="repository_file",
+            )
+            for f in neo_input.context_files
+        ]
+        for doc in discover_agent_docs(self.codebase_root):
+            context_selection.append(ContextSelection(
+                path=doc.path,
+                content_sha256=content_hash(doc.content),
+                kind="project_instruction",
+            ))
+
+        provider = str(getattr(self.lm, "provider", "") or "")
+        model = str(getattr(self.lm, "model", "") or "")
+        if not model:
+            try:
+                model = str(self.lm.name())
+            except Exception:
+                model = ""
+
+        return LearningEpisode(
+            objective=redact_sensitive_text(neo_input.prompt),
+            project_id=self.episode_store.project_id,
+            repository_root=self.codebase_root or "",
+            repository_revision=revision,
+            repository_dirty=dirty,
+            context_selection=context_selection,
+            provider=provider,
+            model=model,
+            operating_mode=neo_input.operating_mode.value,
+            authority=(neo_input.authority.public_summary() if neo_input.authority else {}),
+        )
+
+    def _validate_operating_mode(self, neo_input: NeoInput) -> None:
+        """Fail closed before inference for invalid verification or agent requests."""
+        if neo_input.operating_mode is OperatingMode.VERIFY:
+            if not neo_input.proposed_changes:
+                raise ModeValidationError(
+                    "verify mode requires at least one caller-provided proposed change"
+                )
+            if any(
+                not change.file_path or not (change.unified_diff or change.code_block)
+                for change in neo_input.proposed_changes
+            ):
+                raise ModeValidationError(
+                    "each proposed change requires file_path and unified_diff or code_block"
+                )
+        if neo_input.operating_mode is OperatingMode.AGENT:
+            validate_agent_authority(
+                neo_input.authority,
+                has_executor=self.execution_adapter is not None,
+            )
+
+    def _capture_retrieval_context(self, fact_context, *, included: bool) -> None:
+        """Record retrieved fact IDs and scores without changing fact authority."""
+        episode = self.current_learning_episode
+        if episode is None:
+            return
+        from neo.memory.episodes import RetrievedFactEvidence
+
+        existing = {item.fact_id: item for item in episode.retrieved_facts}
+        for fact in fact_context.valid_facts:
+            score = fact_context.retrieval_scores.get(fact.id)
+            item = existing.get(fact.id)
+            if item is None:
+                item = RetrievedFactEvidence(fact_id=fact.id, score=score)
+                episode.retrieved_facts.append(item)
+                existing[fact.id] = item
+            elif score is not None:
+                item.score = score
+            item.included_in_context = item.included_in_context or included
+
+    def _capture_detectable_fact_use(self, plan, simulations, suggestions) -> None:
+        """Mark facts only when their stable citation survives into reasoning output."""
+        episode = self.current_learning_episode
+        if episode is None or not episode.retrieved_facts:
+            return
+        artifacts = [
+            *(step.rationale for step in plan),
+            *(step.description for step in plan),
+            *(reason for trace in simulations for reason in trace.reasoning_steps),
+            *(suggestion.description for suggestion in suggestions),
+        ]
+        text = "\n".join(str(item) for item in artifacts if item)
+        for evidence in episode.retrieved_facts:
+            evidence.used_in_reasoning = (
+                evidence.included_in_context
+                and f"[fact:{evidence.fact_id}]" in text
+            )
 
     def _log_action(self, action: str, signature: str) -> None:
         """Append an action to the loop-detection log.
@@ -200,10 +340,99 @@ class NeoEngine:
             next_check_delay=5.0 if is_looping else 10.0,
         )
 
+    def _process_verification_only(
+        self, neo_input: NeoInput, start_time: float
+    ) -> NeoOutput:
+        """Verify caller-provided changes deterministically without an LM call."""
+        suggestions = [
+            CodeSuggestion(
+                file_path=change.file_path,
+                unified_diff=change.unified_diff,
+                code_block=change.code_block,
+                description=change.description,
+                confidence=0.0,
+            )
+            for change in neo_input.proposed_changes
+        ]
+        constraints = self._extract_prompt_constraints(neo_input.prompt)
+        static_checks = self._run_static_checks(suggestions, constraints)
+        statuses = [self._static_check_status(check) for check in static_checks]
+        confidence = (
+            0.0 if "failed" in statuses
+            else 1.0 if statuses and all(status == "passed" for status in statuses)
+            else 0.5
+        )
+        if self.current_learning_episode is not None:
+            self.current_learning_episode.applied_actions.extend({
+                "suggestion_id": suggestion.suggestion_id,
+                "file_path": suggestion.file_path,
+                "status": "provided_for_verification",
+            } for suggestion in suggestions)
+        plan = [PlanStep(
+            description="Verify caller-provided changes",
+            rationale="VERIFY mode performs deterministic checks without generation",
+            verifier_checks=[check.tool_name for check in static_checks],
+        )]
+        self.last_reasoning_mode = "verification_only"
+        self.last_reasoning_reason = "caller selected verify mode"
+        return self._finalize_output(
+            neo_input=neo_input,
+            plan=plan,
+            simulation_traces=[],
+            code_suggestions=suggestions,
+            static_checks=static_checks,
+            next_questions=[],
+            confidence=confidence,
+            enriched_context={},
+            start_time=start_time,
+            difficulty="verification",
+            time_budget=0.0,
+            early_exit=False,
+            extra_metadata={"verification_only": True, "lm_calls": 0},
+        )
+
+    def _execute_authorized_suggestions(
+        self, neo_input: NeoInput, suggestions: list[CodeSuggestion]
+    ) -> list[AppliedAction]:
+        """Delegate pre-authorized actions to a host executor; never shell out here."""
+        if neo_input.operating_mode is not OperatingMode.AGENT:
+            return []
+        policy = neo_input.authority
+        if policy is None or self.execution_adapter is None:  # validated before inference
+            raise ModeValidationError("agent execution authority is unavailable")
+        unauthorized = [
+            suggestion.file_path
+            for suggestion in suggestions
+            if suggestion.file_path and not policy.allows_path(suggestion.file_path)
+        ]
+        if unauthorized:
+            raise ModeValidationError(
+                "agent suggestion targets unauthorized path(s): " + ", ".join(unauthorized)
+            )
+        actions = self.execution_adapter.execute(suggestions, policy)
+        suggestion_ids = {suggestion.suggestion_id for suggestion in suggestions}
+        for action in actions:
+            if action.suggestion_id not in suggestion_ids:
+                raise ModeValidationError("executor returned an unknown suggestion_id")
+            if action.file_path and not policy.allows_path(action.file_path):
+                raise ModeValidationError("executor reported an unauthorized path")
+        if self.current_learning_episode is not None:
+            self.current_learning_episode.applied_actions.extend({
+                "suggestion_id": action.suggestion_id,
+                "file_path": action.file_path,
+                "status": action.status,
+                "summary": action.summary,
+                "repository_revision": action.repository_revision,
+            } for action in actions)
+        return actions
+
     def _process_inner(self, neo_input: NeoInput, start_time: float) -> NeoOutput:
         """Internal process() body. Separated so process() can wrap
         with overseer.start()/stop() in a try/finally.
         """
+        if neo_input.operating_mode is OperatingMode.VERIFY:
+            return self._process_verification_only(neo_input, start_time)
+
         # Phase 5: Estimate difficulty and allocate time budget
         difficulty = self._estimate_difficulty(neo_input)
         time_budget = self._get_time_budget(difficulty)
@@ -214,7 +443,7 @@ class NeoEngine:
         self.last_difficulty = difficulty
 
         # Phase 0: Detect implicit feedback from request history
-        if self.persistent_memory:
+        if self.persistent_memory and neo_input.operating_mode.allows_learning:
             current_request = {
                 "prompt": neo_input.prompt,
                 "timestamp": time.time(),
@@ -250,6 +479,9 @@ class NeoEngine:
         decision, route_fn = self._decide_reasoning_mode(enriched_context, difficulty, neo_input)
         self.last_reasoning_mode = decision.mode.value
         self.last_reasoning_reason = decision.reason
+        if self.current_learning_episode is not None:
+            self.current_learning_episode.reasoning_mode = decision.mode.value
+            self.current_learning_episode.reasoning_reason = decision.reason
         logger.info("Reasoning mode: %s — %s", decision.mode.value, decision.reason)
 
         plan = simulation_traces = code_suggestions = None
@@ -269,7 +501,11 @@ class NeoEngine:
             # Fast path (default, or fallback from a failed panel).
             self._log_action("lm_call", neo_input.prompt[:60])
             plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
+        self._capture_detectable_fact_use(plan, simulation_traces, code_suggestions)
         self.last_simulation_traces = simulation_traces
+        self.last_applied_actions = self._execute_authorized_suggestions(
+            neo_input, code_suggestions
+        )
 
         # Phase 5: Run static checks BEFORE deciding early-exit.
         # LM self-reported confidence alone is self-validation — we require an
@@ -289,16 +525,13 @@ class NeoEngine:
         # static_checks is empty because no tools were available.
         if code_suggestions and self._simulation_consensus(simulation_traces):
             max_confidence = max((s.confidence for s in code_suggestions), default=0.0)
-            has_errors = any(
-                d.get("severity") == "error"
-                for check in static_checks
-                for d in check.diagnostics
+            check_statuses = [self._static_check_status(check) for check in static_checks]
+            static_ran_clean = bool(check_statuses) and all(
+                status == "passed" for status in check_statuses
             )
-            static_ran = len(static_checks) > 0
             if (
                 max_confidence > self.EARLY_EXIT_CONFIDENCE
-                and static_ran
-                and not has_errors
+                and static_ran_clean
             ):
                 logger.info(
                     f"Early exit: confidence={max_confidence:.2f}, "
@@ -368,22 +601,53 @@ class NeoEngine:
         Single exit point for both early-exit and full-pipeline paths so the
         save/log/telemetry sequence can't drift between them.
         """
+        learning_allowed = neo_input.operating_mode.allows_learning and (
+            neo_input.operating_mode is not OperatingMode.AGENT
+            or neo_input.authority is None
+            or neo_input.authority.allow_learning
+        )
         fact = None
-        if self.persistent_memory:
+        if self.persistent_memory and learning_allowed:
             fact = self._store_reasoning(
                 neo_input, plan, code_suggestions, confidence, enriched_context
             )
-        if self.fact_store is not None:
+        simulation_facts = []
+        if self.fact_store is not None and learning_allowed:
             ids = self._build_suggestion_fact_ids(fact, code_suggestions)
-            self.fact_store.save_session(code_suggestions, neo_input.prompt, ids)
-            self._persist_simulation_episodes(
-                simulation_traces, plan, neo_input.prompt, code_suggestions=code_suggestions
+            episode = self.current_learning_episode
+            candidates = {
+                candidate.suggestion_id: {
+                    "candidate_id": candidate.candidate_id,
+                    "subject": candidate.subject,
+                    "body": candidate.body,
+                    "kind": candidate.kind,
+                }
+                for candidate in (episode.memory_candidates if episode else [])
+            }
+            self.fact_store.save_session(
+                code_suggestions,
+                neo_input.prompt,
+                ids,
+                learning_episode_id=episode.episode_id if episode else "",
+                repository_revision=episode.repository_revision if episode else "",
+                retrieved_fact_ids=[
+                    evidence.fact_id for evidence in (episode.retrieved_facts if episode else [])
+                ],
+                used_fact_ids=[
+                    evidence.fact_id
+                    for evidence in (episode.retrieved_facts if episode else [])
+                    if evidence.used_in_reasoning is True
+                ],
+                candidates_by_suggestion=candidates,
             )
 
         elapsed = time.time() - start_time
         self._log_metrics(difficulty, time_budget, elapsed, early_exit=early_exit)
 
         metadata: dict[str, Any] = {"early_exit": early_exit} if early_exit else {}
+        metadata["operating_mode"] = neo_input.operating_mode.value
+        metadata["learning_enabled_for_request"] = learning_allowed
+        metadata["repository_actions"] = len(self.last_applied_actions)
         # Reasoning-tier provenance — always explainable which path ran and why.
         metadata["reasoning_mode"] = getattr(self, "last_reasoning_mode", "fast")
         reason = getattr(self, "last_reasoning_reason", "")
@@ -400,6 +664,14 @@ class NeoEngine:
             }
         if extra_metadata:
             metadata.update(extra_metadata)
+
+        self._complete_learning_episode(
+            code_suggestions=code_suggestions,
+            static_checks=static_checks,
+            reasoning_fact=fact,
+            simulation_facts=simulation_facts,
+            metadata=metadata,
+        )
 
         output = NeoOutput(
             plan=plan,
@@ -420,7 +692,7 @@ class NeoEngine:
         plan: list[PlanStep],
         prompt: str,
         code_suggestions: Optional[list[CodeSuggestion]] = None,
-    ) -> None:
+    ) -> list:
         """Write each simulation trace as an EPISODE fact for future retrieval.
 
         Only persists when we have a fact_store. Failure to write a single
@@ -432,7 +704,7 @@ class NeoEngine:
         prompts like this one touch?" — closing the learning loop.
         """
         if not traces:
-            return
+            return []
         # PlanStep has ``actions: list[str]`` (plural) and a top-level
         # ``description`` — both useful for a compact plan summary. Join
         # description preferentially; fall back to first action when missing.
@@ -441,9 +713,10 @@ class NeoEngine:
             for step in plan
         )[:300]
         file_paths = list({s.file_path for s in (code_suggestions or []) if s.file_path})
+        persisted = []
         for trace in traces:
             try:
-                self.fact_store.persist_simulation_episode(
+                persisted.append(self.fact_store.persist_simulation_episode(
                     prompt=prompt,
                     input_data=trace.input_data or "",
                     expected_output=trace.expected_output or "",
@@ -452,9 +725,107 @@ class NeoEngine:
                     plan_summary=plan_summary,
                     file_paths=file_paths,
                     codebase_ref=self.fact_store.codebase_root or "",
-                )
+                ))
             except Exception as e:  # never block on episode-write failure
                 logger.debug(f"persist_simulation_episode failed: {e}")
+        return persisted
+
+    def _complete_learning_episode(
+        self, *, code_suggestions, static_checks, reasoning_fact,
+        simulation_facts, metadata,
+    ) -> None:
+        """Finalize and persist the task evidence without promoting knowledge."""
+        episode = self.current_learning_episode
+        if episode is None:
+            return
+        from neo.memory.episodes import (
+            aggregate_verification_status,
+            MemoryMutationEvidence,
+            SuggestionEvidence,
+            VerificationEvidence,
+            content_hash,
+            redact_sensitive_text,
+        )
+        import uuid
+
+        suggestion_ids: dict[str, str] = {}
+        for suggestion in code_suggestions:
+            suggestion_id = suggestion.suggestion_id
+            suggestion_ids[suggestion.file_path] = suggestion_id
+            episode.suggestions.append(SuggestionEvidence(
+                suggestion_id=suggestion_id,
+                file_path=suggestion.file_path,
+                description=redact_sensitive_text(suggestion.description),
+                confidence=suggestion.confidence,
+                diff_sha256=content_hash(suggestion.unified_diff),
+                code_sha256=content_hash(suggestion.code_block),
+            ))
+
+        if static_checks:
+            for check in static_checks:
+                severities = {str(d.get("severity", "")).lower() for d in check.diagnostics}
+                status = check.status or (
+                    "failed" if "error" in severities
+                    else "warning" if check.diagnostics
+                    else "passed"
+                )
+                episode.verification.append(VerificationEvidence(
+                    verification_id=uuid.uuid4().hex,
+                    kind=check.kind or "neo_static",
+                    status=status,
+                    tool_name=check.tool_name,
+                    summary=check.summary,
+                    diagnostics_count=len(check.diagnostics),
+                    repository_revision=episode.repository_revision,
+                ))
+        else:
+            episode.verification.append(VerificationEvidence(
+                verification_id=uuid.uuid4().hex,
+                kind="neo_static",
+                status="skipped",
+                summary="No deterministic static checker ran",
+                repository_revision=episode.repository_revision,
+            ))
+
+        metadata["verification_verdict"] = aggregate_verification_status(
+            episode.verification
+        )
+        if metadata["verification_verdict"] == "failed":
+            for evidence in episode.retrieved_facts:
+                if evidence.used_in_reasoning is True:
+                    evidence.outcome_association = "failure"
+
+        if reasoning_fact is not None:
+            episode.memory_mutations.append(MemoryMutationEvidence(
+                mutation_id=uuid.uuid4().hex,
+                operation="legacy_fact_write",
+                fact_id=reasoning_fact.id,
+                reason="legacy memory backend only",
+            ))
+        for fact in simulation_facts:
+            episode.memory_mutations.append(MemoryMutationEvidence(
+                mutation_id=uuid.uuid4().hex,
+                operation="add_simulation_episode_fact",
+                fact_id=fact.id,
+                reason="simulation trace persistence",
+            ))
+
+        episode.completed_at = time.time()
+        mode = self.context.operating_mode if self.context else OperatingMode.LEARN
+        episode.final_outcome = {
+            OperatingMode.ADVISE: "advised_no_learning",
+            OperatingMode.PATCH: "patch_proposed_no_learning",
+            OperatingMode.VERIFY: "verification_complete",
+            OperatingMode.LEARN: "suggested_pending_downstream_outcome",
+            OperatingMode.AGENT: "agent_actions_pending_downstream_outcome",
+        }[mode]
+        metadata["learning_episode_id"] = episode.episode_id
+        metadata["learning_task_id"] = episode.task_id
+        metadata["suggestion_ids"] = suggestion_ids
+        try:
+            self.episode_store.save(episode)
+        except Exception as exc:
+            logger.warning("Learning episode persistence failed (non-fatal): %s", exc)
 
     @staticmethod
     def _simulation_consensus(traces: list[SimulationTrace]) -> bool:
@@ -591,6 +962,7 @@ class NeoEngine:
             prompt_text = context.get("prompt", "")
             k = self._adaptive_k_selection(prompt_text, context)
             fact_context = self.fact_store.build_context(prompt_text, environment=context, k=k)
+            self._capture_retrieval_context(fact_context, included=True)
             formatted = self.fact_store.format_context_for_prompt(fact_context)
             if formatted:
                 past_learnings = [formatted]
@@ -832,6 +1204,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
                 prompt_text = context.get("prompt", "")
                 k = self._adaptive_k_selection(prompt_text, context)
                 fc = self.fact_store.build_context(prompt_text, environment=context, k=k)
+                self._capture_retrieval_context(fc, included=False)
                 return signal_from_facts(fc.valid_facts)
             except Exception as e:  # pragma: no cover - defensive
                 logger.debug("memory signal computation failed: %s", e)
@@ -933,6 +1306,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             prompt_text = context.get("prompt", "")
             k = self._adaptive_k_selection(prompt_text, context)
             fact_context = self.fact_store.build_context(prompt_text, environment=context, k=k)
+            self._capture_retrieval_context(fact_context, included=True)
             formatted = self.fact_store.format_context_for_prompt(fact_context)
             if formatted:
                 past_learnings = [formatted]
@@ -1068,6 +1442,20 @@ RULES:
                 results.append(constraint_result)
 
         return results
+
+    @staticmethod
+    def _static_check_status(check: StaticCheckResult) -> str:
+        """Normalize legacy check results without treating absence as success."""
+        if check.status:
+            return check.status
+        severities = {
+            str(item.get("severity", "")).lower() for item in check.diagnostics
+        }
+        if "error" in severities:
+            return "failed"
+        if check.diagnostics:
+            return "warning"
+        return "passed"
 
     def _community_fallback_learnings(self, prompt_text: str) -> str:
         """Return formatted community facts when the primary store misses.
@@ -1452,48 +1840,40 @@ RULES:
 
         # Route to FactStore or legacy memory
         if self.fact_store is not None:
-            # Map task_type to FactKind
-            from neo.memory.models import FactKind
+            # Generated reasoning is evidence, not durable knowledge. Create
+            # one probationary candidate per suggestion in the separate
+            # LearningEpisode; downstream verified outcomes decide whether a
+            # candidate ever enters FactStore.
+            from neo.memory.episodes import MemoryCandidateEvidence, redact_sensitive_text
             kind_map = {
-                "algorithm": FactKind.PATTERN,
-                "refactor": FactKind.ARCHITECTURE,
-                "bugfix": FactKind.FAILURE,
-                "feature": FactKind.DECISION,
-                "explanation": FactKind.PATTERN,
+                "algorithm": "pattern",
+                "refactor": "architecture",
+                "bugfix": "pattern",
+                "feature": "decision",
+                "explanation": "pattern",
             }
-            fact_kind = kind_map.get(task_type_str, FactKind.PATTERN)
+            candidate_kind = kind_map.get(task_type_str, "pattern")
+            episode = self.current_learning_episode
+            if episode is not None:
+                import uuid
 
-            # Combine reasoning + suggestion + pitfalls into body
-            body_parts = [f"Reasoning: {reasoning}"]
-            if suggestion:
-                body_parts.append(f"Suggestion: {suggestion}")
-            if code_skeleton:
-                body_parts.append(f"Code skeleton: {code_skeleton}")
-            if pitfalls:
-                body_parts.append("Pitfalls: " + "; ".join(pitfalls[:5]))
-
-            tags = [task_type_str]
-            deliberation = getattr(self, "last_deliberation", None)
-            if deliberation is not None:
-                # Provenance for deliberated outcomes: recognizable (`multi-agent`)
-                # and trust-first (`probation`). They enter on probation and are
-                # promoted only by real outcomes (access_count>=2 / success_count>0)
-                # via the existing pipeline — so a wrong panel answer never becomes
-                # confident memory unchecked. `confidence` here already reflects the
-                # panel *consensus*, not a single model's self-report.
-                # docs/solutions/tiered-reasoning-multi-agent.md §5.
-                tags += ["multi-agent", "probation"]
-
-            fact = self.fact_store.add_fact(
-                subject=pattern,
-                body="\n".join(body_parts),
-                kind=fact_kind,
-                confidence=confidence,
-                source_prompt=neo_input.prompt[:200],
-                tags=tags,
-            )
-            logger.info(f"_store_reasoning: created fact id={fact.id} subject={pattern[:50]}")
-            return fact
+                for code_suggestion in suggestions:
+                    body_parts = [f"Reasoning: {reasoning}"]
+                    if code_suggestion.description:
+                        body_parts.append(f"Suggestion: {code_suggestion.description}")
+                    if pitfalls:
+                        body_parts.append("Pitfalls: " + "; ".join(pitfalls[:5]))
+                    episode.memory_candidates.append(MemoryCandidateEvidence(
+                        candidate_id=uuid.uuid4().hex,
+                        suggestion_id=code_suggestion.suggestion_id,
+                        subject=redact_sensitive_text(
+                            f"{pattern} [{code_suggestion.file_path}]"
+                        ),
+                        body=redact_sensitive_text("\n".join(body_parts)),
+                        kind=candidate_kind,
+                        supporting_episode_ids=[episode.episode_id],
+                    ))
+            return None
         else:
             # Legacy path
             test_patterns = []

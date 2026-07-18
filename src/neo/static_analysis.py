@@ -375,6 +375,13 @@ _LANGUAGE_CHECKERS: tuple[_LanguageChecker, ...] = (
 # checker doesn't require keeping a second list in sync.
 _KNOWN_TOOLS: frozenset[str] = frozenset(c.tool_name for c in _LANGUAGE_CHECKERS)
 
+_TOOL_KINDS = {
+    "ruff": "lint",
+    "eslint": "lint",
+    "pyright": "type_check",
+    "mypy": "type_check",
+}
+
 
 # ============================================================================
 # Tool Detection
@@ -433,7 +440,30 @@ def run_static_checks(
             if not enable_map.get(checker.tool_name, False):
                 continue
             if checker.tool_name not in available_tools:
+                results.append(StaticCheckResult(
+                    tool_name=checker.tool_name,
+                    diagnostics=[],
+                    summary=f"{checker.tool_name} is unavailable",
+                    kind=_TOOL_KINDS[checker.tool_name],
+                    status="unavailable",
+                ))
                 continue
-            results.append(checker.run(suggestion))
+            result = checker.run(suggestion)
+            if not result.kind:
+                result.kind = _TOOL_KINDS[checker.tool_name]
+            if not result.status:
+                severities = {
+                    str(item.get("severity", "")).lower()
+                    for item in result.diagnostics
+                }
+                if "error" in severities:
+                    result.status = "failed"
+                elif result.diagnostics:
+                    result.status = "warning"
+                elif "not found" in result.summary.lower() or "failed:" in result.summary.lower():
+                    result.status = "unavailable"
+                else:
+                    result.status = "passed"
+            results.append(result)
 
     return results

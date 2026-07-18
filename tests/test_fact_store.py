@@ -461,6 +461,34 @@ class TestScopeLimits:
         # High-confidence fact should survive
         assert high.is_valid is True
 
+    def test_eviction_strips_embedding_without_cascade(self, store):
+        """Eviction invalidates + strips the vector but does NOT flag dependents
+        (cascade=False): eviction-for-capacity isn't supersession."""
+        low = Fact(
+            id="evictme", subject="weak", body="b", scope=FactScope.SESSION,
+            embedding=np.random.randn(768).astype(np.float32),
+            metadata=FactMetadata(confidence=0.05),
+        )
+        dependent = Fact(
+            id="dep", subject="depends", body="b", scope=FactScope.SESSION,
+            depends_on=["evictme"], metadata=FactMetadata(confidence=0.9),
+        )
+        store._facts.extend([low, dependent])
+
+        from neo.memory.store import SCOPE_LIMITS
+        limit = SCOPE_LIMITS[FactScope.SESSION.value]
+        for i in range(limit):  # push well over so `low` is evicted
+            store._facts.append(Fact(
+                subject=f"filler {i}", body="b", scope=FactScope.SESSION,
+                metadata=FactMetadata(confidence=0.6),
+            ))
+
+        store._enforce_scope_limit(FactScope.SESSION)
+
+        assert low.is_valid is False
+        assert low.embedding is None            # stripped at the transition
+        assert dependent.needs_review is False  # cascade=False — no noise flag
+
     def test_constraints_protected_from_eviction(self, store):
         """Constraint facts should never be evicted even when over limit."""
         from neo.memory.store import SCOPE_LIMITS
@@ -671,6 +699,18 @@ class TestInvalidate:
         assert parent.is_valid is False
         assert parent.embedding is None
         assert child.needs_review is False
+
+    def test_strip_ingester_tombstones_nulls_embeddings(self, store):
+        """Ingester-superseded facts (off the _invalidate path) get their
+        vectors dropped at the consumption site."""
+        a = Fact(id="a", subject="A", body="b", is_valid=False,
+                 embedding=np.random.randn(768).astype(np.float32),
+                 metadata=FactMetadata())
+        b = Fact(id="b", subject="B", body="b", is_valid=False,
+                 embedding=np.random.randn(768).astype(np.float32),
+                 metadata=FactMetadata())
+        store._strip_ingester_tombstones([a, b])
+        assert a.embedding is None and b.embedding is None
 
     def test_supersede_strips_old_embedding_and_keeps_pointer(self, store):
         """_supersede routes through _invalidate: old fact loses its vector but
@@ -907,8 +947,8 @@ class TestOutcomeLinkage:
         assert original.metadata.confidence == pytest.approx(1.0)
 
 
-    def test_unverified_outcome_modest_boost_no_review(self, store):
-        """Unverified outcomes give modest boost to linked fact, never create REVIEW."""
+    def test_unverified_outcome_does_not_mutate_linked_fact(self, store):
+        """Missing verification is not success, even for legacy linked facts."""
 
         original = store.add_fact(
             subject="bugfix: add retry",
@@ -927,12 +967,10 @@ class TestOutcomeLinkage:
                           return_value=(outcomes, {"src/foo.py": original.id})):
             store.detect_implicit_feedback({"prompt": "test"}, [])
 
-        # Modest boost (+0.1) for unverified, weaker than accepted (+0.2)
-        assert original.metadata.confidence == pytest.approx(0.8)
-        # success_count IS incremented for unverified (weak acceptance signal)
-        assert original.metadata.success_count == 1
-        assert original.metadata.effectiveness_n == 1
-        assert original.metadata.effectiveness_c == pytest.approx(1.5)
+        assert original.metadata.confidence == pytest.approx(0.7)
+        assert original.metadata.success_count == 0
+        assert original.metadata.effectiveness_n == 0
+        assert original.metadata.effectiveness_c == pytest.approx(0.0)
         # No REVIEW facts created
         review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
         assert len(review_facts) == 0
@@ -953,6 +991,429 @@ class TestOutcomeLinkage:
 
         # No new facts created
         assert len(store._facts) == initial_count
+
+    def test_single_accepted_episode_remains_candidate_only(self, store):
+        """One verified result is insufficient to create durable knowledge."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        episode = LearningEpisode(episode_id="ep-one", project_id=store.project_id)
+        episode.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id="candidate-one",
+            suggestion_id="suggestion-one",
+            subject="pattern: validate input [src/api.py]",
+            body="Suggestion: validate input before processing",
+            kind="pattern",
+        ))
+        LearningEpisodeStore(store.project_id).save(episode)
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED,
+            file_path="src/api.py",
+            suggestion_id="suggestion-one",
+            learning_episode_id="ep-one",
+            candidate_id="candidate-one",
+            candidate_subject="pattern: validate input [src/api.py]",
+            candidate_body="Suggestion: validate input before processing",
+            candidate_kind="pattern",
+        )
+
+        with patch.object(store._outcome_tracker, "detect_outcomes", return_value=([outcome], {})):
+            store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        assert not [f for f in store.entries if "episode-derived" in f.tags]
+        persisted = LearningEpisodeStore(store.project_id).load("ep-one")
+        assert persisted.memory_candidates[0].status == "supported_once"
+
+    def test_repeated_accepted_episodes_promote_durable_pattern(self, store):
+        """Two independent accepted episodes promote one attributed project fact."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        episode_store = LearningEpisodeStore(store.project_id)
+        outcomes = []
+        for suffix in ("one", "two"):
+            episode_id = f"ep-{suffix}"
+            candidate_id = f"candidate-{suffix}"
+            suggestion_id = f"suggestion-{suffix}"
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=candidate_id,
+                suggestion_id=suggestion_id,
+                subject="pattern: validate input [src/api.py]",
+                body="Suggestion: validate input before processing",
+                kind="pattern",
+            ))
+            episode_store.save(episode)
+            outcomes.append(Outcome(
+                outcome_type=OutcomeType.ACCEPTED,
+                file_path="src/api.py",
+                suggestion_id=suggestion_id,
+                learning_episode_id=episode_id,
+                candidate_id=candidate_id,
+                candidate_subject="pattern: validate input [src/api.py]",
+                candidate_body="Suggestion: validate input before processing",
+                candidate_kind="pattern",
+            ))
+
+        for outcome in outcomes:
+            with patch.object(
+                store._outcome_tracker, "detect_outcomes", return_value=([outcome], {})
+            ):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        promoted = [f for f in store.entries if "episode-derived" in f.tags]
+        assert len(promoted) == 1
+        assert promoted[0].metadata.success_count == 2
+        assert set(promoted[0].supporting_episode_ids) == {"ep-one", "ep-two"}
+        assert "durable" in promoted[0].tags
+        assert "probation" not in promoted[0].tags
+
+    def test_attributed_contradictions_demote_then_roll_back_only_derived_fact(self, store):
+        """Repeated corrections invalidate their fact and preserve unrelated memory."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        unrelated = store.add_fact(
+            subject="unrelated verified convention",
+            body="Keep audit timestamps in UTC.",
+            kind=FactKind.PATTERN,
+            confidence=0.8,
+            tags=["durable"],
+        )
+        episode_store = LearningEpisodeStore(store.project_id)
+        accepted = []
+        for index in range(2):
+            episode_id = f"rollback-{index}"
+            candidate_id = f"rollback-candidate-{index}"
+            suggestion_id = f"rollback-suggestion-{index}"
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=candidate_id,
+                suggestion_id=suggestion_id,
+                subject="pattern: validate input [src/api.py]",
+                body="Suggestion: validate input before processing",
+                kind="pattern",
+            ))
+            episode_store.save(episode)
+            accepted.append(Outcome(
+                outcome_type=OutcomeType.ACCEPTED,
+                file_path="src/api.py",
+                suggestion_id=suggestion_id,
+                learning_episode_id=episode_id,
+                candidate_id=candidate_id,
+                candidate_subject="pattern: validate input [src/api.py]",
+                candidate_body="Suggestion: validate input before processing",
+                candidate_kind="pattern",
+            ))
+
+        for outcome in accepted:
+            with patch.object(
+                store._outcome_tracker, "detect_outcomes", return_value=([outcome], {})
+            ):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        promoted = next(f for f in store.entries if "episode-derived" in f.tags)
+        original_confidence = promoted.metadata.confidence
+
+        for index, accepted_outcome in enumerate(accepted):
+            correction = Outcome(
+                outcome_type=OutcomeType.MODIFIED,
+                file_path=accepted_outcome.file_path,
+                suggestion_id=accepted_outcome.suggestion_id,
+                learning_episode_id=accepted_outcome.learning_episode_id,
+                candidate_id=accepted_outcome.candidate_id,
+                candidate_subject=accepted_outcome.candidate_subject,
+                candidate_body=accepted_outcome.candidate_body,
+                candidate_kind=accepted_outcome.candidate_kind,
+                diff_summary="User restored the required behavior.",
+            )
+            with patch.object(
+                store._outcome_tracker, "detect_outcomes", return_value=([correction], {})
+            ):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+
+            if index == 0:
+                assert promoted.is_valid is True
+                assert promoted.metadata.confidence < original_confidence
+
+        assert promoted.is_valid is False
+        assert promoted.invalidation_reason == "repeated_attributed_contradiction"
+        assert set(promoted.contradicting_episode_ids) == {"rollback-0", "rollback-1"}
+        assert promoted.embedding is None
+        assert unrelated.is_valid is True
+        assert unrelated.metadata.confidence == pytest.approx(0.8)
+        assert unrelated.contradicting_episode_ids == []
+
+        for index in range(2):
+            episode = episode_store.load(f"rollback-{index}")
+            assert episode.memory_candidates[0].status == "contradicted"
+            operations = [mutation.operation for mutation in episode.memory_mutations]
+            expected = "rollback_contradicted_fact" if index == 1 else "demote_contradicted_fact"
+            assert expected in operations
+            mutation = next(item for item in episode.memory_mutations if item.operation == expected)
+            assert mutation.before_state["confidence"] > mutation.after_state["confidence"]
+            assert mutation.after_state["is_valid"] is (index == 0)
+
+    def test_later_regression_api_records_normalized_evidence_and_rolls_back(self, store):
+        """Delayed failures use stable attribution rather than similarity fanout."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+            SuggestionEvidence,
+        )
+
+        episode_store = LearningEpisodeStore(store.project_id)
+        accepted = []
+        for index in range(2):
+            episode_id = f"regression-{index}"
+            suggestion_id = f"regression-suggestion-{index}"
+            candidate_id = f"regression-candidate-{index}"
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode.suggestions.append(SuggestionEvidence(
+                suggestion_id=suggestion_id,
+                description="validate input before processing",
+                file_path="src/api.py",
+                confidence=0.7,
+            ))
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=candidate_id,
+                suggestion_id=suggestion_id,
+                subject="pattern: validate input [src/api.py]",
+                body="Suggestion: validate input before processing",
+                kind="pattern",
+            ))
+            episode_store.save(episode)
+            accepted.append(Outcome(
+                outcome_type=OutcomeType.ACCEPTED,
+                file_path="src/api.py",
+                suggestion_id=suggestion_id,
+                learning_episode_id=episode_id,
+                candidate_id=candidate_id,
+                candidate_subject="pattern: validate input [src/api.py]",
+                candidate_body="Suggestion: validate input before processing",
+                candidate_kind="pattern",
+            ))
+
+        for outcome in accepted:
+            with patch.object(
+                store._outcome_tracker, "detect_outcomes", return_value=([outcome], {})
+            ):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        promoted = next(f for f in store.entries if "episode-derived" in f.tags)
+        for index in range(2):
+            affected = store.record_later_regression(
+                learning_episode_id=f"regression-{index}",
+                suggestion_id=f"regression-suggestion-{index}",
+                summary="A later test reproduced data corruption.",
+                repository_revision=f"bad-revision-{index}",
+            )
+            assert affected is promoted
+
+        assert promoted.is_valid is False
+        assert promoted.invalidation_reason == "repeated_attributed_contradiction"
+        for index in range(2):
+            episode = episode_store.load(f"regression-{index}")
+            regression = [
+                evidence for evidence in episode.verification
+                if evidence.kind == "later_regression"
+            ]
+            assert len(regression) == 1
+            assert regression[0].status == "failed"
+            assert regression[0].repository_revision == f"bad-revision-{index}"
+            assert episode.final_outcome == "regression"
+            assert episode.outcome_details["evidence_summary"] == (
+                "A later test reproduced data corruption."
+            )
+            assert len(episode.outcome_details["evidence_sha256"]) == 64
+
+    def test_failed_verification_blocks_repeated_acceptance_promotion(self, store):
+        """Acceptance cannot turn deterministically rejected output into a fact."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+            VerificationEvidence,
+        )
+
+        episode_store = LearningEpisodeStore(store.project_id)
+        outcomes = []
+        for index in range(2):
+            episode_id = f"failed-{index}"
+            candidate_id = f"failed-candidate-{index}"
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=candidate_id,
+                suggestion_id=f"failed-suggestion-{index}",
+                subject="pattern: skip validation [src/api.py]",
+                body="Suggestion: remove the required validation",
+                kind="pattern",
+            ))
+            episode.verification.append(VerificationEvidence(
+                verification_id=f"check-{index}",
+                kind="static_check",
+                status="failed",
+                tool_name="constraint_verifier",
+                summary="required validation was removed",
+            ))
+            episode_store.save(episode)
+            outcomes.append(Outcome(
+                outcome_type=OutcomeType.ACCEPTED,
+                file_path="src/api.py",
+                suggestion_id=f"failed-suggestion-{index}",
+                learning_episode_id=episode_id,
+                candidate_id=candidate_id,
+                candidate_subject="pattern: skip validation [src/api.py]",
+                candidate_body="Suggestion: remove the required validation",
+                candidate_kind="pattern",
+            ))
+
+        for outcome in outcomes:
+            with patch.object(
+                store._outcome_tracker, "detect_outcomes", return_value=([outcome], {})
+            ):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        assert not [f for f in store.entries if "episode-derived" in f.tags]
+        for index in range(2):
+            persisted = episode_store.load(f"failed-{index}")
+            assert persisted.memory_candidates[0].status == "rejected_by_verification"
+
+    def test_repeated_architecture_candidates_do_not_auto_promote(self, store):
+        """Architecture knowledge requires a stronger policy than coding patterns."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        episode_store = LearningEpisodeStore(store.project_id)
+        for index in range(3):
+            episode_id = f"arch-{index}"
+            candidate_id = f"arch-candidate-{index}"
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode.memory_candidates.append(MemoryCandidateEvidence(
+                candidate_id=candidate_id,
+                suggestion_id=f"arch-suggestion-{index}",
+                subject="architecture: split the service",
+                body="Suggestion: introduce a new service boundary",
+                kind="architecture",
+            ))
+            episode_store.save(episode)
+            outcome = Outcome(
+                outcome_type=OutcomeType.ACCEPTED,
+                file_path="src/service.py",
+                learning_episode_id=episode_id,
+                candidate_id=candidate_id,
+                candidate_subject="architecture: split the service",
+                candidate_body="Suggestion: introduce a new service boundary",
+                candidate_kind="architecture",
+            )
+            with patch.object(
+                store._outcome_tracker, "detect_outcomes", return_value=([outcome], {})
+            ):
+                store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        assert not [f for f in store.entries if "episode-derived" in f.tags]
+
+    def test_global_promotion_requires_four_episodes_across_two_projects(self, tmp_path):
+        """One project is insufficient; cross-project evidence is generalized safely."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        facts_dir = tmp_path / "global-facts"
+        episodes_dir = tmp_path / "global-episodes"
+        subject = "pattern: validate credentials [src/private.py]"
+        body = "Validate credentials with api_key=super-secret-value before processing."
+
+        stores = []
+        for project in ("alpha", "beta"):
+            root = tmp_path / project
+            root.mkdir()
+            project_store = FactStore(
+                codebase_root=str(root),
+                eager_init=False,
+                facts_dir=facts_dir,
+                episodes_dir=episodes_dir,
+            )
+            stores.append(project_store)
+            episode_store = LearningEpisodeStore(
+                project_store.project_id, base_dir=episodes_dir
+            )
+            for index in range(2):
+                episode_id = f"{project}-{index}"
+                candidate_id = f"candidate-{project}-{index}"
+                suggestion_id = f"suggestion-{project}-{index}"
+                episode = LearningEpisode(
+                    episode_id=episode_id,
+                    project_id=project_store.project_id,
+                )
+                episode.memory_candidates.append(MemoryCandidateEvidence(
+                    candidate_id=candidate_id,
+                    suggestion_id=suggestion_id,
+                    subject=subject,
+                    body=body,
+                    kind="pattern",
+                ))
+                episode_store.save(episode)
+                outcome = Outcome(
+                    outcome_type=OutcomeType.ACCEPTED,
+                    file_path="src/private.py",
+                    suggestion_id=suggestion_id,
+                    learning_episode_id=episode_id,
+                    candidate_id=candidate_id,
+                    candidate_subject=subject,
+                    candidate_body=body,
+                    candidate_kind="pattern",
+                )
+                with patch.object(
+                    project_store._outcome_tracker,
+                    "detect_outcomes",
+                    return_value=([outcome], {}),
+                ):
+                    project_store.detect_implicit_feedback({"prompt": "next"}, [])
+
+            if project == "alpha":
+                assert not [
+                    fact for fact in project_store.entries
+                    if fact.scope == FactScope.GLOBAL
+                ]
+
+        global_facts = [
+            fact for fact in stores[1].entries if fact.scope == FactScope.GLOBAL
+        ]
+        assert len(global_facts) == 1
+        global_fact = global_facts[0]
+        assert len(global_fact.supporting_episode_ids) == 4
+        assert global_fact.project_id == ""
+        assert "src/private.py" not in global_fact.subject
+        assert "super-secret-value" not in global_fact.body
+        assert "[REDACTED]" in global_fact.body
+        for project_store, project in zip(stores, ("alpha", "beta")):
+            episode_store = LearningEpisodeStore(
+                project_store.project_id, base_dir=episodes_dir
+            )
+            for index in range(2):
+                episode = episode_store.load(f"{project}-{index}")
+                assert episode.memory_candidates[0].promoted_global_fact_id == global_fact.id
+                assert any(
+                    mutation.operation == "promote_cross_project_candidate"
+                    and mutation.fact_id == global_fact.id
+                    for mutation in episode.memory_mutations
+                )
 
     def test_cap_independent_facts(self, store):
         """_cap_independent_facts invalidates excess independent facts."""
@@ -1048,6 +1509,94 @@ class TestOutcomeLinkage:
         assert stats["modified"] == 1
         assert original.metadata.confidence == pytest.approx(0.6)
         assert original.metadata.effectiveness_n == 0
+
+    def test_replay_unverified_feedback_does_not_reinforce_fact(self, store):
+        """Maintenance replay cannot reinterpret absent evidence as success."""
+        original = store.add_fact(
+            subject="bugfix: no evidence",
+            body="Suggestion: add guard",
+            kind=FactKind.PATTERN,
+            confidence=0.6,
+        )
+        outcome = Outcome(
+            outcome_type=OutcomeType.UNVERIFIED,
+            file_path="src/foo.py",
+            suggestion_description="add guard",
+            suggestion_confidence=0.6,
+        )
+
+        with patch.object(
+            store._outcome_tracker,
+            "collect_outcomes",
+            return_value=([outcome], {"src/foo.py": original.id}),
+        ):
+            stats = store.replay_linked_feedback()
+
+        assert stats["unverified"] == 1
+        assert stats["linked_updates"] == 0
+        assert original.metadata.confidence == pytest.approx(0.6)
+        assert original.metadata.success_count == 0
+
+
+class TestRetrievedFactAttribution:
+    def test_only_explicitly_used_fact_receives_success_credit(self, store):
+        used = store.add_fact(
+            subject="project convention",
+            body="Use typed identifiers",
+            kind=FactKind.PATTERN,
+            confidence=0.6,
+        )
+        merely_retrieved = store.add_fact(
+            subject="unrelated convention",
+            body="Use UTC timestamps",
+            kind=FactKind.PATTERN,
+            confidence=0.6,
+        )
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED,
+            file_path="src/new.py",
+            retrieved_fact_ids=[used.id, merely_retrieved.id],
+            used_fact_ids=[used.id],
+        )
+
+        with patch.object(
+            store._outcome_tracker,
+            "detect_outcomes",
+            return_value=([outcome], {}),
+        ), patch.object(store._outcome_tracker, "compute_arch_delta", return_value=None):
+            store.detect_implicit_feedback({}, [])
+
+        assert used.metadata.success_count == 1
+        assert used.metadata.effectiveness_n == 1
+        assert used.metadata.confidence == pytest.approx(0.6)
+        assert merely_retrieved.metadata.success_count == 0
+        assert merely_retrieved.metadata.effectiveness_n == 0
+
+    def test_attributed_modification_applies_bounded_demotion(self, store):
+        used = store.add_fact(
+            subject="project convention",
+            body="Use typed identifiers",
+            kind=FactKind.PATTERN,
+            confidence=0.6,
+        )
+        outcome = Outcome(
+            outcome_type=OutcomeType.MODIFIED,
+            file_path="src/new.py",
+            retrieved_fact_ids=[used.id],
+            used_fact_ids=[used.id],
+        )
+
+        with patch.object(
+            store._outcome_tracker,
+            "detect_outcomes",
+            return_value=([outcome], {}),
+        ), patch.object(store._outcome_tracker, "compute_arch_delta", return_value=None):
+            store.detect_implicit_feedback({}, [])
+
+        assert used.metadata.confidence == pytest.approx(0.55)
+        assert used.metadata.success_count == 0
+        assert used.metadata.effectiveness_n == 1
+        assert used.metadata.effectiveness_c < 0
 
 
 class TestArchDeltaModulation:

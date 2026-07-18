@@ -24,14 +24,16 @@ from neo.models import (
     SimulationTrace,
     StaticCheckResult,
     TaskType,
+    ProposedChange,
 )
+from neo.operating_mode import AuthorityPolicy, OperatingMode
 
 
 TOOL_NAME = "neo.process"
 TOOL_DESCRIPTION = (
-    "Read-only code-reasoning helper. Returns a structured plan, "
-    "simulation traces, and code suggestions (unified diffs) for the "
-    "prompt + context. Does not modify files or run commands."
+    "Mode-explicit code reasoning helper. LEARN is the backward-compatible "
+    "read-only repository default; AGENT requires explicit authority and a "
+    "host execution adapter. Neo never executes generated shell commands."
 )
 
 
@@ -99,6 +101,40 @@ def tool_schema() -> dict[str, Any]:
                     "type": "string",
                     "description": "Caller's cwd. Anchors safe_read_paths and scope detection.",
                 },
+                "operating_mode": {
+                    "type": "string",
+                    "enum": [mode.value for mode in OperatingMode],
+                    "default": OperatingMode.LEARN.value,
+                    "description": "advise | patch | verify | learn | agent",
+                },
+                "proposed_changes": {
+                    "type": "array",
+                    "description": "Caller-provided changes required by verify mode.",
+                    "items": {
+                        "type": "object",
+                        "required": ["file_path"],
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "description": {"type": "string"},
+                            "unified_diff": {"type": "string"},
+                            "code_block": {"type": "string"},
+                        },
+                    },
+                },
+                "authority": {
+                    "type": "object",
+                    "description": "Explicit authority policy; meaningful only in agent mode.",
+                    "properties": {
+                        "workspace_root": {"type": "string"},
+                        "allowed_write_paths": {
+                            "type": "array", "items": {"type": "string"}
+                        },
+                        "allowed_commands": {
+                            "type": "array", "items": {"type": "string"}
+                        },
+                        "allow_learning": {"type": "boolean", "default": True},
+                    },
+                },
             },
         },
         "returns": {
@@ -151,6 +187,38 @@ def dict_to_neo_input(params: dict[str, Any]) -> NeoInput:
         raw = params.get(key) or []
         return [x for x in raw if isinstance(x, str)]
 
+    try:
+        operating_mode = OperatingMode(str(params.get("operating_mode", "learn")))
+    except ValueError:
+        operating_mode = OperatingMode.LEARN
+
+    proposed_changes = []
+    for item in params.get("proposed_changes") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("file_path"), str):
+            continue
+        proposed_changes.append(ProposedChange(
+            file_path=item["file_path"],
+            description=str(item.get("description", "caller-provided change")),
+            unified_diff=str(item.get("unified_diff", "")),
+            code_block=str(item.get("code_block", "")),
+        ))
+
+    authority = None
+    raw_authority = params.get("authority")
+    if isinstance(raw_authority, dict):
+        authority = AuthorityPolicy(
+            workspace_root=str(raw_authority.get("workspace_root", "")),
+            allowed_write_paths=[
+                item for item in raw_authority.get("allowed_write_paths", [])
+                if isinstance(item, str)
+            ],
+            allowed_commands=[
+                item for item in raw_authority.get("allowed_commands", [])
+                if isinstance(item, str)
+            ],
+            allow_learning=bool(raw_authority.get("allow_learning", True)),
+        )
+
     return NeoInput(
         prompt=str(params.get("prompt", "")),
         task_type=task_type,
@@ -159,6 +227,9 @@ def dict_to_neo_input(params: dict[str, Any]) -> NeoInput:
         recent_commands=_str_list("recent_commands"),
         safe_read_paths=_str_list("safe_read_paths"),
         working_directory=params.get("working_directory") if isinstance(params.get("working_directory"), str) else None,
+        operating_mode=operating_mode,
+        authority=authority,
+        proposed_changes=proposed_changes,
     )
 
 
@@ -200,6 +271,7 @@ def _sim_to_dict(trace: SimulationTrace) -> dict[str, Any]:
 
 def _suggestion_to_dict(s: CodeSuggestion) -> dict[str, Any]:
     return {
+        "suggestion_id": s.suggestion_id,
         "file_path": s.file_path,
         "unified_diff": s.unified_diff,
         "description": s.description,

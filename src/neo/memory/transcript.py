@@ -1100,21 +1100,20 @@ class TranscriptIngester:
         return best
 
     def mine_suggestion_outcomes(self, episodes: list) -> int:
-        """Weakly reinforce facts whose past suggestion recurs in later work.
+        """Record when a past suggestion's topic recurs in later work.
 
         The durable-ledger, semantically-correlated complement to
         OutcomeTracker._detect_non_git_outcomes: a suggestion whose description
         matches a *subsequent* transcript episode is evidence the suggestion's
-        area recurred in later work — weak implicit acceptance, not verified
-        diff-overlap. So a match earns the same weak UNVERIFIED delta as neo's
-        other non-git signals (see store.apply_mined_outcomes), NOT the strong
-        ACCEPTED reward the git matcher reserves for proven acceptance. The
+        area recurred in later work, not acceptance or correctness. A match is
+        therefore observation-only (see store.apply_mined_outcomes): it never
+        changes confidence, success, effectiveness, or probation state. The
         episode does not contain neo's suggestion text, so this is topic
         recurrence — deliberately not classified as accept-vs-modify (a matched
         episode's tool errors are its own process noise, unrelated to the
         suggestion's fate). Entries that find no match before their correlation
         window lapses are dropped so the ledger stays bounded. Returns the number
-        of facts reinforced.
+        of attributed topic-recurrence observations.
         """
         tracker = getattr(self._store, "_outcome_tracker", None)
         if tracker is None or not hasattr(tracker, "load_suggestion_ledger"):
@@ -1159,12 +1158,9 @@ class TranscriptIngester:
                 if entry.get("fact_id") in matched_fact_ids:
                     done_ids.add(entry.get("id", ""))
 
-        # Compact BEFORE applying, and unconditionally:
-        #  - before, because apply_mined_outcomes is NOT idempotent (it bumps the
-        #    monotonic success_count); a crash between apply and compaction would
-        #    re-mine the entry and double-count. Dropping the ledger entry first
-        #    means a crash loses a (noisy, plentiful) signal rather than
-        #    corrupting the counter that gates community contribution.
+        # Compact BEFORE recording, and unconditionally. A crash may lose a
+        # low-authority recurrence metric, but can never corrupt durable fact
+        # confidence or success state.
         #  - unconditionally, so the TTL cutoff inside compact_suggestion_ledger
         #    always runs; gating it on done_ids let a ledger of young-unmatched
         #    entries grow without the backstop ever firing.

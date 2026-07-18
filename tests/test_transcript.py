@@ -658,7 +658,7 @@ def _linked_review_fact(st, body="apply the validation fix"):
     return fact
 
 
-def test_mine_match_is_weak_reinforcement(mining_store):
+def test_mine_match_is_observation_only(mining_store):
     st = mining_store
     fact = _linked_review_fact(st)
     ts = st._outcome_tracker.load_suggestion_ledger()[0]["ts"]
@@ -669,14 +669,14 @@ def test_mine_match_is_weak_reinforcement(mining_store):
     applied = ing.mine_suggestion_outcomes([ep])
 
     assert applied == 1
-    # Weak UNVERIFIED delta: +1 success (enough to promote off probation) and
-    # +0.1 confidence — never the strong +0.2 reserved for verified acceptance.
-    assert fact.metadata.success_count == 1
-    assert fact.metadata.confidence == pytest.approx(0.6)
+    assert fact.metadata.success_count == 0
+    assert fact.metadata.confidence == pytest.approx(0.5)
+    assert fact.metadata.effectiveness_n == 0
+    assert "probation" in fact.tags
     assert st._outcome_tracker.load_suggestion_ledger() == []  # entry consumed
 
 
-def test_mine_ignores_episode_errors(mining_store):
+def test_mine_episode_errors_still_do_not_create_learning_signal(mining_store):
     """Tool errors in the matched episode are the assistant's process noise, not
     a 'modify' signal about the suggestion — the reinforcement is unchanged."""
     st = mining_store
@@ -690,8 +690,9 @@ def test_mine_ignores_episode_errors(mining_store):
     applied = ing.mine_suggestion_outcomes([ep])
 
     assert applied == 1
-    assert fact.metadata.success_count == 1          # still reinforced, not demoted
-    assert fact.metadata.confidence == pytest.approx(0.6)
+    assert fact.metadata.success_count == 0
+    assert fact.metadata.confidence == pytest.approx(0.5)
+    assert fact.metadata.effectiveness_n == 0
 
 
 def test_mine_no_match_keeps_entry_until_window_lapses(mining_store):

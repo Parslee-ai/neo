@@ -10,7 +10,10 @@ Split from cli.py for modularity.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+import uuid
 from typing import Any, Literal, Optional, TypedDict
+
+from neo.operating_mode import AuthorityPolicy, OperatingMode
 
 
 # ============================================================================
@@ -44,6 +47,30 @@ class NeoInput:
     recent_commands: list[str] = field(default_factory=list)
     safe_read_paths: list[str] = field(default_factory=list)
     working_directory: Optional[str] = None
+    operating_mode: OperatingMode = OperatingMode.LEARN
+    authority: Optional[AuthorityPolicy] = None
+    proposed_changes: list["ProposedChange"] = field(default_factory=list)
+
+
+@dataclass
+class ProposedChange:
+    """Caller-supplied change for deterministic VERIFY mode."""
+
+    file_path: str
+    description: str = "caller-provided change"
+    unified_diff: str = ""
+    code_block: str = ""
+
+
+@dataclass
+class AppliedAction:
+    """Host-executor evidence for one explicitly authorized action."""
+
+    suggestion_id: str
+    file_path: str
+    status: Literal["applied", "skipped", "failed"]
+    summary: str = ""
+    repository_revision: str = ""
 
 
 @dataclass
@@ -104,6 +131,7 @@ class CodeSuggestion:
     dependencies: list[str] = field(default_factory=list)
     estimated_risk: Literal["", "low", "medium", "high"] = ""
     blast_radius: float = 0.0  # 0.0-100.0 percentage
+    suggestion_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclass
@@ -112,6 +140,8 @@ class StaticCheckResult:
     tool_name: str
     diagnostics: list[dict[str, Any]]
     summary: str
+    kind: str = ""
+    status: str = ""
 
 
 @dataclass

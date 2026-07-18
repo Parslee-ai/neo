@@ -50,6 +50,7 @@ class OutcomeType(enum.Enum):
     """Classification of what the user did after a neo suggestion."""
     ACCEPTED = "accepted"       # User applied the suggestion (diff overlap > 0.3)
     MODIFIED = "modified"       # User changed the file differently (overlap <= 0.3)
+    REGRESSION = "regression"   # Later evidence showed an accepted change was harmful
     UNVERIFIED = "unverified"   # File changed but no diff to compare
     INDEPENDENT = "independent" # User changed a file neo didn't suggest
 
@@ -200,6 +201,10 @@ class SessionRecord:
     # Architectural snapshot at save time. Empty dict when computation
     # failed or codebase_root was unavailable.
     architecture_snapshot: dict = field(default_factory=dict)
+    learning_episode_id: str = ""
+    repository_revision: str = ""
+    retrieved_fact_ids: list[str] = field(default_factory=list)
+    used_fact_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -210,6 +215,15 @@ class Outcome:
     diff_summary: str = ""  # actual git diff content (truncated)
     suggestion_description: str = ""  # empty for independent changes
     suggestion_confidence: float = 0.0
+    suggestion_id: str = ""
+    learning_episode_id: str = ""
+    repository_revision: str = ""
+    retrieved_fact_ids: list[str] = field(default_factory=list)
+    used_fact_ids: list[str] = field(default_factory=list)
+    candidate_id: str = ""
+    candidate_subject: str = ""
+    candidate_body: str = ""
+    candidate_kind: str = "pattern"
 
 
 class OutcomeTracker:
@@ -350,6 +364,12 @@ class OutcomeTracker:
         suggestions: list,
         prompt: str,
         suggestion_fact_ids: Optional[dict[str, str]] = None,
+        *,
+        learning_episode_id: str = "",
+        repository_revision: str = "",
+        retrieved_fact_ids: Optional[list[str]] = None,
+        used_fact_ids: Optional[list[str]] = None,
+        candidates_by_suggestion: Optional[dict[str, dict]] = None,
     ) -> None:
         """Persist current session for outcome detection on next run.
 
@@ -366,16 +386,24 @@ class OutcomeTracker:
             return
 
         records = []
+        candidates_by_suggestion = candidates_by_suggestion or {}
         for s in suggestions:
             file_path = getattr(s, "file_path", "")
             if not file_path or file_path in ("/", "N/A"):
                 continue
+            suggestion_id = getattr(s, "suggestion_id", "")
+            candidate = candidates_by_suggestion.get(suggestion_id, {})
             records.append({
+                "suggestion_id": suggestion_id,
                 "file_path": file_path,
                 "description": getattr(s, "description", "")[:500],
                 "confidence": getattr(s, "confidence", 0.0),
                 "suggested_diff": getattr(s, "unified_diff", "")[:2000],
                 "suggested_code": getattr(s, "code_block", "")[:4000],
+                "candidate_id": candidate.get("candidate_id", ""),
+                "candidate_subject": candidate.get("subject", ""),
+                "candidate_body": candidate.get("body", ""),
+                "candidate_kind": candidate.get("kind", "pattern"),
             })
 
         session = SessionRecord(
@@ -386,6 +414,10 @@ class OutcomeTracker:
             suggestions=records,
             suggestion_fact_ids=suggestion_fact_ids or {},
             architecture_snapshot=self._snapshot_architecture(),
+            learning_episode_id=learning_episode_id,
+            repository_revision=repository_revision,
+            retrieved_fact_ids=list(retrieved_fact_ids or []),
+            used_fact_ids=list(used_fact_ids or []),
         )
 
         try:
@@ -663,6 +695,7 @@ class OutcomeTracker:
         priority = {
             OutcomeType.ACCEPTED: 3,
             OutcomeType.MODIFIED: 3,
+            OutcomeType.REGRESSION: 3,
             OutcomeType.INDEPENDENT: 2,
             OutcomeType.UNVERIFIED: 1,
         }
@@ -720,6 +753,15 @@ class OutcomeTracker:
                     diff_summary="",
                     suggestion_description=sugg.get("description", ""),
                     suggestion_confidence=sugg.get("confidence", 0.0),
+                    suggestion_id=sugg.get("suggestion_id", ""),
+                    learning_episode_id=prev.learning_episode_id,
+                    repository_revision=prev.repository_revision,
+                    retrieved_fact_ids=list(prev.retrieved_fact_ids),
+                    used_fact_ids=list(prev.used_fact_ids),
+                    candidate_id=sugg.get("candidate_id", ""),
+                    candidate_subject=sugg.get("candidate_subject", ""),
+                    candidate_body=sugg.get("candidate_body", ""),
+                    candidate_kind=sugg.get("candidate_kind", "pattern"),
                 ))
 
         return outcomes
@@ -818,6 +860,15 @@ class OutcomeTracker:
                     diff_summary=diff,
                     suggestion_description=sugg.get("description", ""),
                     suggestion_confidence=sugg.get("confidence", 0.0),
+                    suggestion_id=sugg.get("suggestion_id", ""),
+                    learning_episode_id=session.learning_episode_id,
+                    repository_revision=session.repository_revision,
+                    retrieved_fact_ids=list(session.retrieved_fact_ids),
+                    used_fact_ids=list(session.used_fact_ids),
+                    candidate_id=sugg.get("candidate_id", ""),
+                    candidate_subject=sugg.get("candidate_subject", ""),
+                    candidate_body=sugg.get("candidate_body", ""),
+                    candidate_kind=sugg.get("candidate_kind", "pattern"),
                 ))
 
         # Detect independent changes (user changed files neo didn't suggest).

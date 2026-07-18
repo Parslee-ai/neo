@@ -14,7 +14,7 @@ When the user invokes this skill (`$neo <question or task>`), do the following:
 3. **Invoke Neo via stdin heredoc.** Allow up to 5 minutes — Neo runs multi-agent reasoning across LLM calls.
 
    ```bash
-   neo <<'QUERY'
+   neo --mode advise <<'QUERY'
    <restate the user's question here, plus any short context excerpts>
    QUERY
    ```
@@ -25,6 +25,6 @@ When the user invokes this skill (`$neo <question or task>`), do the following:
 
 ## Notes
 
-- Neo learns from every session. Familiar queries return faster (Neo automatically picks lower reasoning effort when memory hits cleanly) and confidence rises over time.
+- This skill uses explicit `advise` mode: it may retrieve established memory but does not create candidates or update durable memory. Use `neo --mode learn` only when the user intends to contribute outcome evidence.
 - For code review, optimization, architectural decisions, debugging, or pattern extraction, prefer the more specific Neo skills (`$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`).
 - Always verify low-confidence suggestions (< 0.7) before applying them.

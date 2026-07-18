@@ -32,6 +32,9 @@ Neo will:
 3. Check semantic memory for similar code review patterns
 4. Provide improvements with confidence scores
 
+This command uses read-only `advise` mode and performs no repository writes or
+durable learning updates.
+
 ## Parameters
 
 - `<target>` - File path, module name, or code description (required)

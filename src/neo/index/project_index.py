@@ -680,7 +680,8 @@ class ProjectIndex:
 
         # Initialize embedding model if needed
         if not self.embedding_model and FASTEMBED_AVAILABLE:
-            self.embedding_model = TextEmbedding(model_name="jinaai/jina-embeddings-v2-base-code")
+            from neo.memory.store import build_resilient_embedder
+            self.embedding_model = build_resilient_embedder(log_prefix="ProjectIndex")
 
         if not self.embedding_model:
             logger.warning("No embedding model available, skipping embeddings")
@@ -700,7 +701,8 @@ class ProjectIndex:
     def _embed_text(self, text: str) -> Optional[np.ndarray]:
         """Generate embedding for a single text."""
         if not self.embedding_model and FASTEMBED_AVAILABLE:
-            self.embedding_model = TextEmbedding(model_name="jinaai/jina-embeddings-v2-base-code")
+            from neo.memory.store import build_resilient_embedder
+            self.embedding_model = build_resilient_embedder(log_prefix="ProjectIndex")
 
         if not self.embedding_model:
             return None

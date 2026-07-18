@@ -175,6 +175,42 @@ class TestSessionRecordWithFactIds:
         assert session is not None
         assert session.suggestions[0]["suggested_code"] == "def handler():\n    return 42\n"
 
+    def test_episode_candidate_attribution_round_trips_to_outcome(self, tracker):
+        suggestion = FakeSuggestion(
+            file_path="src/foo.py",
+            description="Add validation",
+            confidence=0.8,
+            unified_diff="+validate()",
+        )
+        suggestion.suggestion_id = "suggestion-1"
+        tracker.save_session(
+            [suggestion],
+            "fix",
+            learning_episode_id="episode-1",
+            repository_revision="abc123",
+            retrieved_fact_ids=["fact-a"],
+            candidates_by_suggestion={
+                "suggestion-1": {
+                    "candidate_id": "candidate-1",
+                    "subject": "pattern: validate",
+                    "body": "validate before processing",
+                    "kind": "pattern",
+                }
+            },
+        )
+
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/foo.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value="+validate()"):
+            outcomes, _ = tracker.detect_outcomes()
+
+        assert len(outcomes) == 1
+        outcome = outcomes[0]
+        assert outcome.suggestion_id == "suggestion-1"
+        assert outcome.learning_episode_id == "episode-1"
+        assert outcome.repository_revision == "abc123"
+        assert outcome.retrieved_fact_ids == ["fact-a"]
+        assert outcome.candidate_id == "candidate-1"
+
 
 class TestDetectOutcomesAccepted:
     def test_accepted_when_suggested_file_changed(self, tracker):

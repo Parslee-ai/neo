@@ -34,6 +34,9 @@ Neo will:
 
 ## Parameters
 
+This command uses read-only `advise` mode. It does not apply fixes, execute
+commands, or update durable memory.
+
 - `<description>` - Error message or bug description (required)
 
 Include: error messages, frequency, reproduction steps, environment details

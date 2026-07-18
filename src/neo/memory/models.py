@@ -403,6 +403,12 @@ class Fact:
     # hurts generation; separating them is the fix.
     retrieval_text: Optional[str] = None
     context_text: Optional[str] = None
+    supporting_episode_ids: list[str] = field(default_factory=list)
+    contradicting_episode_ids: list[str] = field(default_factory=list)
+    source_candidate_id: Optional[str] = None
+    # Evidence-based invalidation is distinct from semantic supersession: a
+    # harmful fact may be rolled back without a replacement fact existing.
+    invalidation_reason: Optional[str] = None
 
     def size_hint(self) -> int:
         """Approximate token count. Uses len//4 heuristic — not precise, just monotonic."""
@@ -437,6 +443,10 @@ class Fact:
             "needs_review": self.needs_review,
             "metadata": self.metadata.to_dict(),
             "tags": self.tags,
+            "supporting_episode_ids": self.supporting_episode_ids,
+            "contradicting_episode_ids": self.contradicting_episode_ids,
+            "source_candidate_id": self.source_candidate_id,
+            "invalidation_reason": self.invalidation_reason,
         }
         if self.embedding is not None:
             data["embedding"] = self.embedding.tolist()
@@ -474,6 +484,10 @@ class Fact:
             episode_context=EpisodeContext.from_dict(data.get("episode_context")),
             retrieval_text=data.get("retrieval_text"),
             context_text=data.get("context_text"),
+            supporting_episode_ids=data.get("supporting_episode_ids", []),
+            contradicting_episode_ids=data.get("contradicting_episode_ids", []),
+            source_candidate_id=data.get("source_candidate_id"),
+            invalidation_reason=data.get("invalidation_reason"),
         )
 
 
@@ -486,3 +500,6 @@ class ContextResult:
     working_set: list[Fact] = field(default_factory=list)          # Layer 3 (session-scoped)
     environment: dict = field(default_factory=dict)                # Layer 4 (git state, passed through)
     known_unknowns: list[Fact] = field(default_factory=list)       # Hallucination prevention
+    # Ephemeral retrieval evidence for the current query. Not persisted in
+    # FactStore JSON; consumed by LearningEpisode tracing.
+    retrieval_scores: dict[str, float] = field(default_factory=dict)

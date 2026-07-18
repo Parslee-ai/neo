@@ -47,9 +47,11 @@ except ImportError:
 # OpenAI exceptions not imported - not currently used in this module
 # If needed in future, they can be imported in specific exception handlers
 
-# Import fastembed for local embeddings (alternative to OpenAI)
+# Probe fastembed availability for local embeddings (alternative to OpenAI).
+# The embedder itself is built via store.build_resilient_embedder (pinned,
+# self-healing cache) — no direct TextEmbedding construction here.
 try:
-    from fastembed import TextEmbedding
+    import fastembed  # noqa: F401 — availability probe only
     FASTEMBED_AVAILABLE = True
 except ImportError:
     FASTEMBED_AVAILABLE = False
@@ -629,17 +631,14 @@ class PersistentReasoningMemory:
         # Initialize embedding cache
         self.embedding_cache = OrderedDict()  # LRU cache with bounded size
 
-        # Initialize local embedding model (PRIMARY) - code-specific model
-        # Using Jina Code v2 for code similarity tasks (768 dims)
+        # Initialize local embedding model (PRIMARY) - Jina Code v2, 768 dims.
+        # Built via the shared resilient builder so the cache is pinned under
+        # ~/.cache/neo (not fastembed's $TMPDIR default, which macOS sweeps —
+        # the recurring NO_SUCHFILE eviction) and self-heals on a stale cache.
         self.local_embedder = None
         if FASTEMBED_AVAILABLE:
-            try:
-                # Use jinaai/jina-embeddings-v2-base-code - 768 dims, optimized for code
-                # Downloads ~400MB model on first use, cached afterward
-                self.local_embedder = TextEmbedding(model_name="jinaai/jina-embeddings-v2-base-code")
-                logger.info("Local code embedding model (jina-embeddings-v2-base-code) initialized successfully")
-            except Exception as e:
-                logger.warning(f"Failed to initialize local embedder: {e}")
+            from neo.memory.store import build_resilient_embedder
+            self.local_embedder = build_resilient_embedder(log_prefix="ReasoningMemory")
 
         # Initialize OpenAI client for embeddings (OPTIONAL, only if explicitly enabled)
         # Only use if USE_OPENAI_EMBEDDINGS=true is set

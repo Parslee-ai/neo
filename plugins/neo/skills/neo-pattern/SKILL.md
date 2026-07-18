@@ -18,7 +18,7 @@ When the user invokes this skill (`$neo-pattern <code reference or description>`
 4. **Invoke Neo with a pattern-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo <<'QUERY'
+   neo --mode learn <<'QUERY'
    <Extract a reusable pattern from> | <Find code matching this pattern>:
 
    <code or description here>
@@ -31,5 +31,5 @@ When the user invokes this skill (`$neo-pattern <code reference or description>`
 
 ## Notes
 
-- Patterns Neo extracts are stored in its semantic memory and retrieved automatically on future related queries — so this skill is one of the highest-leverage ways to teach Neo about your codebase.
+- `learn` records the extraction as an episode-local candidate. It is not trusted memory until independently verified and supported again.
 - Patterns extracted from a single example are "PROVISIONAL" until Neo sees them confirmed in another part of the codebase. The user should treat single-example patterns as drafts.

@@ -20,6 +20,14 @@ def isolate_neo_home(tmp_path, monkeypatch):
     $HOME and would point into the fake home.
     """
     monkeypatch.setenv("PYTHONUSERBASE", site.getuserbase())
+    # Pin the fastembed model cache to the REAL user cache before patching HOME,
+    # so in-process and subprocess embedders reuse the already-downloaded ~400 MB
+    # model instead of re-fetching it into the throwaway fake home (which would
+    # blow past subprocess CLI timeouts). Model cache is a shared read-mostly
+    # asset, distinct from the ~/.neo state this fixture isolates.
+    monkeypatch.setenv(
+        "NEO_FASTEMBED_CACHE_DIR", str(Path.home() / ".cache" / "neo" / "fastembed")
+    )
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))

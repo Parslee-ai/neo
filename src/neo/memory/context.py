@@ -115,6 +115,7 @@ class ContextAssembler:
             working_set=session_capped,
             environment=environment or {},
             known_unknowns=unknowns_capped,
+            retrieval_scores={f.id: score for f, score in scored_valid},
         )
 
     @staticmethod
@@ -190,11 +191,16 @@ class ContextAssembler:
             sections.append("\n".join(lines))
 
         if ctx.valid_facts:
-            lines = ["## Relevant Knowledge"]
+            lines = [
+                "## Relevant Knowledge",
+                "When a fact materially influences the answer, preserve its "
+                "[fact:<id>] citation in the rationale or suggestion description.",
+            ]
             for fact in ctx.valid_facts:
                 conf = fact.metadata.confidence
                 line = (
-                    f"- **{fact.subject}** ({fact.kind.value}, confidence={conf:.2f}): "
+                    f"- [fact:{fact.id}] **{fact.subject}** "
+                    f"({fact.kind.value}, confidence={conf:.2f}): "
                     f"{_body_for_context(fact, 200)}"
                 )
                 # Inline change annotation. The `in old_lookup` guard is
