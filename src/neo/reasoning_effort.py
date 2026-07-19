@@ -2,7 +2,7 @@
 
 The OpenAI /v1/responses endpoint accepts a `reasoning.effort` parameter that
 controls how many "thinking" tokens the model spends before answering. Effort
-levels (for gpt-5.5): none < low < medium < high < xhigh.
+levels (for gpt-5.6): none < low < medium < high < xhigh.
 
 Neo's memory system already tracks per-pattern confidence, so we can use that
 signal to spend reasoning tokens where they actually help: novel queries get
@@ -15,7 +15,7 @@ from typing import Optional
 
 # Ordered low-to-high. Index in this tuple == relative effort.
 EFFORT_LEVELS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
-DEFAULT_EFFORT = "medium"  # Matches the gpt-5.5 API default when field omitted.
+DEFAULT_EFFORT = "medium"  # Matches the gpt-5.x API default when field omitted.
 
 # Thresholds for the memory-driven heuristic.
 # Tuned to align with the existing 0.8-confidence / 3-success contribution

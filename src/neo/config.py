@@ -91,7 +91,7 @@ class NeoConfig:
 
     # LM Provider settings
     provider: str = "openai"  # openai, anthropic, google, azure, local, ollama
-    model: Optional[str] = "gpt-5.5"
+    model: Optional[str] = "gpt-5.6"
     api_key: Optional[str] = None
     base_url: Optional[str] = None  # For local/ollama
 
@@ -101,7 +101,7 @@ class NeoConfig:
     #              the daemon is reachable; fall back to the static provider above
     #              on absence or runtime failure. CAR is optional but used when
     #              present.
-    # Default is "static" (gpt-5.5) until a CAR release verifies the router's
+    # Default is "static" (gpt-5.6) until a CAR release verifies the router's
     # quality behavior — CAR's released router cost-biases to mini models, a
     # measured regression. Flip to "auto" once a verified CAR build is deployed.
     inference_mode: str = "static"

@@ -68,7 +68,7 @@ def test_load_corrupt_config_falls_back_to_defaults(tmp_path, monkeypatch):
     loaded = NeoConfig.load()
 
     assert loaded.provider == "openai"
-    assert loaded.model == "gpt-5.5"
+    assert loaded.model == "gpt-5.6"
 
 
 def test_env_provider_can_reset_saved_provider_to_default(tmp_path, monkeypatch):
