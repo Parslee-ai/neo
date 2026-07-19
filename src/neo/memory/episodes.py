@@ -109,6 +109,12 @@ class RetrievedFactEvidence:
     score: Optional[float] = None
     included_in_context: bool = False
     used_in_reasoning: Optional[bool] = None
+    # True only when a HARD signal (surviving [fact:<id>] marker or a structured
+    # 'Facts used: [...]' self-report) credited the fact. Soft subject-overlap
+    # sets used_in_reasoning (for the citation_survival metric) but NOT this flag,
+    # so overlap alone can never feed the success_count credit path — which would
+    # grant permanent janitor immunity (see #9003).
+    hard_cited: Optional[bool] = None
     outcome_association: str = ""
 
 

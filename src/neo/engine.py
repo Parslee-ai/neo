@@ -441,6 +441,14 @@ class NeoEngine:
                 evidence.used_in_reasoning = True
             elif evidence.used_in_reasoning is not True:
                 evidence.used_in_reasoning = False
+            # Hard-cited is the SUBSET credited by a hard signal only (marker or
+            # self-report). Overlap alone keeps used_in_reasoning=True for the
+            # citation_survival metric but must NOT set this flag: only hard_cited
+            # facts feed used_fact_ids → success_count → cleanup immunity (#9003).
+            if by_marker or by_self_report:
+                evidence.hard_cited = True
+            elif evidence.hard_cited is not True:
+                evidence.hard_cited = False
         self._use_signal_counts = signals
 
     def _log_action(self, action: str, signature: str) -> None:
@@ -792,10 +800,15 @@ class NeoEngine:
                 retrieved_fact_ids=[
                     evidence.fact_id for evidence in (episode.retrieved_facts if episode else [])
                 ],
+                # Only HARD-cited facts (marker / self-report) feed the
+                # success_count credit path. Soft subject-overlap keeps the
+                # citation_survival metric alive via used_in_reasoning but is
+                # deliberately excluded here — overlap alone must not buy a fact
+                # permanent cleanup immunity (#9003).
                 used_fact_ids=[
                     evidence.fact_id
                     for evidence in (episode.retrieved_facts if episode else [])
-                    if evidence.used_in_reasoning is True
+                    if evidence.hard_cited is True
                 ],
                 candidates_by_suggestion=candidates,
             )
