@@ -85,6 +85,17 @@
     whether the reliable structured self-report carries the reinforcement path or
     the softer subject-overlap heuristic is doing the work (and thus whether to
     keep/tune/drop overlap). Read-only, no LM call (`subcommands._handle_citation_stats`).
+    `neo memory learning-stats [--since 7d] [--json]` is the promote-side pulse:
+    it reads the episode ledger (`~/.neo/episodes`, no LM, no fact-store scan) and
+    reports episodes, final outcomes, candidate statuses (durable / supported_once /
+    contradicted / rejected_by_verification / …), and learning actions (promotions,
+    rollbacks, demotions, reinforcements incl. cited-fact credit) from the ledger
+    mutations. Scoped to the INTERACTIVE / attributed path: an IDLE reading means
+    the accept-driven loop is quiet (suggestions not accepted downstream), NOT
+    that neo isn't learning — the background promote engine (observer
+    `synthesize_reviews`, transcript/GitHub-PR mining) mints facts with no episode
+    footprint and is deliberately not counted here. Together with citation-stats it
+    forms an "is it learning?" dashboard (`subcommands._handle_learning_stats`).
     - `issues` reuses the ingester's `TranscriptSource` episodes but never admits facts or
       touches the `transcript_watermark_*` watermark — decoupled from fact admission and
       idempotent (`find_issues`). Gate mirrors synthesis discipline (≥`min_cluster`

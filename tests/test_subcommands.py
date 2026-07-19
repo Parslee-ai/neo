@@ -90,3 +90,88 @@ def test_citation_stats_since_filters_old_events(capsys):
     _handle_citation_stats(SimpleNamespace(json=True, since="1d"))  # ts=1000 is ancient
     out = json.loads(capsys.readouterr().out)
     assert out["requests"] == 0
+
+
+def test_learning_stats_aggregates_ledger(capsys):
+    """learning-stats sums promotions/rollbacks and candidate statuses from the
+    episode ledger, and reports the loop as ACTIVE when facts move."""
+    import json
+    from types import SimpleNamespace
+    from neo.memory.episodes import (
+        LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        MemoryMutationEvidence,
+    )
+    from neo.subcommands import _handle_learning_stats
+
+    es = LearningEpisodeStore("proj")  # base_dir defaults to ~/.neo/episodes (fake home)
+    ep1 = LearningEpisode(episode_id="e1", started_at=1000.0,
+                          final_outcome="suggested_pending_downstream_outcome")
+    ep1.memory_candidates.append(MemoryCandidateEvidence(
+        candidate_id="c1", suggestion_id="s1", subject="x", body="y",
+        kind="pattern", status="durable"))
+    ep1.memory_mutations.append(MemoryMutationEvidence(
+        mutation_id="m1", operation="promote_repeated_episode_candidate", fact_id="f1"))
+    es.save(ep1)
+    ep2 = LearningEpisode(episode_id="e2", started_at=2000.0, final_outcome="modified")
+    ep2.memory_candidates.append(MemoryCandidateEvidence(
+        candidate_id="c2", suggestion_id="s2", subject="x", body="y",
+        kind="pattern", status="contradicted"))
+    ep2.memory_mutations.append(MemoryMutationEvidence(
+        mutation_id="m2", operation="rollback_contradicted_fact", fact_id="f1"))
+    es.save(ep2)
+
+    _handle_learning_stats(SimpleNamespace(json=True, since=None))
+    out = json.loads(capsys.readouterr().out)
+    assert out["episodes"] == 2
+    assert out["promotions"] == 1 and out["promotions_project"] == 1
+    assert out["rollbacks"] == 1
+    assert out["candidate_status"]["durable"] == 1
+    assert out["candidate_status"]["contradicted"] == 1
+    assert out["interactive_loop_active"] is True
+
+
+def test_learning_stats_cited_fact_credit_counts_as_active(capsys):
+    """A ledger whose only mutation is credit_used_retrieved_fact is genuine
+    fact-level learning and must NOT read as IDLE (the missed-op regression)."""
+    import json
+    from types import SimpleNamespace
+    from neo.memory.episodes import (
+        LearningEpisode, LearningEpisodeStore, MemoryMutationEvidence,
+    )
+    from neo.subcommands import _handle_learning_stats
+
+    es = LearningEpisodeStore("proj")
+    ep = LearningEpisode(episode_id="e1", started_at=1000.0, final_outcome="accepted")
+    ep.memory_mutations.append(MemoryMutationEvidence(
+        mutation_id="m1", operation="credit_used_retrieved_fact", fact_id="f1"))
+    es.save(ep)
+
+    _handle_learning_stats(SimpleNamespace(json=True, since=None))
+    out = json.loads(capsys.readouterr().out)
+    assert out["cited_fact_credits"] == 1
+    assert out["reinforcements"] == 1
+    assert out["interactive_loop_active"] is True
+
+
+def test_learning_stats_idle_when_no_promotions(capsys):
+    """Episodes recorded but no fact-level mutations -> loop reported IDLE."""
+    import json
+    from types import SimpleNamespace
+    from neo.memory.episodes import (
+        LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+    )
+    from neo.subcommands import _handle_learning_stats
+
+    es = LearningEpisodeStore("proj")
+    ep = LearningEpisode(episode_id="e1", started_at=1000.0,
+                         final_outcome="suggested_pending_downstream_outcome")
+    ep.memory_candidates.append(MemoryCandidateEvidence(
+        candidate_id="c1", suggestion_id="s1", subject="x", body="y",
+        kind="pattern", status="observed_unverified"))
+    es.save(ep)
+
+    _handle_learning_stats(SimpleNamespace(json=True, since=None))
+    out = json.loads(capsys.readouterr().out)
+    assert out["episodes"] == 1
+    assert out["promotions"] == 0 and out["rollbacks"] == 0
+    assert out["interactive_loop_active"] is False

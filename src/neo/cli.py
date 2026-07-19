@@ -341,6 +341,15 @@ def parse_args():
         citation_p.add_argument(
             '--since', help='Only events newer than this window, e.g. 7d / 48h / 30m')
 
+        learning_p = subparsers.add_parser(
+            'learning-stats',
+            help='Promote-side pulse: episodes, candidate promotions, rollbacks & '
+                 'reinforcements from the episode ledger — is neo minting durable facts?',
+        )
+        learning_p.add_argument('--json', action='store_true', help='Emit the summary as JSON')
+        learning_p.add_argument(
+            '--since', help='Only episodes newer than this window, e.g. 7d / 48h / 30m')
+
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
         args.memory_action = args.action

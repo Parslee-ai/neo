@@ -873,6 +873,128 @@ def _handle_citation_stats(args) -> None:
                   f"used={stats['used']}  ({rate:.1f}% survival)")
 
 
+def _handle_learning_stats(args) -> None:
+    """Learning pulse for the INTERACTIVE / attributed path: is neo minting and
+    reinforcing facts from real task outcomes? Reads the episode ledger
+    (~/.neo/episodes) — its candidate statuses and mutation operations are that
+    path's learning record — with no LM call and no fact-store scan.
+
+    Scope caveat (surfaced in the output): this counts only mutations that flow
+    through episodes. Neo's BACKGROUND promote engine — the observer's
+    synthesize_reviews and transcript/GitHub-PR mining — mints and reinforces
+    durable facts with NO episode footprint, so an IDLE reading here means the
+    accept-driven path is quiet, NOT that neo isn't learning."""
+    from collections import Counter
+
+    from neo.memory.episodes import LearningEpisodeStore
+
+    episodes_root = Path.home() / ".neo" / "episodes"
+    cutoff = None
+    if getattr(args, "since", None):
+        try:
+            window = _parse_since(args.since)
+        except ValueError as exc:
+            print(f"[Neo] {exc}", file=sys.stderr)
+            return
+        cutoff = (time.time() - window) if window else None
+
+    projects = episodes = 0
+    outcomes: Counter = Counter()
+    candidates: Counter = Counter()
+    mutations: Counter = Counter()
+    if episodes_root.exists():
+        for project_dir in sorted(p for p in episodes_root.iterdir() if p.is_dir()):
+            store = LearningEpisodeStore(project_dir.name, base_dir=episodes_root)
+            listed = store.list()
+            counted_here = 0
+            for episode in listed:
+                if cutoff is not None and float(episode.started_at or 0) < cutoff:
+                    continue
+                counted_here += 1
+                outcomes[episode.final_outcome or "pending"] += 1
+                for candidate in episode.memory_candidates:
+                    candidates[candidate.status or "observed_unverified"] += 1
+                for mutation in episode.memory_mutations:
+                    mutations[mutation.operation] += 1
+            if counted_here:
+                projects += 1
+                episodes += counted_here
+
+    promotions_project = mutations.get("promote_repeated_episode_candidate", 0)
+    promotions_global = mutations.get("promote_cross_project_candidate", 0)
+    promotions = promotions_project + promotions_global
+    rollbacks = (mutations.get("rollback_contradicted_fact", 0)
+                 + mutations.get("rollback_regressed_fact", 0))
+    demotions = (mutations.get("demote_contradicted_fact", 0)
+                 + mutations.get("demote_regressed_fact", 0)
+                 + mutations.get("demote_legacy_fact", 0)
+                 + mutations.get("demote_used_retrieved_fact", 0))
+    # credit_used_retrieved_fact is the cited-only reinforcement — a success bump
+    # on a retrieved fact whose use was detected; on a real ledger it's the most
+    # common mutation, and it IS fact-level learning, so it must count toward the
+    # ACTIVE verdict (else a ledger that's actively crediting facts reads IDLE).
+    reinforcements = (mutations.get("reinforce_legacy_fact", 0)
+                      + mutations.get("credit_used_retrieved_fact", 0))
+    active = promotions + rollbacks + demotions + reinforcements > 0
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "projects": projects,
+            "episodes": episodes,
+            "final_outcomes": dict(outcomes),
+            "candidate_status": dict(candidates),
+            "promotions": promotions,
+            "promotions_project": promotions_project,
+            "promotions_global": promotions_global,
+            "rollbacks": rollbacks,
+            "demotions": demotions,
+            "reinforcements": reinforcements,
+            "cited_fact_credits": mutations.get("credit_used_retrieved_fact", 0),
+            "interactive_loop_active": active,
+        }, indent=2))
+        return
+
+    window_label = f", since {args.since}" if getattr(args, "since", None) else ""
+    scope_note = ("interactive/attributed path — background synthesis "
+                  "(observer + transcript mining) mints facts without episodes "
+                  "and is NOT counted here")
+    if episodes == 0:
+        print(f"[Neo] learning pulse ({scope_note}{window_label}): "
+              "no learning episodes recorded yet")
+        return
+    print(f"[Neo] learning pulse ({scope_note}{window_label}):")
+    print(f"  {episodes} episode(s) across {projects} project(s)")
+    print("  episode outcomes:")
+    for outcome, count in outcomes.most_common():
+        print(f"    {outcome:<42} {count:>5}")
+    if candidates:
+        print(f"  memory candidates ({sum(candidates.values())}):")
+        labels = {
+            "durable": "durable (promoted to a fact)",
+            "supported_once": "supported_once (1 accept, needs 2)",
+            "contradicted": "contradicted (rolled back)",
+            "rejected_by_verification": "rejected_by_verification (det. failure)",
+            "unverified": "unverified",
+            "observed_unverified": "observed_unverified (pending)",
+        }
+        for status, count in candidates.most_common():
+            print(f"    {labels.get(status, status):<42} {count:>5}")
+    print("  learning actions (from the ledger):")
+    print(f"    {'promotions':<42} {promotions:>5}"
+          f"   (project {promotions_project}, cross-project {promotions_global})")
+    print(f"    {'rollbacks':<42} {rollbacks:>5}")
+    print(f"    {'demotions':<42} {demotions:>5}")
+    print(f"    {'reinforcements (incl. cited-fact credit)':<42} {reinforcements:>5}")
+    if active:
+        print(f"  => interactive loop is ACTIVE: {promotions} promoted, "
+              f"{rollbacks} rolled back, {reinforcements} reinforced")
+    else:
+        print("  => interactive loop is IDLE: episodes recorded but no accept-driven "
+              "promotion / reinforcement yet — suggestions aren't being accepted "
+              "downstream. (Does NOT mean neo isn't learning: background synthesis "
+              "mints facts on a separate path this doesn't count.)")
+
+
 def handle_memory(args):
     """Memory maintenance subcommands."""
     action = getattr(args, "memory_action", None)
@@ -899,6 +1021,9 @@ def handle_memory(args):
         return
     if action == "citation-stats":
         _handle_citation_stats(args)
+        return
+    if action == "learning-stats":
+        _handle_learning_stats(args)
         return
     if action == "prune":
         files = _fact_files_for_prune(
