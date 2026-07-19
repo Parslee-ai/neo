@@ -87,6 +87,16 @@ PROTECTION_BOOST = 0.05        # Confidence boost for consistently helpful facts
 # Independent outcome limits (second layer — outcomes.py caps at 5/session)
 MAX_INDEPENDENT_FACTS = 50     # Cap per project to prevent bloat from active repos
 
+# Attempt-outcome EPISODE limits. persist_attempt_outcome writes one EPISODE
+# fact per caller-reported attempt/outcome, and EPISODE facts deliberately
+# bypass dedup/supersession (trajectory attribution needs each observation
+# distinct). A stuck external agent loop that re-reports the same failed attempt
+# each iteration would therefore flood the project fact file unbounded and evict
+# more valuable REVIEW facts. Cap the newest N per project — well below the
+# per-scope 500 limit — so a live flood stays bounded (mirrors
+# MAX_INDEPENDENT_FACTS / _cap_independent_facts).
+MAX_ATTEMPT_OUTCOME_FACTS = 25
+
 # Tags that protect facts from pruning/demotion (curated knowledge)
 # Tag-based janitor immunity for TRUSTED-INTERNAL provenance only: seed corpus,
 # community feed, synthesis output. These tags are written solely by neo's own
@@ -933,6 +943,10 @@ class FactStore:
         )
         fact.metadata.event_time = time.time()
         fact.metadata.ingest_time = fact.metadata.event_time
+        # Bound a live flood within the process, not only on cold start: a stuck
+        # loop re-reporting the same attempt each call is capped here so it can
+        # never fill the project budget and evict useful REVIEW facts.
+        self._cap_attempt_outcome_facts(save=False)
         self.save()
         return fact
 
@@ -2713,6 +2727,7 @@ class FactStore:
         logger.info(f"FactStore: Loaded {len(self._facts)} facts")
         # Cap runs in-memory only; save is deferred to initialize()
         self._cap_independent_facts(save=False)
+        self._cap_attempt_outcome_facts(save=False)
 
     def _cap_independent_facts(self, save: bool = True) -> None:
         """Prevent bloat: invalidate excess independent-tagged facts.
@@ -2745,6 +2760,45 @@ class FactStore:
             else:
                 self._cap_pending = True
             logger.info(f"Capped independent facts: invalidated {pruned}, kept {MAX_INDEPENDENT_FACTS}")
+
+    def _cap_attempt_outcome_facts(self, save: bool = True) -> None:
+        """Prevent bloat: invalidate excess attempt-outcome EPISODE facts.
+
+        persist_attempt_outcome writes one EPISODE fact per caller-reported
+        attempt/outcome, and EPISODE facts bypass dedup/supersession by design.
+        A stuck agent loop re-reporting the same failed attempt each iteration
+        would otherwise flood the project fact file unbounded and evict more
+        valuable REVIEW facts. Keep only the newest MAX_ATTEMPT_OUTCOME_FACTS.
+        Protected-tag / promoted facts are never capped.
+
+        Args:
+            save: If True, persist after capping. Set False when called from
+                  load() to avoid save-during-load (deferred to initialize()).
+        """
+        attempts = [
+            f for f in self._facts
+            if f.is_valid
+            and "attempt" in f.tags and "observed-outcome" in f.tags
+            and not self._is_protected(f)
+        ]
+        if len(attempts) <= MAX_ATTEMPT_OUTCOME_FACTS:
+            return
+        attempts.sort(key=lambda f: f.metadata.created_at, reverse=True)
+        pruned = 0
+        for f in attempts[MAX_ATTEMPT_OUTCOME_FACTS:]:
+            # cascade=False mirrors _cap_independent_facts: these episodes are
+            # redundant observation noise with no dependents worth flagging.
+            self._invalidate(f, cascade=False)
+            pruned += 1
+        if pruned:
+            if save:
+                self.save()
+            else:
+                self._cap_pending = True
+            logger.info(
+                f"Capped attempt-outcome facts: invalidated {pruned}, "
+                f"kept {MAX_ATTEMPT_OUTCOME_FACTS}"
+            )
 
     def _save_file(self, path: Path, facts: list[Fact]) -> None:
         """Save a list of facts to a JSON file atomically.
