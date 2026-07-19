@@ -1414,14 +1414,22 @@ class TestOutcomeLinkage:
                  metadata=FactMetadata(confidence=0.6), **common)
         b = Fact(id="gb", supporting_episode_ids=["e3", "e4", "e5"],
                  metadata=FactMetadata(confidence=0.6), **common)
-        store._facts.extend([a, b])
+        # A distinct-scope duplicate pair sharing the SAME signature must NOT be
+        # collapsed together (dedup keys on (scope, signature)).
+        pcommon = {**common, "scope": FactScope.PROJECT}
+        pa = Fact(id="pa", supporting_episode_ids=["p1", "p2"],
+                  metadata=FactMetadata(confidence=0.6), **pcommon)
+        pb = Fact(id="pb", supporting_episode_ids=["p3", "p4", "p5"],
+                  metadata=FactMetadata(confidence=0.6), **pcommon)
+        store._facts.extend([a, b, pa, pb])
 
-        assert store._dedup_global_signatures() == 1
-        # b has more supporting episodes -> kept; a superseded + invalidated.
-        assert b.is_valid is True and a.is_valid is False
-        assert a.superseded_by == "gb"
+        assert store._dedup_signatures() == 2  # one global pair + one project pair
+        # global: b kept, a collapsed; project: pb kept, pa collapsed.
+        assert b.is_valid is True and a.is_valid is False and a.superseded_by == "gb"
+        assert pb.is_valid is True and pa.is_valid is False and pa.superseded_by == "pb"
         assert set(b.supporting_episode_ids) == {"e1", "e2", "e3", "e4", "e5"}
-        assert store._dedup_global_signatures() == 0  # idempotent
+        assert set(pb.supporting_episode_ids) == {"p1", "p2", "p3", "p4", "p5"}
+        assert store._dedup_signatures() == 0  # idempotent
 
     def test_single_acceptance_leaves_promoted_fact_id_empty(self, store):
         """T2: promoted_fact_id is written ONLY by promotion. One acceptance

@@ -336,6 +336,9 @@ class FactStore:
             changed += self.demote_unhelpful_facts(save=False)
             changed += self.purge_dead_facts(save=False)
             changed += self.strip_tombstone_embeddings(save=False)
+            # Heal any project/global duplicate-signature facts a concurrent
+            # mint left behind (merge-on-save can't dedup by signature).
+            changed += self._dedup_signatures(save=False)
             if changed:
                 self.save()
         except Exception as e:
@@ -1572,23 +1575,26 @@ class FactStore:
             logger.warning("Cross-project candidate promotion failed: %s", exc)
             return None
 
-    def _dedup_global_signatures(self) -> int:
-        """Collapse valid global episode-derived facts that share a canonical
-        signature. This is the durable fix for the narrow concurrency window
-        where the observer and a request-path process mint the SAME signature
-        before either sees the other's write: merge-on-save reconciles by
-        fact.id, not signature, so both distinct-id facts survive. Keep the
-        richest (most supporting episodes), fold the others' episodes into it,
-        and supersede+invalidate the duplicates. Keys on canonical_signature
-        (set at mint since T6), so pre-T6 facts without one are left alone.
-        Returns the number collapsed."""
-        groups: dict[str, list[Fact]] = {}
+    def _dedup_signatures(self, save: bool = True) -> int:
+        """Collapse valid episode-derived facts sharing a (scope, canonical
+        signature). Durable fix for the merge-by-id TOCTOU window where two
+        processes mint the SAME signature before seeing each other's write —
+        merge-on-save reconciles by fact.id, not signature, so both distinct-id
+        facts survive. Applies at EVERY scope: global (the observer/request
+        race) and project (concurrent same-project promotion). Keep the richest
+        (most supporting episodes), fold the others' episodes in, and
+        supersede+invalidate the duplicates. Keys on canonical_signature (set at
+        mint since T6), so pre-T6 facts without one are left alone. Returns the
+        number collapsed.
+
+        The key omits project_id: a store only ever loads ONE project's PROJECT
+        scope (load() reads a single facts_project_<id> file), so two PROJECT
+        facts sharing a signature are necessarily the same project. If loading
+        ever became multi-project, this key would need project_id too."""
+        groups: dict[tuple, list[Fact]] = {}
         for f in self._facts:
-            if (
-                f.is_valid and f.scope == FactScope.GLOBAL
-                and "episode-derived" in f.tags and f.canonical_signature
-            ):
-                groups.setdefault(f.canonical_signature, []).append(f)
+            if f.is_valid and "episode-derived" in f.tags and f.canonical_signature:
+                groups.setdefault((f.scope, f.canonical_signature), []).append(f)
         collapsed = 0
         for facts in groups.values():
             if len(facts) < 2:
@@ -1607,12 +1613,17 @@ class FactStore:
                 dup.superseded_by = keeper.id
                 self._invalidate(dup, cascade=False)
                 collapsed += 1
+            # We fold episodes + take max success_count, but intentionally drop
+            # the duplicates' other accumulated signal (access_count, effectiveness)
+            # — a race-repair keeps the richest-by-support fact, and same-signature
+            # dups almost never diverge in real usage before the heal fires.
             keeper.metadata.success_count = max(
                 keeper.metadata.success_count, len(keeper.supporting_episode_ids)
             )
         if collapsed:
-            self.save()
-            logger.info("Collapsed %d duplicate global-signature fact(s)", collapsed)
+            if save:
+                self.save()
+            logger.info("Collapsed %d duplicate signature fact(s)", collapsed)
         return collapsed
 
     def reconcile_cross_project_promotions(self) -> int:
@@ -1629,9 +1640,9 @@ class FactStore:
             episodes_root = self._episodes_dir or (Path.home() / ".neo" / "episodes")
             if not episodes_root.exists():
                 return 0
-            # Heal any duplicate global facts a concurrent mint left behind
-            # before deciding what still needs promoting.
-            self._dedup_global_signatures()
+            # Heal any duplicate facts a concurrent mint left behind before
+            # deciding what still needs promoting.
+            self._dedup_signatures()
             # One pass: tally distinct projects/episodes per signature + keep a
             # representative candidate. Only signatures that already clear the
             # bar pay the expensive mint+rescan.
