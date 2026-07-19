@@ -1471,6 +1471,12 @@ class FactStore:
                 existing_signature = existing.canonical_signature
                 if (
                     not existing.is_valid
+                    # PROJECT-scope tombstones only. A GLOBAL rollback is a
+                    # separate ownership domain (owned by cross-project
+                    # reconcile); letting one block a project's own local
+                    # promotion means one project's undo silently bars every
+                    # other, unrelated project from re-learning the pattern.
+                    and existing.scope == FactScope.PROJECT
                     and existing.invalidation_reason == "repeated_attributed_contradiction"
                     and existing_signature == target_signature
                 ):
@@ -1552,6 +1558,34 @@ class FactStore:
                     break
         episode_ids = list(dict.fromkeys(ep.episode_id for _, ep in supporting))
         return supporting, project_ids, episode_ids
+
+    def _clear_global_promotion_links(
+        self, target_signature: str, fact_id: str, episodes_root: "Path"
+    ) -> int:
+        """Clear ``promoted_global_fact_id`` on every candidate that links to a
+        torn-down global (``fact_id``) for ``target_signature``, writing the
+        episodes back. Without this the leftover link permanently reads as
+        'already promoted' — barring the signature from re-promotion even under
+        fresh strong evidence, and (because the link lives in the shared episode
+        store) blocking every project. Returns the number of candidates cleared."""
+        from neo.memory.episodes import LearningEpisodeStore
+
+        cleared = 0
+        for project_path in sorted(p for p in episodes_root.iterdir() if p.is_dir()):
+            episode_store = LearningEpisodeStore(project_path.name, base_dir=episodes_root)
+            for episode in episode_store.list():
+                changed = False
+                for candidate in episode.memory_candidates:
+                    if (
+                        candidate.promoted_global_fact_id == fact_id
+                        and self._global_signature(candidate.subject) == target_signature
+                    ):
+                        candidate.promoted_global_fact_id = ""
+                        changed = True
+                        cleared += 1
+                if changed:
+                    episode_store.save(episode)
+        return cleared
 
     def _mint_global_fact(
         self, target_signature: str, subject_src: str, body_src: str,
@@ -1737,6 +1771,12 @@ class FactStore:
             # representative candidate. Only signatures that already clear the
             # bar pay the expensive mint+rescan.
             reps: dict[str, dict[str, Any]] = {}
+            # Signatures with an ACTIVE retraction signal on disk — a candidate
+            # downgraded to 'contradicted' by a repeated attributed
+            # contradiction. Teardown fires only for these; a signature whose
+            # support merely dropped (episodes aged out of the bounded per-
+            # project ring buffer, no contradiction) is left intact.
+            contradicted_signatures: set[str] = set()
             for project_path in sorted(p for p in episodes_root.iterdir() if p.is_dir()):
                 episode_store = LearningEpisodeStore(project_path.name, base_dir=episodes_root)
                 for episode in episode_store.list():
@@ -1744,9 +1784,12 @@ class FactStore:
                     for candidate in episode.memory_candidates:
                         if candidate.kind != FactKind.PATTERN.value:
                             continue
+                        signature = self._global_signature(candidate.subject)
+                        if candidate.status == "contradicted":
+                            contradicted_signatures.add(signature)
+                            continue
                         if candidate.status not in {"supported_once", "durable"}:
                             continue
-                        signature = self._global_signature(candidate.subject)
                         entry = reps.setdefault(signature, {
                             "subject": candidate.subject, "body": candidate.body,
                             "cid": candidate.candidate_id,
@@ -1775,13 +1818,21 @@ class FactStore:
                     minted += 1
             if minted:
                 logger.info("Reconciled %d cross-project global promotion(s)", minted)
-            # Teardown: retract any existing global whose LIVE cross-project
-            # support has fallen below the bar — e.g. a contributing project
-            # rolled its pattern back (its candidates downgraded to
-            # 'contradicted', so absent from the reps tally). reconcile is
-            # otherwise additive-only; this is the only path that tears a global
-            # down, and it runs on the observer's fresh reload, so it sees the
-            # global a rolling-back project's stale store could not.
+            # Teardown: retract an existing global ONLY when a contributing
+            # project ACTIVELY rolled its pattern back — i.e. some candidate for
+            # this signature is now 'contradicted'. reconcile is otherwise
+            # additive-only; this is the only path that tears a global down, and
+            # it runs on the observer's fresh reload, so it sees the global a
+            # rolling-back project's stale store could not.
+            #
+            # Absence of support alone is NOT a retraction: supporting episodes
+            # scroll out of the bounded per-project ring buffer
+            # (LearningEpisodeStore._enforce_limit) in busy projects, dropping
+            # the live tally below the bar with nobody having retracted. Tearing
+            # down then silently deletes a healthy shared pattern that (because
+            # of the lingering promoted_global_fact_id links) could never be
+            # re-learned. Requiring a contradiction signal preserves the stated
+            # intent ("fire only when support was actively retracted").
             retracted = 0
             for fact in [
                 f for f in self._facts
@@ -1796,6 +1847,8 @@ class FactStore:
                 sig = fact.canonical_signature
                 if not sig:
                     continue
+                if sig not in contradicted_signatures:
+                    continue
                 entry = reps.get(sig)
                 projects = len(entry["projects"]) if entry else 0
                 episodes = len(entry["episodes"]) if entry else 0
@@ -1805,6 +1858,13 @@ class FactStore:
                 ):
                     fact.invalidation_reason = "repeated_attributed_contradiction"
                     self._invalidate(fact)
+                    # Clear the on-disk global link off every still-present
+                    # supporting candidate for this signature. The link is the
+                    # idempotency key both _mint_global_fact and the reps tally
+                    # read as "already promoted"; leaving it set would bar the
+                    # pattern from ever being re-minted even under fresh strong
+                    # evidence. Mirrors how the link is set at mint.
+                    self._clear_global_promotion_links(sig, fact.id, episodes_root)
                     retracted += 1
             if retracted:
                 self.save()
