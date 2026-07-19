@@ -332,6 +332,15 @@ def parse_args():
             help='Retain isolated benchmark facts and episodes under this directory',
         )
 
+        citation_p = subparsers.add_parser(
+            'citation-stats',
+            help='Summarize [fact:id] citation-survival from metrics.jsonl '
+                 '(which detector — marker / self-report / overlap — earns the credit)',
+        )
+        citation_p.add_argument('--json', action='store_true', help='Emit the summary as JSON')
+        citation_p.add_argument(
+            '--since', help='Only events newer than this window, e.g. 7d / 48h / 30m')
+
         args = p.parse_args(sys.argv[2:])
         args.command = 'memory'
         args.memory_action = args.action

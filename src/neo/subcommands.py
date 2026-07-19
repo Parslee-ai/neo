@@ -788,6 +788,91 @@ def _handle_evaluate_learning(args) -> None:
         raise SystemExit(1)
 
 
+def _handle_citation_stats(args) -> None:
+    """Summarize citation_survival events from metrics.jsonl: how often a
+    retrieved [fact:id] survives into reasoning, and WHICH detector earns the
+    credit (marker vs structured self-report vs subject overlap). Answers the
+    open question of whether the reliable self-report carries the retrieved-fact
+    reinforcement path or the softer overlap signal is doing the work."""
+    path = Path.home() / ".neo" / "metrics.jsonl"
+
+    cutoff = None
+    if getattr(args, "since", None):
+        try:
+            window = _parse_since(args.since)
+        except ValueError as exc:
+            print(f"[Neo] {exc}", file=sys.stderr)
+            return
+        cutoff = (time.time() - window) if window else None
+
+    agg = {k: 0 for k in (
+        "requests", "retrieved", "included", "used",
+        "by_marker", "by_self_report", "by_overlap", "by_overlap_only",
+    )}
+    by_model: dict[str, dict[str, int]] = {}
+    if path.exists():
+        with path.open() as handle:
+            for line in handle:
+                # Cheap pre-filter before parsing every metrics line.
+                if '"citation_survival"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Valid-but-non-object JSON (a bare scalar/list that happens to
+                # contain the substring) would crash .get() — skip it.
+                if not isinstance(event, dict) or event.get("event") != "citation_survival":
+                    continue
+                if cutoff is not None and float(event.get("ts", 0) or 0) < cutoff:
+                    continue
+                agg["requests"] += 1
+                for key in ("retrieved", "included", "used", "by_marker",
+                            "by_self_report", "by_overlap", "by_overlap_only"):
+                    agg[key] += int(event.get(key, 0) or 0)
+                model = event.get("model") or "unknown"
+                stats = by_model.setdefault(model, {"requests": 0, "included": 0, "used": 0})
+                stats["requests"] += 1
+                stats["included"] += int(event.get("included", 0) or 0)
+                stats["used"] += int(event.get("used", 0) or 0)
+
+    survival = (agg["used"] / agg["included"] * 100) if agg["included"] else 0.0
+    window_label = f" (since {args.since})" if getattr(args, "since", None) else ""
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            **agg,
+            "survival_rate_pct": round(survival, 2),
+            "by_model": by_model,
+        }, indent=2))
+        return
+
+    if agg["requests"] == 0:
+        print(f"[Neo] citation-survival{window_label}: "
+              "no citation_survival events recorded yet")
+        return
+    print(f"[Neo] citation-survival{window_label}: {agg['requests']} request(s)")
+    print(f"  retrieved={agg['retrieved']}  included={agg['included']}  used={agg['used']}")
+    print(f"  survival rate (used/included): {survival:.1f}%")
+    denom = agg["used"] or 1
+    print("  which detector earned it (share of 'used'; a fact can match >1):")
+    for label, key in (("marker", "by_marker"),
+                       ("self-report", "by_self_report"),
+                       ("overlap", "by_overlap")):
+        count = agg[key]
+        print(f"    {label:<12} {count:>7}  ({count / denom * 100:5.1f}%)")
+    # The decision number: facts credited by overlap and nothing else.
+    only = agg["by_overlap_only"]
+    print(f"  overlap-only credited: {only}  ({only / denom * 100:.1f}% of used) "
+          f"-> {'overlap is dead weight, safe to drop' if only == 0 else 'overlap is load-bearing, tune not cut'}")
+    if by_model:
+        print("  by model:")
+        for model, stats in sorted(by_model.items(), key=lambda kv: -kv[1]["requests"]):
+            rate = (stats["used"] / stats["included"] * 100) if stats["included"] else 0.0
+            print(f"    {model:<20} {stats['requests']:>5} req  "
+                  f"used={stats['used']}  ({rate:.1f}% survival)")
+
+
 def handle_memory(args):
     """Memory maintenance subcommands."""
     action = getattr(args, "memory_action", None)
@@ -811,6 +896,9 @@ def handle_memory(args):
         return
     if action == "evaluate-learning":
         _handle_evaluate_learning(args)
+        return
+    if action == "citation-stats":
+        _handle_citation_stats(args)
         return
     if action == "prune":
         files = _fact_files_for_prune(

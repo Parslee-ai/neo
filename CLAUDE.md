@@ -78,6 +78,13 @@
     `imported:claude-memory` tag, content-hash watermark for idempotency).
     (`neo/memory/issues.py`, `neo/memory/rulesync.py`, `neo/memory/memaudit.py`,
     `neo/memory/memimport.py`)
+    `neo memory citation-stats [--since 7d] [--json]` summarizes the
+    `citation_survival` metric from `~/.neo/metrics.jsonl` — retrieved/included/used
+    counts plus the per-signal split (`by_marker` / `by_self_report` / `by_overlap`)
+    showing WHICH detector earns the retrieved-fact use-credit. Use it to decide
+    whether the reliable structured self-report carries the reinforcement path or
+    the softer subject-overlap heuristic is doing the work (and thus whether to
+    keep/tune/drop overlap). Read-only, no LM call (`subcommands._handle_citation_stats`).
     - `issues` reuses the ingester's `TranscriptSource` episodes but never admits facts or
       touches the `transcript_watermark_*` watermark — decoupled from fact admission and
       idempotent (`find_issues`). Gate mirrors synthesis discipline (≥`min_cluster`

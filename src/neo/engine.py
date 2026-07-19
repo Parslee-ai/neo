@@ -412,7 +412,12 @@ class NeoEngine:
         # whether the reliable self-report is carrying the path or the softer
         # overlap is the only thing keeping it alive (which decides overlap's
         # future). A fact matched by two signals counts in both.
-        signals = {"by_marker": 0, "by_self_report": 0, "by_overlap": 0}
+        # `overlap_only` is the decision number for keep/tune/drop of the soft
+        # overlap signal: facts credited by overlap and NOTHING else. The other
+        # three tallies are OR-counted (a fact can match >1), so their "share"
+        # measures participation, not marginal credit — overlap_only is the real
+        # risk population and can't be derived post-hoc from the aggregates.
+        signals = {"by_marker": 0, "by_self_report": 0, "by_overlap": 0, "overlap_only": 0}
         for evidence in episode.retrieved_facts:
             fid = evidence.fact_id
             if not evidence.included_in_context:
@@ -428,6 +433,8 @@ class NeoEngine:
                 signals["by_self_report"] += 1
             if by_overlap:
                 signals["by_overlap"] += 1
+                if not (by_marker or by_self_report):
+                    signals["overlap_only"] += 1
             if by_marker or by_self_report or by_overlap:
                 # Sticky OR-accumulate across reasoning passes — never clobber True.
                 evidence.used_in_reasoning = True
@@ -1041,6 +1048,7 @@ class NeoEngine:
                 by_marker=sig.get("by_marker", 0),
                 by_self_report=sig.get("by_self_report", 0),
                 by_overlap=sig.get("by_overlap", 0),
+                by_overlap_only=sig.get("overlap_only", 0),
                 provider=episode.provider or "",
                 model=episode.model or "",
             )
