@@ -74,9 +74,17 @@
     *eligibility* (e.g. "improve the errors page" → BUGFIX; "summarize the
     performance of this algorithm" → ALGORITHM) — it still can't mint a durable fact
     without two independent git-verified acceptances of a matching diff shape.
-    **Deferred fast-follows**: feed `error_trace` into the JSON-path classification;
-    share the bugfix-signal vocabulary with `execution_context._infer_intent` before
-    the two keyword classifiers drift.
+    `classify_task_type(prompt, error_trace=None)` also takes an optional
+    `error_trace` (wired on the JSON path): a supplied traceback adds
+    `_FAILURE_TRACE_WEIGHT` (=2) to BUGFIX — strong but overridable (a 3-signal
+    dominant intent still wins; a signal-less/empty prompt + trace → BUGFIX). The
+    BUGFIX failure-symptom patterns are DERIVED from the shared
+    `execution_context.FAILURE_SIGNAL_KEYWORDS` (`error/fail/exception/crash`) so
+    this classifier and `_infer_intent` can't drift; `_infer_goal` keeps its own
+    timeout-inclusive set by design. (If a third module needs the lexicon, extract
+    it to a neutral `neo.lexicon` then.) The derived `\bcrash(?:…)?\b` is
+    boundary-closed, so compound terms like `crashloop` no longer match — a
+    deliberate precision/recall trade in the fail-safe direction.
   - REVIEW → PATTERN/FAILURE synthesis needs ≥20 valid REVIEWs and ≥3-member clusters;
     triple-trigger gate fires when ANY of: count-delta ≥10, elapsed ≥1h, or
     confidence-decile entropy >0.9.

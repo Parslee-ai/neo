@@ -128,6 +128,47 @@ def test_uppercase_big_o_still_detected():
     assert classify_task_type("reduce this from O(n^2) to O(n)") == TaskType.ALGORITHM
 
 
+def test_error_trace_biases_bugfix():
+    """A supplied error_trace is strong (but not absolute) evidence of a bugfix:
+    it tips signal-less and lightly-feature prompts to BUGFIX, but a strongly
+    dominant different intent still overrides."""
+    trace = "Traceback (most recent call last):\n  ...\nValueError: boom"
+    # Signal-less prompt + trace -> BUGFIX (not the FEATURE fallback).
+    assert classify_task_type("please review this output", trace) == TaskType.BUGFIX
+    # A realistic single-signal feature prompt + trace -> BUGFIX (trace tips it).
+    assert classify_task_type("add a user settings page", trace) == TaskType.BUGFIX
+    # Empty prompt + trace still reads as a debugging task.
+    assert classify_task_type("", trace) == TaskType.BUGFIX
+    # A genuine bugfix prompt is only reinforced.
+    assert classify_task_type("fix the crash", trace) == TaskType.BUGFIX
+
+
+def test_error_trace_not_absolute():
+    """The trace bias is overridable: a strongly-dominant non-bugfix intent wins,
+    so error_trace doesn't blindly force BUGFIX regardless of the prompt."""
+    trace = "Traceback: ..."
+    # FEATURE scores 3 (add/new/feature) > BUGFIX 2 (trace boost) -> FEATURE.
+    assert classify_task_type("add a new feature", trace) == TaskType.FEATURE
+
+
+def test_no_trace_is_unchanged():
+    """Passing no error_trace (the plain-text CLI path) leaves classification
+    identical to the single-arg form."""
+    for prompt in ("optimize this loop", "add a settings page", "explain the flow",
+                   "help me here"):
+        assert classify_task_type(prompt) == classify_task_type(prompt, None)
+
+
+def test_bugfix_symptoms_derived_from_shared_vocabulary():
+    """The BUGFIX failure symptoms are the shared FAILURE_SIGNAL_KEYWORDS
+    (execution_context) — proving a single source of truth, so adding a symptom
+    word there propagates to this classifier and can't drift from _infer_intent."""
+    from neo.execution_context import FAILURE_SIGNAL_KEYWORDS
+    for kw in FAILURE_SIGNAL_KEYWORDS:
+        # Each shared symptom word, alone, classifies as BUGFIX here.
+        assert classify_task_type(f"the {kw} happened") == TaskType.BUGFIX
+
+
 def test_deterministic():
     """Same prompt always classifies the same way (no randomness)."""
     prompt = "optimize the O(n^2) scan to O(n)"

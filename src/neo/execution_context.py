@@ -244,6 +244,15 @@ _CONF_ROLE_DERIVED = 0.9  # deterministic from an explicit caller role
 _CONF_KEYWORD = 0.5       # a lexical signal matched (test/error/regression/…)
 _CONF_NONE = 0.3          # no signal — restating the task verbatim
 
+# Core failure-symptom lexicon shared by TWO of three consumers: _infer_intent
+# (below) and models.classify_task_type's BUGFIX symptom patterns. Adding a word
+# here moves both as one, so they can't drift on "what signals a failure/bug".
+# NOT fully authoritative: _infer_goal keeps its own timeout-inclusive set on
+# purpose (see the marker there). If a THIRD module outside execution_context /
+# models reaches for these words, extract this to a neutral `neo.lexicon` then —
+# a 4-tuple doesn't earn its own module yet.
+FAILURE_SIGNAL_KEYWORDS = ("error", "fail", "exception", "crash")
+
 
 def _infer_goal(task: str, error_trace: Optional[str]) -> tuple[str, float, list[str]]:
     text = f"{task}\n{error_trace or ''}".lower()
@@ -251,6 +260,10 @@ def _infer_goal(task: str, error_trace: Optional[str]) -> tuple[str, float, list
     if "test" in text and any(token in text for token in ("fail", "error", "still")):
         unknowns.append("The exact command and exit condition that define success")
         return "Restore the affected test suite to a passing state", _CONF_KEYWORD, unknowns
+    # Deliberately NOT FAILURE_SIGNAL_KEYWORDS: goal-framing drops "fail" (handled
+    # by the test-state branch above) and adds "timeout" as a goal symptom. This
+    # third failure vocabulary diverges on purpose — do not fold it into the shared
+    # constant.
     if any(token in text for token in ("error", "exception", "crash", "timeout")):
         unknowns.append("Whether symptom mitigation or root-cause elimination is preferred")
         return "Resolve the reported failure without introducing regressions", _CONF_KEYWORD, unknowns
@@ -266,7 +279,7 @@ def _infer_intent(task: str, error_trace: Optional[str], role: CallerRole) -> tu
         return "Critique the current attempt and identify the highest-value correction", _CONF_ROLE_DERIVED
     if any(token in text for token in ("still fail", "did not", "regression", "timeout")):
         return "Diagnose why the current attempt did not produce sufficient progress", _CONF_KEYWORD
-    if any(token in text for token in ("error", "fail", "exception", "crash")):
+    if any(token in text for token in FAILURE_SIGNAL_KEYWORDS):
         return "Diagnose the reported failure and recommend the next action", _CONF_KEYWORD
     return "Produce the requested reasoning artifact", _CONF_NONE
 

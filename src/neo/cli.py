@@ -813,11 +813,14 @@ def main():
             neo_input = NeoInput(
                 prompt=input_data["prompt"],
                 # Explicit caller task_type wins; otherwise classify from the prompt
-                # (not a blanket FEATURE default — see classify_task_type).
+                # + error_trace (a supplied traceback strongly implies a bugfix —
+                # see classify_task_type).
                 task_type=(
                     TaskType(input_data["task_type"])
                     if input_data.get("task_type")
-                    else classify_task_type(input_data["prompt"])
+                    else classify_task_type(
+                        input_data["prompt"], input_data.get("error_trace")
+                    )
                 ),
                 context_files=[
                     ContextFile(**cf) for cf in input_data.get("context_files", [])

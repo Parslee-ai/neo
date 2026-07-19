@@ -15,6 +15,7 @@ import uuid
 from typing import Any, Literal, Optional, TypedDict
 
 from neo.execution_context import (
+    FAILURE_SIGNAL_KEYWORDS,
     AttemptContext,
     CallerRole,
     GoalAssessment,
@@ -42,6 +43,15 @@ class TaskType(Enum):
     EXPLANATION = "explanation"
 
 
+# Failure-symptom sub-patterns for BUGFIX, DERIVED from the shared
+# FAILURE_SIGNAL_KEYWORDS (execution_context) so this classifier and
+# _infer_intent can't drift on the failure vocabulary. Word-boundary-anchored
+# with a generic inflection tail (errors/failing/crashed/exceptions), which is
+# stricter than execution_context's substring match — intentional here.
+_FAILURE_SYMPTOM_PATTERNS = tuple(
+    rf"\b{kw}(?:s|es|ed|ing|ure)?\b" for kw in FAILURE_SIGNAL_KEYWORDS
+)
+
 # Keyword signals per task type, checked case-insensitively. Kept OUTSIDE the
 # Enum body because a plain container assigned there would be coerced into an
 # enum member. Ordered most- to least-specific for readability only; scoring
@@ -53,12 +63,13 @@ _TASK_TYPE_SIGNALS: list[tuple[TaskType, tuple[str, ...]]] = [
         r"\bwhy (?:does|is|do|are)\b", r"\bunderstand\b",
     )),
     (TaskType.BUGFIX, (
-        # Deliberately excludes ambient descriptors (wrong/incorrect/broken) that
-        # show up in feature/design prose as often as in bug reports.
-        r"\bfix(?:es|ed|ing)?\b", r"\bbugs?\b", r"\berrors?\b", r"\bcrash",
-        r"\bfail(?:s|ed|ing|ure)?\b", r"\bexceptions?\b", r"\btraceback\b",
+        # Fix-action / bug-noun vocabulary local to task classification, PLUS the
+        # shared failure symptoms (_FAILURE_SYMPTOM_PATTERNS). Deliberately excludes
+        # ambient descriptors (wrong/incorrect/broken) that show up in feature/
+        # design prose as often as in bug reports.
+        r"\bfix(?:es|ed|ing)?\b", r"\bbugs?\b", r"\btraceback\b",
         r"\bregression\b", r"\bnot working\b", r"\bdoesn'?t work\b", r"\bthrows?\b",
-    )),
+    ) + _FAILURE_SYMPTOM_PATTERNS),
     (TaskType.ALGORITHM, (
         # (?-i:O) keeps Big-O case-sensitive; under the file-wide IGNORECASE a
         # bare ``O\(`` would match any lowercase ``o(`` — i.e. every ``info(``,
@@ -99,12 +110,24 @@ _TASK_TYPE_PRIORITY = (
     TaskType.BUGFIX, TaskType.ALGORITHM,
 )
 
+# How many keyword signals a supplied error_trace is worth toward BUGFIX. Two:
+# strong enough to beat a lone feature/refactor verb, weak enough that a
+# 3-signal dominant intent still overrides. A named calibration, not a literal.
+_FAILURE_TRACE_WEIGHT = 2
 
-def classify_task_type(prompt: str) -> TaskType:
+
+def classify_task_type(prompt: str, error_trace: Optional[str] = None) -> TaskType:
     """Infer a task type from a free-text prompt via deterministic keyword
     scoring (no LLM): the type whose distinct signal patterns match most wins; a
     tie breaks by ``_TASK_TYPE_PRIORITY`` (which fails SAFE toward the
     non-promotable kinds); a prompt with NO signal falls back to FEATURE.
+
+    ``error_trace`` (present on the JSON/structured input path) is strong — but
+    not absolute — evidence of a bugfix: a supplied traceback weights BUGFIX like
+    two keyword signals, consistent with the engine's ``error_trace + BUGFIX``
+    handling. It wins ties and near-ties but a clearly dominant different intent
+    (e.g. a prompt that scores ALGORITHM 3) can still override, and an error_trace
+    with a signal-less prompt classifies BUGFIX rather than the FEATURE fallback.
 
     Replaces the CLI's previously hardcoded ``TaskType.FEATURE``. That default
     routed every interactive prompt to the non-promotable ``decision`` candidate
@@ -115,12 +138,15 @@ def classify_task_type(prompt: str) -> TaskType:
     conservatism is preserved at the kind level and, for ties, in the tie-break
     direction, not forced by a blanket default.
     """
+    has_trace = isinstance(error_trace, str) and bool(error_trace.strip())
     if not isinstance(prompt, str) or not prompt:
-        return TaskType.FEATURE
+        return TaskType.BUGFIX if has_trace else TaskType.FEATURE
     scores = {
         tt: sum(1 for pat in patterns if pat.search(prompt))
         for tt, patterns in _TASK_TYPE_COMPILED
     }
+    if has_trace:
+        scores[TaskType.BUGFIX] = scores.get(TaskType.BUGFIX, 0) + _FAILURE_TRACE_WEIGHT
     best = max(scores.values())
     if best == 0:
         return TaskType.FEATURE
