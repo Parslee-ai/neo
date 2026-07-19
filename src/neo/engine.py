@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import textwrap
 import time
 from collections import deque
 from pathlib import Path
@@ -2192,6 +2193,42 @@ RULES:
             return ""
         return hashlib.sha256(skeleton.encode("utf-8")).hexdigest()[:12]
 
+    def _parse_snippet(self, code: str):
+        """Best-effort ``ast.parse`` of a possibly-fragmentary code snippet.
+
+        The raw snippet is often NOT top-level-parseable, and the two shapes
+        that fail are the dominant real-world ones (issue #9005): a method
+        indented inside a class (``IndentationError``) and a partial diff hunk
+        whose added lines are a mid-block fragment (``SyntaxError`` on a bare
+        ``return``/``else``). When parsing fails the fingerprint is "" and
+        episode correlation silently degrades to a prompt-prefix-only key,
+        letting unrelated accepted fixes merge into one over-trusted memory.
+
+        We progressively normalize: (1) parse as-is; (2) ``textwrap.dedent``
+        then parse — an indented class method dedents to a top-level ``def``,
+        and a dedented hunk body parses on its own; (3) wrap the dedented
+        snippet in a synthetic ``class _S: / def _f(self):`` scaffold so a bare
+        statement fragment (``return``/``yield``/``self.x = ...``) still yields
+        a tree. Returns the parsed module, or ``None`` when the snippet is
+        genuinely unparseable (non-Python, prose) so the caller degrades to "".
+        """
+        candidates = [code]
+        dedented = textwrap.dedent(code)
+        if dedented != code:
+            candidates.append(dedented)
+        # Nest the fragment inside a class method so statements only legal
+        # inside a function body (return/yield) parse too. Deterministic, so
+        # identical fragments still fingerprint identically.
+        candidates.append(
+            "class _S:\n    def _f(self):\n" + textwrap.indent(dedented, "        ")
+        )
+        for candidate in candidates:
+            try:
+                return ast.parse(candidate)
+            except (SyntaxError, ValueError):
+                continue
+        return None
+
     def _extract_code_skeleton(self, code: str) -> str:
         """
         Extract structural pattern from code using AST analysis.
@@ -2216,62 +2253,60 @@ RULES:
                     added_lines.append(line[1:])  # Remove the '+' prefix
             code = '\n'.join(added_lines)
 
-        skeleton_tokens = []
-        try:
-            tree = ast.parse(code)
-
-            # Walk AST and extract structural patterns
-            for node in ast.walk(tree):
-                # Control flow
-                if isinstance(node, ast.For):
-                    skeleton_tokens.append("for-loop")
-                elif isinstance(node, ast.While):
-                    skeleton_tokens.append("while-loop")
-                elif isinstance(node, ast.If):
-                    skeleton_tokens.append("if-stmt")
-
-                # Data structures (common in algorithmic code)
-                elif isinstance(node, ast.List):
-                    skeleton_tokens.append("list")
-                elif isinstance(node, ast.Dict):
-                    skeleton_tokens.append("dict")
-                elif isinstance(node, ast.Set):
-                    skeleton_tokens.append("set")
-                elif isinstance(node, ast.ListComp):
-                    skeleton_tokens.append("list-comp")
-                elif isinstance(node, ast.DictComp):
-                    skeleton_tokens.append("dict-comp")
-                elif isinstance(node, ast.SetComp):
-                    skeleton_tokens.append("set-comp")
-
-                # Function definitions
-                elif isinstance(node, ast.FunctionDef):
-                    skeleton_tokens.append(f"def:{node.name}")
-                elif isinstance(node, ast.Lambda):
-                    skeleton_tokens.append("lambda")
-
-                # Common algorithmic patterns
-                elif isinstance(node, ast.Call):
-                    if isinstance(node.func, ast.Name):
-                        # Track common collections/algorithms
-                        if node.func.id in ('deque', 'defaultdict', 'Counter',
-                                          'heapq', 'bisect', 'sorted', 'reversed',
-                                          'set', 'list', 'dict'):  # Also track constructor calls
-                            skeleton_tokens.append(node.func.id)
-                    elif isinstance(node.func, ast.Attribute):
-                        # Track common methods (append, pop, etc)
-                        if node.func.attr in ('append', 'pop', 'popleft',
-                                             'add', 'remove', 'sort'):
-                            skeleton_tokens.append(f"method:{node.func.attr}")
-
-                # Recursion indicator
-                elif isinstance(node, ast.Return):
-                    skeleton_tokens.append("return")
-
-        except SyntaxError:
-            # Not valid Python, return empty skeleton
+        tree = self._parse_snippet(code)
+        if tree is None:
+            # Not valid Python even after dedent/scaffold, return empty skeleton
             logger.debug(f"Could not parse code for skeleton extraction: {code[:100]}")
             return ""
+
+        skeleton_tokens = []
+        # Walk AST and extract structural patterns
+        for node in ast.walk(tree):
+            # Control flow
+            if isinstance(node, ast.For):
+                skeleton_tokens.append("for-loop")
+            elif isinstance(node, ast.While):
+                skeleton_tokens.append("while-loop")
+            elif isinstance(node, ast.If):
+                skeleton_tokens.append("if-stmt")
+
+            # Data structures (common in algorithmic code)
+            elif isinstance(node, ast.List):
+                skeleton_tokens.append("list")
+            elif isinstance(node, ast.Dict):
+                skeleton_tokens.append("dict")
+            elif isinstance(node, ast.Set):
+                skeleton_tokens.append("set")
+            elif isinstance(node, ast.ListComp):
+                skeleton_tokens.append("list-comp")
+            elif isinstance(node, ast.DictComp):
+                skeleton_tokens.append("dict-comp")
+            elif isinstance(node, ast.SetComp):
+                skeleton_tokens.append("set-comp")
+
+            # Function definitions
+            elif isinstance(node, ast.FunctionDef):
+                skeleton_tokens.append(f"def:{node.name}")
+            elif isinstance(node, ast.Lambda):
+                skeleton_tokens.append("lambda")
+
+            # Common algorithmic patterns
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    # Track common collections/algorithms
+                    if node.func.id in ('deque', 'defaultdict', 'Counter',
+                                      'heapq', 'bisect', 'sorted', 'reversed',
+                                      'set', 'list', 'dict'):  # Also track constructor calls
+                        skeleton_tokens.append(node.func.id)
+                elif isinstance(node.func, ast.Attribute):
+                    # Track common methods (append, pop, etc)
+                    if node.func.attr in ('append', 'pop', 'popleft',
+                                         'add', 'remove', 'sort'):
+                        skeleton_tokens.append(f"method:{node.func.attr}")
+
+            # Recursion indicator
+            elif isinstance(node, ast.Return):
+                skeleton_tokens.append("return")
 
         # Deduplicate while preserving order, limit to 500 chars
         seen = set()
