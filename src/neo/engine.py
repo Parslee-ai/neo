@@ -2102,14 +2102,18 @@ RULES:
             # LearningEpisode; downstream verified outcomes decide whether a
             # candidate ever enters FactStore.
             from neo.memory.episodes import MemoryCandidateEvidence, redact_sensitive_text
+            # Only 'pattern' auto-promotes to a durable fact (see
+            # _promote_repeatedly_supported_candidate). Explanation is prose Q&A,
+            # not a durable code lesson -> non-promotable 'review'. The default is
+            # also 'review' (fail safe): an unrecognized task_type must not promote.
             kind_map = {
                 "algorithm": "pattern",
                 "refactor": "architecture",
                 "bugfix": "pattern",
                 "feature": "decision",
-                "explanation": "pattern",
+                "explanation": "review",
             }
-            candidate_kind = kind_map.get(task_type_str, "pattern")
+            candidate_kind = kind_map.get(task_type_str, "review")
             episode = self.current_learning_episode
             if episode is not None:
                 import uuid

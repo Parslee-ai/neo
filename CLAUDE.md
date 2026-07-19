@@ -55,6 +55,28 @@
     correlation, subject+fp) are distinct from `_canonical_signature` (pre-write
     exact-twin dedup, which DOES include body+kind+scope) — one keystroke apart,
     do not conflate.
+  - Candidate KIND gate + task-type classification (`models.classify_task_type`,
+    engine `kind_map`): a candidate promotes only when its kind is `pattern`. Kind
+    derives from the task type — `algorithm`/`bugfix` → `pattern` (promotable);
+    `feature` → `decision`, `refactor` → `architecture`, `explanation` → `review`,
+    and the unknown-type default → `review` (all non-promotable, by design — auto-
+    minting durable decisions/architecture/prose is riskier than patterns). The CLI
+    used to hardcode `task_type=FEATURE` for every plain-text prompt, so nothing
+    interactive could ever promote; it now calls `classify_task_type(prompt)` —
+    deterministic keyword scoring (no LLM), highest distinct-match count wins, ties
+    break by `_TASK_TYPE_PRIORITY` which is ordered so ALL non-promotable kinds
+    precede the two promotable ones (ties FAIL SAFE to non-promotable; EXPLANATION
+    must stay ahead of BUGFIX/ALGORITHM). No signal → `FEATURE`. JSON callers'
+    explicit `task_type` still wins; only an omitted one is classified.
+    **Known limitation** (contained by the double-acceptance + fingerprint promotion
+    gate, not the kind map): a lone/multi promotable-noun in feature/explanation
+    prose with no competing feature/refactor verb can win by score and raise
+    *eligibility* (e.g. "improve the errors page" → BUGFIX; "summarize the
+    performance of this algorithm" → ALGORITHM) — it still can't mint a durable fact
+    without two independent git-verified acceptances of a matching diff shape.
+    **Deferred fast-follows**: feed `error_trace` into the JSON-path classification;
+    share the bugfix-signal vocabulary with `execution_context._infer_intent` before
+    the two keyword classifiers drift.
   - REVIEW → PATTERN/FAILURE synthesis needs ≥20 valid REVIEWs and ≥3-member clusters;
     triple-trigger gate fires when ANY of: count-delta ≥10, elapsed ≥1h, or
     confidence-decile entropy >0.9.

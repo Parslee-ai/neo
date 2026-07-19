@@ -10,6 +10,7 @@ Split from cli.py for modularity.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 import uuid
 from typing import Any, Literal, Optional, TypedDict
 
@@ -39,6 +40,94 @@ class TaskType(Enum):
     BUGFIX = "bugfix"
     FEATURE = "feature"
     EXPLANATION = "explanation"
+
+
+# Keyword signals per task type, checked case-insensitively. Kept OUTSIDE the
+# Enum body because a plain container assigned there would be coerced into an
+# enum member. Ordered most- to least-specific for readability only; scoring
+# (not order) decides the winner in classify_task_type.
+_TASK_TYPE_SIGNALS: list[tuple[TaskType, tuple[str, ...]]] = [
+    (TaskType.EXPLANATION, (
+        r"\bexplain\b", r"\bdescribe\b", r"\bsummar", r"\bwalk me through\b",
+        r"\bwhat (?:does|is|are|happens)\b", r"\bhow (?:does|do|is|can)\b",
+        r"\bwhy (?:does|is|do|are)\b", r"\bunderstand\b",
+    )),
+    (TaskType.BUGFIX, (
+        # Deliberately excludes ambient descriptors (wrong/incorrect/broken) that
+        # show up in feature/design prose as often as in bug reports.
+        r"\bfix(?:es|ed|ing)?\b", r"\bbugs?\b", r"\berrors?\b", r"\bcrash",
+        r"\bfail(?:s|ed|ing|ure)?\b", r"\bexceptions?\b", r"\btraceback\b",
+        r"\bregression\b", r"\bnot working\b", r"\bdoesn'?t work\b", r"\bthrows?\b",
+    )),
+    (TaskType.ALGORITHM, (
+        # (?-i:O) keeps Big-O case-sensitive; under the file-wide IGNORECASE a
+        # bare ``O\(`` would match any lowercase ``o(`` — i.e. every ``info(``,
+        # ``foo(``, ``undo(`` call reference — and falsely flag ALGORITHM.
+        r"\boptimiz", r"\bperformance\b", r"\bfaster\b", r"\bspeed ?up\b",
+        r"\befficient\b", r"\bcomplexity\b", r"(?-i:O)\(", r"\balgorithms?\b",
+        r"\bdata structure\b", r"\bmemoiz",
+    )),
+    (TaskType.REFACTOR, (
+        # No \bdedup: "dedupe"/"deduplicate" is far more often an operation/
+        # function name (algorithmic) than a refactor intent; "consolidate"
+        # already covers "remove duplication". Matching it tied genuine ALGORITHM
+        # prompts (e.g. "optimize the dedupe function") into non-promotable REFACTOR.
+        r"\brefactor", r"\bclean ?up\b", r"\brestructure\b", r"\brename\b",
+        r"\bextract\b", r"\bsimplif(?:y|ies|ied)\b", r"\breorganiz",
+        r"\bconsolidat", r"\btidy\b",
+    )),
+    (TaskType.FEATURE, (
+        r"\badd\b", r"\bimplement\b", r"\bcreate\b", r"\bbuild\b",
+        r"\bsupport\b", r"\bnew\b", r"\bfeature\b",
+    )),
+]
+_TASK_TYPE_COMPILED = [
+    (tt, tuple(re.compile(p, re.IGNORECASE) for p in pats))
+    for tt, pats in _TASK_TYPE_SIGNALS
+]
+# Score-tie break, ordered to FAIL SAFE: ALL THREE non-promotable kinds
+# (feature→decision, refactor→architecture, explanation→review in the engine
+# kind_map) come before the two promotable ones (bugfix→pattern, algorithm→
+# pattern). So a genuinely ambiguous prompt that ties a non-promotable signal
+# against a promotable one resolves to the conservative non-promotable kind
+# rather than leaking into durable-pattern eligibility. EXPLANATION MUST stay
+# ahead of BUGFIX/ALGORITHM: "explain how optimize works" ties explanation vs
+# algorithm, and prose Q&A must not mint a durable pattern. A type only wins
+# outright by scoring STRICTLY higher; ties never promote.
+_TASK_TYPE_PRIORITY = (
+    TaskType.FEATURE, TaskType.REFACTOR, TaskType.EXPLANATION,
+    TaskType.BUGFIX, TaskType.ALGORITHM,
+)
+
+
+def classify_task_type(prompt: str) -> TaskType:
+    """Infer a task type from a free-text prompt via deterministic keyword
+    scoring (no LLM): the type whose distinct signal patterns match most wins; a
+    tie breaks by ``_TASK_TYPE_PRIORITY`` (which fails SAFE toward the
+    non-promotable kinds); a prompt with NO signal falls back to FEATURE.
+
+    Replaces the CLI's previously hardcoded ``TaskType.FEATURE``. That default
+    routed every interactive prompt to the non-promotable ``decision`` candidate
+    kind (engine ``kind_map``), so the interactive evidence-learning loop could
+    never mint a durable fact. Honest classification lets a genuinely
+    algorithmic/bugfix request reach the promotable ``pattern`` kind, while
+    feature/refactor/explanation stay on the intentionally non-promotable kinds —
+    conservatism is preserved at the kind level and, for ties, in the tie-break
+    direction, not forced by a blanket default.
+    """
+    if not isinstance(prompt, str) or not prompt:
+        return TaskType.FEATURE
+    scores = {
+        tt: sum(1 for pat in patterns if pat.search(prompt))
+        for tt, patterns in _TASK_TYPE_COMPILED
+    }
+    best = max(scores.values())
+    if best == 0:
+        return TaskType.FEATURE
+    for task_type in _TASK_TYPE_PRIORITY:
+        if scores.get(task_type, 0) == best:
+            return task_type
+    return TaskType.FEATURE
 
 
 @dataclass

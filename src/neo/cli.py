@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 from neo.models import (  # noqa: E402, F401
     TaskType, ContextFile, NeoInput, PlanStep, SimulationTrace,
     CodeSuggestion, StaticCheckResult, NeoOutput, RegenerateStats, LMAdapter,
-    ProposedChange,
+    ProposedChange, classify_task_type,
 )
 from neo.operating_mode import AuthorityPolicy, OperatingMode  # noqa: E402
 from neo.execution_context import execution_fields_from_dict  # noqa: E402
@@ -812,7 +812,13 @@ def main():
                 )
             neo_input = NeoInput(
                 prompt=input_data["prompt"],
-                task_type=TaskType(input_data.get("task_type", "feature")),
+                # Explicit caller task_type wins; otherwise classify from the prompt
+                # (not a blanket FEATURE default — see classify_task_type).
+                task_type=(
+                    TaskType(input_data["task_type"])
+                    if input_data.get("task_type")
+                    else classify_task_type(input_data["prompt"])
+                ),
                 context_files=[
                     ContextFile(**cf) for cf in input_data.get("context_files", [])
                 ],
@@ -847,7 +853,10 @@ def main():
 
         neo_input = NeoInput(
             prompt=prompt,
-            task_type=TaskType.FEATURE,
+            # Classify from the prompt instead of a blanket FEATURE default, which
+            # routed every interactive prompt to the non-promotable 'decision' kind
+            # and kept the evidence-learning loop from ever minting a durable fact.
+            task_type=classify_task_type(prompt),
             context_files=[],
             working_directory=working_dir,
             safe_read_paths=[working_dir],
