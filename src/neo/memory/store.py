@@ -1158,6 +1158,54 @@ class FactStore:
                 return fact
         return None
 
+    def _retract_supporting_candidates(self, fact: Fact) -> None:
+        """When a promoted fact is rolled back by repeated attributed
+        contradiction, downgrade the candidates in its supporting episodes from
+        supported_once/durable to 'contradicted', so a project's retraction can
+        no longer feed CROSS-PROJECT (global) promotion. Without this, the stale
+        'durable' candidates of a project that RETRACTED a pattern still count
+        toward the global bar — evidence against the pattern counted for it."""
+        if not fact.supporting_episode_ids:
+            return
+        from neo.memory.episodes import LearningEpisodeStore
+        from neo.memory.generalize import generalize
+
+        signature = fact.canonical_signature or generalize(f"{fact.subject} {fact.body}")
+        episode_store = LearningEpisodeStore(
+            self.project_id or "unscoped", base_dir=self._episodes_dir
+        )
+        for episode_id in fact.supporting_episode_ids:
+            episode = episode_store.load(episode_id)
+            if episode is None:
+                continue
+            changed = False
+            for candidate in episode.memory_candidates:
+                if (
+                    candidate.status in {"supported_once", "durable"}
+                    # Only touch candidates promoted into THIS fact. When a
+                    # contradiction resolves to a GLOBAL fact by signature, the
+                    # current project's candidates were promoted into the still-
+                    # valid LOCAL fact (their promoted_fact_id points there, not
+                    # at the global) — downgrading them would strip support from
+                    # a fact that wasn't rolled back.
+                    and (
+                        not candidate.promoted_fact_id
+                        or candidate.promoted_fact_id == fact.id
+                    )
+                    and generalize(f"{candidate.subject} {candidate.body}") == signature
+                ):
+                    candidate.status = "contradicted"
+                    changed = True
+            if changed:
+                episode_store.save(episode)
+        # The already-minted global (if any) may now be under-supported, but a
+        # rolling-back project's store holds a stale view of the global scope
+        # (it can't see a global another project minted after it loaded). The
+        # teardown is therefore done in reconcile_cross_project_promotions, which
+        # reloads fresh each observer cycle — same eventual-consistency home as
+        # global promotion itself. The synchronous candidate downgrade above is
+        # what makes that later recount correct.
+
     def _apply_candidate_contradiction(
         self, outcome
     ) -> tuple[Optional[Fact], dict[str, Any]]:
@@ -1210,6 +1258,7 @@ class FactStore:
             if len(fact.contradicting_episode_ids) >= 2 and fact.is_valid:
                 fact.invalidation_reason = "repeated_attributed_contradiction"
                 self._invalidate(fact)
+                self._retract_supporting_candidates(fact)
             self.save()
             return fact, before_state
         except Exception as exc:
@@ -1625,6 +1674,33 @@ class FactStore:
                     minted += 1
             if minted:
                 logger.info("Reconciled %d cross-project global promotion(s)", minted)
+            # Teardown: retract any existing global whose LIVE cross-project
+            # support has fallen below the bar — e.g. a contributing project
+            # rolled its pattern back (its candidates downgraded to
+            # 'contradicted', so absent from the reps tally). reconcile is
+            # otherwise additive-only; this is the only path that tears a global
+            # down, and it runs on the observer's fresh reload, so it sees the
+            # global a rolling-back project's stale store could not.
+            retracted = 0
+            for fact in [
+                f for f in self._facts
+                if f.is_valid and f.scope == FactScope.GLOBAL
+                and "episode-derived" in f.tags
+            ]:
+                sig = fact.canonical_signature or generalize(f"{fact.subject} {fact.body}")
+                entry = reps.get(sig)
+                projects = len(entry["projects"]) if entry else 0
+                episodes = len(entry["episodes"]) if entry else 0
+                if (
+                    projects < GLOBAL_PROMOTION_MIN_PROJECTS
+                    or episodes < GLOBAL_PROMOTION_MIN_EPISODES
+                ):
+                    fact.invalidation_reason = "repeated_attributed_contradiction"
+                    self._invalidate(fact)
+                    retracted += 1
+            if retracted:
+                self.save()
+                logger.info("Retracted %d under-supported global fact(s)", retracted)
             return minted
         except Exception as exc:
             logger.warning("Cross-project reconcile failed: %s", exc)

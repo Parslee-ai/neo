@@ -1717,6 +1717,112 @@ class TestOutcomeLinkage:
         ]
         assert still_valid_globals == []  # not resurrected
 
+    def test_rolled_back_project_does_not_feed_global_promotion(self, tmp_path):
+        """A project's RETRACTION is evidence against a pattern, not for it: once
+        project A rolls a pattern back, its supporting candidates are downgraded
+        so they can no longer feed cross-project (global) promotion from another
+        project. Otherwise a retracted pattern gets globally promoted."""
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        facts_dir = tmp_path / "facts"
+        episodes_dir = tmp_path / "episodes"
+        subject = "pattern: escape shell args [src/sh.py]"
+        body = "escape shell arguments before exec"
+
+        def _project(name):
+            root = tmp_path / name
+            root.mkdir()
+            return FactStore(codebase_root=str(root), eager_init=False,
+                             facts_dir=facts_dir, episodes_dir=episodes_dir)
+
+        def _feed(st, prefix, n, otype):
+            es = LearningEpisodeStore(st.project_id, base_dir=episodes_dir)
+            for i in range(n):
+                ep = LearningEpisode(episode_id=f"{prefix}-{i}", project_id=st.project_id)
+                ep.memory_candidates.append(MemoryCandidateEvidence(
+                    candidate_id=f"{prefix}c{i}", suggestion_id=f"{prefix}s{i}",
+                    subject=subject, body=body, kind="pattern"))
+                es.save(ep)
+                outcome = Outcome(
+                    outcome_type=otype, file_path="src/sh.py",
+                    suggestion_id=f"{prefix}s{i}", learning_episode_id=f"{prefix}-{i}",
+                    candidate_id=f"{prefix}c{i}", candidate_subject=subject,
+                    candidate_body=body, candidate_kind="pattern")
+                with patch.object(st._outcome_tracker, "detect_outcomes",
+                                  return_value=([outcome], {})):
+                    st.detect_implicit_feedback({"prompt": "n"}, [])
+
+        a = _project("A")
+        _feed(a, "acc", 2, OutcomeType.ACCEPTED)    # A promotes
+        _feed(a, "corr", 2, OutcomeType.MODIFIED)   # then A rolls it back
+        rolled = next(f for f in a.entries if "episode-derived" in f.tags)
+        assert rolled.is_valid is False
+
+        # A's supporting candidates are downgraded, so they no longer support.
+        es = LearningEpisodeStore(a.project_id, base_dir=episodes_dir)
+        for eid in ("acc-0", "acc-1"):
+            assert all(c.status == "contradicted" for c in es.load(eid).memory_candidates)
+
+        b = _project("B")
+        _feed(b, "bacc", 2, OutcomeType.ACCEPTED)   # B alone can't reach 2 projects
+        assert [f for f in b.entries if f.scope == FactScope.GLOBAL and f.is_valid] == []
+        assert b.reconcile_cross_project_promotions() == 0  # reconcile won't either
+
+    def test_rollback_after_global_mint_tears_down_the_global(self, tmp_path):
+        """Ordering teardown: when the global fact was minted BEFORE a
+        contributing project's rollback, the rollback must recount surviving
+        support and retract the now-under-supported global (reconcile is
+        additive-only and never tears one down)."""
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        facts_dir = tmp_path / "facts"
+        episodes_dir = tmp_path / "episodes"
+        subject = "pattern: escape shell args [src/sh.py]"
+        body = "escape shell arguments before exec"
+
+        def _project(name):
+            root = tmp_path / name
+            root.mkdir()
+            return FactStore(codebase_root=str(root), eager_init=False,
+                             facts_dir=facts_dir, episodes_dir=episodes_dir)
+
+        def _feed(st, prefix, n, otype):
+            es = LearningEpisodeStore(st.project_id, base_dir=episodes_dir)
+            for i in range(n):
+                ep = LearningEpisode(episode_id=f"{prefix}-{i}", project_id=st.project_id)
+                ep.memory_candidates.append(MemoryCandidateEvidence(
+                    candidate_id=f"{prefix}c{i}", suggestion_id=f"{prefix}s{i}",
+                    subject=subject, body=body, kind="pattern"))
+                es.save(ep)
+                outcome = Outcome(
+                    outcome_type=otype, file_path="src/sh.py",
+                    suggestion_id=f"{prefix}s{i}", learning_episode_id=f"{prefix}-{i}",
+                    candidate_id=f"{prefix}c{i}", candidate_subject=subject,
+                    candidate_body=body, candidate_kind="pattern")
+                with patch.object(st._outcome_tracker, "detect_outcomes",
+                                  return_value=([outcome], {})):
+                    st.detect_implicit_feedback({"prompt": "n"}, [])
+
+        a = _project("A")
+        _feed(a, "acc", 2, OutcomeType.ACCEPTED)
+        b = _project("B")
+        _feed(b, "bacc", 2, OutcomeType.ACCEPTED)   # A+B mint the global first
+        assert len([f for f in b.entries if f.scope == FactScope.GLOBAL and f.is_valid]) == 1
+
+        _feed(a, "corr", 2, OutcomeType.MODIFIED)   # THEN A rolls back (candidates downgraded)
+
+        # Teardown is eventual-consistency via reconcile: a rolling-back store has
+        # a stale view of the global scope, so the observer's fresh reconcile is
+        # what recounts and retracts. b's store holds the global and reads A's
+        # now-contradicted candidates from disk.
+        b.reconcile_cross_project_promotions()
+        remaining = [f for f in b.entries if f.scope == FactScope.GLOBAL and f.is_valid]
+        assert remaining == []  # global torn down — support fell below the bar
+        torn = [f for f in b.entries if f.scope == FactScope.GLOBAL]
+        assert torn and torn[0].invalidation_reason == "repeated_attributed_contradiction"
+
     def test_global_promotion_requires_four_episodes_across_two_projects(self, tmp_path):
         """One project is insufficient; cross-project evidence is generalized safely."""
         from neo.memory.episodes import (
