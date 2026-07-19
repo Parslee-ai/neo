@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.38.0] - 2026-07-19
+
+### Added
+
+- **Evidence-driven learning loop: a per-request episode ledger, separate from the fact store, that promotes a candidate to a durable fact only on repeated, independently verified evidence.** Generated reasoning is now recorded as probationary `MemoryCandidateEvidence` in a `LearningEpisode` (`~/.neo/episodes/<project_id>/<id>.json`); downstream git-verified outcomes decide whether a candidate ever enters `FactStore`. Project-scope promotion needs ≥2 independent accepted episodes sharing a correlation signature; cross-project (global) promotion needs ≥4 episodes across ≥2 projects; attributed contradictions demote and eventually roll a promoted fact back. A live end-to-end drill (real model, real git-diff attribution) confirmed a durable PATTERN fact mints from two independent acceptances. (`memory/episodes.py`, `engine.py`, `memory/store.py`)
+- **Goal-aware execution envelopes.** Explicit caller-supplied goal/intent/role are honored; otherwise conservative provisional defaults are inferred (`resolve_execution_context`), with a shared failure-symptom lexicon (`FAILURE_SIGNAL_KEYWORDS`) so intent inference and task-type classification can't drift. (`execution_context.py`, `models.py`)
+- **An "is it learning?" dashboard: `neo memory citation-stats` and `neo memory learning-stats`.** citation-stats reads the `citation_survival` metric (retrieved/included/used, split by which detector earned the use-credit); learning-stats reads the episode ledger (episodes, outcomes, candidate statuses, and promote/rollback/demote/reinforce actions) for the INTERACTIVE/attributed path. Both read-only, no LM call. (`subcommands.py`)
+- **Prompt→task-type classification (`models.classify_task_type`).** The plain-text CLI previously hardcoded `TaskType.FEATURE`, routing every interactive prompt to the non-promotable `decision` candidate kind — so interactive use could never mint a durable fact. It now classifies (deterministic keyword scoring, no LLM; ties fail SAFE toward non-promotable kinds; an optional `error_trace` strongly biases BUGFIX). Genuinely algorithmic/bugfix work reaches the promotable `pattern` kind while feature/refactor/explanation stay conservatively non-promotable. (`models.py`, `cli.py`)
+
+### Fixed
+
+- **The interactive episode→durable promotion path, provably inert, now fires.** A live drill measured zero promotions for two independent reasons, both fixed: (1) the correlation signature keyed on the run-varying LM reasoning body, so two acceptances of one task never matched — now keyed on the subject plus a structural diff **fingerprint** (`sha256` of the AST-shaped code skeleton), with a separate **path-agnostic** key for cross-project promotion so the same lesson correlates across repos; (2) the CLI hardcoded a non-promotable task_type (see Added). Rollback is fingerprint-precise; single-project rollback deliberately cannot reach a global fact (teardown is reconcile-owned). (`memory/store.py`, `engine.py`, `models.py`, `cli.py`)
+- **Tombstone dead-embedding bloat and invalidation consolidation.** Invalidation now routes through a single choke point that strips the 768-dim embedding at the transition; a cold-start janitor chain (`prune → demote → purge → strip → dedup`) flushes one merge-on-save instead of several. Reclaimed hundreds of MB on a live store. (`memory/store.py`)
+- **A project's retraction no longer feeds cross-project (global) promotion**, and duplicate same-signature facts are collapsed at every scope (not just via merge-by-id). (`memory/store.py`)
+
+### Changed
+
+- **Default static model `gpt-5.5` → `gpt-5.6`** (verified live: a real call succeeds, a bogus-model control fails, and the `reasoning.effort` levels still apply). Users on a pinned `config.json` are unaffected; this is the fresh-install default. (`config.py`)
+
 ## [0.37.0] - 2026-07-06
 
 ### Changed
