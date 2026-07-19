@@ -1074,6 +1074,67 @@ class TestOutcomeLinkage:
         assert "durable" in promoted[0].tags
         assert "probation" not in promoted[0].tags
 
+    def _accept_episode(self, store, ep_id, subject, body, kind="pattern"):
+        """Record one ACCEPTED outcome for a fresh episode (drives the real
+        detect_implicit_feedback promotion path)."""
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        episode_store = LearningEpisodeStore(store.project_id)
+        cand_id = f"{ep_id}-cand"
+        episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+        episode.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id=cand_id, suggestion_id=f"{ep_id}-sug",
+            subject=subject, body=body, kind=kind,
+        ))
+        episode_store.save(episode)
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED, file_path="util.py",
+            suggestion_id=f"{ep_id}-sug", learning_episode_id=ep_id,
+            candidate_id=cand_id, candidate_subject=subject,
+            candidate_body=body, candidate_kind=kind,
+        )
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=([outcome], {})):
+            store.detect_implicit_feedback({"prompt": "next"}, [])
+        return episode_store
+
+    def test_body_drift_with_matching_fingerprint_promotes(self, store):
+        """The live-drill regression: two independent accepted episodes of the
+        SAME task whose bodies differ (run-varying LM prose) but whose subject +
+        structural fingerprint agree MUST promote. Pre-fix, the subject+body key
+        gave them different signatures and they never reached the >=2 bar."""
+        subject = "algorithm: dedupe a list preserving order [util.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "drift-0", subject,
+                             "Reasoning: initialize a seen set alongside result, check membership.")
+        self._accept_episode(store, "drift-1", subject,
+                             "Reasoning: maintain a separate set named seen for O(1) membership.")
+
+        promoted = [f for f in store.entries if "episode-derived" in f.tags]
+        assert len(promoted) == 1
+        assert "durable" in promoted[0].tags
+        assert promoted[0].metadata.success_count == 2
+        # Stored subject is user-facing: the [fp:] qualifier is stripped, but the
+        # fingerprint survives in the frozen correlation signature.
+        assert "[fp:" not in promoted[0].subject
+        assert promoted[0].canonical_signature.endswith("deadbeef1234")
+
+    def test_divergent_fingerprint_blocks_false_promotion(self, store):
+        """Two accepted episodes sharing a task/prompt prefix but proposing
+        DIFFERENTLY shaped fixes (distinct [fp:]) must NOT promote — the
+        fingerprint stops unrelated fixes from falsely reinforcing each other and
+        stamping one fix's body with 2-episode trust."""
+        base = "algorithm: normalize the payload [util.py]"
+        self._accept_episode(store, "diverge-0", f"{base} [fp:aaaaaaaaaaaa]", "Reasoning: fix A.")
+        self._accept_episode(store, "diverge-1", f"{base} [fp:bbbbbbbbbbbb]", "Reasoning: fix B.")
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+        from neo.memory.episodes import LearningEpisodeStore
+        es = LearningEpisodeStore(store.project_id)
+        for ep_id in ("diverge-0", "diverge-1"):
+            episode = es.load(ep_id)
+            assert episode.memory_candidates[0].status == "supported_once"
+
     def test_attributed_contradictions_demote_then_roll_back_only_derived_fact(self, store):
         """Repeated corrections invalidate their fact and preserve unrelated memory."""
         from neo.memory.episodes import (
@@ -1208,7 +1269,7 @@ class TestOutcomeLinkage:
         promoted.body = "nothing to do with the original"
         assert promoted.canonical_signature == frozen
 
-        resolved = store._resolve_promoted_fact_by_signature(subject, body)
+        resolved = store._resolve_promoted_fact_by_signature(subject)
         assert resolved is promoted  # found via the frozen signature, not recompute
 
     def test_corrections_on_new_episodes_roll_back_promoted_fact(self, store):
@@ -1919,6 +1980,65 @@ class TestOutcomeLinkage:
                     and mutation.fact_id == global_fact.id
                     for mutation in episode.memory_mutations
                 )
+
+    def test_cross_project_promotion_is_path_agnostic(self, tmp_path):
+        """Global-tier fix: the SAME lesson accepted in two repos whose file paths
+        DIFFER must still correlate and promote globally. The correlation key drops
+        the [<path>] token (matching the bracket-stripped text a global fact stores)
+        while still requiring a matching structural fingerprint. Pre-fix the
+        path-bearing key gave the two repos different signatures and global
+        promotion silently under-fired."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        facts_dir = tmp_path / "facts"
+        episodes_dir = tmp_path / "episodes"
+        body = "Reasoning: guard the accessor with a null check before deref."
+        # Same task + same fingerprint, but a DIFFERENT file path per repo.
+        per_project_subject = {
+            "alpha": "bugfix: guard null deref [src/neo/engine.py] [fp:cafebabe0001]",
+            "beta": "bugfix: guard null deref [lib/core/handler.py] [fp:cafebabe0001]",
+        }
+
+        stores = []
+        for project in ("alpha", "beta"):
+            root = tmp_path / project
+            root.mkdir()
+            project_store = FactStore(
+                codebase_root=str(root), eager_init=False,
+                facts_dir=facts_dir, episodes_dir=episodes_dir,
+            )
+            stores.append(project_store)
+            episode_store = LearningEpisodeStore(project_store.project_id, base_dir=episodes_dir)
+            subject = per_project_subject[project]
+            for index in range(2):
+                ep_id = f"{project}-{index}"
+                cand_id = f"cand-{project}-{index}"
+                episode = LearningEpisode(episode_id=ep_id, project_id=project_store.project_id)
+                episode.memory_candidates.append(MemoryCandidateEvidence(
+                    candidate_id=cand_id, suggestion_id=f"sug-{project}-{index}",
+                    subject=subject, body=body, kind="pattern",
+                ))
+                episode_store.save(episode)
+                outcome = Outcome(
+                    outcome_type=OutcomeType.ACCEPTED, file_path="x.py",
+                    suggestion_id=f"sug-{project}-{index}", learning_episode_id=ep_id,
+                    candidate_id=cand_id, candidate_subject=subject,
+                    candidate_body=body, candidate_kind="pattern",
+                )
+                with patch.object(project_store._outcome_tracker, "detect_outcomes",
+                                  return_value=([outcome], {})):
+                    project_store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        global_facts = [f for f in stores[1].entries if f.scope == FactScope.GLOBAL]
+        assert len(global_facts) == 1
+        assert len(global_facts[0].supporting_episode_ids) == 4
+        # Stored global text is path-agnostic.
+        assert "engine.py" not in global_facts[0].subject
+        assert "handler.py" not in global_facts[0].subject
 
     def test_cap_independent_facts(self, store):
         """_cap_independent_facts invalidates excess independent facts."""

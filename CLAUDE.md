@@ -24,6 +24,37 @@
     invalidated facts persist as tombstones until `purge_dead_facts` runs.
   - Supersession & pre-write canonical-signature dedup at cosine ≥ 0.85
     (`SYNTHESIS_SIMILARITY`, `memory.generalize`).
+  - Episode-derived promotion correlation (`store._episode_signature` /
+    `_global_signature`): a candidate promotes to a durable fact only when ≥2
+    independent verified-accepted episodes share a **correlation signature**. That
+    signature is keyed on the candidate SUBJECT, never the body — the body is the
+    LM's run-varying Reasoning/Suggestion prose, and including it (the old
+    `generalize(subject+body)`) gave two acceptances of one task different
+    signatures so promotion never fired (a live drill measured this). The subject
+    is `f"{task_type}: {prompt[:50]} [{file_path}] [fp:{hash}]"`; the `[fp:<hash>]`
+    is a structural fingerprint of the suggested change
+    (`engine._suggestion_fingerprint` = sha256 of the AST-shaped
+    `_extract_code_skeleton`, Python-only, "" for unparseable code → key degrades
+    to subject-only). `_split_fingerprint` pulls the fp OUT before `generalize`
+    (whose `_HASH_RE` would collapse the hex to `<hash>`) and appends it RAW after
+    a `\x1f` separator, so two episodes correlate only when prompt-prefix AND
+    diff-shape agree. **Two tiers**: PROJECT uses `_episode_signature`
+    (path-bearing, though `generalize` collapses deep multi-segment paths so it
+    only discriminates SHALLOW `[file.py]` names); cross-project GLOBAL uses
+    `_global_signature` (path-agnostic — strips all bracket qualifiers to match
+    the bracket-stripped text `_mint_global_fact` stores, so the same lesson
+    correlates across repos). The signature is **frozen** into
+    `Fact.canonical_signature` at mint; all rollback/dedup/teardown sites use the
+    frozen value only (never recompute a global fact's transformed subject).
+    **Deliberate invariant**: single-project rollback keys on the path-bearing
+    project signature and therefore can NEVER hard-retract a path-agnostic global
+    fact — global teardown requires cross-project contradiction and is owned by
+    `reconcile_cross_project_promotions`. Rollback-resolve is fingerprint-precise
+    (a differently-shaped correction won't hard-retract; soft confidence demotion
+    still applies). **Footgun**: `_episode_signature`/`_global_signature` (episode
+    correlation, subject+fp) are distinct from `_canonical_signature` (pre-write
+    exact-twin dedup, which DOES include body+kind+scope) — one keystroke apart,
+    do not conflate.
   - REVIEW → PATTERN/FAILURE synthesis needs ≥20 valid REVIEWs and ≥3-member clusters;
     triple-trigger gate fires when ANY of: count-delta ≥10, elapsed ≥1h, or
     confidence-decile entropy >0.9.

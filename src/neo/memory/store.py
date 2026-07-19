@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from collections import Counter, OrderedDict
@@ -1131,9 +1132,79 @@ class FactStore:
             "invalidation_reason": fact.invalidation_reason,
         }
 
-    def _resolve_promoted_fact_by_signature(
-        self, subject: str, body: str
-    ) -> Optional[Fact]:
+    # Structural fingerprint embedded in a candidate subject as ``[fp:<hash>]``
+    # (engine._suggestion_fingerprint). Split OUT before generalize() because
+    # generalize's _HASH_RE would collapse every hex hash to ``<hash>`` and erase
+    # the discriminator; appended to the key RAW instead. The separator is the
+    # ASCII unit-separator so it can't collide with subject text.
+    _FINGERPRINT_RE = re.compile(r"\s*\[fp:([^\]]*)\]")
+    _SIG_SEP = "\x1f"
+
+    @staticmethod
+    def _split_fingerprint(subject: str) -> tuple[str, str]:
+        """Return (subject_without_fp_bracket, fingerprint). Fingerprint is "" for
+        legacy/no-code candidates, degrading the key to subject-only."""
+        match = FactStore._FINGERPRINT_RE.search(subject or "")
+        fingerprint = match.group(1) if match else ""
+        clean = FactStore._FINGERPRINT_RE.sub("", subject or "")
+        return clean, fingerprint
+
+    @staticmethod
+    def _episode_signature(subject: str) -> str:
+        """PROJECT-tier correlation identity for episode-derived candidates and
+        facts: ``generalize(subject_sans_fp) <sep> fingerprint``.
+
+        Why not the body: the body carries the LM's free-text Reasoning/Suggestion
+        prose, which varies run-to-run for the SAME task. Including it (the pre-fix
+        formula ``generalize(subject + body)``) made two independent accepted
+        episodes of one task generalize to DIFFERENT signatures, so they never
+        reached the >=2-episode promotion bar — a live drill measured this as the
+        reason the interactive promote path never fired.
+
+        The subject is ``f"{task_type}: {prompt[:50]} [{file_path}] [fp:{hash}]"``
+        (engine.py). ``generalize`` collapses multi-segment paths to a ``<path>``
+        token, so the "path-bearing" property is real only for SHALLOW paths: a
+        bare ``[util.py]`` survives and discriminates, but ``[src/neo/engine.py]``
+        collapses to ``[<path>]`` and does not — deep-path files in one project
+        already correlate as if path-agnostic. The base key is thus
+        ``task_type + generalize(prompt[:50]) (+ a path token for shallow paths)``.
+        That alone is loose (two different fixes sharing a prompt prefix would
+        merge), so the structural diff fingerprint is appended: two episodes now
+        correlate only when the prompt-prefix AND the shape of the accepted change
+        agree.
+
+        Scope note: this is the EPISODE-derived correlation signature only. The
+        separate pre-write exact-twin dedup (``_canonical_signature``, which adds
+        kind+scope and DOES include the body) is intentionally unaffected. See
+        ``_global_signature`` for the path-agnostic cross-project variant.
+        """
+        from neo.memory.generalize import generalize
+
+        clean, fingerprint = FactStore._split_fingerprint(subject)
+        base = generalize(clean)
+        if not base:
+            return ""
+        return f"{base}{FactStore._SIG_SEP}{fingerprint}"
+
+    @staticmethod
+    def _global_signature(subject: str) -> str:
+        """CROSS-PROJECT (global) correlation identity: like ``_episode_signature``
+        but PATH-AGNOSTIC. A global fact is meant to cross repos, and
+        ``_mint_global_fact`` stores its subject bracket-stripped — so the key must
+        drop the ``[<path>]`` token too, else the same lesson in two repos (whose
+        file paths differ) never correlates and cross-project promotion silently
+        under-fires. Strips all bracket qualifiers from the generalized text, then
+        appends the same raw structural fingerprint so cross-repo correlation still
+        requires a matching change shape."""
+        from neo.memory.generalize import generalize
+
+        clean, fingerprint = FactStore._split_fingerprint(subject)
+        base = re.sub(r"\[[^\]]*\]", "", generalize(clean)).strip()
+        if not base:
+            return ""
+        return f"{base}{FactStore._SIG_SEP}{fingerprint}"
+
+    def _resolve_promoted_fact_by_signature(self, subject: str) -> Optional[Fact]:
         """Find the valid episode-derived fact a candidate promoted into, keyed by
         the same canonical signature promotion itself matches on.
 
@@ -1142,22 +1213,28 @@ class FactStore:
         arrives on a *new* episode whose candidate has ``promoted_fact_id == ""``,
         so resolving by signature is the only way a user correction can reach the
         fact it was promoted into.
-        """
-        from neo.memory.generalize import generalize
 
-        signature = generalize(f"{subject} {body}")
+        Deliberate invariant: this resolves only PROJECT facts. It keys on the
+        path-bearing ``_episode_signature``; a global fact's frozen signature is
+        the path-agnostic ``_global_signature`` and therefore can NEVER match
+        here. That is intended — a single project's correction must not hard-retract
+        a cross-project global fact; global teardown requires cross-project
+        contradiction and is owned by ``reconcile_cross_project_promotions``. Do
+        not "fix" this into matching globals.
+        """
+        signature = self._episode_signature(subject)
         if not signature:
             return None
         for fact in self._facts:
             if not (fact.is_valid and "episode-derived" in fact.tags):
                 continue
-            # Prefer the signature frozen at mint; recompute only for facts
-            # promoted before canonical_signature was stored (back-compat), so a
-            # later generalize() change can't orphan already-promoted facts.
-            fact_signature = fact.canonical_signature or generalize(
-                f"{fact.subject} {fact.body}"
-            )
-            if fact_signature == signature:
+            # Use the signature frozen at mint. Do NOT recompute from
+            # fact.subject: a GLOBAL episode fact stores its subject
+            # bracket-stripped + redacted (_mint_global_fact), so re-deriving its
+            # signature would silently mis-key. Every episode-derived fact freezes
+            # canonical_signature at mint (project + global promote paths), so a
+            # missing one is a pre-freeze legacy row we skip rather than mis-key.
+            if fact.canonical_signature and fact.canonical_signature == signature:
                 return fact
         return None
 
@@ -1171,9 +1248,12 @@ class FactStore:
         if not fact.supporting_episode_ids:
             return
         from neo.memory.episodes import LearningEpisodeStore
-        from neo.memory.generalize import generalize
 
-        signature = fact.canonical_signature or generalize(f"{fact.subject} {fact.body}")
+        # Frozen signature only — never recompute from fact.subject (a global
+        # fact's subject is transformed at mint; see _resolve_promoted_fact_by_signature).
+        signature = fact.canonical_signature
+        if not signature:
+            return
         episode_store = LearningEpisodeStore(
             self.project_id or "unscoped", base_dir=self._episodes_dir
         )
@@ -1185,17 +1265,18 @@ class FactStore:
             for candidate in episode.memory_candidates:
                 if (
                     candidate.status in {"supported_once", "durable"}
-                    # Only touch candidates promoted into THIS fact. When a
-                    # contradiction resolves to a GLOBAL fact by signature, the
-                    # current project's candidates were promoted into the still-
-                    # valid LOCAL fact (their promoted_fact_id points there, not
-                    # at the global) — downgrading them would strip support from
-                    # a fact that wasn't rolled back.
+                    # Only touch candidates promoted into THIS fact (or not yet
+                    # promoted). A candidate carrying a DIFFERENT promoted_fact_id
+                    # belongs to another fact and must keep its support here.
+                    # This path only ever rolls back a PROJECT fact: a global
+                    # fact's frozen signature is path-agnostic (_global_signature)
+                    # and can never equal the path-bearing _episode_signature this
+                    # loop compares against, so global teardown stays reconcile-owned.
                     and (
                         not candidate.promoted_fact_id
                         or candidate.promoted_fact_id == fact.id
                     )
-                    and generalize(f"{candidate.subject} {candidate.body}") == signature
+                    and self._episode_signature(candidate.subject) == signature
                 ):
                     candidate.status = "contradicted"
                     changed = True
@@ -1243,9 +1324,7 @@ class FactStore:
                 # no promoted_fact_id; resolve the promoted fact by canonical
                 # signature so the rollback contract is not a no-op on the only
                 # path users actually exercise.
-                fact = self._resolve_promoted_fact_by_signature(
-                    candidate.subject, candidate.body
-                )
+                fact = self._resolve_promoted_fact_by_signature(candidate.subject)
             if fact is None:
                 return None, {}
 
@@ -1345,14 +1424,11 @@ class FactStore:
             return None
         try:
             from neo.memory.episodes import LearningEpisodeStore
-            from neo.memory.generalize import generalize
 
             episode_store = LearningEpisodeStore(
                 self.project_id or "unscoped", base_dir=self._episodes_dir
             )
-            target_signature = generalize(
-                f"{outcome.candidate_subject} {outcome.candidate_body}"
-            )
+            target_signature = self._episode_signature(outcome.candidate_subject)
             supporting_ids: list[str] = []
             for episode in episode_store.list():
                 for candidate in episode.memory_candidates:
@@ -1360,7 +1436,7 @@ class FactStore:
                         continue
                     if candidate.status not in {"supported_once", "durable"}:
                         continue
-                    signature = generalize(f"{candidate.subject} {candidate.body}")
+                    signature = self._episode_signature(candidate.subject)
                     if signature == target_signature:
                         supporting_ids.append(episode.episode_id)
                         break
@@ -1376,9 +1452,9 @@ class FactStore:
             # a 30-day window. Only a pattern that generalizes to a DIFFERENT
             # signature can promote past it.
             for existing in self._facts:
-                existing_signature = existing.canonical_signature or generalize(
-                    f"{existing.subject} {existing.body}"
-                )
+                # Frozen signature only (never recompute a global fact's
+                # transformed subject); an empty one can't equal a non-empty target.
+                existing_signature = existing.canonical_signature
                 if (
                     not existing.is_valid
                     and existing.invalidation_reason == "repeated_attributed_contradiction"
@@ -1391,7 +1467,14 @@ class FactStore:
                     return None
 
             fact = self.add_fact(
-                subject=outcome.candidate_subject,
+                # Strip the [fp:<hash>] correlation qualifier from the stored
+                # subject — it's a key ingredient, not user-facing text. The
+                # fingerprint survives in the frozen canonical_signature below.
+                subject=self._split_fingerprint(outcome.candidate_subject)[0].strip(),
+                # The fingerprint gate verified the two episodes share a code
+                # SHAPE; the body stored here is ONE triggering episode's prose.
+                # It is representative of the co-verified shape, not a co-verified
+                # artifact — the other episode's prose may word it differently.
                 body=outcome.candidate_body,
                 kind=FactKind.PATTERN,
                 scope=FactScope.PROJECT,
@@ -1420,7 +1503,7 @@ class FactStore:
                     continue
                 changed = False
                 for candidate in episode.memory_candidates:
-                    signature = generalize(f"{candidate.subject} {candidate.body}")
+                    signature = self._episode_signature(candidate.subject)
                     if signature == target_signature:
                         candidate.status = "durable"
                         candidate.promoted_fact_id = fact.id
@@ -1437,7 +1520,6 @@ class FactStore:
         signature across every project's episodes. One supporting entry per
         (episode, signature)."""
         from neo.memory.episodes import LearningEpisodeStore
-        from neo.memory.generalize import generalize
 
         supporting: list[tuple[str, Any]] = []
         project_ids: set[str] = set()
@@ -1449,7 +1531,7 @@ class FactStore:
                         continue
                     if candidate.status not in {"supported_once", "durable"}:
                         continue
-                    if generalize(f"{candidate.subject} {candidate.body}") != target_signature:
+                    if self._global_signature(candidate.subject) != target_signature:
                         continue
                     supporting.append((episode.project_id or project_path.name, episode))
                     project_ids.add(episode.project_id or project_path.name)
@@ -1464,7 +1546,6 @@ class FactStore:
         """Promote one signature to global scope IF its cross-project evidence
         meets the bar and it isn't already global. Shared by the per-request
         gated path and the observer reconcile sweep. Returns the fact or None."""
-        import re
         import uuid
 
         from neo.memory.episodes import LearningEpisodeStore, MemoryMutationEvidence, redact_sensitive_text
@@ -1493,7 +1574,7 @@ class FactStore:
             for candidate in episode.memory_candidates:
                 if (
                     candidate.promoted_global_fact_id
-                    and generalize(f"{candidate.subject} {candidate.body}") == target_signature
+                    and self._global_signature(candidate.subject) == target_signature
                 ):
                     return None
 
@@ -1529,7 +1610,7 @@ class FactStore:
         for project_id, episode in supporting:
             changed = False
             for candidate in episode.memory_candidates:
-                if generalize(f"{candidate.subject} {candidate.body}") == target_signature:
+                if self._global_signature(candidate.subject) == target_signature:
                     candidate.promoted_global_fact_id = fact.id
                     changed = True
             if changed and not any(
@@ -1559,14 +1640,10 @@ class FactStore:
         if outcome.candidate_kind != FactKind.PATTERN.value or not outcome.candidate_id:
             return None
         try:
-            from neo.memory.generalize import generalize
-
             episodes_root = self._episodes_dir or (Path.home() / ".neo" / "episodes")
             if not episodes_root.exists():
                 return None
-            target_signature = generalize(
-                f"{outcome.candidate_subject} {outcome.candidate_body}"
-            )
+            target_signature = self._global_signature(outcome.candidate_subject)
             return self._mint_global_fact(
                 target_signature, outcome.candidate_subject, outcome.candidate_body,
                 episodes_root, source_candidate_id=outcome.candidate_id,
@@ -1635,7 +1712,6 @@ class FactStore:
         Idempotent (skips already-global signatures). Returns new global facts."""
         try:
             from neo.memory.episodes import LearningEpisodeStore
-            from neo.memory.generalize import generalize
 
             episodes_root = self._episodes_dir or (Path.home() / ".neo" / "episodes")
             if not episodes_root.exists():
@@ -1656,7 +1732,7 @@ class FactStore:
                             continue
                         if candidate.status not in {"supported_once", "durable"}:
                             continue
-                        signature = generalize(f"{candidate.subject} {candidate.body}")
+                        signature = self._global_signature(candidate.subject)
                         entry = reps.setdefault(signature, {
                             "subject": candidate.subject, "body": candidate.body,
                             "cid": candidate.candidate_id,
@@ -1698,7 +1774,14 @@ class FactStore:
                 if f.is_valid and f.scope == FactScope.GLOBAL
                 and "episode-derived" in f.tags
             ]:
-                sig = fact.canonical_signature or generalize(f"{fact.subject} {fact.body}")
+                # Frozen signature only. The reps tally is keyed by
+                # _global_signature (path-agnostic); a global fact's subject is
+                # bracket-stripped + redacted at mint, so recomputing a signature
+                # from it would mis-key against that tally and could spuriously
+                # retract a well-supported global. Skip pre-freeze rows.
+                sig = fact.canonical_signature
+                if not sig:
+                    continue
                 entry = reps.get(sig)
                 projects = len(entry["projects"]) if entry else 0
                 episodes = len(entry["episodes"]) if entry else 0

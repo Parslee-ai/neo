@@ -8,6 +8,7 @@ Split from cli.py for modularity.
 """
 
 import ast
+import hashlib
 import json
 import logging
 import os
@@ -2119,12 +2120,19 @@ RULES:
                         body_parts.append(f"Suggestion: {code_suggestion.description}")
                     if pitfalls:
                         body_parts.append("Pitfalls: " + "; ".join(pitfalls[:5]))
+                    # Embed a structural fingerprint of the suggested change in the
+                    # subject as [fp:<hash>]. FactStore keys episode correlation on
+                    # the subject, so this makes two acceptances merge toward
+                    # promotion only when the prompt-prefix AND the diff shape agree
+                    # (empty when there's no parseable code -> subject-only key).
+                    fingerprint = self._suggestion_fingerprint(code_suggestion)
+                    subject_text = f"{pattern} [{code_suggestion.file_path}]"
+                    if fingerprint:
+                        subject_text += f" [fp:{fingerprint}]"
                     episode.memory_candidates.append(MemoryCandidateEvidence(
                         candidate_id=uuid.uuid4().hex,
                         suggestion_id=code_suggestion.suggestion_id,
-                        subject=redact_sensitive_text(
-                            f"{pattern} [{code_suggestion.file_path}]"
-                        ),
+                        subject=redact_sensitive_text(subject_text),
                         body=redact_sensitive_text("\n".join(body_parts)),
                         kind=candidate_kind,
                         supporting_episode_ids=[episode.episode_id],
@@ -2154,6 +2162,31 @@ RULES:
                 test_patterns=test_patterns[:3],
             )
             return None
+
+    def _suggestion_fingerprint(self, code_suggestion) -> str:
+        """Short stable hash of a suggestion's structural code shape, used to
+        tighten episode correlation for promotion (see
+        FactStore._episode_signature): two acceptances only merge toward a durable
+        fact when their prompt-prefix AND diff shape agree.
+
+        Built from the AST-shaped code skeleton. Independent of LOCAL identifiers
+        (variable names differing between runs still fingerprint identically), but
+        NOT of function/method names — the skeleton captures ``def:{name}`` and
+        ``method:{attr}``, so ``dedupe`` vs ``deduplicate`` fingerprint differently.
+        That only costs recall (correlation under-fires), never precision. The
+        skeleton is Python-only (``ast.parse``): non-Python or unparseable code
+        yields "" and the key degrades to subject-only — the prior, looser behavior.
+        """
+        code_source = (
+            getattr(code_suggestion, "code_block", "")
+            or getattr(code_suggestion, "unified_diff", "")
+        )
+        if not code_source:
+            return ""
+        skeleton = self._extract_code_skeleton(code_source)
+        if not skeleton:
+            return ""
+        return hashlib.sha256(skeleton.encode("utf-8")).hexdigest()[:12]
 
     def _extract_code_skeleton(self, code: str) -> str:
         """

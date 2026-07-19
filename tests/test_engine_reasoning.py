@@ -136,3 +136,44 @@ def test_deliberated_output_also_stays_unverified_candidate():
     e._store_reasoning(ni, plan, code, 0.7, {})
     assert store.added == []
     assert len(e.current_learning_episode.memory_candidates) == 1
+
+
+def test_suggestion_fingerprint_is_shape_based_not_name_based():
+    """The structural fingerprint hashes the AST-shaped code skeleton, so the SAME
+    fix with different LOCAL identifiers/values fingerprints identically (the
+    function name is part of the shape and kept stable here), while a structurally
+    different fix differs. This is what lets two independent acceptances of one
+    task correlate toward promotion without merging unrelated fixes
+    (FactStore._episode_signature)."""
+    from types import SimpleNamespace
+    e = _engine(FakeLM(lambda m: ""))
+
+    dedupe_seen = SimpleNamespace(
+        code_block="def dedupe(items):\n"
+                   "    result = []\n    seen = set()\n"
+                   "    for x in items:\n        if x not in seen:\n"
+                   "            seen.add(x)\n            result.append(x)\n"
+                   "    return result\n",
+        unified_diff="")
+    # Same shape, renamed identifiers + different container name.
+    dedupe_renamed = SimpleNamespace(
+        code_block="def dedupe(values):\n"
+                   "    out = []\n    seen = set()\n"
+                   "    for v in values:\n        if v not in seen:\n"
+                   "            seen.add(v)\n            out.append(v)\n"
+                   "    return out\n",
+        unified_diff="")
+    # Structurally different fix (dict-based, no loop membership guard).
+    dedupe_dict = SimpleNamespace(
+        code_block="def dedupe(items):\n    return list(dict.fromkeys(items))\n",
+        unified_diff="")
+
+    fp_seen = e._suggestion_fingerprint(dedupe_seen)
+    fp_renamed = e._suggestion_fingerprint(dedupe_renamed)
+    fp_dict = e._suggestion_fingerprint(dedupe_dict)
+
+    assert fp_seen and len(fp_seen) == 12
+    assert fp_seen == fp_renamed          # identifier-independent
+    assert fp_seen != fp_dict             # shape-sensitive
+    # No parseable code -> empty (degrades to a subject-only key).
+    assert e._suggestion_fingerprint(SimpleNamespace(code_block="", unified_diff="")) == ""
