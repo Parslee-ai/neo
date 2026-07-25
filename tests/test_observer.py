@@ -848,7 +848,7 @@ class TestGlobalSweep:
         from neo.memory.observer import Observer
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a"])
         monkeypatch.setattr(Observer, "_run_project",
-                            lambda self, root, peer_roots=None: (0, 0, object()))
+                            lambda self, root, peer_roots=None, shared_store=None: (0, 0, object()))
         cleared = []
         monkeypatch.setattr("neo.memory.scope.clear_remote_url_cache",
                             lambda: cleared.append(1))
@@ -863,7 +863,7 @@ class TestGlobalSweep:
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: roots)
         seen = []
         monkeypatch.setattr(Observer, "_run_project",
-                            lambda self, root, peer_roots=None:
+                            lambda self, root, peer_roots=None, shared_store=None:
                             (seen.append((root, peer_roots)) or (0, 0, object())))
         Observer(global_mode=True)._cycle()
         assert seen == [("/a", roots), ("/a/nested", roots)]
@@ -874,7 +874,7 @@ class TestGlobalSweep:
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c"])
         swept = []
         monkeypatch.setattr(Observer, "_run_project",
-                            lambda self, root, peer_roots=None: (swept.append(root) or (1, 2, object())))
+                            lambda self, root, peer_roots=None, shared_store=None: (swept.append(root) or (1, 2, object())))
         o = Observer(global_mode=True)
         o._cycle()
         assert swept == ["/a", "/b", "/c"]
@@ -884,7 +884,7 @@ class TestGlobalSweep:
         import neo.memory.observer as obs
         from neo.memory.observer import Observer
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a/foo", "/b/bar"])
-        monkeypatch.setattr(Observer, "_run_project", lambda self, root, peer_roots=None: (1, 0, object()))
+        monkeypatch.setattr(Observer, "_run_project", lambda self, root, peer_roots=None, shared_store=None: (1, 0, object()))
         o = Observer(global_mode=True)
         o._cycle()
         out = capsys.readouterr().out
@@ -899,7 +899,7 @@ class TestGlobalSweep:
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c", "/d"])
         swept = []
         monkeypatch.setattr(Observer, "_run_project",
-                            lambda self, root, peer_roots=None: (swept.append(root) or (0, 0, object())))
+                            lambda self, root, peer_roots=None, shared_store=None: (swept.append(root) or (0, 0, object())))
         o = Observer(global_mode=True, config=ObserverConfig(max_projects_per_cycle=2))
         o._cycle()
         o._cycle()
@@ -909,7 +909,7 @@ class TestGlobalSweep:
         import neo.memory.observer as obs
         from neo.memory.observer import Observer
 
-        def rp(self, root, peer_roots=None):
+        def rp(self, root, peer_roots=None, shared_store=None):
             if root == "/boom":
                 raise RuntimeError("bad project")
             return (1, 0, object())
@@ -1055,3 +1055,77 @@ class TestMallocDebugEnvScrub:
         import neo.memory.observer as obs
         monkeypatch.delenv("MallocStackLogging", raising=False)
         obs._scrub_inherited_malloc_debug_env()  # must not raise
+
+
+class TestSameProjectIdRoots:
+    """Two clones of one repo hash to the same project_id (flyx/fms + fms2 here),
+    so they share a fact file AND a pid-keyed watermark."""
+
+    def _wire(self, monkeypatch, roots, pids):
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: roots)
+        monkeypatch.setattr("neo.memory.scope._compute_project_id",
+                            lambda root: pids[root])
+
+    def test_shared_project_id_synthesizes_once(self, monkeypatch):
+        from neo.memory.observer import Observer
+
+        roots = ["/w/fms", "/w/fms2", "/w/other"]
+        self._wire(monkeypatch, roots, {"/w/fms": "AAA", "/w/fms2": "AAA", "/w/other": "BBB"})
+
+        built, synthesized = [], []
+
+        class FakeStore:
+            def __init__(self, codebase_root=None, **kw):
+                self.codebase_root = codebase_root
+                built.append(codebase_root)
+
+            def initialize(self):
+                pass
+
+            def synthesize_reviews(self):
+                synthesized.append(self.codebase_root)
+                return 0
+
+        monkeypatch.setattr("neo.memory.store.FactStore", FakeStore)
+        ingested = []
+        monkeypatch.setattr(
+            Observer, "_ingest_transcripts",
+            lambda self, store, root, peer_roots=None: ingested.append((root, store)) or 0,
+        )
+
+        Observer(global_mode=True)._cycle()
+
+        # One store load + one synthesis per project_id...
+        assert built == ["/w/fms", "/w/other"]
+        assert synthesized == ["/w/fms", "/w/other"]
+        # ...but EVERY root still gets mined: the second clone has its own
+        # sessions, and cwd attribution would never reach them otherwise.
+        assert [r for r, _ in ingested] == roots
+        by_root = dict(ingested)
+        assert by_root["/w/fms"] is by_root["/w/fms2"], "clones share one store"
+        assert by_root["/w/other"] is not by_root["/w/fms"]
+
+    def test_distinct_project_ids_are_unaffected(self, monkeypatch):
+        from neo.memory.observer import Observer
+
+        roots = ["/w/a", "/w/b"]
+        self._wire(monkeypatch, roots, {"/w/a": "AAA", "/w/b": "BBB"})
+        synthesized = []
+
+        class FakeStore:
+            def __init__(self, codebase_root=None, **kw):
+                self.codebase_root = codebase_root
+
+            def initialize(self):
+                pass
+
+            def synthesize_reviews(self):
+                synthesized.append(self.codebase_root)
+                return 0
+
+        monkeypatch.setattr("neo.memory.store.FactStore", FakeStore)
+        monkeypatch.setattr(Observer, "_ingest_transcripts",
+                            lambda self, store, root, peer_roots=None: 0)
+        Observer(global_mode=True)._cycle()
+        assert synthesized == roots

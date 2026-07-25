@@ -3335,9 +3335,17 @@ class FactStore:
             1 for f in self._facts
             if f.kind == FactKind.REVIEW and self._is_synthesizable_review(f)
         )
+        # PROJECT-scoped input, so the homeostatic downscale below can key off
+        # the same scope rather than guessing at it independently. Every current
+        # REVIEW-minting site is PROJECT; were an ORG REVIEW ever minted, a
+        # scope-blind population would let `_hebbian_strengthen` boost it while
+        # a PROJECT-scoped downscale never decayed it — a monotonic ratchet to
+        # 1.0 — and `_synthesize_cluster` would invalidate an ORG fact and
+        # replace it with a PROJECT one.
         valid_review_facts = [
             f for f in self._facts
             if f.is_valid and f.kind == FactKind.REVIEW
+            and f.scope == FactScope.PROJECT
             and self._is_synthesizable_review(f)
         ]
 
@@ -3423,16 +3431,29 @@ class FactStore:
             fact.metadata.confidence = min(1.0, fact.metadata.confidence + boost)
 
     def _global_confidence_downscale(self, *, alpha: float) -> None:
-        """Multiply all non-curated, valid facts' confidence by alpha.
+        """Multiply non-curated, valid PROJECT facts' confidence by alpha.
 
         Curated/CONSTRAINT/ARCHITECTURE/DECISION facts skip the decay
         (mirrors the rank_score curated-bypass policy). Floor at 0.05 so
         nothing collapses to zero — a long-dormant fact stays visible.
+
+        Scoped to PROJECT deliberately. This is the homeostatic half of the
+        Hebbian step, so it must not reach outside the population that was
+        potentiated: ``self._facts`` also holds the ORG and GLOBAL scopes, and a
+        GLOBAL PATTERN — precisely what ``reconcile_cross_project_promotions``
+        mints after evidence from ≥2 projects — is decay-eligible. Unscoped,
+        *every* project's synthesis eroded those cross-project promotions, so a
+        machine sweeping 37 projects would decay one hard-won global fact many
+        times per cycle for reasons having nothing to do with it. Latent rather
+        than observed today only because no GLOBAL fact currently carries a
+        decaying kind.
         """
         from neo.memory.models import _decays  # local: cycle
 
         for fact in self._facts:
             if not fact.is_valid:
+                continue
+            if fact.scope != FactScope.PROJECT:
                 continue
             if not _decays(fact):
                 continue
@@ -3443,10 +3464,31 @@ class FactStore:
     def _is_synthesizable_review(fact: Fact) -> bool:
         """Can this REVIEW ever consolidate into a PATTERN/FAILURE?
 
+        Two exclusions:
+
         ``history`` facts are per-commit records — distinct events by
         construction, never a recurring lesson. Feeding them to the clusterer
         is unbounded work with a provably empty result.
+
+        ``synthesized`` facts are this function's own output. ``_synthesize_cluster``
+        mints them as ``kind=REVIEW`` carrying the union of their members' tags,
+        so without this they are eligible input on the very next pass — the
+        system consolidating its own summaries and counting them as fresh
+        evidence. Live census: 68 valid synthesized ``independent`` REVIEWs
+        against 29 raw ones. A summary is a restatement of evidence already
+        counted, never new evidence.
+
+        **Consequence, deliberate:** the eligible population is now strictly
+        decreasing — a cluster consumes >=3 facts (``_synthesize_cluster``
+        invalidates its members) and returns an excluded one. A project sitting
+        just above the ``>= 20`` gate can synthesize itself below it and stay
+        frozen until 20 *new* raw REVIEWs arrive. That is the honest behavior:
+        the old recycling propped the gate open on the subsystem's own output.
+        But ``20`` was tuned when recycling existed and is a materially stricter
+        gate now — revisit the constant if synthesis is kept.
         """
+        if "synthesized" in fact.tags:
+            return False
         return FactStore._synthesis_group_key(fact) != "history"
 
     @staticmethod
@@ -3483,6 +3525,25 @@ class FactStore:
 
         For clusters of 5+, attempts LLM-based synthesis for richer output.
         Falls back to mechanical synthesis on any error or for smaller clusters.
+
+        **The PATTERN branch below is unreachable in normal operation** — it
+        requires ``group_key == "outcome:accepted"``, and no ``accepted``-tagged
+        REVIEW has ever existed on a live store (census: 0, against 97
+        ``independent`` and 3046 ``history``). That is not a tag-writing bug:
+        ``detect_implicit_feedback`` handles an ACCEPTED outcome by boosting the
+        linked fact, or by supporting an episode candidate, and both ``continue``
+        before reaching the REVIEW fallback that would carry the tag. So this
+        subsystem has only ever produced REVIEWs — 114 of them to date, zero
+        PATTERNs.
+
+        Do NOT "fix" that by making ACCEPTED always mint an accepted-tagged
+        REVIEW. It would reintroduce the orphan REVIEWs the boost path exists to
+        avoid, and stand up an unverified similarity-based promotion route
+        competing with the git-verified episode ledger
+        (``_promote_repeatedly_supported_candidate``), which requires two
+        independent verified acceptances. The weaker mechanism must not
+        manufacture the appearance of support. If this branch is ever to mean
+        something, it needs an explicit design decision, not a tag patch.
         """
         if not cluster:
             return None

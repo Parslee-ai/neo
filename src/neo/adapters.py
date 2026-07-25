@@ -989,6 +989,20 @@ def _model_pin_honored(requested: str, used: str) -> bool:
     return r in u or u in r
 
 
+def _names_model(message: str, model: str) -> bool:
+    """Does ``message`` name ``model`` itself, not merely contain it as a prefix?
+
+    A plain substring test is unsound for exactly the case this guards: pin
+    ``gpt-5``, have the router fall through to ``gpt-5.5``, and ``"gpt-5" in
+    "...gpt-5.5..."`` is True — so we would conclude the error already names the
+    pinned model and skip decorating, in the one scenario the decoration exists
+    for. ``\\b`` doesn't help either, since ``.`` and ``-`` are word boundaries
+    inside model ids. Require that the match is not followed by another model-id
+    character.
+    """
+    return re.search(re.escape(model) + r"(?![\w.\-])", message) is not None
+
+
 class CarAdapter(LMAdapter):
     """Route Neo's outbound inference through CAR's unified inference layer.
 
@@ -1099,19 +1113,40 @@ class CarAdapter(LMAdapter):
             max_tokens=int(max_tokens),
             intent_task=(self.intent_hint or {}).get("task") if self.intent_hint else None,
         ):
-            if isinstance(messages, str):
-                result_raw = self._rt.infer_tracked(messages, **kwargs)
-            elif isinstance(messages, list):
-                kwargs["messages_json"] = json.dumps(messages)
-                # Prompt arg is still required by infer_tracked; pass the first
-                # user message (or an empty string) — messages_json takes priority.
-                first_user = next(
-                    (m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"),
-                    "",
-                )
-                result_raw = self._rt.infer_tracked(first_user, **kwargs)
-            else:
-                result_raw = self._rt.infer_tracked(str(messages), **kwargs)
+            try:
+                if isinstance(messages, str):
+                    result_raw = self._rt.infer_tracked(messages, **kwargs)
+                elif isinstance(messages, list):
+                    kwargs["messages_json"] = json.dumps(messages)
+                    # Prompt arg is still required by infer_tracked; pass the first
+                    # user message (or an empty string) — messages_json takes priority.
+                    first_user = next(
+                        (m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+                        "",
+                    )
+                    result_raw = self._rt.infer_tracked(first_user, **kwargs)
+                else:
+                    result_raw = self._rt.infer_tracked(str(messages), **kwargs)
+            except Exception as e:
+                # When a model is pinned and CAR can't serve it, the router may
+                # fall through to another candidate and report *that* backend's
+                # failure — so the model the caller actually asked for never
+                # appears in the message and the error isn't diagnosable. Name it
+                # ourselves rather than depending on car-server's wording, which
+                # varies by version and by which candidate it fell through to.
+                # Only decorate; never swallow.
+                if self.model and not _names_model(str(e), self.model):
+                    msg = f"CAR inference failed for pinned model {self.model!r}: {e}"
+                    # Keep the original class where it can be rebuilt from a
+                    # single message — AutoAdapter's breaker logs type(e).__name__
+                    # to distinguish a timeout from a refusal, and flattening
+                    # everything to RuntimeError would erase that.
+                    try:
+                        decorated: Exception = type(e)(msg)
+                    except Exception:  # noqa: BLE001 - exotic __init__ signature
+                        decorated = RuntimeError(msg)
+                    raise decorated from e
+                raise
 
         try:
             result = json.loads(result_raw) if isinstance(result_raw, str) else result_raw

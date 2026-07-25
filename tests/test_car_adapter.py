@@ -502,6 +502,73 @@ def test_runtime_runtime_error_propagates_uncaught(monkeypatch):
         adapter.generate([{"role": "user", "content": "hi"}])
 
 
+def test_pinned_model_named_when_car_error_omits_it():
+    """CAR's router can fall through to another candidate and report THAT
+    backend's failure, so the pinned model never appears and an operator can't
+    tell what they asked for. neo names it rather than trusting car wording."""
+    class FallthroughRuntime:
+        def infer_tracked(self, prompt, **kwargs):
+            raise RuntimeError(
+                "rpc infer: -32603 inference failed: mode apple-foundation-models "
+                "not implemented on backend foundation-models"
+            )
+
+    adapter = CarAdapter(model="nonexistent-model-id-xyz", runtime=FallthroughRuntime())
+    with pytest.raises(RuntimeError) as exc:
+        adapter.generate([{"role": "user", "content": "hi"}])
+    assert "nonexistent-model-id-xyz" in str(exc.value)
+    assert "apple-foundation-models" in str(exc.value), "original cause preserved"
+
+
+def test_prefix_model_id_is_not_mistaken_for_a_match():
+    """`gpt-5` pinned, router falls through to `gpt-5.5`: a substring test says
+    "already named" and skips decoration — in the exact case decoration exists
+    for. Match must not treat a prefix as the model itself."""
+    class PrefixRuntime:
+        def infer_tracked(self, prompt, **kwargs):
+            raise RuntimeError("rpc infer: -32603 backend gpt-5.5 unavailable")
+
+    adapter = CarAdapter(model="gpt-5", runtime=PrefixRuntime())
+    with pytest.raises(RuntimeError) as exc:
+        adapter.generate([{"role": "user", "content": "hi"}])
+    assert "pinned model 'gpt-5'" in str(exc.value)
+
+
+def test_decoration_preserves_exception_type():
+    """AutoAdapter's breaker logs type(e).__name__ to tell a timeout from a
+    refusal; flattening everything to RuntimeError would erase that."""
+    class TimeoutRuntime:
+        def infer_tracked(self, prompt, **kwargs):
+            raise TimeoutError("upstream timed out")
+
+    adapter = CarAdapter(model="some-model", runtime=TimeoutRuntime())
+    with pytest.raises(TimeoutError) as exc:
+        adapter.generate([{"role": "user", "content": "hi"}])
+    assert "some-model" in str(exc.value)
+
+
+def test_error_not_double_decorated_when_model_already_named():
+    class NamingRuntime:
+        def infer_tracked(self, prompt, **kwargs):
+            raise RuntimeError("rpc infer: model not found: bogus-model")
+
+    adapter = CarAdapter(model="bogus-model", runtime=NamingRuntime())
+    with pytest.raises(RuntimeError) as exc:
+        adapter.generate([{"role": "user", "content": "hi"}])
+    assert str(exc.value).count("bogus-model") == 1
+
+
+def test_router_mode_errors_pass_through_untouched():
+    """With no pinned model there is nothing to name — don't rewrite the error."""
+    class BoomRuntime:
+        def infer_tracked(self, prompt, **kwargs):
+            raise RuntimeError("rpc infer: -32603 upstream unavailable")
+
+    adapter = CarAdapter(runtime=BoomRuntime())
+    with pytest.raises(RuntimeError, match="^rpc infer: -32603 upstream unavailable$"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
 @pytest.mark.skipif(not car_inference.is_available(), reason="car_runtime not installed")
 def test_live_bad_model_raises_actionable_error(monkeypatch):
     """Pinning a model CAR doesn't know about must raise a clear error

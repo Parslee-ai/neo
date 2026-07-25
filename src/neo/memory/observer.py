@@ -199,6 +199,25 @@ def _discover_project_roots() -> list[str]:
     return sorted(r for r in roots if not _is_container_root(r, roots))
 
 
+def _group_roots_by_project_id(roots: list[str]) -> list[str]:
+    """Reorder so roots sharing a project_id sit together, order otherwise kept.
+
+    Two clones of one repo share a fact file and watermark. Making them adjacent
+    lets the sweep carry one store forward in a single slot rather than keeping a
+    whole-batch map of deserialized stores alive.
+    """
+    from neo.memory.scope import _compute_project_id
+
+    grouped: dict[str, list[str]] = {}
+    for root in roots:
+        try:
+            pid = _compute_project_id(root)
+        except Exception:  # noqa: BLE001 - identity failure must not drop a root
+            pid = root
+        grouped.setdefault(pid, []).append(root)
+    return [root for group in grouped.values() for root in group]
+
+
 def _build_spec(project_id: str, codebase_root: str) -> dict:
     """Spec for ``agents_upsert``. ``command`` must be an absolute
     interpreter path per the CAR contract; ``args`` invokes our daemon
@@ -382,7 +401,8 @@ class Observer:
             self._cycle_one()
 
     def _run_project(self, root: str,
-                     peer_roots: Optional[list[str]] = None) -> tuple[int, int, object]:
+                     peer_roots: Optional[list[str]] = None,
+                     shared_store: Optional[object] = None) -> tuple[int, int, object]:
         """Synthesize + transcript-mine one project. Returns (synthesized,
         mined, store). Transcript mining MUST run AFTER synthesis so a durable
         synthesis can't be aborted by an ingest/LM failure (isolated in its own
@@ -391,12 +411,28 @@ class Observer:
         ``peer_roots`` is the sweep's full root set, so cwd-attributed sources
         can hand a nested project's sessions to that project instead of to an
         enclosing container root.
+
+        ``shared_store`` is the already-loaded store for this root's
+        project_id. Two clones of one repo (``flyx/fms`` and ``flyx/fms2`` here)
+        hash to the same project_id, so they share a fact file *and* a watermark
+        — loading and synthesizing twice is pure duplication of a multi-MB read.
+        The caller groups same-id roots adjacently and passes the store forward,
+        so at most ONE extra store is ever resident; a project_id→store map for
+        the whole batch would pin up to ``max_projects_per_cycle`` fully
+        deserialized stores (inline 768-dim embeddings) to save a single
+        duplicate load. We still ingest each root separately: transcripts are
+        attributed by cwd, and the second clone has 56 sessions of its own that
+        sweeping only the first would silently drop.
         """
         from neo.memory.store import FactStore
 
-        store = FactStore(codebase_root=root, eager_init=False)
-        store.initialize()
-        count = store.synthesize_reviews()
+        if shared_store is not None:
+            store = shared_store
+            count = 0  # already synthesized for this project_id this cycle
+        else:
+            store = FactStore(codebase_root=root, eager_init=False)
+            store.initialize()
+            count = store.synthesize_reviews()
         mined = self._ingest_transcripts(store, root, peer_roots)
         return count, mined, store
 
@@ -473,15 +509,27 @@ class Observer:
             flush=True,
         )
 
+        # Same-project_id roots adjacent, so the shared store is carried in a
+        # single slot instead of a whole-batch map — O(1) stores resident.
+        batch = _group_roots_by_project_id(batch)
+
         total_synth = total_mined = errors = covered = 0
         last_store = None
+        prev_pid: Optional[str] = None
+        prev_store = None
         for i, root in enumerate(batch, 1):
             if self._stop:
                 break
             label = os.path.basename(root.rstrip("/")) or root
             p0 = time.time()
             try:
-                count, mined, store = self._run_project(root, peer_roots=roots)
+                from neo.memory.scope import _compute_project_id
+                pid = _compute_project_id(root)
+                count, mined, store = self._run_project(
+                    root, peer_roots=roots,
+                    shared_store=prev_store if pid == prev_pid else None,
+                )
+                prev_pid, prev_store = pid, store
                 last_store = store
                 total_synth += count
                 total_mined += mined

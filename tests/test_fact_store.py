@@ -2353,6 +2353,71 @@ class TestSynthesizeReviews:
             )
         assert store.synthesize_reviews() == 0
 
+    def test_synthesized_facts_do_not_re_enter_as_input(self, store):
+        """Synthesis must not consume its own output.
+
+        `_synthesize_cluster` mints kind=REVIEW carrying the union of member
+        tags, so without an exclusion a summary is eligible input next pass —
+        the system counting restatements of already-counted evidence as fresh.
+        """
+        for i in range(30):
+            emb = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(store, f"outcome:accepted s{i}.py", f"b{i}",
+                                   ["synthesized", "outcome", "accepted"],
+                                   embedding=emb / np.linalg.norm(emb))
+        assert store.synthesize_reviews() == 0, "30 synthesized facts must not open the gate"
+        eligible = [f for f in store._facts if store._is_synthesizable_review(f)]
+        assert eligible == []
+
+    def test_mixed_corpus_counts_only_raw_reviews(self, store):
+        """The regressable case: raw facts open the gate, synthesized don't count."""
+        for i in range(19):  # one short of the >=20 gate on raw material alone
+            emb = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(store, f"outcome:accepted raw{i}.py", f"b{i}",
+                                   ["outcome", "accepted"],
+                                   embedding=emb / np.linalg.norm(emb))
+        for i in range(25):  # padding it out with summaries must not help
+            emb = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(store, f"outcome:accepted syn{i}.py", f"b{i}",
+                                   ["synthesized", "outcome", "accepted"],
+                                   embedding=emb / np.linalg.norm(emb))
+        assert store.synthesize_reviews() == 0, "summaries must not prop the gate open"
+
+    def test_org_scope_reviews_are_not_synthesis_input(self, store):
+        """Input is PROJECT-scoped so the downscale scope follows from it.
+
+        A scope-blind population would let _hebbian_strengthen boost an ORG
+        REVIEW that the PROJECT-scoped downscale never decays — a ratchet to 1.0.
+        """
+        for i in range(30):
+            emb = np.random.randn(768).astype(np.float32)
+            f = self._make_review_fact(store, f"outcome:accepted o{i}.py", f"b{i}",
+                                       ["outcome", "accepted"],
+                                       embedding=emb / np.linalg.norm(emb))
+            f.scope = FactScope.ORG
+        assert store.synthesize_reviews() == 0
+
+    def test_downscale_spares_other_scopes(self, store):
+        """Homeostasis must not reach outside the potentiated population.
+
+        A GLOBAL PATTERN is what cross-project promotion mints and it IS
+        decay-eligible; unscoped, every project's synthesis eroded it.
+        """
+        g = Fact(subject="global lesson", body="b", kind=FactKind.PATTERN,
+                 scope=FactScope.GLOBAL, org_id="testorg", project_id="",
+                 metadata=FactMetadata(confidence=0.90))
+        p = Fact(subject="project lesson", body="b", kind=FactKind.PATTERN,
+                 scope=FactScope.PROJECT, org_id="testorg", project_id="testproj1234",
+                 metadata=FactMetadata(confidence=0.90))
+        o = Fact(subject="org lesson", body="b", kind=FactKind.PATTERN,
+                 scope=FactScope.ORG, org_id="testorg", project_id="",
+                 metadata=FactMetadata(confidence=0.90))
+        store._facts.extend([g, o, p])
+        store._global_confidence_downscale(alpha=0.5)
+        assert g.metadata.confidence == 0.90, "GLOBAL scope untouched"
+        assert o.metadata.confidence == 0.90, "ORG scope untouched"
+        assert p.metadata.confidence == 0.45, "PROJECT scope decayed"
+
     def test_watermark_rebaselines_after_population_change(self, store, tmp_path):
         """Excluding `history` shrank the counted population under existing watermarks.
 
