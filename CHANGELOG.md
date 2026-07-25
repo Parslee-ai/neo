@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.39.1] - 2026-07-25
+
+### Changed
+
+- **Local checks now actually predict CI.** `ruff` is pinned to an exact version instead of a range: it is pre-1.0 and changes both its default rule set and rule behavior in minor bumps, so a range let a contributor's linter and CI's disagree — which is how a green local tree turned `main` red twice during the 0.39.0 release. The `Makefile` now runs tools through the project venv rather than whatever `ruff`/`pytest` sit on `PATH` (a system ruff 0.15.1 was shadowing the pinned 0.16.0, so `make lint` was linting against the wrong rules). The repo's `.githooks/pre-commit` runs the same commands as CI and refuses to run at all on a linter version mismatch, and `make hooks` installs it so it is versioned with the code instead of drifting untracked in `.git/hooks/`. `make ci-local` runs the gate without committing. Documented in CONTRIBUTING, including the limit: CI is Linux across Python 3.10–3.13 while the hook is one machine and one interpreter, so green locally is necessary but not sufficient. (`pyproject.toml`, `Makefile`, `.githooks/pre-commit`, `CONTRIBUTING.md`)
+
 ## [0.39.0] - 2026-07-25
 
 ### Changed

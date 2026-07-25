@@ -1,6 +1,22 @@
 #!/bin/sh
-# Pre-commit hook: lint and test before every commit
-# Install: git config core.hooksPath .githooks
+# Pre-commit hook: run the SAME checks CI runs, before the commit exists.
+#
+# Install:  make hooks     (or: git config core.hooksPath .githooks)
+#
+# This is a parity gate, not a general test run. Every command below must stay
+# identical to .github/workflows/ci.yml, and the toolchain must be pinned in
+# pyproject's [dev] extra — otherwise "passes locally" means nothing. That is not
+# hypothetical: during 0.39.0 a green local tree turned main red, because local
+# ruff was 0.15 while CI resolved 0.16 and the two disagreed about which rules
+# are on by default.
+#
+# It still cannot catch everything. CI runs Linux across Python 3.10-3.13; this
+# runs your machine on one interpreter. A test that assumes macOS paths passes
+# here and fails there — that happened too. Treat green as necessary, not
+# sufficient.
+#
+# Bypassing with --no-verify is a decision, not a shortcut. If you do it, say why
+# in the commit message.
 
 set -e
 
@@ -10,10 +26,20 @@ if [ -x ".venv/bin/python" ]; then
 fi
 export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}src"
 
-echo "Running ruff lint..."
+# Fail loudly on a linter version mismatch rather than linting clean against the
+# wrong rule set and handing CI a red build.
+PINNED_RUFF=$(sed -n 's/^ *"ruff==\([0-9.]*\)",/\1/p' pyproject.toml | head -1)
+LOCAL_RUFF=$("$PYTHON_BIN" -m ruff --version 2>/dev/null | awk '{print $2}')
+if [ -n "$PINNED_RUFF" ] && [ "$PINNED_RUFF" != "$LOCAL_RUFF" ]; then
+  echo "pre-commit: ruff version mismatch — pinned ${PINNED_RUFF}, local ${LOCAL_RUFF:-none}." >&2
+  echo "            CI lints with ${PINNED_RUFF}. Run: pip install -e '.[dev]'" >&2
+  exit 1
+fi
+
+echo "Running ruff lint (same command as CI)..."
 "$PYTHON_BIN" -m ruff check src/ tests/
 
-echo "Running tests..."
-"$PYTHON_BIN" -m pytest tests/ -q --tb=line -x
+echo "Running tests (same command as CI)..."
+"$PYTHON_BIN" -m pytest tests/ -q --tb=line
 
 echo "All checks passed."

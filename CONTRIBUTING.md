@@ -28,6 +28,36 @@ pip install -e ".[dev]"
 
 This installs Neo in editable mode with all development tools (pytest, black, ruff, mypy).
 
+`ruff` is pinned to an **exact** version, not a range. It is pre-1.0 and changes
+both its default rule set and rule behavior in minor bumps, so a range lets your
+local linter and CI's disagree — which is exactly how a green local tree turned
+`main` red during 0.39.0. Bump the pin deliberately, in its own commit, with the
+lint delta reviewed.
+
+### 3a. Enable the pre-commit hook
+
+```bash
+make hooks
+```
+
+Run this once per clone. It points `core.hooksPath` at the repo's `.githooks/`,
+so the hook is versioned with the code rather than living untracked in
+`.git/hooks/` where it silently drifts.
+
+The hook runs the **same** lint and test commands as CI, and refuses to run at
+all if your `ruff` differs from the pinned version. It is a parity gate, not a
+general test run — if you change it, change `.github/workflows/ci.yml` to match.
+
+It cannot catch everything: CI runs Linux across Python 3.10–3.13, the hook runs
+your machine on one interpreter. A test that assumes macOS paths passes locally
+and fails in CI. Green locally is necessary, not sufficient.
+
+To run the same checks without committing:
+
+```bash
+make ci-local
+```
+
 ### 4. Configure API Keys
 
 ```bash
