@@ -359,6 +359,11 @@ class FactStore:
         except Exception as e:
             logger.warning(f"Temp-file reap on init failed (non-fatal): {e}")
 
+        try:
+            self._reap_dead_synthesis_watermarks()
+        except Exception as e:
+            logger.warning(f"Watermark reap on init failed (non-fatal): {e}")
+
     def _ensure_embedder(self) -> None:
         """Lazy-initialize the embedding model on first use."""
         if self._embedder_initialized:
@@ -2871,6 +2876,27 @@ class FactStore:
     # 15 and 35 days old). Nothing swept them, so they were permanent.
     _TEMP_REAP_AGE_SECONDS = 24 * 3600
 
+    def _reap_dead_synthesis_watermarks(self) -> bool:
+        """Delete this project's ``synthesis_watermark_*.json``.
+
+        REVIEW->PATTERN synthesis is gone and no reader or writer of these files
+        remains, so they are pure residue. Scoped to our own project_id rather
+        than globbing the shared directory, so one project's cold start never
+        deletes files on another's behalf; every project is swept regularly, so
+        the set converges within a couple of cycles.
+        """
+        if not self._project_path:
+            return False
+        path = self._project_path.parent / f"synthesis_watermark_{self.project_id}.json"
+        try:
+            if not path.exists():
+                return False
+            path.unlink()
+            logger.info("Reaped dead synthesis watermark %s", path.name)
+            return True
+        except OSError:
+            return False
+
     def _reap_stale_temp_files(self) -> int:
         """Delete abandoned atomic-write temp files. Returns bytes reclaimed.
 
@@ -3326,16 +3352,17 @@ class FactStore:
                 logger.warning(f"Legacy fact-file rename failed (non-fatal): {e}")
 
         # Synthesis watermarks are dead files now that REVIEW->PATTERN synthesis
-        # is gone: nothing reads or writes them. Delete rather than migrate, so
-        # a rename doesn't carry stale state forward under the new project_id.
-        for stale_wm in (
-            self._facts_dir / f"synthesis_watermark_{legacy_id}.json",
-            self._facts_dir / f"synthesis_watermark_{self.project_id}.json",
-        ):
-            try:
-                stale_wm.unlink(missing_ok=True)
-            except OSError as e:
-                logger.debug(f"Stale synthesis watermark cleanup failed (non-fatal): {e}")
+        # is gone, so the legacy one is dropped rather than renamed forward.
+        # (The current-id one is reaped by `_reap_dead_synthesis_watermarks`,
+        # which unlike this method runs for every project — this one returns
+        # early whenever legacy_id == project_id, i.e. for every repo without a
+        # git remote.)
+        try:
+            (self._facts_dir / f"synthesis_watermark_{legacy_id}.json").unlink(
+                missing_ok=True
+            )
+        except OSError as e:
+            logger.debug(f"Legacy synthesis watermark cleanup failed (non-fatal): {e}")
 
     def _maybe_migrate(self) -> None:
         """Migrate from old PersistentReasoningMemory format if needed.

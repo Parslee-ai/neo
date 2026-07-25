@@ -3044,6 +3044,20 @@ class TestSynthesisRemoved:
         for f in bystanders:
             assert f.metadata.confidence == 0.70, "untouched facts must not drift"
 
+    def test_dead_watermark_reaped_for_every_project(self, tmp_path):
+        """Must not hinge on the legacy-id migration, which returns early
+        whenever legacy_id == project_id — i.e. for every repo with no remote."""
+        facts_dir = tmp_path / "facts"
+        facts_dir.mkdir()
+        store = FactStore(codebase_root=str(tmp_path), facts_dir=facts_dir,
+                          eager_init=False)
+        wm = facts_dir / f"synthesis_watermark_{store.project_id}.json"
+        wm.write_text('{"review_count": 42}')
+        assert store._reap_dead_synthesis_watermarks() is True
+        assert not wm.exists()
+        # Idempotent.
+        assert store._reap_dead_synthesis_watermarks() is False
+
     def test_supersession_and_dedup_survive(self):
         """Deletion was bounded to the failed subsystem."""
         from neo.memory.store import PROTECTED_TAGS, SUPERSESSION_THRESHOLD
