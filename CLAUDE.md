@@ -88,40 +88,24 @@
     it to a neutral `neo.lexicon` then.) The derived `\bcrash(?:…)?\b` is
     boundary-closed, so compound terms like `crashloop` no longer match — a
     deliberate precision/recall trade in the fail-safe direction.
-  - REVIEW → PATTERN/FAILURE synthesis needs ≥20 valid REVIEWs and ≥3-member clusters;
-    triple-trigger gate fires when ANY of: count-delta ≥10, elapsed ≥1h, or
-    confidence-decile entropy >0.9. **`history` REVIEWs are excluded from both
-    the gate count and the clustering** (`store._is_synthesizable_review`): they
-    are one-git-commit-each, distinct by construction, and a live census found
-    all 1039 of them across 15 projects clustering into groups of exactly 1 —
-    they opened the gate on material that could never produce output, then got
-    re-clustered every cycle. Excluding them dropped projects doing pointless
-    clustering work from 15 → 2. The watermark counts the same population as the
-    gate, so an existing watermark (taken over all REVIEWs) makes the first
-    count-delta negative once; elapsed/entropy still fire and the next save
-    re-baselines (pinned by `test_watermark_rebaselines_after_population_change`).
-    **Corpus-wide finding**: at `SYNTHESIS_SIMILARITY` 0.85 *no* group in *any*
-    project currently reaches a 3-member cluster, so the **observer** path has
-    produced zero facts in 265 cycles. It is NOT dead code, though — the inline
-    trigger in `detect_implicit_feedback` (`store.py:2159`) fires on the request
-    path and has minted 114 synthesized facts since 2026-03-24. **All 114 are
-    `kind=REVIEW`; zero PATTERNs have ever been produced**, because
-    `_synthesize_cluster` mints PATTERN only for `group_key == "outcome:accepted"`
-    and no REVIEW on this machine has ever carried the `accepted` tag — the
-    subsystem's headline REVIEW→PATTERN function has never executed. Two further
-    Two further defects, both now FIXED: synthesized output is itself a valid
-    REVIEW carrying its members' tags, so summaries re-entered as inputs
-    (`_is_synthesizable_review` now excludes the `synthesized` tag); and
-    `_global_confidence_downscale(0.97)` iterated every loaded scope, so each
-    project's synthesis eroded GLOBAL PATTERNs minted by cross-project
-    promotion (now PROJECT-scoped, matching the potentiated population).
-    The **PATTERN branch remains unreachable by design evolution** — see the
-    `_synthesize_cluster` docstring; do not resurrect it with a tag patch.
-    Do not "fix" the clustering by lowering `SYNTHESIS_SIMILARITY` — a sweep
-    showed 0.60 already yields a 40-member merge. (Note `SYNTHESIS_SIMILARITY`
-    and `SUPERSESSION_THRESHOLD` are **separate** constants that merely both
-    equal 0.85, and pre-write dedup uses canonical-signature equality, not
-    cosine — an earlier version of this file claimed they were shared.)
+  - **REVIEW → PATTERN synthesis has been REMOVED** (`synthesize_reviews` and
+    its cluster/watermark/Hebbian machinery). It ran for four months and minted
+    114 facts, **none of them a PATTERN** — the PATTERN branch required a
+    `group_key == "outcome:accepted"` and a census found 0 accepted-tagged
+    REVIEWs (against 97 `independent`, 3046 `history`), because
+    `detect_implicit_feedback` boosts the linked fact or supports an episode
+    candidate and both return before the fallback that would carry the tag.
+    Meanwhile it re-consumed its own summaries as fresh evidence (68 synthesized
+    vs 29 raw), and every run multiplied the whole corpus by 0.97. A live census
+    also showed zero ≥3-member clusters at cosine 0.85 across all 1152 valid
+    REVIEWs, so it could not fire on real data anyway. The git-verified episode
+    ledger (`_promote_repeatedly_supported_candidate`, ≥2 independent verified
+    acceptances) is the learning path that remains — do not reintroduce an
+    unverified similarity-clustered route beside it. Facts minted before the
+    removal keep their `synthesized` tag and prune immunity; nothing mints it
+    now. `SUPERSESSION_THRESHOLD` (0.85) and canonical-signature dedup are
+    untouched — they were always separate from the deleted
+    `SYNTHESIS_SIMILARITY`.
   - Probation: new non-curated facts enter with a `probation` tag and a 3-day stale window
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
@@ -188,12 +172,12 @@
     mutations. Scoped to the INTERACTIVE / attributed path: an IDLE reading means
     the accept-driven loop is quiet (suggestions not accepted downstream), NOT
     that neo isn't learning — the background promote engine (observer
-    `synthesize_reviews`, transcript/GitHub-PR mining) mints facts with no episode
-    footprint and is deliberately not counted here. Together with citation-stats it
+    transcript/GitHub-PR mining) mints facts with no episode footprint and is
+    deliberately not counted here. Together with citation-stats it
     forms an "is it learning?" dashboard (`subcommands._handle_learning_stats`).
     - `issues` reuses the ingester's `TranscriptSource` episodes but never admits facts or
       touches the `transcript_watermark_*` watermark — decoupled from fact admission and
-      idempotent (`find_issues`). Gate mirrors synthesis discipline (≥`min_cluster`
+      idempotent (`find_issues`). Gate mirrors the old synthesis discipline (≥`min_cluster`
       members, ≥2 sessions, ≥2 frictional, verbatim evidence); clusters at
       `SYNTHESIS_SIMILARITY` via the shared `math_utils.cluster_by_similarity`. See
       `docs/solutions/conversation-mined-issues.md` and `docs/solutions/rule-file-sync.md`.
@@ -207,8 +191,8 @@
   `GitHubPRSource`: PROJECT-scoped (owner/repo derived from the git remote, so PR
   facts co-scope with that repo's transcript facts under the same `project_id`);
   enters facts as **REVIEW on probation** (`imported:github-pr` tag) — trust-first,
-  and NOT promoted by recurrence (synthesis keys it `"other"` → stays REVIEW; only an
-  independent git-verified acceptance ever mints PATTERN). Mine-once (watermark keyed
+  and NOT promoted by recurrence (only an independent git-verified acceptance
+  ever mints PATTERN). Mine-once (watermark keyed
   on PR number, bounded); maps title+body→`ask`, reviews/comments/inline-thread
   comments→`assistant_text`, `CHANGES_REQUESTED`→`errors`; filters bot authors;
   skips PRs with no human discussion. Throttled to one `gh` fetch per repo per
@@ -262,7 +246,7 @@
   live. Two tabs: **Observer** (status badge, pid, last cycle, recent cycles
   list, Kick/Stop buttons) and **Memory** (valid fact count, by kind, by scope,
   probation count). Updates pushed by the observer process at the end of each
-  synthesis cycle — the same FactStore load powers both tabs, so the
+  sweep cycle — the same FactStore load powers both tabs, so the
   inspector adds zero hot-path cost. Kick/Stop buttons emit `a2ui.action`
   notifications which the observer dispatches to `kick_observer` /
   `stop_observer` — closes the loop with CAR's supervisor. **Footgun**:
@@ -271,12 +255,12 @@
   JSON-RPC over its WebSocket. `neo.a2ui.DaemonClient` is that bridge.
   Activation: auto when `127.0.0.1:9100` is reachable; silent no-op
   otherwise. Adds `websockets>=12.0` to the `[car]` extra.
-- Async synthesis observer (`memory.observer`): a **single global** background
-  process (CAR agent `neo-observer`, daemon `--daemon --all`) that **sweeps all
-  discovered projects** each cycle — round-robin/budgeted (`max_projects_per_cycle`,
-  default 25; watermark-gated so unchanged projects do near-zero work) — running
-  `synthesize_reviews` + transcript mining per project. *Additive* — the inline
-  triple-trigger gate keeps firing too. Two roots can share a `project_id` (two
+- Async transcript-mining observer (`memory.observer`): a **single global**
+  background process (CAR agent `neo-observer`, daemon `--daemon --all`) that
+  **sweeps all discovered projects** each cycle — round-robin/budgeted
+  (`max_projects_per_cycle`, default 25; watermark-gated so unchanged projects do
+  near-zero work) — running transcript mining per project. (It also ran
+  `synthesize_reviews` until that subsystem was removed.) Two roots can share a `project_id` (two
   clones of one remote, e.g. `flyx/fms` + `flyx/fms2`), meaning one fact file and
   one pid-keyed watermark; the sweep keeps a per-cycle `store_cache` so such a
   project loads and synthesizes **once**, while transcript ingest still runs per
@@ -318,14 +302,14 @@
   daemon's own startup. A second guarantee backs it up — the daemon holds a
   cross-process **single-instance lock** (`_SingleInstanceLock`, `fcntl`/`msvcrt`
   on `~/.neo/observer.lock`) for its lifetime, so two observers can never run
-  synthesis at once even in the handoff window; a contended daemon exits 0
+  a sweep at once even in the handoff window; a contended daemon exits 0
   (benign no-op, no CAR backoff). If a straggler ignores SIGTERM past the
   `_LOCK_ESCALATE_AFTER` grace, the daemon escalates to SIGKILL so the kernel
   frees the lock — safe because `FactStore._save_file` is atomic (temp +
   `os.replace`), so a hard kill can only leave a stray `.tmp`, never a torn
   fact file. (This is belt-and-suspenders: `store.save()` already serializes
   writers with its own per-scope flock, so the orphan was never a corruption
-  bug — just doubled LM spend and synthesis.) Tunables:
+  bug — just doubled LM spend and mining.) Tunables:
   `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
   (default 60, per-process). **Footgun**: the interpreter path (`sys.executable`)
   must not live under a world-writable directory (`/tmp`, `/private/tmp`,

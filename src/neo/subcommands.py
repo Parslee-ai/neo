@@ -881,9 +881,9 @@ def _handle_learning_stats(args) -> None:
 
     Scope caveat (surfaced in the output): this counts only mutations that flow
     through episodes. Neo's BACKGROUND promote engine — the observer's
-    synthesize_reviews and transcript/GitHub-PR mining — mints and reinforces
-    durable facts with NO episode footprint, so an IDLE reading here means the
-    accept-driven path is quiet, NOT that neo isn't learning."""
+    transcript/GitHub-PR mining — mints and reinforces durable facts with NO
+    episode footprint, so an IDLE reading here means the accept-driven path is
+    quiet, NOT that neo isn't learning."""
     from collections import Counter
 
     from neo.memory.episodes import LearningEpisodeStore

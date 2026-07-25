@@ -1,10 +1,11 @@
-"""Async out-of-band synthesis observer, supervised by car-server.
+"""Async out-of-band transcript-mining observer, supervised by car-server.
 
 A **single global** background process (CAR agent ``neo-observer``,
-``GLOBAL_AGENT_ID``) that runs REVIEW→PATTERN/FAILURE synthesis on a
-wall-clock cadence, **sweeping every discovered project each cycle** —
-round-robin/budgeted (``max_projects_per_cycle``, watermark-gated so
-unchanged projects do near-zero work). The earlier model spawned one
+``GLOBAL_AGENT_ID``) that mines transcripts on a wall-clock cadence,
+**sweeping every discovered project each cycle** — round-robin/budgeted
+(``max_projects_per_cycle``, watermark-gated so unchanged projects do
+near-zero work). It also ran REVIEW→PATTERN synthesis until that
+subsystem was removed (it never produced a PATTERN in production). The earlier model spawned one
 per-project agent (``neo-observer-<id12>``, ``--cwd <root>``); those
 legacy agents are stopped and ``agents_remove``d on bootstrap. Lifecycle
 is owned by CAR's agent supervisor:
@@ -33,7 +34,7 @@ Tunables (env, read by the daemon child):
                                      lifecycle there's no SIGUSR1
                                      kick; the cooldown still bounds
                                      the rate at which restarts re-
-                                     trigger synthesis.
+                                     trigger mining.
 """
 
 from __future__ import annotations
@@ -300,7 +301,7 @@ class Observer:
 
     Process lifecycle (spawn, restart, stop) is owned by CAR's
     supervisor. This class only owns the in-process loop: wake on
-    interval, run synthesis, sleep. Receives SIGTERM from the
+    interval, run a sweep, sleep. Receives SIGTERM from the
     supervisor on stop and exits cleanly.
     """
 
@@ -339,7 +340,7 @@ class Observer:
 
     def run(self) -> None:
         """Main entry — switches to async so we can run a WS client for
-        A2UI alongside the synthesis loop. ``_cycle`` stays sync
+        A2UI alongside the sweep loop. ``_cycle`` stays sync
         (heavy I/O) and runs in the default executor."""
         try:
             asyncio.run(self._run_async())
@@ -372,7 +373,7 @@ class Observer:
             if self._cooldown_ok():
                 # _cycle is synchronous and does blocking I/O. Run in
                 # the executor so the WS recv loop keeps draining
-                # action notifications during a long synthesis pass.
+                # action notifications during a long sweep pass.
                 await loop.run_in_executor(None, self._cycle)
                 await self._push_surface_after_cycle()
 
@@ -403,10 +404,11 @@ class Observer:
     def _run_project(self, root: str,
                      peer_roots: Optional[list[str]] = None,
                      shared_store: Optional[object] = None) -> tuple[int, int, object]:
-        """Synthesize + transcript-mine one project. Returns (synthesized,
-        mined, store). Transcript mining MUST run AFTER synthesis so a durable
-        synthesis can't be aborted by an ingest/LM failure (isolated in its own
-        guard). Do not reorder.
+        """Transcript-mine one project. Returns (0, mined, store).
+
+        The leading element is a vestigial synthesized-count, kept so the tuple
+        shape and the A2UI cycle record stay stable; REVIEW->PATTERN synthesis
+        was removed.
 
         ``peer_roots`` is the sweep's full root set, so cwd-attributed sources
         can hand a nested project's sessions to that project instead of to an
@@ -428,13 +430,11 @@ class Observer:
 
         if shared_store is not None:
             store = shared_store
-            count = 0  # already synthesized for this project_id this cycle
         else:
             store = FactStore(codebase_root=root, eager_init=False)
             store.initialize()
-            count = store.synthesize_reviews()
         mined = self._ingest_transcripts(store, root, peer_roots)
-        return count, mined, store
+        return 0, mined, store
 
     def _cycle_one(self) -> None:
         """Per-project pass (also feeds the A2UI inspector). Errors are caught
@@ -459,12 +459,12 @@ class Observer:
                 "timestamp": self._last_analysis_epoch,
                 "text": (
                     f"{time.strftime('%H:%M:%S', time.localtime(self._last_analysis_epoch))} · "
-                    f"{count} synthesized, {mined}"
+                    f"{mined}"
                 ),
             })
             self._last_store_snapshot = self._build_store_snapshot(store)
             print(
-                f"neo observer cycle ok: {count} synthesized, {mined} ({tick:.1f}s)",
+                f"neo observer cycle ok: {mined} ({tick:.1f}s)",
                 flush=True,
             )
         except Exception as e:
@@ -513,7 +513,7 @@ class Observer:
         # single slot instead of a whole-batch map — O(1) stores resident.
         batch = _group_roots_by_project_id(batch)
 
-        total_synth = total_mined = errors = covered = 0
+        total_mined = errors = covered = 0
         last_store = None
         prev_pid: Optional[str] = None
         prev_store = None
@@ -531,7 +531,6 @@ class Observer:
                 )
                 prev_pid, prev_store = pid, store
                 last_store = store
-                total_synth += count
                 total_mined += mined
                 covered += 1
                 # Per-project heartbeat so a long first sweep is legible (it logs
@@ -539,7 +538,7 @@ class Observer:
                 # backlog catch-up).
                 print(
                     f"neo observer sweep [{i}/{n}] {label}: "
-                    f"{count} synthesized, {mined} mined ({time.time() - p0:.1f}s)",
+                    f"{mined} mined ({time.time() - p0:.1f}s)",
                     flush=True,
                 )
             except Exception as e:
@@ -567,10 +566,10 @@ class Observer:
         tick = time.time() - t0
         self._last_analysis_epoch = time.time()
         self._cycles_total += 1
-        self._last_cycle_count = total_synth
+        self._last_cycle_count = total_mined
         self._last_cycle_error = None
         summary = (
-            f"swept {covered}/{len(roots)} projects: {total_synth} synthesized, "
+            f"swept {covered}/{len(roots)} projects: "
             f"{total_mined} mined"
             + (f", {reconciled} global-promoted" if reconciled else "")
             + (f", {errors} errors" if errors else "")
@@ -585,8 +584,8 @@ class Observer:
                             peer_roots: Optional[list[str]] = None) -> int:
         """Mine Claude Code transcripts for lessons, bounded by the per-cycle
         episode budget AND a wall-clock deadline. Isolated in its own
-        try/except so an LM or transcript failure never aborts the synthesis
-        cycle (which has already completed). Returns facts admitted; records a
+        try/except so an LM or transcript failure never aborts the sweep
+        cycle. Returns facts admitted; records a
         failure marker in ``self._last_ingest_error`` so a silently-failing LM
         key is visible in the cycle record, not just stderr.
         """
@@ -841,7 +840,7 @@ def stop_observer(codebase_root: Optional[str] = None) -> dict:
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
 
-    # "Stop" must halt ALL synthesis, including any unsupervised straggler —
+    # "Stop" must halt ALL sweeping, including any unsupervised straggler —
     # an orphan isn't CAR-managed, so agents_stop alone wouldn't touch it.
     reaped = _reap_orphan_observers()
 
@@ -1003,7 +1002,7 @@ def _reap_orphan_observers(codebase_root: Optional[str] = None,
     (it always has a live parent, so ``_find_orphan_observers`` never returns
     it). Any neo observer daemon with no live parent is therefore redundant: a
     straggler left by a car-server that died without reaping its child. Left
-    alone it keeps running synthesis cycles, doubling LM spend and exercising
+    alone it keeps running sweep cycles, doubling LM spend and exercising
     the (documented-lossy) concurrent confidence-merge path on the shared fact
     files, so we clear it before standing up a fresh supervised observer.
 

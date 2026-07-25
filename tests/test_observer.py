@@ -878,7 +878,9 @@ class TestGlobalSweep:
         o = Observer(global_mode=True)
         o._cycle()
         assert swept == ["/a", "/b", "/c"]
-        assert o._last_cycle_count == 3
+        # _last_cycle_count reports facts MINED (2 per stubbed project); it
+        # tracked synthesized facts until REVIEW->PATTERN synthesis was removed.
+        assert o._last_cycle_count == 6
 
     def test_global_cycle_logs_per_project_progress(self, monkeypatch, capsys):
         import neo.memory.observer as obs
@@ -918,37 +920,39 @@ class TestGlobalSweep:
         monkeypatch.setattr(Observer, "_run_project", rp)
         o = Observer(global_mode=True)
         o._cycle()  # must not raise
-        assert o._last_cycle_count == 2
+        # Two projects survived; the stub mines 0, so the mined total is 0.
+        assert o._last_cycle_count == 0
 
 
 class TestObserverCycleUnit:
     """Drive Observer._cycle directly — no daemon, no signals."""
 
-    def test_cycle_calls_synthesize_reviews(self, fake_project_id, monkeypatch):
+    def test_cycle_initializes_store_and_records(self, fake_project_id, monkeypatch):
+        """A cycle loads the store and stamps the epoch.
+
+        Formerly asserted `synthesize_reviews` was called; REVIEW->PATTERN
+        synthesis has been removed, so a cycle is now load + transcript mine.
+        """
         from neo.memory.observer import Observer, ObserverConfig
-        # ingest_budget=0 so this isolates synthesis (otherwise the real ingest
-        # path runs and only passes because it swallows its own failure).
         observer = Observer(codebase_root="/some/path",
                             config=ObserverConfig(ingest_budget=0))
 
-        call_count = {"n": 0}
+        init_count = {"n": 0}
 
         class _FakeStore:
             def __init__(self, **kwargs):
                 pass
 
             def initialize(self):
-                pass
-
-            def synthesize_reviews(self):
-                call_count["n"] += 1
-                return 3
+                init_count["n"] += 1
 
         monkeypatch.setattr("neo.memory.store.FactStore", _FakeStore)
         observer._cycle()
 
-        assert call_count["n"] == 1
+        assert init_count["n"] == 1
         assert observer._last_analysis_epoch > 0
+        assert not hasattr(_FakeStore, "synthesize_reviews"), \
+            "cycle must not depend on a synthesis entry point"
 
     def test_cycle_swallows_errors(self, fake_project_id, monkeypatch):
         from neo.memory.observer import Observer, ObserverConfig
@@ -1067,14 +1071,7 @@ class TestSameProjectIdRoots:
         monkeypatch.setattr("neo.memory.scope._compute_project_id",
                             lambda root: pids[root])
 
-    def test_shared_project_id_synthesizes_once(self, monkeypatch):
-        from neo.memory.observer import Observer
-
-        roots = ["/w/fms", "/w/fms2", "/w/other"]
-        self._wire(monkeypatch, roots, {"/w/fms": "AAA", "/w/fms2": "AAA", "/w/other": "BBB"})
-
-        built, synthesized = [], []
-
+    def _fake_store_cls(self, built):
         class FakeStore:
             def __init__(self, codebase_root=None, **kw):
                 self.codebase_root = codebase_root
@@ -1082,12 +1079,16 @@ class TestSameProjectIdRoots:
 
             def initialize(self):
                 pass
+        return FakeStore
 
-            def synthesize_reviews(self):
-                synthesized.append(self.codebase_root)
-                return 0
+    def test_shared_project_id_loads_store_once(self, monkeypatch):
+        from neo.memory.observer import Observer
 
-        monkeypatch.setattr("neo.memory.store.FactStore", FakeStore)
+        roots = ["/w/fms", "/w/fms2", "/w/other"]
+        self._wire(monkeypatch, roots, {"/w/fms": "AAA", "/w/fms2": "AAA", "/w/other": "BBB"})
+
+        built = []
+        monkeypatch.setattr("neo.memory.store.FactStore", self._fake_store_cls(built))
         ingested = []
         monkeypatch.setattr(
             Observer, "_ingest_transcripts",
@@ -1096,9 +1097,8 @@ class TestSameProjectIdRoots:
 
         Observer(global_mode=True)._cycle()
 
-        # One store load + one synthesis per project_id...
+        # One multi-MB store load per project_id...
         assert built == ["/w/fms", "/w/other"]
-        assert synthesized == ["/w/fms", "/w/other"]
         # ...but EVERY root still gets mined: the second clone has its own
         # sessions, and cwd attribution would never reach them otherwise.
         assert [r for r, _ in ingested] == roots
@@ -1106,26 +1106,38 @@ class TestSameProjectIdRoots:
         assert by_root["/w/fms"] is by_root["/w/fms2"], "clones share one store"
         assert by_root["/w/other"] is not by_root["/w/fms"]
 
-    def test_distinct_project_ids_are_unaffected(self, monkeypatch):
+    def test_distinct_project_ids_each_load_their_own_store(self, monkeypatch):
         from neo.memory.observer import Observer
 
         roots = ["/w/a", "/w/b"]
         self._wire(monkeypatch, roots, {"/w/a": "AAA", "/w/b": "BBB"})
-        synthesized = []
-
-        class FakeStore:
-            def __init__(self, codebase_root=None, **kw):
-                self.codebase_root = codebase_root
-
-            def initialize(self):
-                pass
-
-            def synthesize_reviews(self):
-                synthesized.append(self.codebase_root)
-                return 0
-
-        monkeypatch.setattr("neo.memory.store.FactStore", FakeStore)
+        built = []
+        monkeypatch.setattr("neo.memory.store.FactStore", self._fake_store_cls(built))
         monkeypatch.setattr(Observer, "_ingest_transcripts",
                             lambda self, store, root, peer_roots=None: 0)
         Observer(global_mode=True)._cycle()
-        assert synthesized == roots
+        assert built == roots
+
+    def test_same_id_roots_are_grouped_adjacently(self):
+        """Adjacency is what lets the sweep hold ONE extra store instead of a
+        whole-batch map of deserialized stores."""
+        import neo.memory.observer as obs
+        pids = {"/a": "X", "/b": "Y", "/c": "X", "/d": "Y"}
+        grouped = obs._group_roots_by_project_id.__wrapped__(list(pids)) \
+            if hasattr(obs._group_roots_by_project_id, "__wrapped__") else None
+        # Exercise via the real function with a patched id resolver.
+        import neo.memory.scope as scope
+        orig = scope._compute_project_id
+        scope._compute_project_id = lambda r: pids[r]
+        try:
+            grouped = obs._group_roots_by_project_id(list(pids))
+        finally:
+            scope._compute_project_id = orig
+        assert sorted(grouped) == sorted(pids), "no root dropped or duplicated"
+        seen, prev = set(), None
+        for r in grouped:
+            pid = pids[r]
+            if pid != prev:
+                assert pid not in seen, f"{pid} is not contiguous"
+                seen.add(pid)
+                prev = pid

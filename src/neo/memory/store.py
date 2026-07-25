@@ -14,7 +14,7 @@ import os
 import re
 import shutil
 import time
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,14 +25,13 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 import numpy as np
 
-from neo.math_utils import batched_cosine, cluster_by_similarity, cosine_similarity
+from neo.math_utils import batched_cosine, cosine_similarity
 from neo.memory.bm25 import BM25, tokenize
 from neo.memory.query_routing import QueryShape, decompose as _decompose_query
 from neo.memory.claude_memory import ClaudeMemoryIngester
 from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
-from neo.memory.io_utils import atomic_write_json
 from neo.memory.metrics import record as metrics_record, time_block
 from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
@@ -58,12 +57,6 @@ logger = logging.getLogger(__name__)
 EMBEDDING_CACHE_MAX_SIZE = 500
 MAX_TEXT_LENGTH = 32000
 SUPERSESSION_THRESHOLD = 0.85  # Cosine similarity threshold for supersession
-SYNTHESIS_SIMILARITY = 0.85    # Cosine similarity threshold for review clustering.
-                                # Paper 2603.10600 (Trajectory-Memory) §7:
-                                # τ = 0.85 was their empirical sweet spot for
-                                # description-generalized clusters. Below this
-                                # we over-merge unrelated REVIEWs; above this
-                                # we get singleton clusters.
 
 # Per-scope capacity limits
 SCOPE_LIMITS: dict[str, int] = {
@@ -107,6 +100,10 @@ MAX_ATTEMPT_OUTCOME_FACTS = 25
 # supporting_episode_ids (set only at promotion); see `_is_protected`. Janitor
 # protection only — retrieval decay is governed separately by
 # models._CURATED_TAGS; intentional rollback bypasses this.
+# ``synthesized`` stays in this set even though REVIEW->PATTERN synthesis has
+# been removed: facts minted by it before the removal still carry the tag (90
+# valid ones on a live store) and must keep their prune immunity. Nothing mints
+# the tag any more, so the set is now closed rather than growing.
 PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 
 # Dual-buffer consolidation (paper 2603.07670 §9.1). New non-curated
@@ -2153,10 +2150,10 @@ class FactStore:
                 f"Processed {len(outcomes)} outcome(s): "
                 f"modified={modified}, regressions={regressions}"
             )
-            # Chain maintenance: synthesize -> prune stale -> demote unhelpful
-            # -> purge dead -> strip tombstone embeddings. The four janitors
-            # defer their saves and flush once here.
-            self.synthesize_reviews()
+            # Chain maintenance: prune stale -> demote unhelpful -> purge dead
+            # -> strip tombstone embeddings. The four janitors defer their saves
+            # and flush once here. (REVIEW->PATTERN synthesis used to lead this
+            # chain; it was removed — see the note on PROTECTED_TAGS.)
             changed = self.prune_stale_facts(save=False)
             changed += self.demote_unhelpful_facts(save=False)
             changed += self.purge_dead_facts(save=False)
@@ -3299,473 +3296,6 @@ class FactStore:
         logger.info(f"Ingested {len(records)} facts from git history")
 
     # ------------------------------------------------------------------ #
-    # Review synthesis
-    # ------------------------------------------------------------------ #
-
-    def synthesize_reviews(self) -> int:
-        """Distill clusters of REVIEW facts into higher-level PATTERN/FAILURE facts.
-
-        Triple-trigger from SCM (paper 2604.20943 §3.6): consolidation fires
-        when ANY of the following holds:
-
-          1. count-delta  ≥ 10  — the legacy gate (preserved for back-compat)
-          2. elapsed time ≥ 1h since last consolidation
-          3. entropy(value-score over REVIEW facts) > 0.9  — high-uncertainty
-             corpus state where consolidation usually pays off most
-
-        Groups by tag, clusters by cosine similarity, synthesizes clusters of
-        3+ into a single fact that supersedes the sources. The watermark
-        tracks total REVIEW facts ever seen (valid + invalidated) to avoid
-        the count-drift bug where synthesis invalidates facts and the
-        watermark comparison breaks.
-
-        Returns:
-            Number of synthesized facts created.
-        """
-        # ``history`` REVIEWs are one git commit each. They are chronological
-        # events, not recurring lessons, so they can never legitimately
-        # consolidate — measured across this machine's 15 gate-passing
-        # projects, all 1039 of them clustered into groups of exactly 1. They
-        # were still counted toward the >=20 gate and then re-clustered every
-        # cycle, so the gate opened on material that could not produce output.
-        # Excluding them here makes the gate mean what it says and drops ~90%
-        # of the per-cycle clustering work. Watermark counts the same
-        # population as the gate so the count-delta trigger stays coherent.
-        all_review_count = sum(
-            1 for f in self._facts
-            if f.kind == FactKind.REVIEW and self._is_synthesizable_review(f)
-        )
-        # PROJECT-scoped input, so the homeostatic downscale below can key off
-        # the same scope rather than guessing at it independently. Every current
-        # REVIEW-minting site is PROJECT; were an ORG REVIEW ever minted, a
-        # scope-blind population would let `_hebbian_strengthen` boost it while
-        # a PROJECT-scoped downscale never decayed it — a monotonic ratchet to
-        # 1.0 — and `_synthesize_cluster` would invalidate an ORG fact and
-        # replace it with a PROJECT one.
-        valid_review_facts = [
-            f for f in self._facts
-            if f.is_valid and f.kind == FactKind.REVIEW
-            and f.scope == FactScope.PROJECT
-            and self._is_synthesizable_review(f)
-        ]
-
-        if len(valid_review_facts) < 20:
-            return 0
-
-        # Triple-trigger gate. Any single condition is enough.
-        watermark = self._load_synthesis_watermark()
-        count_delta = all_review_count - watermark
-        elapsed_seconds = time.time() - self._load_synthesis_timestamp()
-        entropy_score = self._review_entropy(valid_review_facts)
-
-        # Logs are deliberately one-line so it's easy to grep which trigger
-        # fired in production: most consolidations should be count-driven,
-        # but a corpus that goes high-entropy without writes (e.g. lots of
-        # outcome-driven confidence shifts) should still consolidate.
-        if (
-            count_delta < 10
-            and elapsed_seconds < 3600.0
-            and entropy_score <= 0.9
-        ):
-            return 0
-
-        logger.info(
-            "synthesis-trigger: count_delta=%d elapsed=%.1fs entropy=%.3f",
-            count_delta, elapsed_seconds, entropy_score,
-        )
-
-        synthesized_count = 0
-
-        # Group by primary tag (outcome:accepted, outcome:independent, history:*)
-        groups: dict[str, list[Fact]] = {}
-        for fact in valid_review_facts:
-            key = self._synthesis_group_key(fact)
-            groups.setdefault(key, []).append(fact)
-
-        for group_key, facts in groups.items():
-            if len(facts) < 3:
-                continue
-
-            clusters = self._cluster_by_similarity(facts, SYNTHESIS_SIMILARITY)
-
-            for cluster in clusters:
-                if len(cluster) < 3:
-                    continue
-
-                # NREM Hebbian strengthening (paper 2604.20943 §3, the
-                # consolidation phase): facts that survived clustering
-                # co-occurred — their mutual reinforcement is the cluster
-                # itself. Bump each member's confidence by η · |cluster|
-                # before synthesis runs, so the synthesized fact
-                # inherits a strengthened lineage.
-                self._hebbian_strengthen(cluster)
-
-                new_fact = self._synthesize_cluster(cluster, group_key)
-                if new_fact:
-                    self._facts.append(new_fact)
-                    synthesized_count += 1
-
-        if synthesized_count:
-            # Global downscale (paper 2604.20943 §3, α = 0.8 → too
-            # aggressive at our scale; we use a gentler 0.97 multiplier
-            # so an unused fact loses ~3% per consolidation cycle).
-            # Keeps confidence values from drifting upward forever as
-            # the Hebbian step accumulates.
-            self._global_confidence_downscale(alpha=0.97)
-            self.save()
-            logger.info(f"Synthesized {synthesized_count} fact(s) from REVIEW clusters")
-
-        # Save total count as watermark (valid + invalidated)
-        self._save_synthesis_watermark(all_review_count)
-        return synthesized_count
-
-    @staticmethod
-    def _hebbian_strengthen(cluster: list[Fact], *, eta: float = 0.02) -> None:
-        """Bump each cluster member's confidence by η · cluster_size.
-
-        Bounded by the [0, 1] interval. Small η keeps individual
-        strengthens from dominating success_bonus.
-        """
-        boost = min(0.1, eta * len(cluster))
-        for fact in cluster:
-            fact.metadata.confidence = min(1.0, fact.metadata.confidence + boost)
-
-    def _global_confidence_downscale(self, *, alpha: float) -> None:
-        """Multiply non-curated, valid PROJECT facts' confidence by alpha.
-
-        Curated/CONSTRAINT/ARCHITECTURE/DECISION facts skip the decay
-        (mirrors the rank_score curated-bypass policy). Floor at 0.05 so
-        nothing collapses to zero — a long-dormant fact stays visible.
-
-        Scoped to PROJECT deliberately. This is the homeostatic half of the
-        Hebbian step, so it must not reach outside the population that was
-        potentiated: ``self._facts`` also holds the ORG and GLOBAL scopes, and a
-        GLOBAL PATTERN — precisely what ``reconcile_cross_project_promotions``
-        mints after evidence from ≥2 projects — is decay-eligible. Unscoped,
-        *every* project's synthesis eroded those cross-project promotions, so a
-        machine sweeping 37 projects would decay one hard-won global fact many
-        times per cycle for reasons having nothing to do with it. Latent rather
-        than observed today only because no GLOBAL fact currently carries a
-        decaying kind.
-        """
-        from neo.memory.models import _decays  # local: cycle
-
-        for fact in self._facts:
-            if not fact.is_valid:
-                continue
-            if fact.scope != FactScope.PROJECT:
-                continue
-            if not _decays(fact):
-                continue
-            new_conf = max(0.05, fact.metadata.confidence * alpha)
-            fact.metadata.confidence = new_conf
-
-    @staticmethod
-    def _is_synthesizable_review(fact: Fact) -> bool:
-        """Can this REVIEW ever consolidate into a PATTERN/FAILURE?
-
-        Two exclusions:
-
-        ``history`` facts are per-commit records — distinct events by
-        construction, never a recurring lesson. Feeding them to the clusterer
-        is unbounded work with a provably empty result.
-
-        ``synthesized`` facts are this function's own output. ``_synthesize_cluster``
-        mints them as ``kind=REVIEW`` carrying the union of their members' tags,
-        so without this they are eligible input on the very next pass — the
-        system consolidating its own summaries and counting them as fresh
-        evidence. Live census: 68 valid synthesized ``independent`` REVIEWs
-        against 29 raw ones. A summary is a restatement of evidence already
-        counted, never new evidence.
-
-        **Consequence, deliberate:** the eligible population is now strictly
-        decreasing — a cluster consumes >=3 facts (``_synthesize_cluster``
-        invalidates its members) and returns an excluded one. A project sitting
-        just above the ``>= 20`` gate can synthesize itself below it and stay
-        frozen until 20 *new* raw REVIEWs arrive. That is the honest behavior:
-        the old recycling propped the gate open on the subsystem's own output.
-        But ``20`` was tuned when recycling existed and is a materially stricter
-        gate now — revisit the constant if synthesis is kept.
-        """
-        if "synthesized" in fact.tags:
-            return False
-        return FactStore._synthesis_group_key(fact) != "history"
-
-    @staticmethod
-    def _synthesis_group_key(fact: Fact) -> str:
-        """Determine the grouping key for a REVIEW fact based on its tags."""
-        tags = set(fact.tags)
-        if "accepted" in tags:
-            return "outcome:accepted"
-        if "independent" in tags:
-            return "outcome:independent"
-        if "history" in tags:
-            return "history"
-        return "other"
-
-    def _cluster_by_similarity(
-        self, facts: list[Fact], threshold: float
-    ) -> list[list[Fact]]:
-        """Cluster facts by cosine similarity using complete-linkage.
-
-        A candidate joins a cluster only if it meets the similarity threshold
-        against ALL existing cluster members, ensuring all facts in a cluster
-        are mutually similar.
-
-        Returns list of clusters (each a list of facts).
-        """
-        return cluster_by_similarity(
-            facts, embed_fn=lambda f: f.embedding, threshold=threshold
-        )
-
-    def _synthesize_cluster(
-        self, cluster: list[Fact], group_key: str
-    ) -> Optional[Fact]:
-        """Create a single synthesized fact from a cluster of REVIEW facts.
-
-        For clusters of 5+, attempts LLM-based synthesis for richer output.
-        Falls back to mechanical synthesis on any error or for smaller clusters.
-
-        **The PATTERN branch below is unreachable in normal operation** — it
-        requires ``group_key == "outcome:accepted"``, and no ``accepted``-tagged
-        REVIEW has ever existed on a live store (census: 0, against 97
-        ``independent`` and 3046 ``history``). That is not a tag-writing bug:
-        ``detect_implicit_feedback`` handles an ACCEPTED outcome by boosting the
-        linked fact, or by supporting an episode candidate, and both ``continue``
-        before reaching the REVIEW fallback that would carry the tag. So this
-        subsystem has only ever produced REVIEWs — 114 of them to date, zero
-        PATTERNs.
-
-        Do NOT "fix" that by making ACCEPTED always mint an accepted-tagged
-        REVIEW. It would reintroduce the orphan REVIEWs the boost path exists to
-        avoid, and stand up an unverified similarity-based promotion route
-        competing with the git-verified episode ledger
-        (``_promote_repeatedly_supported_candidate``), which requires two
-        independent verified acceptances. The weaker mechanism must not
-        manufacture the appearance of support. If this branch is ever to mean
-        something, it needs an explicit design decision, not a tag patch.
-        """
-        if not cluster:
-            return None
-
-        # Pick highest-confidence as base
-        cluster.sort(key=lambda f: f.metadata.confidence, reverse=True)
-        base = cluster[0]
-
-        # Accepted suggestions become validated patterns; everything else stays REVIEW
-        kind = FactKind.PATTERN if group_key == "outcome:accepted" else FactKind.REVIEW
-
-        # Try LLM synthesis for large clusters
-        subject = None
-        body_text = None
-        avg_conf = sum(f.metadata.confidence for f in cluster) / len(cluster)
-
-        if len(cluster) >= 5 and self._lm_adapter:
-            llm_result = self._llm_synthesize(cluster, group_key)
-            if llm_result:
-                subject, body_text, llm_conf = llm_result
-                avg_conf = llm_conf
-
-        # Mechanical fallback
-        if subject is None:
-            subject = self._extract_common_subject(cluster)
-        if body_text is None:
-            seen_lines: set[str] = set()
-            merged_body_parts: list[str] = []
-            for fact in cluster:
-                if len(merged_body_parts) >= 20:
-                    break
-                for line in fact.body.split("\n"):
-                    stripped = line.strip()
-                    if stripped and stripped not in seen_lines:
-                        seen_lines.add(stripped)
-                        merged_body_parts.append(stripped)
-                    if len(merged_body_parts) >= 20:
-                        break
-            body_text = "\n".join(merged_body_parts[:20])
-
-        embedding = self._embed_text(f"{subject} {body_text}")
-        if embedding is None:
-            embedding = base.embedding
-
-        new_fact = Fact(
-            subject=subject,
-            body=body_text,
-            kind=kind,
-            scope=FactScope.PROJECT,
-            org_id=self.org_id,
-            project_id=self.project_id,
-            metadata=FactMetadata(
-                confidence=avg_conf,
-                source_prompt=f"synthesized from {len(cluster)} REVIEW facts",
-            ),
-            embedding=embedding,
-            tags=["synthesized"] + list({t for f in cluster for t in f.tags}),
-        )
-
-        # Supersede all source facts and cascade dependency reviews
-        for fact in cluster:
-            self._invalidate(fact)
-            fact.superseded_by = new_fact.id
-
-        return new_fact
-
-    def _llm_synthesize(
-        self, cluster: list[Fact], group_key: str
-    ) -> Optional[tuple[str, str, float]]:
-        """Use LLM to synthesize a cluster into a concise actionable insight.
-
-        Returns (subject, body, confidence) or None on any error.
-        """
-        if not self._lm_adapter:
-            return None
-
-        try:
-            # Build compact prompt from cluster data
-            facts_text = "\n".join(
-                f"- [{f.subject}] {f.body[:200]}"
-                for f in cluster[:10]  # Cap at 10 to keep prompt small
-            )
-            group_label = group_key.replace("outcome:", "")
-
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        f"Distill these {len(cluster)} related {group_label} code observations "
-                        "into one actionable insight.\n"
-                        "Return exactly 3 lines:\n"
-                        "SUBJECT: <concise label, max 60 chars>\n"
-                        "BODY: <actionable guidance, 1-3 sentences>\n"
-                        "CONFIDENCE: <0.0-1.0 based on consistency of evidence>"
-                    ),
-                },
-                {"role": "user", "content": facts_text},
-            ]
-
-            response = self._lm_adapter.generate(
-                messages=messages,
-                max_tokens=300,
-                temperature=0.3,
-                reasoning_effort="low",  # Distilling clustered facts; not reasoning.
-            )
-
-            return self._parse_llm_synthesis(response)
-
-        except Exception as e:
-            logger.debug(f"LLM synthesis failed (falling back to mechanical): {e}")
-            return None
-
-    @staticmethod
-    def _parse_llm_synthesis(response: str) -> Optional[tuple[str, str, float]]:
-        """Parse the 3-line LLM response into (subject, body, confidence)."""
-        subject = None
-        body = None
-        confidence = None
-
-        for line in response.strip().split("\n"):
-            line = line.strip()
-            if line.upper().startswith("SUBJECT:"):
-                subject = line.split(":", 1)[1].strip()[:60]
-            elif line.upper().startswith("BODY:"):
-                body = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("CONFIDENCE:"):
-                try:
-                    confidence = float(line.split(":", 1)[1].strip())
-                    confidence = max(0.0, min(1.0, confidence))
-                except ValueError:
-                    pass
-
-        if subject and body and confidence is not None:
-            return subject, body, confidence
-        return None
-
-    @staticmethod
-    def _extract_common_subject(facts: list[Fact]) -> str:
-        """Find a shared file or area across cluster members for the subject line."""
-        import re
-        # Match file-like tokens: must contain / or have a code file extension
-        file_pattern = re.compile(r'(\S+/\S+|\S+\.(?:py|js|ts|tsx|go|rs|java|c|cpp|rb|swift))\b')
-        file_mentions: Counter = Counter()
-        for fact in facts:
-            for match in file_pattern.findall(fact.subject):
-                file_mentions[match] += 1
-
-        if file_mentions:
-            most_common = file_mentions.most_common(1)[0][0]
-            return f"pattern: {most_common}"
-
-        # Fallback: use first few words of subjects
-        if facts:
-            return f"pattern: {facts[0].subject[:50]}"
-        return "pattern: synthesized"
-
-    def _load_synthesis_watermark(self) -> int:
-        """Load the count of REVIEW facts at last synthesis run."""
-        if not self._project_path:
-            return 0
-        watermark_path = self._project_path.parent / f"synthesis_watermark_{self.project_id}.json"
-        if not watermark_path.exists():
-            return 0
-        try:
-            data = json.loads(watermark_path.read_text())
-            return data.get("review_count", 0)
-        except (json.JSONDecodeError, OSError):
-            return 0
-
-    def _load_synthesis_timestamp(self) -> float:
-        """Wall-clock time of the last completed consolidation, or 0 if none."""
-        if not self._project_path:
-            return 0.0
-        watermark_path = self._project_path.parent / f"synthesis_watermark_{self.project_id}.json"
-        if not watermark_path.exists():
-            return 0.0
-        try:
-            data = json.loads(watermark_path.read_text())
-            return float(data.get("updated_at", 0.0))
-        except (json.JSONDecodeError, OSError):
-            return 0.0
-
-    @staticmethod
-    def _review_entropy(facts: list[Fact]) -> float:
-        """Shannon entropy of REVIEW facts' confidence distribution.
-
-        Buckets confidence into deciles [0.0..1.0] and computes
-        H = −Σ p_i log2 p_i, normalized by log2(num_nonzero_bins) so the
-        result is in [0, 1]. High entropy ≈ uniform → consolidation gets a
-        lot of leverage. Low entropy ≈ already-clustered → not much to gain.
-        """
-        if not facts:
-            return 0.0
-        import math as _math
-
-        buckets = [0] * 10
-        for fact in facts:
-            c = max(0.0, min(0.999, fact.metadata.confidence))
-            buckets[int(c * 10)] += 1
-        total = sum(buckets)
-        if total <= 0:
-            return 0.0
-        probs = [b / total for b in buckets if b > 0]
-        if len(probs) <= 1:
-            return 0.0
-        h = -sum(p * _math.log2(p) for p in probs)
-        return h / _math.log2(len(probs))
-
-    def _save_synthesis_watermark(self, count: int) -> None:
-        """Save the current REVIEW fact count as synthesis watermark."""
-        if not self._project_path:
-            return
-        watermark_path = self._project_path.parent / f"synthesis_watermark_{self.project_id}.json"
-        try:
-            atomic_write_json(watermark_path, {
-                "review_count": count,
-                "updated_at": time.time(),
-            })
-        except OSError as e:
-            logger.debug(f"Failed to save synthesis watermark: {e}")
-
-    # ------------------------------------------------------------------ #
     # Migration
     # ------------------------------------------------------------------ #
 
@@ -3795,13 +3325,17 @@ class FactStore:
             except OSError as e:
                 logger.warning(f"Legacy fact-file rename failed (non-fatal): {e}")
 
-        legacy_wm = self._facts_dir / f"synthesis_watermark_{legacy_id}.json"
-        new_wm = self._facts_dir / f"synthesis_watermark_{self.project_id}.json"
-        if legacy_wm.exists() and not new_wm.exists():
+        # Synthesis watermarks are dead files now that REVIEW->PATTERN synthesis
+        # is gone: nothing reads or writes them. Delete rather than migrate, so
+        # a rename doesn't carry stale state forward under the new project_id.
+        for stale_wm in (
+            self._facts_dir / f"synthesis_watermark_{legacy_id}.json",
+            self._facts_dir / f"synthesis_watermark_{self.project_id}.json",
+        ):
             try:
-                legacy_wm.rename(new_wm)
+                stale_wm.unlink(missing_ok=True)
             except OSError as e:
-                logger.debug(f"Legacy watermark rename failed (non-fatal): {e}")
+                logger.debug(f"Stale synthesis watermark cleanup failed (non-fatal): {e}")
 
     def _maybe_migrate(self) -> None:
         """Migrate from old PersistentReasoningMemory format if needed.

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Removed
+
+- **REVIEW → PATTERN synthesis is deleted.** `synthesize_reviews` and its whole apparatus — cluster/LLM synthesis, the triple-trigger gate, synthesis watermarks, `_hebbian_strengthen`, and the corpus-wide `_global_confidence_downscale` — are gone (467 lines from `store.py`), along with both call sites and the `SYNTHESIS_SIMILARITY` constant.
+
+  It ran for four months on this machine and minted 114 facts. **Not one was a PATTERN.** The PATTERN branch required `group_key == "outcome:accepted"`, and a census found **0** accepted-tagged REVIEWs against 97 `independent` and 3046 `history` — because `detect_implicit_feedback` handles an ACCEPTED outcome by boosting the linked fact or by supporting an episode candidate, and both return before the fallback that would carry the tag. So the subsystem's headline function never executed once.
+
+  What it did do: re-consume its own summaries as fresh evidence (68 synthesized `independent` REVIEWs against 29 raw), and multiply the confidence of every decaying fact in the store by 0.97 on each run. It also could not have fired on real data — a census showed **zero** ≥3-member clusters at cosine 0.85 across all 1152 valid REVIEWs, in any project, in any group.
+
+  Deletion is bounded to the failed subsystem. `SUPERSESSION_THRESHOLD` and `_supersede`, canonical-signature dedup, the janitor chain, and the git-verified episode ledger (`_promote_repeatedly_supported_candidate`, which requires ≥2 independent verified acceptances) are untouched — regression-tested in `TestSynthesisRemoved`. Facts minted before the removal keep their `synthesized` tag and its prune immunity; nothing mints the tag now, so `PROTECTED_TAGS` is closed rather than growing. Orphaned `synthesis_watermark_*.json` files are deleted rather than migrated. The observer no longer reports a synthesized count, and `_last_cycle_count` now means facts *mined*. (`memory/store.py`, `memory/observer.py`, `memory/issues.py`, `subcommands.py`)
+
 ### Fixed
 
 - **Two clones of one repo were swept twice per cycle.** `flyx/fms` and `flyx/fms2` share a git remote, so `_compute_project_id` gives both the same id — one fact file, one pid-keyed watermark, loaded and synthesized twice. The sweep now shares a `FactStore` per project_id within a cycle. Transcript ingest still runs **per root**: attribution is by cwd and the second clone has 56 sessions of its own that sweeping only the first would silently drop. (Checked and dismissed a related concern: shifting a rollout between same-pid roots cannot lose data, because the destination fact file and watermark are the same ones; across *different* pids the watermarks differ, so it re-ingests rather than skipping.) (`memory/observer.py`)

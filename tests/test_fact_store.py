@@ -2312,259 +2312,18 @@ class TestArchDeltaModulation:
         assert original.metadata.effectiveness_c == pytest.approx(-0.5)
 
 
-class TestSynthesizeReviews:
-    """Tests for Step 2: periodic review synthesis."""
-
-    def _make_review_fact(self, store, subject, body, tags, embedding=None):
-        """Helper to add a REVIEW fact directly."""
-        fact = Fact(
-            subject=subject,
-            body=body,
-            kind=FactKind.REVIEW,
-            scope=FactScope.PROJECT,
-            org_id="testorg",
-            project_id="testproj1234",
-            metadata=FactMetadata(confidence=0.5),
-            embedding=embedding,
-            tags=tags,
-        )
-        store._facts.append(fact)
-        return fact
-
-    def test_no_synthesis_below_threshold(self, store):
-        """Should not synthesize when fewer than 20 REVIEW facts exist."""
-        for i in range(15):
-            self._make_review_fact(store, f"review {i}", f"body {i}", ["outcome", "accepted"])
-        assert store.synthesize_reviews() == 0
-
-    def test_history_reviews_do_not_open_the_gate(self, store):
-        """``history`` REVIEWs are per-commit events and must not count.
-
-        Measured on this machine: 1039 history REVIEWs across 15 projects, all
-        clustering into groups of exactly 1. They passed the >=20 gate and were
-        re-clustered every observer cycle, guaranteeing wasted work for a
-        provably empty result.
-        """
-        for i in range(40):
-            emb = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(
-                store, f"history:{i:08x} commit subject {i}", f"body {i}",
-                ["history"], embedding=emb / np.linalg.norm(emb),
-            )
-        assert store.synthesize_reviews() == 0
-
-    def test_synthesized_facts_do_not_re_enter_as_input(self, store):
-        """Synthesis must not consume its own output.
-
-        `_synthesize_cluster` mints kind=REVIEW carrying the union of member
-        tags, so without an exclusion a summary is eligible input next pass —
-        the system counting restatements of already-counted evidence as fresh.
-        """
-        for i in range(30):
-            emb = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(store, f"outcome:accepted s{i}.py", f"b{i}",
-                                   ["synthesized", "outcome", "accepted"],
-                                   embedding=emb / np.linalg.norm(emb))
-        assert store.synthesize_reviews() == 0, "30 synthesized facts must not open the gate"
-        eligible = [f for f in store._facts if store._is_synthesizable_review(f)]
-        assert eligible == []
-
-    def test_mixed_corpus_counts_only_raw_reviews(self, store):
-        """The regressable case: raw facts open the gate, synthesized don't count."""
-        for i in range(19):  # one short of the >=20 gate on raw material alone
-            emb = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(store, f"outcome:accepted raw{i}.py", f"b{i}",
-                                   ["outcome", "accepted"],
-                                   embedding=emb / np.linalg.norm(emb))
-        for i in range(25):  # padding it out with summaries must not help
-            emb = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(store, f"outcome:accepted syn{i}.py", f"b{i}",
-                                   ["synthesized", "outcome", "accepted"],
-                                   embedding=emb / np.linalg.norm(emb))
-        assert store.synthesize_reviews() == 0, "summaries must not prop the gate open"
-
-    def test_org_scope_reviews_are_not_synthesis_input(self, store):
-        """Input is PROJECT-scoped so the downscale scope follows from it.
-
-        A scope-blind population would let _hebbian_strengthen boost an ORG
-        REVIEW that the PROJECT-scoped downscale never decays — a ratchet to 1.0.
-        """
-        for i in range(30):
-            emb = np.random.randn(768).astype(np.float32)
-            f = self._make_review_fact(store, f"outcome:accepted o{i}.py", f"b{i}",
-                                       ["outcome", "accepted"],
-                                       embedding=emb / np.linalg.norm(emb))
-            f.scope = FactScope.ORG
-        assert store.synthesize_reviews() == 0
-
-    def test_downscale_spares_other_scopes(self, store):
-        """Homeostasis must not reach outside the potentiated population.
-
-        A GLOBAL PATTERN is what cross-project promotion mints and it IS
-        decay-eligible; unscoped, every project's synthesis eroded it.
-        """
-        g = Fact(subject="global lesson", body="b", kind=FactKind.PATTERN,
-                 scope=FactScope.GLOBAL, org_id="testorg", project_id="",
-                 metadata=FactMetadata(confidence=0.90))
-        p = Fact(subject="project lesson", body="b", kind=FactKind.PATTERN,
-                 scope=FactScope.PROJECT, org_id="testorg", project_id="testproj1234",
-                 metadata=FactMetadata(confidence=0.90))
-        o = Fact(subject="org lesson", body="b", kind=FactKind.PATTERN,
-                 scope=FactScope.ORG, org_id="testorg", project_id="",
-                 metadata=FactMetadata(confidence=0.90))
-        store._facts.extend([g, o, p])
-        store._global_confidence_downscale(alpha=0.5)
-        assert g.metadata.confidence == 0.90, "GLOBAL scope untouched"
-        assert o.metadata.confidence == 0.90, "ORG scope untouched"
-        assert p.metadata.confidence == 0.45, "PROJECT scope decayed"
-
-    def test_watermark_rebaselines_after_population_change(self, store, tmp_path):
-        """Excluding `history` shrank the counted population under existing watermarks.
-
-        A saved watermark was taken over ALL REVIEWs, so the first count_delta
-        after this change goes strongly negative. That must not wedge synthesis:
-        the elapsed>=1h trigger still fires and the run re-baselines the mark.
-        """
-        import json
-        import time as _time
-
-        for i in range(30):
-            emb = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(store, f"history:{i:08x} commit {i}", f"b{i}",
-                                   ["history"], embedding=emb / np.linalg.norm(emb))
-        for i in range(25):
-            emb = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(store, f"outcome:accepted f{i}.py", f"b{i}",
-                                   ["outcome", "accepted"], embedding=emb / np.linalg.norm(emb))
-
-        wpath = store._project_path.parent / f"synthesis_watermark_{store.project_id}.json"
-        wpath.parent.mkdir(parents=True, exist_ok=True)
-        wpath.write_text(json.dumps({"review_count": 55, "updated_at": _time.time() - 7200}))
-
-        expected = sum(1 for f in store._facts
-                       if f.kind == FactKind.REVIEW and store._is_synthesizable_review(f))
-        assert expected - 55 < 0, "precondition: the first delta is negative"
-
-        store.synthesize_reviews()
-        assert store._load_synthesis_watermark() == expected, "re-baselined, not wedged"
-
-    def test_history_reviews_do_not_mask_a_real_cluster(self, store):
-        """History bulk must not be *needed* for, nor block, a real synthesis."""
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-        for i in range(30):
-            noise = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(
-                store, f"history:{i:08x} commit {i}", f"body {i}",
-                ["history"], embedding=noise / np.linalg.norm(noise),
-            )
-        for i in range(20):
-            noise = np.random.randn(768).astype(np.float32)
-            self._make_review_fact(
-                store, f"outcome:accepted other_{i}.py", f"body {i}",
-                ["outcome", "accepted"], embedding=noise / np.linalg.norm(noise),
-            )
-        for i in range(5):
-            var = emb + np.random.randn(768).astype(np.float32) * 0.01
-            self._make_review_fact(
-                store, "outcome:accepted store.py", f"wrap I/O variant {i}",
-                ["outcome", "accepted"], embedding=var / np.linalg.norm(var),
-            )
-        assert store.synthesize_reviews() >= 1
-        # Nothing in the synthesized lineage came from a history fact.
-        synth = [f for f in store._facts if "synthesized" in f.tags]
-        assert synth and not any("history" in f.tags for f in synth)
-
-    def test_synthesis_creates_pattern_from_accepted_cluster(self, store):
-        """A cluster of 3+ similar accepted REVIEW facts should synthesize into PATTERN."""
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-
-        # Create 25 REVIEW facts; 5 of them are a tight cluster
-        for i in range(20):
-            random_emb = np.random.randn(768).astype(np.float32)
-            random_emb = random_emb / np.linalg.norm(random_emb)
-            self._make_review_fact(
-                store, f"outcome:accepted other_{i}.py", f"body {i}",
-                ["outcome", "accepted"], embedding=random_emb,
-            )
-
-        # Add a tight cluster of 5 similar facts
-        for i in range(5):
-            slight_variation = emb + np.random.randn(768).astype(np.float32) * 0.01
-            slight_variation = slight_variation / np.linalg.norm(slight_variation)
-            self._make_review_fact(
-                store, "outcome:accepted store.py", f"wrap I/O in try/except variant {i}",
-                ["outcome", "accepted"], embedding=slight_variation,
-            )
-
-        count = store.synthesize_reviews()
-        assert count >= 1
-
-        # The synthesized fact should be PATTERN kind
-        patterns = [f for f in store._facts if f.kind == FactKind.PATTERN and f.is_valid]
-        assert len(patterns) >= 1
-        assert "synthesized" in patterns[0].tags
-
-    def test_synthesis_supersedes_source_facts(self, store):
-        """Source REVIEW facts should be marked invalid after synthesis."""
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-
-        # 20 filler + 3 clustered
-        for i in range(20):
-            random_emb = np.random.randn(768).astype(np.float32)
-            random_emb = random_emb / np.linalg.norm(random_emb)
-            self._make_review_fact(
-                store, f"filler {i}", f"body {i}",
-                ["outcome", "accepted"], embedding=random_emb,
-            )
-
-        cluster_facts = []
-        for i in range(4):
-            slight = emb + np.random.randn(768).astype(np.float32) * 0.005
-            slight = slight / np.linalg.norm(slight)
-            f = self._make_review_fact(
-                store, "outcome:accepted store.py", f"same pattern {i}",
-                ["outcome", "accepted"], embedding=slight,
-            )
-            cluster_facts.append(f)
-
-        store.synthesize_reviews()
-
-        # All cluster source facts should be invalidated
-        for f in cluster_facts:
-            assert f.is_valid is False
-            assert f.superseded_by is not None
-
-    def test_watermark_prevents_rerun(self, store):
-        """Synthesis should not re-run until 10 more REVIEW facts accumulate."""
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-
-        for i in range(25):
-            random_emb = np.random.randn(768).astype(np.float32)
-            random_emb = random_emb / np.linalg.norm(random_emb)
-            self._make_review_fact(
-                store, f"review {i}", f"body {i}",
-                ["outcome", "accepted"], embedding=random_emb,
-            )
-
-        # First run sets watermark
-        store.synthesize_reviews()
-
-        # Second run without new facts should skip
-        count = store.synthesize_reviews()
-        assert count == 0
-
-
 class TestLegacyProjectIdMigration:
     """Verifies that fact + watermark files written under the pre-remote-hash
     project ID get renamed to the new (git-remote-hashed) ID on FactStore init.
     """
 
-    def test_renames_legacy_fact_and_watermark_files(self, tmp_facts_dir, tmp_path):
-        """Legacy path-hashed files should be moved to the remote-hashed key."""
+    def test_renames_legacy_fact_file_and_drops_dead_watermark(self, tmp_facts_dir, tmp_path):
+        """Legacy fact file moves to the remote-hashed key.
+
+        Synthesis watermarks are dead files since REVIEW->PATTERN synthesis was
+        removed — nothing reads or writes them — so migration deletes rather than
+        carrying stale state forward under the new project_id.
+        """
         from contextlib import ExitStack
 
         from neo.memory.scope import _compute_legacy_project_id
@@ -2597,11 +2356,12 @@ class TestLegacyProjectIdMigration:
 
         # New (remote-hashed) ID must differ from the legacy one
         assert store.project_id != legacy_id
-        # Legacy files moved to new ID
+        # Legacy fact file moved to new ID
         assert not legacy_facts.exists()
-        assert not legacy_wm.exists()
         assert (tmp_facts_dir / f"facts_project_{store.project_id}.json").exists()
-        assert (tmp_facts_dir / f"synthesis_watermark_{store.project_id}.json").exists()
+        # Dead watermark reaped at both keys, not migrated
+        assert not legacy_wm.exists()
+        assert not (tmp_facts_dir / f"synthesis_watermark_{store.project_id}.json").exists()
 
     def test_no_op_when_no_remote(self, tmp_facts_dir, tmp_path):
         """Without a remote, legacy ID == new ID, so nothing should be renamed."""
@@ -2860,172 +2620,6 @@ class TestDemoteUnhelpfulFacts:
         )
         store._facts.append(fact)
         assert store.demote_unhelpful_facts() == 0
-
-
-class TestLLMSynthesis:
-    """Tests for LLM-based synthesis enhancement."""
-
-    def _make_review_fact(self, store, subject, body, tags, embedding=None):
-        fact = Fact(
-            subject=subject,
-            body=body,
-            kind=FactKind.REVIEW,
-            scope=FactScope.PROJECT,
-            org_id="testorg",
-            project_id="testproj1234",
-            metadata=FactMetadata(confidence=0.5),
-            embedding=embedding,
-            tags=tags,
-        )
-        store._facts.append(fact)
-        return fact
-
-    def test_llm_used_for_large_cluster(self, store):
-        """Clusters of 5+ should use LLM synthesis when adapter is available."""
-        # Set up a mock LM adapter
-        mock_lm = type("MockLM", (), {
-            "generate": lambda self, **kwargs: (
-                "SUBJECT: error handling pattern in store.py\n"
-                "BODY: Wrap all I/O operations in try/except with logger.debug for resilience.\n"
-                "CONFIDENCE: 0.85"
-            )
-        })()
-        store._lm_adapter = mock_lm
-
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-
-        # 20 filler + 5 tight cluster
-        for i in range(20):
-            random_emb = np.random.randn(768).astype(np.float32)
-            random_emb = random_emb / np.linalg.norm(random_emb)
-            self._make_review_fact(
-                store, f"outcome:accepted other_{i}.py", f"body {i}",
-                ["outcome", "accepted"], embedding=random_emb,
-            )
-        for i in range(5):
-            slight = emb + np.random.randn(768).astype(np.float32) * 0.005
-            slight = slight / np.linalg.norm(slight)
-            self._make_review_fact(
-                store, "outcome:accepted store.py", f"wrap I/O variant {i}",
-                ["outcome", "accepted"], embedding=slight,
-            )
-
-        store.synthesize_reviews()
-
-        patterns = [f for f in store._facts if f.kind == FactKind.PATTERN and f.is_valid]
-        assert len(patterns) >= 1
-        # Should use the LLM-generated subject
-        llm_pattern = [p for p in patterns if "error handling" in p.subject]
-        assert len(llm_pattern) == 1
-        assert llm_pattern[0].metadata.confidence == pytest.approx(0.85)
-
-    def test_mechanical_fallback_for_small_cluster(self, store):
-        """Clusters of 3-4 should use mechanical synthesis even with adapter."""
-        mock_lm = type("MockLM", (), {
-            "generate": lambda self, **kwargs: "should not be called"
-        })()
-        store._lm_adapter = mock_lm
-
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-
-        for i in range(20):
-            random_emb = np.random.randn(768).astype(np.float32)
-            random_emb = random_emb / np.linalg.norm(random_emb)
-            self._make_review_fact(
-                store, f"filler {i}", f"body {i}",
-                ["outcome", "accepted"], embedding=random_emb,
-            )
-        # Only 3 in cluster (below LLM threshold of 5)
-        for i in range(3):
-            slight = emb + np.random.randn(768).astype(np.float32) * 0.005
-            slight = slight / np.linalg.norm(slight)
-            self._make_review_fact(
-                store, "outcome:accepted store.py", f"pattern {i}",
-                ["outcome", "accepted"], embedding=slight,
-            )
-
-        count = store.synthesize_reviews()
-        assert count >= 1  # Mechanical synthesis still works
-
-    def test_mechanical_fallback_on_llm_error(self, store):
-        """LLM errors should fall back to mechanical synthesis gracefully."""
-        mock_lm = type("MockLM", (), {
-            "generate": lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("API down"))
-        })()
-        store._lm_adapter = mock_lm
-
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-
-        for i in range(20):
-            random_emb = np.random.randn(768).astype(np.float32)
-            random_emb = random_emb / np.linalg.norm(random_emb)
-            self._make_review_fact(
-                store, f"filler {i}", f"body {i}",
-                ["outcome", "accepted"], embedding=random_emb,
-            )
-        for i in range(5):
-            slight = emb + np.random.randn(768).astype(np.float32) * 0.005
-            slight = slight / np.linalg.norm(slight)
-            self._make_review_fact(
-                store, "outcome:accepted store.py", f"variant {i}",
-                ["outcome", "accepted"], embedding=slight,
-            )
-
-        count = store.synthesize_reviews()
-        assert count >= 1  # Falls back to mechanical
-
-    def test_mechanical_fallback_no_adapter(self, store):
-        """No adapter should mean pure mechanical synthesis."""
-        assert store._lm_adapter is None  # Default fixture has no adapter
-
-        emb = np.random.randn(768).astype(np.float32)
-        emb = emb / np.linalg.norm(emb)
-
-        for i in range(20):
-            random_emb = np.random.randn(768).astype(np.float32)
-            random_emb = random_emb / np.linalg.norm(random_emb)
-            self._make_review_fact(
-                store, f"filler {i}", f"body {i}",
-                ["outcome", "accepted"], embedding=random_emb,
-            )
-        for i in range(5):
-            slight = emb + np.random.randn(768).astype(np.float32) * 0.005
-            slight = slight / np.linalg.norm(slight)
-            self._make_review_fact(
-                store, "outcome:accepted store.py", f"variant {i}",
-                ["outcome", "accepted"], embedding=slight,
-            )
-
-        count = store.synthesize_reviews()
-        assert count >= 1
-
-    def test_parse_llm_response(self, store):
-        """Test parsing of various LLM response formats."""
-        from neo.memory.store import FactStore
-
-        # Good response
-        result = FactStore._parse_llm_synthesis(
-            "SUBJECT: error handling in store.py\n"
-            "BODY: Always wrap I/O in try/except.\n"
-            "CONFIDENCE: 0.9"
-        )
-        assert result is not None
-        assert result[0] == "error handling in store.py"
-        assert "wrap I/O" in result[1]
-        assert result[2] == pytest.approx(0.9)
-
-        # Bad response (missing fields)
-        assert FactStore._parse_llm_synthesis("just some text") is None
-
-        # Confidence out of range gets clamped
-        result = FactStore._parse_llm_synthesis(
-            "SUBJECT: test\nBODY: test body\nCONFIDENCE: 1.5"
-        )
-        assert result is not None
-        assert result[2] == pytest.approx(1.0)
 
 
 class TestConstraintEmbeddings:
@@ -3406,3 +3000,60 @@ class TestMetricsRotation:
         path.write_text("x" * 500)  # already oversized from prior runs
         metrics.record("retrieve", i=0)
         assert (path.parent / "metrics.jsonl.1").exists()
+
+
+class TestSynthesisRemoved:
+    """REVIEW->PATTERN synthesis was deleted: it produced 114 facts in
+    production and not one of them was a PATTERN, while silently decaying the
+    corpus and re-consuming its own summaries as evidence.
+
+    These pin the deletion so it can't be reintroduced by accident.
+    """
+
+    def test_synthesis_entry_points_are_gone(self):
+        for name in ("synthesize_reviews", "_synthesize_cluster", "_synthesis_group_key",
+                     "_is_synthesizable_review", "_hebbian_strengthen",
+                     "_global_confidence_downscale", "_review_entropy",
+                     "_cluster_by_similarity", "_llm_synthesize",
+                     "_load_synthesis_watermark", "_save_synthesis_watermark"):
+            assert not hasattr(FactStore, name), f"{name} should have been removed"
+
+    def test_outcome_processing_leaves_unrelated_confidence_alone(self, tmp_path):
+        """The corpus-wide 0.97 downscale rode on synthesis. Nothing may move
+        the confidence of a fact the outcome never touched."""
+        from neo.memory.outcomes import Outcome, OutcomeType
+
+        store = FactStore(codebase_root=str(tmp_path), facts_dir=tmp_path / "facts",
+                          eager_init=False)
+        bystanders = []
+        for i in range(5):
+            f = Fact(subject=f"unrelated {i}", body="b", kind=FactKind.PATTERN,
+                     scope=FactScope.PROJECT, org_id="o", project_id=store.project_id,
+                     metadata=FactMetadata(confidence=0.70))
+            store._facts.append(f)
+            bystanders.append(f)
+
+        outcomes = [Outcome(outcome_type=OutcomeType.INDEPENDENT,
+                            file_path="some/file.py",
+                            suggestion_description="unrelated change",
+                            suggestion_confidence=0.5)]
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=(outcomes, {})):
+            store.detect_implicit_feedback({"prompt": "test"}, [])
+
+        for f in bystanders:
+            assert f.metadata.confidence == 0.70, "untouched facts must not drift"
+
+    def test_supersession_and_dedup_survive(self):
+        """Deletion was bounded to the failed subsystem."""
+        from neo.memory.store import PROTECTED_TAGS, SUPERSESSION_THRESHOLD
+        assert SUPERSESSION_THRESHOLD == 0.85
+        assert hasattr(FactStore, "_supersede")
+        assert hasattr(FactStore, "_canonical_signature")
+        # Pre-existing synthesized facts keep prune immunity.
+        assert "synthesized" in PROTECTED_TAGS
+
+    def test_episode_promotion_path_survives(self):
+        """The git-verified learning path is untouched."""
+        assert hasattr(FactStore, "_promote_repeatedly_supported_candidate")
+        assert hasattr(FactStore, "reconcile_cross_project_promotions")

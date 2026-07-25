@@ -30,8 +30,11 @@ from neo.math_utils import cluster_by_similarity
 
 logger = logging.getLogger(__name__)
 
-# Same threshold the REVIEW->PATTERN synthesis uses (store.SYNTHESIS_SIMILARITY);
-# kept as a local constant so this module imports nothing heavy at import time.
+# Paper 2603.10600 (Trajectory-Memory) §7: τ = 0.85 was the empirical sweet spot
+# for description-generalized clusters — below it unrelated items over-merge,
+# above it everything is a singleton. Local constant so this module imports
+# nothing heavy. (Formerly shared its value with REVIEW->PATTERN synthesis, which
+# has since been removed.)
 CLUSTER_SIMILARITY = 0.85
 
 # Issue categories, mapped to the harness failure taxonomy ("most agent failures
