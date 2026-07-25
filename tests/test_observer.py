@@ -784,8 +784,12 @@ class TestGlobalSweep:
         decoder cannot round-trip), so the real mapping is pinned here instead.
         """
         from neo.prompt.scanner import _decode_project_path
+        # The decoder only returns paths that EXIST, so assert against ones
+        # present on every platform CI runs on — "/Users" is macOS-only and made
+        # this test pass locally while failing on Linux.
         assert _decode_project_path("-") == "/"
-        assert _decode_project_path("-Users") == "/Users"
+        assert _decode_project_path("-tmp") == "/tmp"
+        assert _decode_project_path("-no-such-directory-anywhere") is None
 
     def _discover_with(self, monkeypatch, tmp_path, decoded):
         import neo.memory.transcript as tr
