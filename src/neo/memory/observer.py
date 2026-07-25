@@ -35,6 +35,9 @@ Tunables (env, read by the daemon child):
                                      kick; the cooldown still bounds
                                      the rate at which restarts re-
                                      trigger mining.
+    NEO_OBSERVER_RECYCLE_CYCLES    — re-exec after this many cycles to
+                                     bound RSS (default 48, ~4h). 0
+                                     disables recycling.
 """
 
 from __future__ import annotations
@@ -277,6 +280,10 @@ class ObserverConfig:
     # cycle paying to load every project's FactStore. Projects with no new
     # transcripts since their watermark do near-zero work (ingest finds nothing).
     max_projects_per_cycle: int = 25
+    # Re-exec after this many cycles to bound RSS (see Observer._should_recycle).
+    # 48 cycles is ~4h at the default 300s interval — long enough that the swap
+    # is invisible, short enough that fragmentation never compounds. 0 disables.
+    recycle_after_cycles: int = 48
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -293,6 +300,7 @@ class ObserverConfig:
         return cls(
             interval_seconds=_read("NEO_OBSERVER_INTERVAL_SECONDS", 300.0),
             cooldown_seconds=_read("NEO_OBSERVER_COOLDOWN", 60.0),
+            recycle_after_cycles=int(_read("NEO_OBSERVER_RECYCLE_CYCLES", 48.0)),
         )
 
 
@@ -377,6 +385,14 @@ class Observer:
                 await loop.run_in_executor(None, self._cycle)
                 await self._push_surface_after_cycle()
 
+                # Recycle between cycles, never mid-sweep, so no project is
+                # left half-processed and no fact file is mid-save.
+                if self._should_recycle():
+                    await self._teardown_surface()
+                    if self._lock is not None:
+                        self._lock.release()
+                    _reexec_self()  # does not return
+
             # Sleep in 1-second slices so SIGTERM is responsive without
             # leaving the supervisor waiting through a full interval.
             slept = 0.0
@@ -386,6 +402,23 @@ class Observer:
 
         await self._teardown_surface()
         print(f"neo observer stopped pid={os.getpid()}", flush=True)
+
+    #: Set by ``_daemon_main`` so a recycle can drop the single-instance lock
+    #: before exec. None when the Observer is driven directly (tests).
+    _lock = None
+
+    def _should_recycle(self) -> bool:
+        """Has this process swept enough to be worth replacing?
+
+        The daemon's RSS is peak working set plus CPython arena fragmentation:
+        each project sweep deserializes a multi-MB fact file (79% of whose rows
+        are tombstones retained by policy), and the allocator never returns
+        those arenas to the OS. Nothing leaks — RSS drifts up to the high-water
+        mark and stays there, measured at 0.5-0.7 GB. Re-exec'ing on a cadence
+        bounds it for the cost of one process image swap.
+        """
+        limit = self.config.recycle_after_cycles
+        return limit > 0 and self._cycles_total >= limit
 
     def _handle_stop(self, _signum: int, _frame) -> None:
         self._stop = True
@@ -1161,6 +1194,40 @@ _LOCK_ESCALATE_AFTER = 3  # attempts of SIGTERM grace before SIGKILL
 _LOCK_PATH = os.path.expanduser("~/.neo/observer.lock")
 
 
+def _reexec_self() -> None:
+    """Replace this process image with a fresh one. Does not return.
+
+    Why re-exec rather than exit and let the supervisor restart us: the CAR
+    agent spec is ``restart: "on_failure"`` with ``max_restarts: 10``. A clean
+    exit(0) would never be restarted — the observer would simply stop — and
+    exiting non-zero to force a restart would burn the restart budget, so after
+    ten recycles the supervisor would give up permanently. Re-exec keeps the
+    same pid, needs no supervisor cooperation, consumes no restart budget, and
+    works identically when CAR is absent.
+
+    The caller must release the single-instance lock first. Carrying it across
+    the exec looks safer but is not: ``flock`` is owned by the open file
+    description, so the inherited fd keeps the file locked and the new image
+    can never take it — it exits as "contended" and the machine is left with no
+    observer at all. Measured that failure directly before fixing it. Dropping
+    the lock leaves a sub-millisecond window, which the acquire loop's retries
+    already cover.
+    """
+    print(
+        f"neo observer recycling pid={os.getpid()} (bounding RSS; re-exec)",
+        flush=True,
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "neo.memory.observer", *sys.argv[1:]])
+    except OSError as e:
+        # Exec failed: we still hold the lock and a working process, so carry on
+        # rather than dying. RSS stays high until the next attempt — strictly
+        # better than leaving the machine with no observer.
+        logger.warning("observer re-exec failed (%s); continuing without recycling", e)
+
+
 class _SingleInstanceLock:
     """Advisory exclusive file lock held for the observer's lifetime.
 
@@ -1291,6 +1358,7 @@ def _daemon_main(argv: list[str]) -> int:
             print(f"observer init failed: {e}", file=sys.stderr)
             return 1
 
+        observer._lock = lock
         observer.run()
         return 0
     finally:

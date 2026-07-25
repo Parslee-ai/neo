@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **The observer now bounds its own RSS by re-exec'ing on a cadence** (`NEO_OBSERVER_RECYCLE_CYCLES`, default 48 cycles ≈ 4h, 0 disables). Its memory is peak working set plus CPython arena fragmentation — every sweep deserializes a multi-MB fact file and the allocator never hands those arenas back — so RSS drifted to 0.5–0.7 GB and stayed. Nothing leaked. Measured with recycling on: 179–381 MB across 10 recycles.
+
+  Two things worth recording, because both are counter-intuitive. Embeddings are **not** the cost: they total 1.9 MB in memory and only dominate the file on disk, as JSON text. And re-exec is used rather than exiting for the supervisor to restart, because the CAR spec is `restart: "on_failure"` with `max_restarts: 10` — a clean `exit(0)` would never be restarted, and forcing a non-zero exit would exhaust the budget after ten recycles, permanently. Re-exec keeps the pid, needs no supervisor cooperation, and consumes no restart budget.
+
+  The single-instance lock is released immediately before the exec. Carrying the fd across looks safer and is not: `flock` is owned by the open file description, so the inherited fd keeps the file locked and the new image can never acquire it — it exits as "contended", leaving the machine with no observer at all. That was measured directly during development before being fixed. (`memory/observer.py`)
+
 ## [0.39.1] - 2026-07-25
 
 ### Changed

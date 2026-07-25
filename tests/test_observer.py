@@ -1142,3 +1142,55 @@ class TestSameProjectIdRoots:
                 assert pid not in seen, f"{pid} is not contiguous"
                 seen.add(pid)
                 prev = pid
+
+
+class TestRecycleToBoundRSS:
+    """The daemon's RSS is peak working set plus CPython arena fragmentation —
+    each sweep deserializes multi-MB fact files and the allocator never returns
+    the arenas. Measured drifting to 0.5-0.7 GB; re-exec caps it.
+    """
+
+    def _observer(self, cycles_done, limit):
+        from neo.memory.observer import Observer, ObserverConfig
+        o = Observer(global_mode=True,
+                     config=ObserverConfig(recycle_after_cycles=limit))
+        o._cycles_total = cycles_done
+        return o
+
+    def test_recycles_once_the_cycle_budget_is_reached(self):
+        assert self._observer(48, 48)._should_recycle() is True
+        assert self._observer(49, 48)._should_recycle() is True
+
+    def test_does_not_recycle_early(self):
+        assert self._observer(47, 48)._should_recycle() is False
+        assert self._observer(0, 48)._should_recycle() is False
+
+    def test_zero_disables_recycling(self):
+        assert self._observer(10_000, 0)._should_recycle() is False
+
+    def test_env_knob_is_read(self, monkeypatch):
+        from neo.memory.observer import ObserverConfig
+        monkeypatch.setenv("NEO_OBSERVER_RECYCLE_CYCLES", "7")
+        assert ObserverConfig.from_env().recycle_after_cycles == 7
+
+    def test_reexec_uses_the_same_interpreter_and_args(self, monkeypatch):
+        """Must re-exec the module, not a shell string, and preserve --all."""
+        import neo.memory.observer as obs
+        captured = {}
+        monkeypatch.setattr(obs.sys, "argv", ["neo.memory.observer", "--daemon", "--all"])
+        monkeypatch.setattr(obs.os, "execv",
+                            lambda path, argv: captured.update(path=path, argv=argv))
+        obs._reexec_self()
+        assert captured["path"] == obs.sys.executable
+        assert captured["argv"][1:] == ["-m", "neo.memory.observer", "--daemon", "--all"]
+
+    def test_failed_reexec_does_not_kill_the_daemon(self, monkeypatch):
+        """If exec fails we still hold a working process — carry on rather than
+        leaving the machine with no observer."""
+        import neo.memory.observer as obs
+
+        def boom(path, argv):
+            raise OSError("exec failed")
+
+        monkeypatch.setattr(obs.os, "execv", boom)
+        obs._reexec_self()  # must not raise
