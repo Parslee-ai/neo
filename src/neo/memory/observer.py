@@ -48,7 +48,9 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from neo.memory.scope import detect_org_and_project
@@ -133,12 +135,52 @@ def _agent_id(project_id: str) -> str:
     return f"neo-observer-{project_id[:12]}"
 
 
+def _path_within(child: str, parent: str) -> bool:
+    """Component-aware containment. ``/work/github`` is NOT under ``/work/git``."""
+    try:
+        return Path(child) != Path(parent) and Path(child).is_relative_to(Path(parent))
+    except (ValueError, OSError):
+        return False
+
+
+def _is_container_root(root: str, all_roots: Iterable[str]) -> bool:
+    """True for paths that are directory *containers*, never project roots.
+
+    Claude Code mints a transcript dir for whatever cwd a session ran in, so an
+    ad-hoc session from ``/`` or ``~`` or ``~/git`` creates a "project" that is
+    an ancestor of every real one. Sweeping those is pure waste, and any source
+    attributing work by cwd (``CodexSource``) then claims the machine's entire
+    history under them.
+
+    The test is structural, not a blocklist: a root is a container when it holds
+    another discovered root **and is not itself a repository**. Measured on this
+    machine the ancestor counts separate cleanly — 39 / 38 / 25, then zero — so
+    ``/``, ``$HOME`` and ``~/git`` are caught while every real project is kept.
+    The ``.git`` clause is what protects a monorepo or a repo with a vendored
+    sub-repo: it holds nested roots but is a genuine project, so it stays.
+    Note ``.git`` is only ever used to *rescue* an ancestor — never as a blanket
+    requirement, since plenty of real roots here have no repo at all.
+    """
+    if (Path(root) / ".git").exists():
+        return False
+    return any(_path_within(other, root) for other in all_roots)
+
+
 def _discover_project_roots() -> list[str]:
     """All project roots neo has seen, for the global observer's sweep.
 
     Source of truth is Claude Code's per-project transcript dirs
     (``~/.claude/projects/<encoded>``); the encoded name decodes back to an
     absolute root. Best-effort — returns ``[]`` if the dir is absent/unreadable.
+
+    Known limitation: the inventory is Claude Code's, so a project only ever
+    opened in another tool is invisible here and its sessions attribute to the
+    nearest enclosing known root (or to nothing once containers are dropped).
+
+    Comparison is case-sensitive while macOS/APFS is case-insensitive, so a
+    session started from a differently-cased path (``/users/me`` vs
+    ``/Users/me``) is a distinct root. Rare, and the structural container test
+    still catches it once it holds another root.
     """
     from neo.memory.transcript import CLAUDE_PROJECTS_DIR
     from neo.prompt.scanner import _decode_project_path
@@ -153,8 +195,8 @@ def _discover_project_roots() -> list[str]:
             continue
         root = _decode_project_path(d.name)
         if root:
-            roots.add(root)
-    return sorted(roots)
+            roots.add(os.path.normpath(root))
+    return sorted(r for r in roots if not _is_container_root(r, roots))
 
 
 def _build_spec(project_id: str, codebase_root: str) -> dict:
@@ -339,18 +381,23 @@ class Observer:
         else:
             self._cycle_one()
 
-    def _run_project(self, root: str) -> tuple[int, int, object]:
+    def _run_project(self, root: str,
+                     peer_roots: Optional[list[str]] = None) -> tuple[int, int, object]:
         """Synthesize + transcript-mine one project. Returns (synthesized,
         mined, store). Transcript mining MUST run AFTER synthesis so a durable
         synthesis can't be aborted by an ingest/LM failure (isolated in its own
         guard). Do not reorder.
+
+        ``peer_roots`` is the sweep's full root set, so cwd-attributed sources
+        can hand a nested project's sessions to that project instead of to an
+        enclosing container root.
         """
         from neo.memory.store import FactStore
 
         store = FactStore(codebase_root=root, eager_init=False)
         store.initialize()
         count = store.synthesize_reviews()
-        mined = self._ingest_transcripts(store, root)
+        mined = self._ingest_transcripts(store, root, peer_roots)
         return count, mined, store
 
     def _cycle_one(self) -> None:
@@ -402,7 +449,12 @@ class Observer:
         synthesizing + mining each. Per-project errors are isolated so one bad
         project never aborts the sweep.
         """
+        from neo.memory.scope import clear_remote_url_cache
+
         t0 = time.time()
+        # Fresh view of every project's git remote once per cycle; within the
+        # cycle the memo removes ~3 redundant forks per project.
+        clear_remote_url_cache()
         roots = _discover_project_roots()
         if not roots:
             self._last_analysis_epoch = time.time()
@@ -429,7 +481,7 @@ class Observer:
             label = os.path.basename(root.rstrip("/")) or root
             p0 = time.time()
             try:
-                count, mined, store = self._run_project(root)
+                count, mined, store = self._run_project(root, peer_roots=roots)
                 last_store = store
                 total_synth += count
                 total_mined += mined
@@ -481,7 +533,8 @@ class Observer:
         })
         print(f"neo observer cycle ok: {summary} ({tick:.1f}s)", flush=True)
 
-    def _ingest_transcripts(self, store, root: str) -> int:
+    def _ingest_transcripts(self, store, root: str,
+                            peer_roots: Optional[list[str]] = None) -> int:
         """Mine Claude Code transcripts for lessons, bounded by the per-cycle
         episode budget AND a wall-clock deadline. Isolated in its own
         try/except so an LM or transcript failure never aborts the synthesis
@@ -500,7 +553,8 @@ class Observer:
             cfg = NeoConfig.load()
             adapter = resolve_adapter(cfg)
             ingester = TranscriptIngester(
-                store=store, lm_adapter=adapter, codebase_root=root
+                store=store, lm_adapter=adapter, codebase_root=root,
+                peer_roots=peer_roots,
             )
             stats = ingester.ingest(
                 max_episodes=self.config.ingest_budget,
@@ -1122,6 +1176,24 @@ class _SingleInstanceLock:
 # ---------------------------------------------------------------------------
 
 
+def _scrub_inherited_malloc_debug_env() -> None:
+    """Drop macOS malloc-debug vars inherited from whoever launched us.
+
+    When ``MallocStackLogging`` is present but the feature wasn't enabled,
+    libmalloc writes "can't turn off malloc stack logging because it was not
+    enabled" to stderr **once per forked child**. The sweep forks git per
+    project, so this produced 23,943 lines — 97% of a 2.6 MB stderr log, burying
+    the 29 real ENOSPC errors and the one real LM failure in it.
+
+    We inherit these from car-server's environment and never want them, so drop
+    them once at daemon start; every child then gets a clean env. No-op off
+    macOS and no-op when they aren't set.
+    """
+    for var in ("MallocStackLogging", "MallocStackLoggingNoCompact",
+                "MallocStackLoggingDirectory", "MallocScribble"):
+        os.environ.pop(var, None)
+
+
 def _daemon_main(argv: list[str]) -> int:
     import argparse
 
@@ -1136,6 +1208,8 @@ def _daemon_main(argv: list[str]) -> int:
     if not args.all and not args.cwd:
         print("observer requires --all or --cwd", file=sys.stderr)
         return 2
+
+    _scrub_inherited_malloc_debug_env()
 
     # Clear any straggler from a dead car-server, then claim the lock so we
     # never run synthesis concurrently with another observer. SIGTERM first;

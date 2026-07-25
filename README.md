@@ -676,7 +676,7 @@ $ neo --version
 "What is real? How do you define 'real'?"
 
 neo 0.18.1
-Provider: openai | Model: gpt-5.5
+Provider: openai | Model: gpt-5.6
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 0 facts | 0.00 avg confidence
@@ -875,7 +875,7 @@ parameter is sized from the strength of the memory hit:
 Familiar queries get cheap thinking; novel-and-hard queries get max thinking.
 Cap with `NEO_REASONING_EFFORT={none,low,medium,high,xhigh}` for cost control.
 
-> **Model note:** the effort vocabulary differs by model. gpt-5.5 (the default)
+> **Model note:** the effort vocabulary differs by model. gpt-5.6 (the default)
 > accepts the full `none / low / medium / high / xhigh` range. Older
 > `gpt-5-codex` only accepts `low / medium / high` — if you switch back to
 > that model, set `NEO_REASONING_EFFORT=high` to cap the auto-selector.
@@ -915,7 +915,7 @@ neo --config reset
 
 **Exposed Configuration Fields:**
 - `provider` - LM provider (openai, anthropic, google, azure, ollama, local)
-- `model` - Model name (e.g., gpt-5.5, claude-sonnet-4-5-20250929)
+- `model` - Model name (e.g., gpt-5.6, claude-sonnet-4-5-20250929)
 - `api_key` - API key for the chosen provider
 - `base_url` - Base URL for local/Ollama endpoints
 - `memory_backend` - Memory backend: "fact_store" (default) or "legacy"
@@ -953,7 +953,7 @@ export GOOGLE_API_KEY=...
 
 # Neo-generic override (takes precedence over provider-specific keys)
 export NEO_PROVIDER=openai
-export NEO_MODEL=gpt-5.5
+export NEO_MODEL=gpt-5.6
 export NEO_API_KEY=sk-...
 export NEO_BASE_URL=http://localhost:11434       # for Ollama/local endpoints
 ```
@@ -994,10 +994,10 @@ Neo writes structured per-operation events (retrieve / add_fact / lm_call / over
 
 ```python
 from neo.adapters import OpenAIAdapter
-adapter = OpenAIAdapter(model="gpt-5.5", api_key="sk-...")
+adapter = OpenAIAdapter(model="gpt-5.6", api_key="sk-...")
 ```
 
-Default model: `gpt-5.5`. GPT-5/Codex models use the `/v1/responses` endpoint automatically.
+Default model: `gpt-5.6`. GPT-5/Codex models use the `/v1/responses` endpoint automatically.
 
 ### Anthropic
 

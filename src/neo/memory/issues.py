@@ -458,7 +458,16 @@ def find_issues(
 
     root = getattr(store, "codebase_root", None)
     if sources is None:
-        sources = [ClaudeCodeSource(root), CodexSource(root), CarSource()]
+        # Same most-specific-root attribution the observer sweep uses, so a
+        # diagnostic run over a container root doesn't fold ten unrelated
+        # projects' sessions into one report.
+        from neo.memory.observer import _discover_project_roots
+
+        try:
+            peers = _discover_project_roots()
+        except Exception:  # noqa: BLE001 - diagnostics must not hard-fail
+            peers = []
+        sources = [ClaudeCodeSource(root), CodexSource(root, peer_roots=peers), CarSource()]
 
     cutoff = (now - since_seconds) if since_seconds else None
 

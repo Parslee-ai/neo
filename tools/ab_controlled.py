@@ -4,9 +4,14 @@
 Three arms produced for the SAME task, scored in ONE judge call (order
 randomized), so there's no cross-run judge variance:
 
-    A  single  = one combined gpt-5.5 call
-    B  panel_gpt    = panel with a SAME-model critic (gpt-5.5)
+    A  single  = one combined single-model call
+    B  panel_gpt    = panel with a SAME-model critic
     C  panel_claude = panel with a DISTINCT critic (Claude)
+
+The OpenAI arm tracks neo's current default model. The published baseline in
+``docs/solutions/tiered-reasoning-multi-agent.md`` (single 7.88 / panel 9.00,
+n=8) was measured on ``gpt-5.5`` — pass ``--model gpt-5.5`` to reproduce those
+numbers exactly rather than to re-measure on today's default.
 
 Therefore:
     orchestration gain = B - A   (structure, no diversity)
@@ -31,6 +36,10 @@ import ab_reasoning as ab  # noqa: E402  (sets up src path + shared helpers)
 from neo.adapters import OpenAIAdapter  # noqa: E402
 from neo.config import NeoConfig  # noqa: E402
 from neo.multi_agent import MultiAgentReasoner, _extract_json  # noqa: E402
+
+# Track neo's shipped default rather than restating it — a hardcoded copy here
+# is what drifted a full model version behind the runtime.
+DEFAULT_MODEL = NeoConfig().model
 
 _JUDGE3_SYS = (
     "You are a strict code reviewer judging three solutions to the same task. "
@@ -58,9 +67,10 @@ def judge3(adapter, task, ordered):
     return [int(obj.get(f"score_{i + 1}", 0) or 0) for i in range(3)]
 
 
-def run(n: int, k: int, out: Path, effort: str = "low") -> dict:
+def run(n: int, k: int, out: Path, effort: str = "low",
+        model: str = DEFAULT_MODEL) -> dict:
     key = NeoConfig.load().api_key
-    base = ab.EffortAdapter(OpenAIAdapter(model="gpt-5.5", api_key=key), effort)
+    base = ab.EffortAdapter(OpenAIAdapter(model=model, api_key=key), effort)
     claude = ab._critic_adapter("anthropic", "claude-sonnet-4-5-20250929")
 
     panel_gpt = MultiAgentReasoner(lambda role: base, k_plans=k, max_repair_rounds=1)
@@ -121,5 +131,7 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--effort", default="low")
     ap.add_argument("--out", default="/tmp/ab_controlled.json")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="OpenAI arm model (use gpt-5.5 to reproduce the published baseline)")
     a = ap.parse_args()
-    run(a.n, a.k, Path(a.out), effort=a.effort)
+    run(a.n, a.k, Path(a.out), effort=a.effort, model=a.model)

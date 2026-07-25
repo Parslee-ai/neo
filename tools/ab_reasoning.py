@@ -29,6 +29,10 @@ from neo.adapters import OpenAIAdapter  # noqa: E402
 from neo.config import NeoConfig  # noqa: E402
 from neo.multi_agent import MultiAgentReasoner, _extract_json  # noqa: E402
 
+# Track neo's shipped default rather than restating it — a hardcoded copy here
+# is what drifted a full model version behind the runtime.
+DEFAULT_MODEL = NeoConfig().model
+
 
 class EffortAdapter:
     """Wrap an adapter to inject a fixed reasoning effort on every call — so
@@ -124,7 +128,7 @@ def _critic_adapter(provider: str, model: str):
         return AnthropicAdapter(model=model or "claude-sonnet-4-5-20250929", api_key=key)
     if provider == "openai":
         from neo.adapters import OpenAIAdapter
-        return OpenAIAdapter(model=model or "gpt-5.5", api_key=NeoConfig.load().api_key)
+        return OpenAIAdapter(model=model or DEFAULT_MODEL, api_key=NeoConfig.load().api_key)
     from neo.adapters import CarAdapter
     return CarAdapter(model=model)
 
@@ -224,7 +228,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--k", type=int, default=3)
-    ap.add_argument("--model", default="gpt-5.5")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="use gpt-5.5 to reproduce the published tiered-reasoning baseline")
     ap.add_argument("--effort", default="low")
     ap.add_argument("--critic-model", default="", help="Distinct-family model for the critic role (e.g. claude-sonnet-4-5-20250929, mlx/qwen3-4b:4bit)")
     ap.add_argument("--critic-provider", default="car", choices=["car", "anthropic", "openai"], help="Provider for the critic model")

@@ -1,6 +1,7 @@
 """Tests for neo.memory.store - FactStore integration tests."""
 
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -2336,6 +2337,79 @@ class TestSynthesizeReviews:
             self._make_review_fact(store, f"review {i}", f"body {i}", ["outcome", "accepted"])
         assert store.synthesize_reviews() == 0
 
+    def test_history_reviews_do_not_open_the_gate(self, store):
+        """``history`` REVIEWs are per-commit events and must not count.
+
+        Measured on this machine: 1039 history REVIEWs across 15 projects, all
+        clustering into groups of exactly 1. They passed the >=20 gate and were
+        re-clustered every observer cycle, guaranteeing wasted work for a
+        provably empty result.
+        """
+        for i in range(40):
+            emb = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(
+                store, f"history:{i:08x} commit subject {i}", f"body {i}",
+                ["history"], embedding=emb / np.linalg.norm(emb),
+            )
+        assert store.synthesize_reviews() == 0
+
+    def test_watermark_rebaselines_after_population_change(self, store, tmp_path):
+        """Excluding `history` shrank the counted population under existing watermarks.
+
+        A saved watermark was taken over ALL REVIEWs, so the first count_delta
+        after this change goes strongly negative. That must not wedge synthesis:
+        the elapsed>=1h trigger still fires and the run re-baselines the mark.
+        """
+        import json
+        import time as _time
+
+        for i in range(30):
+            emb = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(store, f"history:{i:08x} commit {i}", f"b{i}",
+                                   ["history"], embedding=emb / np.linalg.norm(emb))
+        for i in range(25):
+            emb = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(store, f"outcome:accepted f{i}.py", f"b{i}",
+                                   ["outcome", "accepted"], embedding=emb / np.linalg.norm(emb))
+
+        wpath = store._project_path.parent / f"synthesis_watermark_{store.project_id}.json"
+        wpath.parent.mkdir(parents=True, exist_ok=True)
+        wpath.write_text(json.dumps({"review_count": 55, "updated_at": _time.time() - 7200}))
+
+        expected = sum(1 for f in store._facts
+                       if f.kind == FactKind.REVIEW and store._is_synthesizable_review(f))
+        assert expected - 55 < 0, "precondition: the first delta is negative"
+
+        store.synthesize_reviews()
+        assert store._load_synthesis_watermark() == expected, "re-baselined, not wedged"
+
+    def test_history_reviews_do_not_mask_a_real_cluster(self, store):
+        """History bulk must not be *needed* for, nor block, a real synthesis."""
+        emb = np.random.randn(768).astype(np.float32)
+        emb = emb / np.linalg.norm(emb)
+        for i in range(30):
+            noise = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(
+                store, f"history:{i:08x} commit {i}", f"body {i}",
+                ["history"], embedding=noise / np.linalg.norm(noise),
+            )
+        for i in range(20):
+            noise = np.random.randn(768).astype(np.float32)
+            self._make_review_fact(
+                store, f"outcome:accepted other_{i}.py", f"body {i}",
+                ["outcome", "accepted"], embedding=noise / np.linalg.norm(noise),
+            )
+        for i in range(5):
+            var = emb + np.random.randn(768).astype(np.float32) * 0.01
+            self._make_review_fact(
+                store, "outcome:accepted store.py", f"wrap I/O variant {i}",
+                ["outcome", "accepted"], embedding=var / np.linalg.norm(var),
+            )
+        assert store.synthesize_reviews() >= 1
+        # Nothing in the synthesized lineage came from a history fact.
+        synth = [f for f in store._facts if "synthesized" in f.tags]
+        assert synth and not any("history" in f.tags for f in synth)
+
     def test_synthesis_creates_pattern_from_accepted_cluster(self, store):
         """A cluster of 3+ similar accepted REVIEW facts should synthesize into PATTERN."""
         emb = np.random.randn(768).astype(np.float32)
@@ -3146,3 +3220,124 @@ class TestConcurrentSaveMerge:
             store.detect_implicit_feedback({"prompt": "p"}, [])
         modified_reviews = [x for x in store._facts if x.is_valid and "modified" in x.tags]
         assert len(modified_reviews) == 1
+
+
+class TestStaleTempFileReap:
+    """A save hard-killed between mkstemp and os.replace strands its temp file.
+    `_save_file` unlinks on exception, but SIGKILL runs no handler — and the
+    observer's lock-escalation path SIGKILLs a straggler by design. 84 MB was
+    stranded in ~/.neo/facts this way, aged 15 and 35 days, swept by nothing.
+    """
+
+    def _store(self, tmp_path):
+        from neo.memory.store import FactStore
+        return FactStore(codebase_root=str(tmp_path), facts_dir=tmp_path / "facts",
+                         eager_init=False)
+
+    def test_reaps_old_temp_files_only(self, tmp_path):
+        import os
+        import time
+        store = self._store(tmp_path)
+        facts_dir = tmp_path / "facts"
+        facts_dir.mkdir(parents=True, exist_ok=True)
+
+        old = facts_dir / "tmpdead.tmp"
+        old.write_text("x" * 1000)
+        stale = time.time() - (48 * 3600)
+        os.utime(old, (stale, stale))
+
+        fresh = facts_dir / "tmplive.tmp"
+        fresh.write_text("y" * 10)
+
+        real = facts_dir / "facts_global.json"
+        real.write_text("{}")
+
+        reclaimed = store._reap_stale_temp_files()
+
+        assert reclaimed == 1000
+        assert not old.exists()
+        assert fresh.exists(), "an in-flight write must never be reaped"
+        assert real.exists(), "only *.tmp is eligible"
+
+    def test_reap_survives_missing_dir(self, tmp_path):
+        store = self._store(tmp_path)
+        store._facts_dir = tmp_path / "does-not-exist"
+        assert store._reap_stale_temp_files() == 0
+
+    def test_reap_is_wired_into_cold_start(self, tmp_path, monkeypatch):
+        """The whole point of the change: init must actually run the reap."""
+        from neo.memory.store import FactStore
+
+        called = []
+        monkeypatch.setattr(FactStore, "_reap_stale_temp_files",
+                            lambda self: called.append(1) or 0)
+        FactStore(codebase_root=str(tmp_path), facts_dir=tmp_path / "facts")
+        assert called, "cold start must reap stranded temp files"
+
+    def test_reap_failure_never_breaks_init(self, tmp_path, monkeypatch):
+        """Disk hygiene is best-effort — it must not take the store down."""
+        from neo.memory.store import FactStore
+
+        def boom(self):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(FactStore, "_reap_stale_temp_files", boom)
+        FactStore(codebase_root=str(tmp_path), facts_dir=tmp_path / "facts")
+
+
+class TestMetricsRotation:
+    """metrics.jsonl was append-only with no bound — 17 MB on a live install."""
+
+    def _wire(self, tmp_path, monkeypatch, *, cap, every):
+        from neo.memory import metrics
+        path = tmp_path / "metrics.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(metrics, "_metrics_path", lambda: path)
+        monkeypatch.setattr(metrics, "_should_emit", lambda _e: True)
+        monkeypatch.setattr(metrics, "_MAX_METRICS_BYTES", cap)
+        monkeypatch.setattr(metrics, "_SIZE_CHECK_EVERY", every)
+        # Primed exactly as a fresh process is: first write checks.
+        monkeypatch.setattr(metrics, "_writes_since_size_check", every)
+        return metrics, path
+
+    def test_rotates_when_oversized(self, tmp_path, monkeypatch):
+        metrics, path = self._wire(tmp_path, monkeypatch, cap=200, every=1)
+        for i in range(12):
+            metrics.record("lm_call", model="gpt-5.6", i=i)
+        rotated = path.parent / "metrics.jsonl.1"
+        assert rotated.exists(), "one old generation is retained"
+        # Rotation renames the active log away; the next write recreates it.
+        metrics.record("lm_call", model="gpt-5.6", i="after")
+        assert path.exists() and path.stat().st_size < 200, "active log restarted small"
+
+    def test_no_rotation_below_cap(self, tmp_path, monkeypatch):
+        metrics, path = self._wire(tmp_path, monkeypatch, cap=10 * 1024 * 1024, every=1)
+        for i in range(20):
+            metrics.record("retrieve", i=i)
+        assert not (path.parent / "metrics.jsonl.1").exists()
+        assert len(path.read_text().splitlines()) == 20
+
+    def test_size_check_is_sampled_after_the_first_write(self, tmp_path, monkeypatch):
+        """Steady state must not pay a size check on every event...
+
+        ...but the sampling must not starve short-lived processes either: most
+        neo runs are CLI invocations emitting a handful of events, so the first
+        write of every process checks, then every 500th after.
+        """
+        metrics, path = self._wire(tmp_path, monkeypatch, cap=10 * 1024 * 1024, every=500)
+        stats = []
+        real_stat = Path.stat
+        monkeypatch.setattr(
+            Path, "stat",
+            lambda self, *a, **k: (stats.append(self.name), real_stat(self, *a, **k))[1],
+        )
+        for i in range(10):
+            metrics.record("retrieve", i=i)
+        assert stats.count("metrics.jsonl") == 1, "checked once, on the first write"
+
+    def test_short_lived_process_still_rotates(self, tmp_path, monkeypatch):
+        """A CLI run emitting a few events must not skip rotation entirely."""
+        metrics, path = self._wire(tmp_path, monkeypatch, cap=50, every=500)
+        path.write_text("x" * 500)  # already oversized from prior runs
+        metrics.record("retrieve", i=0)
+        assert (path.parent / "metrics.jsonl.1").exists()

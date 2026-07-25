@@ -539,6 +539,105 @@ def test_codex_source_filters_by_cwd(tmp_path):
     assert len(eps) == 1 and eps[0].ask == "within the repo"  # only the in-repo cwd
 
 
+def test_codex_source_root_slash_yields_to_any_known_peer(tmp_path):
+    """``"/"`` must not claim the machine's entire Codex history.
+
+    Every path really is inside ``/``, so containment alone can't refuse it —
+    the protection is that ``/`` loses to any more specific known root, and
+    that observer discovery drops it as a container in the first place. This
+    pins the half that lives here.
+    """
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-a.jsonl", cwd="/work/proj", sid="s1",
+                   records=[_ev("user_message", message="anywhere on disk")])
+    peers = ["/", "/work/proj"]
+    assert CodexSource("/", sessions_dir=sdir, peer_roots=peers).collect_episodes() == []
+    won = CodexSource("/work/proj", sessions_dir=sdir, peer_roots=peers).collect_episodes()
+    assert [e.ask for e in won] == ["anywhere on disk"]
+
+
+def test_codex_source_nested_peer_root_wins(tmp_path):
+    """A container root must not claim a nested project's sessions."""
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-nested.jsonl", cwd="/work/git/proj", sid="s1",
+                   records=[_ev("user_message", message="belongs to proj")])
+    _write_rollout(sdir / "rollout-loose.jsonl", cwd="/work/git", sid="s2",
+                   records=[_ev("user_message", message="belongs to the container")])
+    peers = ["/work/git", "/work/git/proj"]
+
+    container = CodexSource(codebase_root="/work/git", sessions_dir=sdir,
+                            peer_roots=peers).collect_episodes()
+    assert [e.ask for e in container] == ["belongs to the container"]
+
+    nested = CodexSource(codebase_root="/work/git/proj", sessions_dir=sdir,
+                         peer_roots=peers).collect_episodes()
+    assert [e.ask for e in nested] == ["belongs to proj"]
+
+
+def test_codex_source_rejects_false_prefix_sibling(tmp_path):
+    """``/work/github/x`` is NOT inside ``/work/git`` — component-aware, not string prefix.
+
+    This is the same family as the ``"/".rstrip("/") == ""`` bug and is exactly
+    what regresses when someone "simplifies" the containment test.
+    """
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-sib.jsonl", cwd="/work/github/x", sid="s1",
+                   records=[_ev("user_message", message="different project")])
+    assert CodexSource(codebase_root="/work/git", sessions_dir=sdir).collect_episodes() == []
+
+
+def test_codex_source_deepest_of_three_levels_wins(tmp_path):
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-deep.jsonl", cwd="/a/b/c", sid="s1",
+                   records=[_ev("user_message", message="deepest")])
+    peers = ["/a", "/a/b", "/a/b/c"]
+    for root in ("/a", "/a/b"):
+        assert CodexSource(root, sessions_dir=sdir, peer_roots=peers).collect_episodes() == []
+    won = CodexSource("/a/b/c", sessions_dir=sdir, peer_roots=peers).collect_episodes()
+    assert [e.ask for e in won] == ["deepest"]
+
+
+def test_codex_source_unattributable_rollouts(tmp_path):
+    """No session_meta, malformed JSON, and a session_meta with no cwd all mean 'skip'."""
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    (sdir / "rollout-bad.jsonl").write_text("{not json", encoding="utf-8")
+    (sdir / "rollout-nometa.jsonl").write_text(
+        json.dumps({"timestamp": "t", "type": "event_msg", "payload": {}}), encoding="utf-8")
+    _write_rollout(sdir / "rollout-nocwd.jsonl", cwd="", sid="s",
+                   records=[_ev("user_message", message="no cwd")])
+    assert CodexSource(codebase_root="/work/proj", sessions_dir=sdir).collect_episodes() == []
+
+
+def test_ingester_threads_peer_roots_to_codex_source():
+    """The middle hops: TranscriptIngester must actually reach CodexSource."""
+    ing = TranscriptIngester(store=object(), lm_adapter=None, codebase_root="/a",
+                             peer_roots=["/a", "/a/b", "/other"])
+    codex = next(s for s in ing.sources if isinstance(s, CodexSource))
+    assert codex._nested_peers == ["/a/b"]  # only nested peers, "/other" excluded
+
+
+def test_ingester_rejects_peer_roots_with_explicit_sources():
+    """peer_roots would be silently ignored alongside explicit sources — refuse instead."""
+    with pytest.raises(ValueError, match="peer_roots"):
+        TranscriptIngester(store=object(), lm_adapter=None, codebase_root="/a",
+                           sources=[CodexSource("/a")], peer_roots=["/a", "/a/b"])
+
+
+def test_codex_source_without_peers_keeps_prefix_behavior(tmp_path):
+    """Single-project callers (the request path) pass no peers and are unchanged."""
+    sdir = tmp_path / "codex"
+    sdir.mkdir()
+    _write_rollout(sdir / "rollout-nested.jsonl", cwd="/work/git/proj", sid="s1",
+                   records=[_ev("user_message", message="nested")])
+    eps = CodexSource(codebase_root="/work/git", sessions_dir=sdir).collect_episodes()
+    assert [e.ask for e in eps] == ["nested"]
+
+
 def test_codex_source_multiple_user_messages(tmp_path):
     sdir = tmp_path / "codex"
     sdir.mkdir()

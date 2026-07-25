@@ -22,8 +22,11 @@
   - Per-scope valid-fact caps (`SCOPE_LIMITS` in `store.py`): global=200, org=100,
     project=500, session=50. Enforced per loaded scope set (project+org+global);
     invalidated facts persist as tombstones until `purge_dead_facts` runs.
-  - Supersession & pre-write canonical-signature dedup at cosine ≥ 0.85
-    (`SYNTHESIS_SIMILARITY`, `memory.generalize`).
+  - Supersession at cosine ≥ 0.85 (`SUPERSESSION_THRESHOLD`, `store.py:3017`);
+    pre-write dedup is canonical-signature **equality**, not cosine
+    (`memory.generalize`). `SYNTHESIS_SIMILARITY` is a *separate* constant that
+    happens to equal 0.85 and is used only by REVIEW clustering
+    (`store.py:3381`) — the two can be tuned independently.
   - Episode-derived promotion correlation (`store._episode_signature` /
     `_global_signature`): a candidate promotes to a durable fact only when ≥2
     independent verified-accepted episodes share a **correlation signature**. That
@@ -87,7 +90,34 @@
     deliberate precision/recall trade in the fail-safe direction.
   - REVIEW → PATTERN/FAILURE synthesis needs ≥20 valid REVIEWs and ≥3-member clusters;
     triple-trigger gate fires when ANY of: count-delta ≥10, elapsed ≥1h, or
-    confidence-decile entropy >0.9.
+    confidence-decile entropy >0.9. **`history` REVIEWs are excluded from both
+    the gate count and the clustering** (`store._is_synthesizable_review`): they
+    are one-git-commit-each, distinct by construction, and a live census found
+    all 1039 of them across 15 projects clustering into groups of exactly 1 —
+    they opened the gate on material that could never produce output, then got
+    re-clustered every cycle. Excluding them dropped projects doing pointless
+    clustering work from 15 → 2. The watermark counts the same population as the
+    gate, so an existing watermark (taken over all REVIEWs) makes the first
+    count-delta negative once; elapsed/entropy still fire and the next save
+    re-baselines (pinned by `test_watermark_rebaselines_after_population_change`).
+    **Corpus-wide finding**: at `SYNTHESIS_SIMILARITY` 0.85 *no* group in *any*
+    project currently reaches a 3-member cluster, so the **observer** path has
+    produced zero facts in 265 cycles. It is NOT dead code, though — the inline
+    trigger in `detect_implicit_feedback` (`store.py:2159`) fires on the request
+    path and has minted 114 synthesized facts since 2026-03-24. **All 114 are
+    `kind=REVIEW`; zero PATTERNs have ever been produced**, because
+    `_synthesize_cluster` mints PATTERN only for `group_key == "outcome:accepted"`
+    and no REVIEW on this machine has ever carried the `accepted` tag — the
+    subsystem's headline REVIEW→PATTERN function has never executed. Two further
+    smells: synthesized output is itself a valid REVIEW carrying its members'
+    tags with no `synthesized` exclusion in the gate filter, so summaries re-enter
+    as inputs; and every successful synthesis runs
+    `_global_confidence_downscale(0.97)` over the whole valid corpus.
+    Do not "fix" the clustering by lowering `SYNTHESIS_SIMILARITY` — a sweep
+    showed 0.60 already yields a 40-member merge. (Note `SYNTHESIS_SIMILARITY`
+    and `SUPERSESSION_THRESHOLD` are **separate** constants that merely both
+    equal 0.85, and pre-write dedup uses canonical-signature equality, not
+    cosine — an earlier version of this file claimed they were shared.)
   - Probation: new non-curated facts enter with a `probation` tag and a 3-day stale window
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
@@ -245,7 +275,19 @@
   triple-trigger gate keeps firing too. **Not opt-in**: `maybe_autostart_observer()`
   (called from `cli.main`) auto-registers it whenever `car-server` is reachable;
   opt out with `NEO_OBSERVER_AUTOSTART=0`. No CAR → one-time hint, then silent.
-  Projects are discovered from `~/.claude/projects/*` (decoded roots). On
+  Projects are discovered from `~/.claude/projects/*` (decoded roots), minus
+  **container roots** (`observer._is_container_root`): a decoded root that holds
+  another discovered root and is not itself a repo. Claude Code mints a
+  transcript dir for whatever cwd a session ran in, so ad-hoc sessions from `/`,
+  `$HOME` or `~/git` created pseudo-projects that were ancestors of every real
+  one — 26.3s of a ~40s cycle, and `CodexSource`'s cwd-prefix attribution then
+  claimed the machine's entire Codex history under them (`/` matched everything
+  because `"/".rstrip("/")` is `""`). The `.git` clause only ever *rescues* an
+  ancestor (a monorepo is a real project); it is never a blanket requirement,
+  since many real roots here have no repo. Nested real roots are disambiguated
+  by `CodexSource(peer_roots=…)` — deepest root wins. Known limits: the
+  inventory is Claude Code's, so a project only ever opened in another tool is
+  invisible; comparisons are case-sensitive on a case-insensitive filesystem. On
   bootstrap/start, legacy **per-project** agents (`neo-observer-<id12>`, the old
   model) are stopped + `agents_remove`d. **Hard dep**: car-runtime ≥ 0.18.0
   (pin floor 0.27.0) + a running `car-server` — CAR's supervisor owns
@@ -285,7 +327,23 @@
   `off` (no emit), `minimal` (lm_call only), `standard` (default, all events),
   `strict` (reserved for future verbose events; currently == standard).
   `NEO_METRICS=off` is a legacy hard kill-switch that overrides `NEO_PROFILE`.
+  The log rotates to `metrics.jsonl.1` at 32 MB (one generation retained); the
+  size is sampled every 500th write so the steady state stays one `write` per
+  event. Readers (`memory citation-stats`, `memory learning-stats`) window by
+  `--since` and read only the active file — a `--since` older than the last
+  rotation silently sees less history.
   Sessions and watermarks live in `~/.neo/sessions/`.
+- Disk hygiene: `FactStore` reaps abandoned `*.tmp` atomic-write files older
+  than 24h from `~/.neo/facts` on cold start (`_reap_stale_temp_files`). A save
+  that is SIGKILLed between `mkstemp` and `os.replace` strands its temp file —
+  `_save_file` unlinks on *exception*, but SIGKILL runs no handler, and the
+  observer's own lock-escalation path SIGKILLs stragglers by design. 88 MB had
+  accumulated this way with nothing to sweep it.
+- `scope._get_git_remote_url` is memoized per root (`clear_remote_url_cache`
+  resets it, called once per observer cycle). Resolving one project's identity
+  asked git for the same remote 3× — ~100 forks/cycle, ~26k/week. Staleness is
+  bounded to one cycle because a stale hit would write facts under the wrong
+  `project_id`.
 - Debugging: `neo --dry-run "your query"` assembles the full context (file selection,
   fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
   the LM, then exits without making the LLM call. Faster iteration on context-gatherer

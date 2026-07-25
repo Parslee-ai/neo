@@ -503,9 +503,21 @@ class CodexSource:
     name = "codex"
     scope = FactScope.PROJECT
 
-    def __init__(self, codebase_root: Optional[str], sessions_dir: Optional[Path] = None):
+    def __init__(self, codebase_root: Optional[str], sessions_dir: Optional[Path] = None,
+                 peer_roots: Optional[list[str]] = None):
         self.codebase_root = codebase_root
         self._dir = sessions_dir or CODEX_SESSIONS_DIR
+        # Only peers *nested under* our root can out-specify us for a given cwd,
+        # so narrow once here rather than re-scanning every peer per rollout.
+        # Built through the same containment primitive the ownership test uses,
+        # so there is one rule for "is X under Y" rather than two that can drift.
+        self._nested_peers: list[str] = []
+        if codebase_root and peer_roots:
+            self._nested_peers = [
+                p for p in peer_roots
+                if Path(p) != Path(codebase_root)
+                and self._cwd_within_root(p, codebase_root)
+            ]
 
     def collect_episodes(self) -> list[Episode]:
         root = self.codebase_root
@@ -513,7 +525,7 @@ class CodexSource:
             return []
         episodes: list[Episode] = []
         for fp in sorted(self._dir.glob("**/rollout-*.jsonl")):
-            if not self._cwd_within_root(fp, root):
+            if not self._owns_rollout(fp, root):
                 continue
             try:
                 if fp.stat().st_size > _CODEX_MAX_ROLLOUT_BYTES:
@@ -524,19 +536,52 @@ class CodexSource:
             episodes.extend(self._rollout_to_episodes(fp))
         return episodes
 
+    def _owns_rollout(self, fp: Path, root: str) -> bool:
+        """Does ``root`` own this rollout? Most-specific root wins.
+
+        A rollout belongs to the *deepest* known project root containing its
+        cwd. Without that, a container root (``~/git``, or worse ``/``) claims
+        every nested project's sessions too — re-ingesting the machine's whole
+        Codex history under a junk scope on every observer cycle.
+        """
+        cwd = self._rollout_cwd(fp)
+        if cwd is None or not self._cwd_within_root(cwd, root):
+            return False
+        return not any(self._cwd_within_root(cwd, p) for p in self._nested_peers)
+
     @staticmethod
-    def _cwd_within_root(fp: Path, root: str) -> bool:
-        """Cheap project filter: read only the first record (session_meta)."""
+    def _rollout_cwd(fp: Path) -> Optional[str]:
+        """The session's recorded cwd, or None if it can't be determined.
+
+        Reads only the first record (``session_meta``) — a rollout is often
+        megabytes and this runs per file per sweep. Returns None for an
+        unreadable/malformed file, a first record that isn't session_meta, and
+        a session_meta carrying no cwd: all three mean "unattributable", and
+        collapsing them keeps callers from reasoning about a third state.
+        """
         try:
             with fp.open(encoding="utf-8") as f:
                 first = f.readline()
             r = json.loads(first)
         except (OSError, json.JSONDecodeError):
-            return False
+            return None
         if r.get("type") != "session_meta":
+            return None
+        return (r.get("payload") or {}).get("cwd") or None
+
+    @staticmethod
+    def _cwd_within_root(cwd: str, root: str) -> bool:
+        """Component-aware containment.
+
+        ``Path.is_relative_to`` rather than a string prefix: it makes the
+        ``"/".rstrip("/") == ""`` empty-base footgun structurally impossible,
+        handles trailing slashes, and refuses the false-prefix sibling case
+        (``/work/github/x`` is NOT inside ``/work/git``) by construction.
+        """
+        try:
+            return Path(cwd).is_relative_to(Path(root))
+        except (ValueError, OSError):
             return False
-        cwd = (r.get("payload") or {}).get("cwd") or ""
-        return cwd == root or cwd.startswith(root.rstrip("/") + "/")
 
     @staticmethod
     def _rollout_to_episodes(fp: Path) -> list[Episode]:
@@ -895,7 +940,7 @@ class TranscriptIngester:
     """
 
     def __init__(self, store, lm_adapter, codebase_root: Optional[str] = None,
-                 sources: Optional[list] = None):
+                 sources: Optional[list] = None, peer_roots: Optional[list[str]] = None):
         self._store = store
         self._lm = lm_adapter
         self.codebase_root = codebase_root or getattr(store, "codebase_root", None)
@@ -903,9 +948,20 @@ class TranscriptIngester:
         # toggles: GitHubPRSource self-disables (returns []) when the repo has no
         # github.com remote or `gh` isn't on PATH, so it costs nothing where it
         # doesn't apply rather than needing an opt-out flag.
+        # ``peer_roots`` (the observer's full sweep set) lets cwd-attributed
+        # sources give a nested project's sessions to that project, not to an
+        # enclosing container root. Absent it, single-project callers keep the
+        # plain within-root behavior.
+        if sources is not None and peer_roots:
+            # Explicit sources are used verbatim, so peer_roots would be a
+            # silent no-op. Say so rather than pretending it applied.
+            raise ValueError(
+                "peer_roots does not apply when explicit sources are supplied; "
+                "construct the sources with peer_roots= directly"
+            )
         self.sources = sources if sources is not None else [
             ClaudeCodeSource(self.codebase_root),
-            CodexSource(self.codebase_root),
+            CodexSource(self.codebase_root, peer_roots=peer_roots),
             CarSource(),
             GitHubPRSource(self.codebase_root),
         ]

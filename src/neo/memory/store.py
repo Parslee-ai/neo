@@ -355,6 +355,13 @@ class FactStore:
         except Exception as e:
             logger.warning(f"Lifecycle maintenance on init failed (non-fatal): {e}")
 
+        # Independent of the fact-level janitors above (and of their save), so a
+        # failure there still reclaims disk.
+        try:
+            self._reap_stale_temp_files()
+        except Exception as e:
+            logger.warning(f"Temp-file reap on init failed (non-fatal): {e}")
+
     def _ensure_embedder(self) -> None:
         """Lazy-initialize the embedding model on first use."""
         if self._embedder_initialized:
@@ -2860,6 +2867,37 @@ class FactStore:
                 f"kept {MAX_ATTEMPT_OUTCOME_FACTS}"
             )
 
+    # A save that is hard-killed between mkstemp and os.replace strands its temp
+    # file. `_save_file` unlinks on exception, but SIGKILL runs no handler — and
+    # the observer's own lock-escalation path SIGKILLs a straggler by design.
+    # Measured fallout: 84 MB stranded in ~/.neo/facts (a 77 MB and a 7 MB file,
+    # 15 and 35 days old). Nothing swept them, so they were permanent.
+    _TEMP_REAP_AGE_SECONDS = 24 * 3600
+
+    def _reap_stale_temp_files(self) -> int:
+        """Delete abandoned atomic-write temp files. Returns bytes reclaimed.
+
+        Only files older than a day are touched, so a temp file a concurrent
+        process is actively writing (a sub-second window) can never be hit.
+        """
+        facts_dir = self._facts_dir
+        if not facts_dir.is_dir():
+            return 0
+        cutoff = time.time() - self._TEMP_REAP_AGE_SECONDS
+        reclaimed = 0
+        for tmp in facts_dir.glob("*.tmp"):
+            try:
+                st = tmp.stat()
+                if st.st_mtime >= cutoff:
+                    continue
+                size = st.st_size
+                tmp.unlink()
+                reclaimed += size
+                logger.info("Reaped stale temp file %s (%.1f MB)", tmp.name, size / 1e6)
+            except OSError:
+                continue  # vanished or not ours — either way, not our problem
+        return reclaimed
+
     def _save_file(self, path: Path, facts: list[Fact]) -> None:
         """Save a list of facts to a JSON file atomically.
 
@@ -3284,13 +3322,23 @@ class FactStore:
         Returns:
             Number of synthesized facts created.
         """
-        # Count ALL review facts (valid + invalid) for watermark comparison
+        # ``history`` REVIEWs are one git commit each. They are chronological
+        # events, not recurring lessons, so they can never legitimately
+        # consolidate — measured across this machine's 15 gate-passing
+        # projects, all 1039 of them clustered into groups of exactly 1. They
+        # were still counted toward the >=20 gate and then re-clustered every
+        # cycle, so the gate opened on material that could not produce output.
+        # Excluding them here makes the gate mean what it says and drops ~90%
+        # of the per-cycle clustering work. Watermark counts the same
+        # population as the gate so the count-delta trigger stays coherent.
         all_review_count = sum(
-            1 for f in self._facts if f.kind == FactKind.REVIEW
+            1 for f in self._facts
+            if f.kind == FactKind.REVIEW and self._is_synthesizable_review(f)
         )
         valid_review_facts = [
             f for f in self._facts
             if f.is_valid and f.kind == FactKind.REVIEW
+            and self._is_synthesizable_review(f)
         ]
 
         if len(valid_review_facts) < 20:
@@ -3390,6 +3438,16 @@ class FactStore:
                 continue
             new_conf = max(0.05, fact.metadata.confidence * alpha)
             fact.metadata.confidence = new_conf
+
+    @staticmethod
+    def _is_synthesizable_review(fact: Fact) -> bool:
+        """Can this REVIEW ever consolidate into a PATTERN/FAILURE?
+
+        ``history`` facts are per-commit records — distinct events by
+        construction, never a recurring lesson. Feeding them to the clusterer
+        is unbounded work with a provably empty result.
+        """
+        return FactStore._synthesis_group_key(fact) != "history"
 
     @staticmethod
     def _synthesis_group_key(fact: Fact) -> str:

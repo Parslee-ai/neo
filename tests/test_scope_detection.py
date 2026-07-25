@@ -1,5 +1,6 @@
 """Tests for neo.memory.scope - org/project detection."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from neo.memory.scope import (
@@ -66,6 +67,60 @@ class TestNormalizeRemoteUrl:
 
     def test_trailing_slash_stripped(self):
         assert _normalize_remote_url("https://github.com/o/r/") == "github.com/o/r"
+
+
+class TestRemoteUrlCache:
+    """The sweep asked git for the same remote 3x per project — ~100 forks per
+    observer cycle, ~26k over a week, for an answer fixed within the cycle."""
+
+    def test_repeat_lookups_fork_once(self, monkeypatch):
+        from neo.memory import scope
+
+        scope.clear_remote_url_cache()
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(kwargs.get("cwd"))
+            return SimpleNamespace(returncode=0, stdout="git@github.com:o/r.git\n")
+
+        monkeypatch.setattr(scope.subprocess, "run", fake_run)
+        for _ in range(3):
+            assert scope._get_git_remote_url("/repo/a") == "git@github.com:o/r.git"
+        assert len(calls) == 1
+
+        # A different root is a separate entry, not a cache hit.
+        scope._get_git_remote_url("/repo/b")
+        assert len(calls) == 2
+
+    def test_non_repo_result_is_cached_too(self, monkeypatch):
+        """Non-repo roots are the common case (7 of 37 here) — don't re-fork them."""
+        from neo.memory import scope
+
+        scope.clear_remote_url_cache()
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(returncode=128, stdout="")
+
+        monkeypatch.setattr(scope.subprocess, "run", fake_run)
+        assert scope._get_git_remote_url("/plain") == ""
+        assert scope._get_git_remote_url("/plain") == ""
+        assert len(calls) == 1
+
+    def test_clear_forces_refresh(self, monkeypatch):
+        """Bounded staleness: a remote can change under a multi-day daemon."""
+        from neo.memory import scope
+
+        scope.clear_remote_url_cache()
+        urls = iter(["git@github.com:o/old.git", "git@github.com:o/new.git"])
+        monkeypatch.setattr(
+            scope.subprocess, "run",
+            lambda cmd, **kw: SimpleNamespace(returncode=0, stdout=next(urls)),
+        )
+        assert scope._get_git_remote_url("/repo") == "git@github.com:o/old.git"
+        scope.clear_remote_url_cache()
+        assert scope._get_git_remote_url("/repo") == "git@github.com:o/new.git"
 
 
 class TestComputeProjectId:

@@ -776,13 +776,105 @@ class TestGlobalSweep:
         roots = obs._discover_project_roots()
         assert roots == ["/Users/me/git/bar", "/Users/me/git/foo"]
 
+    def test_real_decoder_maps_bare_dash_to_filesystem_root(self):
+        """Pin the decoder behavior that created the bug.
+
+        ``~/.claude/projects/-`` decodes to ``/``. The discovery tests below
+        stub the decoder (pytest's ``tmp_path`` contains dashes, which this
+        decoder cannot round-trip), so the real mapping is pinned here instead.
+        """
+        from neo.prompt.scanner import _decode_project_path
+        assert _decode_project_path("-") == "/"
+        assert _decode_project_path("-Users") == "/Users"
+
+    def _discover_with(self, monkeypatch, tmp_path, decoded):
+        import neo.memory.transcript as tr
+        import neo.prompt.scanner as scanner
+        proj = tmp_path / "projects"
+        proj.mkdir()
+        for name in decoded:
+            (proj / name).mkdir()
+        monkeypatch.setattr(tr, "CLAUDE_PROJECTS_DIR", proj)
+        monkeypatch.setattr(scanner, "_decode_project_path", lambda n: decoded.get(n))
+
+    def test_discover_drops_container_roots(self, monkeypatch, tmp_path):
+        """A root that merely *holds* other roots is a container, not a project.
+
+        Claude Code mints a transcript dir for whatever cwd a session ran in, so
+        an ad-hoc session from ``/``, ``~`` or ``~/git`` creates a "project"
+        that is an ancestor of every real one — a full-history scan per sweep
+        (measured 13s each) plus cwd-attribution claiming the whole machine.
+        """
+        import neo.memory.observer as obs
+        self._discover_with(monkeypatch, tmp_path, {
+            "-": "/", "-u": "/u", "-u-git": "/u/git", "-u-git-foo": "/u/git/foo",
+        })
+        assert obs._discover_project_roots() == ["/u/git/foo"]
+
+    def test_discover_keeps_non_git_project_roots(self, monkeypatch, tmp_path):
+        """``.git`` may only rescue an ancestor — never gate a leaf.
+
+        Real project roots on this machine have no repo (flyx/demo, git/vaunt).
+        """
+        import neo.memory.observer as obs
+        self._discover_with(monkeypatch, tmp_path, {"-work-plain": "/work/plain"})
+        assert obs._discover_project_roots() == ["/work/plain"]
+
+    def test_discover_keeps_repo_that_contains_a_nested_root(self, monkeypatch, tmp_path):
+        """A monorepo / repo with a vendored sub-repo is an ancestor AND a project."""
+        import neo.memory.observer as obs
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        nested = repo / "vendor" / "sub"
+        nested.mkdir(parents=True)
+        self._discover_with(monkeypatch, tmp_path,
+                            {"-repo": str(repo), "-repo-vendor-sub": str(nested)})
+        assert obs._discover_project_roots() == [str(repo), str(nested)]
+
+    def test_container_root_test_is_component_aware(self):
+        """``/work/github`` must not count as nested inside ``/work/git``."""
+        import neo.memory.observer as obs
+        assert not obs._is_container_root("/work/git", ["/work/git", "/work/github/x"])
+        assert obs._is_container_root("/work/git", ["/work/git", "/work/git/x"])
+
+    def test_global_cycle_clears_remote_url_cache(self, monkeypatch):
+        """The staleness bound rests entirely on this call.
+
+        `scope._get_git_remote_url` is memoized per root; if the cycle stops
+        clearing it, a remote that changes under a multi-day daemon is never
+        noticed and facts get written under a stale project_id.
+        """
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a"])
+        monkeypatch.setattr(Observer, "_run_project",
+                            lambda self, root, peer_roots=None: (0, 0, object()))
+        cleared = []
+        monkeypatch.setattr("neo.memory.scope.clear_remote_url_cache",
+                            lambda: cleared.append(1))
+        Observer(global_mode=True)._cycle()
+        assert cleared, "each cycle must re-fetch every project's git remote once"
+
+    def test_global_cycle_passes_peer_roots(self, monkeypatch):
+        """Sweep hands each project the full root set for most-specific attribution."""
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer
+        roots = ["/a", "/a/nested"]
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: roots)
+        seen = []
+        monkeypatch.setattr(Observer, "_run_project",
+                            lambda self, root, peer_roots=None:
+                            (seen.append((root, peer_roots)) or (0, 0, object())))
+        Observer(global_mode=True)._cycle()
+        assert seen == [("/a", roots), ("/a/nested", roots)]
+
     def test_global_cycle_sweeps_each(self, monkeypatch):
         import neo.memory.observer as obs
         from neo.memory.observer import Observer
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c"])
         swept = []
         monkeypatch.setattr(Observer, "_run_project",
-                            lambda self, root: (swept.append(root) or (1, 2, object())))
+                            lambda self, root, peer_roots=None: (swept.append(root) or (1, 2, object())))
         o = Observer(global_mode=True)
         o._cycle()
         assert swept == ["/a", "/b", "/c"]
@@ -792,7 +884,7 @@ class TestGlobalSweep:
         import neo.memory.observer as obs
         from neo.memory.observer import Observer
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a/foo", "/b/bar"])
-        monkeypatch.setattr(Observer, "_run_project", lambda self, root: (1, 0, object()))
+        monkeypatch.setattr(Observer, "_run_project", lambda self, root, peer_roots=None: (1, 0, object()))
         o = Observer(global_mode=True)
         o._cycle()
         out = capsys.readouterr().out
@@ -807,7 +899,7 @@ class TestGlobalSweep:
         monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c", "/d"])
         swept = []
         monkeypatch.setattr(Observer, "_run_project",
-                            lambda self, root: (swept.append(root) or (0, 0, object())))
+                            lambda self, root, peer_roots=None: (swept.append(root) or (0, 0, object())))
         o = Observer(global_mode=True, config=ObserverConfig(max_projects_per_cycle=2))
         o._cycle()
         o._cycle()
@@ -817,7 +909,7 @@ class TestGlobalSweep:
         import neo.memory.observer as obs
         from neo.memory.observer import Observer
 
-        def rp(self, root):
+        def rp(self, root, peer_roots=None):
             if root == "/boom":
                 raise RuntimeError("bad project")
             return (1, 0, object())
@@ -941,3 +1033,25 @@ class TestCooldown:
         from neo.memory.observer import Observer
         observer = Observer(codebase_root="/some/path")
         assert observer._cooldown_ok() is True
+
+
+class TestMallocDebugEnvScrub:
+    """23,943 of 24,000 stderr lines were libmalloc warnings emitted once per
+    forked child, burying 29 real ENOSPC errors and one real LM failure."""
+
+    def test_scrub_removes_inherited_vars(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.setenv("MallocStackLogging", "1")
+        monkeypatch.setenv("MallocScribble", "1")
+        monkeypatch.setenv("NEO_OBSERVER_INTERVAL_SECONDS", "300")
+        obs._scrub_inherited_malloc_debug_env()
+        import os
+        assert "MallocStackLogging" not in os.environ
+        assert "MallocScribble" not in os.environ
+        # Unrelated config must survive.
+        assert os.environ["NEO_OBSERVER_INTERVAL_SECONDS"] == "300"
+
+    def test_scrub_is_noop_when_unset(self, monkeypatch):
+        import neo.memory.observer as obs
+        monkeypatch.delenv("MallocStackLogging", raising=False)
+        obs._scrub_inherited_malloc_debug_env()  # must not raise

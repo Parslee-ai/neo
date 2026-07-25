@@ -109,6 +109,38 @@ def _metrics_path() -> Path:
     return Path.home() / ".neo" / "metrics.jsonl"
 
 
+# The log was append-only with no bound — 17 MB and growing on a live install.
+# One generation is retained: the readers (`memory citation-stats`,
+# `memory learning-stats`) window by `--since`, and this cap holds weeks of
+# events at the observed rate (~800 events/day).
+_MAX_METRICS_BYTES = 32 * 1024 * 1024
+# Size is checked every Nth write rather than every write, so the steady-state
+# cost stays one `write` syscall per event, not a `stat` as well.
+_SIZE_CHECK_EVERY = 500
+# Primed so the FIRST write in any process checks. Most neo processes are
+# short-lived CLI invocations emitting a handful of events; starting at 0 would
+# mean only the long-running observer ever reached the check, so a machine that
+# used neo purely interactively would grow the log without bound forever.
+_writes_since_size_check = _SIZE_CHECK_EVERY
+
+
+def _rotate_if_oversized(path: Path) -> None:
+    global _writes_since_size_check
+    _writes_since_size_check += 1
+    if _writes_since_size_check < _SIZE_CHECK_EVERY:
+        return
+    _writes_since_size_check = 0
+    try:
+        if path.stat().st_size < _MAX_METRICS_BYTES:
+            return
+        # os.replace is atomic, so a concurrent reader sees either the old or
+        # the new file — never a partial one.
+        path.replace(path.with_suffix(path.suffix + ".1"))
+        logger.info("rotated %s at %d bytes", path.name, _MAX_METRICS_BYTES)
+    except OSError as e:
+        logger.debug("metrics rotate failed: %s", e)
+
+
 def record(event: str, **fields: Any) -> None:
     """Append a structured event to metrics.jsonl.
 
@@ -124,6 +156,7 @@ def record(event: str, **fields: Any) -> None:
         line = {"ts": time.time(), "event": event, **fields}
         with path.open("a") as f:
             f.write(json.dumps(line, default=str) + "\n")
+        _rotate_if_oversized(path)
     except Exception as e:  # never let a metrics write break retrieval
         logger.debug("metrics write failed: %s", e)
 

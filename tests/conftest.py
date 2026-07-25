@@ -32,3 +32,18 @@ def isolate_neo_home(tmp_path, monkeypatch):
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("HOME", str(fake_home))  # Also patch $HOME for expanduser()
+
+
+@pytest.fixture(autouse=True)
+def clear_remote_url_cache():
+    """Reset the memoized git-remote lookups between tests.
+
+    ``scope._REMOTE_URL_CACHE`` is process-global and its ``codebase_root=None``
+    key resolves to ``os.getcwd()`` — so without this, the first test to take
+    that path poisons the answer for every later test in the process.
+    """
+    from neo.memory import scope
+
+    scope.clear_remote_url_cache()
+    yield
+    scope.clear_remote_url_cache()

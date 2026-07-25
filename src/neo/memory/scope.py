@@ -7,12 +7,30 @@ stable project IDs from codebase root paths.
 
 import hashlib
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Resolving one project's identity asks git for the same remote 3x (org id,
+# project id, and the transcript sources' repo lookup), each a fork+exec. Across
+# the observer's 25-project sweep that measured ~100 forks per cycle, ~26k over
+# a week, for an answer that cannot change mid-sweep. Cache it.
+#
+# Deliberately NOT unbounded-lifetime: a remote really can change under a daemon
+# that runs for days, and a stale hit would silently write facts under the wrong
+# project_id. The observer clears this once per cycle (see
+# ``Observer._cycle_global``), so staleness is bounded by one cycle while the
+# intra-sweep redundancy — the actual waste — is gone.
+_REMOTE_URL_CACHE: dict[str, str] = {}
+
+
+def clear_remote_url_cache() -> None:
+    """Drop memoized git remotes. Called once per observer cycle."""
+    _REMOTE_URL_CACHE.clear()
 
 
 def detect_org_and_project(codebase_root: Optional[str] = None) -> tuple[str, str]:
@@ -47,7 +65,15 @@ def _detect_org(codebase_root: Optional[str] = None) -> str:
 
 
 def _get_git_remote_url(codebase_root: Optional[str] = None) -> str:
-    """Get git remote origin URL."""
+    """Get git remote origin URL. Memoized per root; see ``_REMOTE_URL_CACHE``."""
+    try:
+        key = os.path.abspath(codebase_root) if codebase_root else os.getcwd()
+    except OSError:  # cwd deleted out from under us
+        key = codebase_root or ""
+    if key in _REMOTE_URL_CACHE:
+        return _REMOTE_URL_CACHE[key]
+
+    url = ""
     try:
         cmd = ["git", "remote", "get-url", "origin"]
         kwargs = {}
@@ -61,10 +87,27 @@ def _get_git_remote_url(codebase_root: Optional[str] = None) -> str:
             **kwargs,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            url = result.stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         logger.debug("Failed to get git remote URL")
-    return ""
+    # A non-repo root is the common case (7 of 37 here), so "" is worth caching
+    # — but ONLY when the answer is structural. A *transient* git failure (fork
+    # limit, 5s timeout under load) also yields "", and memoizing that would
+    # silently downgrade an established project to its path-hash project_id for
+    # the rest of the cycle, writing its facts into a different file that
+    # nothing reconciles back. Confirm the repo is genuinely absent first.
+    if url or not _has_git_dir(key):
+        _REMOTE_URL_CACHE[key] = url
+    return url
+
+
+def _has_git_dir(root: str) -> bool:
+    """Is this a git working tree? ``.git`` is a dir in a clone, a file in a
+    worktree/submodule — both count."""
+    try:
+        return Path(root, ".git").exists()
+    except OSError:
+        return False
 
 
 def _parse_org_from_url(url: str) -> str:
