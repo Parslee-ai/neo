@@ -109,7 +109,8 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "black>=23.0.0",
-    "ruff>=0.1.0",
+    # Upper bound: ruff is pre-1.0 and changes rule behavior in minor bumps.
+    "ruff>=0.15.0,<1.0",
     "mypy>=1.0.0",
 ]
 
@@ -152,6 +153,16 @@ target-version = ['py310']
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# Declared explicitly rather than inheriting ruff's defaults. Those defaults
+# change between releases, and `dev` pins only `ruff>=...`, so CI silently
+# adopts whatever rule set the newest ruff ships. That is not hypothetical: the
+# 0.15 -> 0.16 bump turned a green tree red with 1050 errors on a commit that had
+# passed six days earlier, none of them from any code change. These four are the
+# set the project has actually been enforcing all along (ruff's historical
+# default): pycodestyle errors + pyflakes.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
 python_version = "3.10"

@@ -4,6 +4,8 @@
 
 ### Changed
 
+- **CI lint is no longer at the mercy of ruff's shifting defaults.** `[dev]` pinned only `ruff>=0.1.0` and `[tool.ruff]` declared no `select`, so every CI run adopted whatever rule set the newest ruff shipped. The 0.15 → 0.16 bump turned the tree red with **1050 errors on the previously-released commit**, none from any code change. The lint rule set is now declared explicitly (`E4`, `E7`, `E9`, `F` — the historical default the project has actually been enforcing) and ruff carries an upper bound, so lint results depend on the code rather than on release timing. (`pyproject.toml`)
+
 - **Learning stats now separate "no edit target" from "failed to verify".** The single verifiable/total ratio conflated a usage property with a bug: an advisory prompt legitimately has no file to diff, while a genuine code suggestion that didn't resolve is an attribution failure worth chasing. `learning-stats` now buckets recorded suggestions three ways — verifiable / advisory / unattributable — and flags the case where unattributable exceeds verifiable, since that skew is a bug signal rather than a usage one. The advisory rule is reporting-only and deliberately does NOT widen `OutcomeTracker._is_review_only_path`, which drives real weak-acceptance behavior; widening a production predicate to tidy a statistic would change what neo learns. (`subcommands.py`)
 
 
