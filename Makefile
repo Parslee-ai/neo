@@ -1,4 +1,9 @@
-.PHONY: help install install-dev test format lint clean
+.PHONY: help install install-dev test format lint hooks ci-local clean
+
+# Prefer the project venv over whatever happens to be on PATH. A system-wide
+# `ruff` is routinely a different version from the pinned one, and linting with
+# the wrong version is precisely how a green local tree turned main red.
+PYTHON := $(shell test -x .venv/bin/python && echo .venv/bin/python || echo python3)
 
 help:
 	@echo "Neo Makefile Commands:"
@@ -8,6 +13,8 @@ help:
 	@echo "  make test          - Run all tests"
 	@echo "  make format        - Format code with black"
 	@echo "  make lint          - Lint code with ruff"
+	@echo "  make hooks         - Enable the pre-commit hook (run once per clone)"
+	@echo "  make ci-local      - Run exactly what CI runs, before pushing"
 	@echo "  make clean         - Clean up generated files"
 
 install:
@@ -17,13 +24,21 @@ install-dev:
 	pip install -e ".[dev]"
 
 test:
-	pytest
+	$(PYTHON) -m pytest
 
 format:
-	black src/ tests/
+	$(PYTHON) -m black src/ tests/
 
 lint:
-	ruff check src/ tests/
+	$(PYTHON) -m ruff check src/ tests/
+
+hooks:
+	git config core.hooksPath .githooks
+	@echo "pre-commit hook enabled (.githooks). It runs the same lint + tests as CI."
+
+ci-local:
+	$(PYTHON) -m ruff check src/ tests/
+	$(PYTHON) -m pytest -q
 
 clean:
 	rm -rf __pycache__

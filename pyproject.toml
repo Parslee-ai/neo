@@ -109,8 +109,11 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "black>=23.0.0",
-    # Upper bound: ruff is pre-1.0 and changes rule behavior in minor bumps.
-    "ruff>=0.15.0,<1.0",
+    # Pinned EXACTLY, not a range. ruff is pre-1.0 and changes both its default
+    # rule set and rule behavior in minor bumps, so a range means a contributor's
+    # local ruff and CI's can disagree — which is how a green local tree pushed a
+    # red main in 0.39.0. Bump this deliberately, with the lint delta reviewed.
+    "ruff==0.16.0",
     "mypy>=1.0.0",
 ]
 
