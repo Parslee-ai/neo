@@ -983,9 +983,6 @@ class TestObserverCycleUnit:
             def initialize(self):
                 pass
 
-            def synthesize_reviews(self):
-                return 0
-
             def add_fact(self, **kw):
                 admitted.append(kw)
                 return object()
