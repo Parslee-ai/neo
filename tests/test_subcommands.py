@@ -175,3 +175,33 @@ def test_learning_stats_idle_when_no_promotions(capsys):
     assert out["episodes"] == 1
     assert out["promotions"] == 0 and out["rollbacks"] == 0
     assert out["interactive_loop_active"] is False
+
+
+def test_learning_stats_reports_suggestion_verifiability(tmp_path, monkeypatch):
+    """A starved loop and a broken one both read as IDLE without this."""
+    import json as _json
+
+    from neo import subcommands
+
+    sessions = tmp_path / ".neo" / "sessions"
+    sessions.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "real.py").write_text("x = 1")
+
+    (sessions / "session_a.json").write_text(_json.dumps({
+        "codebase_root": str(repo),
+        "suggestions": [
+            {"file_path": "real.py", "suggested_code": "x = 2"},          # verifiable
+            {"file_path": "/review/commit-abc.md", "suggested_code": "z"},  # invented
+            {"file_path": "real.py"},                                      # no code
+        ],
+    }))
+    monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
+    assert subcommands._suggestion_verifiability() == (1, 3)
+
+
+def test_learning_stats_verifiability_handles_missing_sessions(tmp_path, monkeypatch):
+    from neo import subcommands
+    monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
+    assert subcommands._suggestion_verifiability() == (0, 0)

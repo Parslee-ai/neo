@@ -985,14 +985,63 @@ def _handle_learning_stats(args) -> None:
     print(f"    {'rollbacks':<42} {rollbacks:>5}")
     print(f"    {'demotions':<42} {demotions:>5}")
     print(f"    {'reinforcements (incl. cited-fact credit)':<42} {reinforcements:>5}")
+    verifiable, total_sugg = _suggestion_verifiability()
+    if total_sugg:
+        print(f"  suggestion verifiability (all time, all projects): "
+              f"{verifiable}/{total_sugg} could ever be git-verified "
+              f"({verifiable * 100 // total_sugg}%)")
+
     if active:
+        # Include demotions: `active` counts them, so omitting them here printed
+        # "ACTIVE: 0 promoted, 0 rolled back, 0 reinforced" off a lone demotion.
         print(f"  => interactive loop is ACTIVE: {promotions} promoted, "
-              f"{rollbacks} rolled back, {reinforcements} reinforced")
+              f"{rollbacks} rolled back, {demotions} demoted, "
+              f"{reinforcements} reinforced")
+    elif total_sugg and verifiable == 0:
+        print("  => interactive loop is STARVED, not broken: no recorded "
+              "suggestion could be git-verified, so no acceptance is detectable. "
+              "Advisory/planning prompts produce pseudo-paths, not edit targets.")
     else:
         print("  => interactive loop is IDLE: episodes recorded but no accept-driven "
               "promotion / reinforcement yet — suggestions aren't being accepted "
-              "downstream. (Does NOT mean neo isn't learning: background synthesis "
+              "downstream. (Does NOT mean neo isn't learning: transcript mining "
               "mints facts on a separate path this doesn't count.)")
+
+
+def _suggestion_verifiability() -> tuple[int, int]:
+    """(verifiable, total) over recorded session suggestions, all time.
+
+    A suggestion can only ever yield a git-verified acceptance when its path is
+    one a diff could name AND it carries code/diff to compare against. Without
+    this line a starved loop and a broken one both read as "IDLE".
+
+    Uses the same predicate as attribution and candidate minting — a private
+    copy of the rule here would gate on a different answer than the code it is
+    describing.
+    """
+    from neo.memory.outcomes import suggestion_is_verifiable
+
+    sessions_dir = Path.home() / ".neo" / "sessions"
+    verifiable = total = 0
+    try:
+        session_files = sorted(sessions_dir.glob("session_*.json"))
+    except OSError:
+        return (0, 0)
+    for path in session_files:
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        root = data.get("codebase_root") or ""
+        for sugg in data.get("suggestions") or []:
+            total += 1
+            if suggestion_is_verifiable(
+                sugg.get("file_path") or "",
+                bool(sugg.get("suggested_code") or sugg.get("suggested_diff")),
+                root,
+            ):
+                verifiable += 1
+    return (verifiable, total)
 
 
 def handle_memory(args):

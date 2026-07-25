@@ -2147,12 +2147,22 @@ RULES:
                     subject_text = f"{pattern} [{code_suggestion.file_path}]"
                     if fingerprint:
                         subject_text += f" [fp:{fingerprint}]"
+                    # Promotion is gated on a git-verified outcome, detected by
+                    # diffing the suggested path. A suggestion whose path a diff
+                    # could never name can therefore never be verified, so
+                    # calling it promotable is a lie that leaves the ledger
+                    # accruing permanently-pending episodes. Measured on a live
+                    # install: only 23 of 65 recorded suggestions were verifiable
+                    # at all — the rest are advisory prompts where the model
+                    # emits a topical pseudo-path ("/review/commit-<sha>.md")
+                    # rather than an edit target.
+                    verifiable = self._suggestion_is_verifiable(code_suggestion)
                     episode.memory_candidates.append(MemoryCandidateEvidence(
                         candidate_id=uuid.uuid4().hex,
                         suggestion_id=code_suggestion.suggestion_id,
                         subject=redact_sensitive_text(subject_text),
                         body=redact_sensitive_text("\n".join(body_parts)),
-                        kind=candidate_kind,
+                        kind=candidate_kind if verifiable else "review",
                         supporting_episode_ids=[episode.episode_id],
                     ))
             return None
@@ -2180,6 +2190,23 @@ RULES:
                 test_patterns=test_patterns[:3],
             )
             return None
+
+    def _suggestion_is_verifiable(self, code_suggestion) -> bool:
+        """Could a downstream git diff ever confirm this suggestion?
+
+        Thin wrapper over the shared predicate in ``memory.outcomes``, which is
+        also what attribution uses to resolve paths — an independent copy here
+        drifted and wrongly rejected bare-leading-slash paths like
+        ``/src/foo.py``.
+        """
+        from neo.memory.outcomes import suggestion_is_verifiable
+
+        return suggestion_is_verifiable(
+            getattr(code_suggestion, "file_path", "") or "",
+            bool(getattr(code_suggestion, "code_block", "")
+                 or getattr(code_suggestion, "unified_diff", "")),
+            self.codebase_root,
+        )
 
     def _suggestion_fingerprint(self, code_suggestion) -> str:
         """Short stable hash of a suggestion's structural code shape, used to

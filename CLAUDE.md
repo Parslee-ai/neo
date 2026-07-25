@@ -106,6 +106,30 @@
     now. `SUPERSESSION_THRESHOLD` (0.85) and canonical-signature dedup are
     untouched — they were always separate from the deleted
     `SYNTHESIS_SIMILARITY`.
+  - **Candidate verifiability gate** (`memory.outcomes.suggestion_is_verifiable`,
+    applied in `engine._store_reasoning`): a candidate is minted with its
+    task-type kind only when a downstream git diff could ever confirm it — the
+    path must be one attribution could name AND there must be code/diff text to
+    compare against. Otherwise it is downgraded to non-promotable `review`.
+    Promotion is gated on git-verified acceptance, so an unverifiable suggestion
+    was previously minted `pattern` and then sat pending forever. Measured live:
+    only 23 of 65 recorded suggestions were verifiable at all; the rest are
+    advisory prompts where the model answers with a topical pseudo-path
+    (`/review/commit-<sha>.md`) instead of an edit target. **Footgun**: this
+    predicate MUST resolve paths via `normalize_suggestion_path` — the same
+    helper `OutcomeTracker._normalize_path` delegates to. An independent copy
+    missed bare-leading-slash paths (`/src/foo.js`, which normalize to
+    repo-relative) and wrongly rejected two genuinely promotable candidates.
+    A not-yet-existing path still qualifies when its parent dir is inside the
+    repo — proposing a NEW file is legitimate and shows up in `git log` once
+    committed. Known limit: a bare-slash name at the repo ROOT
+    (`/NO_CODE_PLANNING_ONLY` vs `/README.md`) is structurally indistinguishable
+    from a real new file and is admitted. That asymmetry is deliberate —
+    `kind` is frozen at mint, so under-admitting permanently kills a real
+    lesson, while over-admitting only leaves a candidate pending.
+    `neo memory learning-stats` reports the verifiable/total ratio and says
+    STARVED (rather than IDLE) when nothing is verifiable, so a starved loop is
+    distinguishable from a broken one.
   - Probation: new non-curated facts enter with a `probation` tag and a 3-day stale window
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in

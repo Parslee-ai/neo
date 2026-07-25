@@ -448,3 +448,111 @@ def test_execution_envelope_is_persisted_with_explicit_inference_provenance(
     assert "SECRET_SOURCE_PAYLOAD" not in json.dumps(episode.execution_context)
     assert episode.execution_context["current_state"]["source_code"]["sha256"]
     assert output.goal_assessment.status == "in_progress"
+
+
+class TestSuggestionVerifiability:
+    """Promotion is gated on a git-verified outcome, which is detected by
+    diffing the suggested file. A suggestion whose path doesn't resolve can
+    never be verified — calling it promotable leaves the ledger accruing
+    permanently-pending episodes. Measured live: only 23 of 65 recorded
+    suggestions were verifiable at all.
+    """
+
+    def _engine(self, root):
+        from neo.engine import NeoEngine
+        eng = NeoEngine.__new__(NeoEngine)
+        eng.codebase_root = str(root) if root else None
+        return eng
+
+    def _sugg(self, file_path, code="x = 1"):
+        import types
+        return types.SimpleNamespace(file_path=file_path, code_block=code,
+                                     unified_diff="")
+
+    def test_real_relative_file_with_code_is_verifiable(self, tmp_path):
+        (tmp_path / "app.py").write_text("x = 0")
+        eng = self._engine(tmp_path)
+        assert eng._suggestion_is_verifiable(self._sugg("app.py")) is True
+
+    def test_real_absolute_file_is_verifiable(self, tmp_path):
+        target = tmp_path / "app.py"
+        target.write_text("x = 0")
+        eng = self._engine(None)
+        assert eng._suggestion_is_verifiable(self._sugg(str(target))) is True
+
+    def test_model_invented_pseudo_path_is_not_verifiable(self, tmp_path):
+        """The dominant real-world case: advisory prompts get a topical path.
+
+        These are rejected because the invented parent directory ("review/",
+        "architecture-review/") does not exist in the repo.
+        """
+        eng = self._engine(tmp_path)
+        for bogus in ("/review/commit-840d4b625d5d.md",
+                      "/architecture-review/notification-idempotency.md",
+                      "/REVIEW_ONLY/no_code_change.md"):
+            assert eng._suggestion_is_verifiable(self._sugg(bogus)) is False
+
+    def test_known_limit_root_level_sentinel_is_admitted(self, tmp_path):
+        """A bare-slash name at repo ROOT can't be told from a real new file.
+
+        "/NO_CODE_PLANNING_ONLY" and "/README.md" are structurally identical:
+        both normalize to a repo-root path whose parent exists. We admit them
+        deliberately — under-admitting is unrecoverable because `kind` is frozen
+        when the candidate is minted, so a wrongly-rejected suggestion can never
+        promote; over-admitting only leaves a candidate pending, which is the
+        pre-existing behavior. The >=2 verified-acceptance gate is what actually
+        keeps unverified material out of the fact store.
+        """
+        eng = self._engine(tmp_path)
+        assert eng._suggestion_is_verifiable(self._sugg("/NO_CODE_PLANNING_ONLY")) is True
+
+    def test_bare_leading_slash_real_file_is_verifiable(self, tmp_path):
+        """`/src/foo.js` under codebase_root is a REAL, verifiable file.
+
+        Attribution normalizes bare-leading-slash paths (a common shape in
+        recorded suggestions) before diffing. An independent resolver here that
+        treated them as absolute rejected two genuinely promotable candidates on
+        live data — this is the case that catches that class of drift.
+        """
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "analyzer.js").write_text("var x = 1;")
+        eng = self._engine(tmp_path)
+        assert eng._suggestion_is_verifiable(self._sugg("/src/analyzer.js")) is True
+
+    def test_plausible_new_file_in_repo_is_verifiable(self, tmp_path):
+        """Proposing a NEW file is a real suggestion — once committed it shows
+        up in `git log --since`, so it must stay promotable."""
+        (tmp_path / "src").mkdir()
+        eng = self._engine(tmp_path)
+        assert eng._suggestion_is_verifiable(self._sugg("src/newmod.py")) is True
+
+    def test_new_file_in_missing_directory_is_not_verifiable(self, tmp_path):
+        eng = self._engine(tmp_path)
+        assert eng._suggestion_is_verifiable(self._sugg("nope/newmod.py")) is False
+
+    def test_new_file_outside_the_repo_is_not_verifiable(self, tmp_path):
+        """`/dev/null` has an existing parent but is not the repo's business."""
+        eng = self._engine(tmp_path / "repo")
+        (tmp_path / "repo").mkdir()
+        assert eng._suggestion_is_verifiable(self._sugg("/dev/null")) is False
+        assert eng._suggestion_is_verifiable(self._sugg(str(tmp_path / "outside.py"))) is False
+
+    def test_directory_is_not_verifiable(self, tmp_path):
+        (tmp_path / "pkg").mkdir()
+        eng = self._engine(tmp_path)
+        assert eng._suggestion_is_verifiable(self._sugg("pkg")) is False
+
+    def test_real_file_without_code_is_not_verifiable(self, tmp_path):
+        """Nothing to diff against — the outcome could only ever be UNVERIFIED."""
+        (tmp_path / "app.py").write_text("x = 0")
+        eng = self._engine(tmp_path)
+        assert eng._suggestion_is_verifiable(self._sugg("app.py", code="")) is False
+
+    def test_relative_path_without_codebase_root_is_not_verifiable(self, tmp_path):
+        eng = self._engine(None)
+        assert eng._suggestion_is_verifiable(self._sugg("app.py")) is False
+
+    def test_placeholder_paths_rejected(self, tmp_path):
+        eng = self._engine(tmp_path)
+        for bogus in ("", "/", "N/A"):
+            assert eng._suggestion_is_verifiable(self._sugg(bogus)) is False

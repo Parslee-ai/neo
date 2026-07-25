@@ -226,6 +226,85 @@ class Outcome:
     candidate_kind: str = "pattern"
 
 
+def normalize_suggestion_path(path: str, codebase_root: Optional[str]) -> str:
+    """Normalize a suggestion's file path to the form outcome matching uses.
+
+    Handles three cases:
+    1. True absolute paths under codebase_root -> relative
+    2. Bare leading slash under codebase_root (/src/bar.py) -> src/bar.py
+    3. Everything else unchanged
+
+    Module-level and shared: anything that predicts whether a suggestion can be
+    verified MUST resolve paths the same way attribution does, or it will gate
+    on a different answer than the code it is predicting.
+    """
+    if not path:
+        return path
+
+    if codebase_root:
+        try:
+            p = Path(path)
+            root = Path(codebase_root)
+            if p.is_absolute():
+                return str(p.relative_to(root))
+        except (ValueError, TypeError):
+            pass
+
+        # Strip bare leading slash if the result exists relative to codebase_root
+        # (common in suggestion file_path values like "/src/foo.py")
+        if path.startswith("/"):
+            stripped = path.lstrip("/")
+            candidate = Path(codebase_root) / stripped
+            if candidate.exists() or candidate.parent.exists():
+                return stripped
+
+    return path
+
+
+def suggestion_is_verifiable(
+    file_path: str, has_change_text: bool, codebase_root: Optional[str]
+) -> bool:
+    """Could a downstream git diff ever confirm this suggestion?
+
+    Promotion to a durable fact is gated on a git-verified outcome, which is
+    detected by diffing the suggested path. So a suggestion qualifies only when
+    the path is one a diff could name AND there is code/diff text to compare the
+    change against — without the latter the outcome can only ever be UNVERIFIED.
+
+    A path that doesn't exist yet still qualifies when its parent directory does
+    and it sits inside the repo: proposing a *new* file is a real suggestion, and
+    once committed it appears in ``git log --name-only``. What this rejects is
+    the path a model invents for an advisory answer, whose parent doesn't exist
+    or which points outside the repo ("/review/commit-<sha>.md", "/dev/null").
+    Directories are rejected — a diff never names one.
+
+    Resolution goes through ``normalize_suggestion_path`` deliberately: an
+    independent reimplementation missed bare-leading-slash paths and so called
+    two genuinely promotable candidates unverifiable.
+    """
+    if not file_path or not has_change_text:
+        return False
+    try:
+        normalized = normalize_suggestion_path(file_path, codebase_root)
+        path = Path(normalized)
+        if not path.is_absolute():
+            if not codebase_root:
+                return False
+            path = Path(codebase_root) / normalized
+        if path.is_dir():
+            return False
+        if path.is_file():
+            return True
+        # Doesn't exist yet: only a plausible new file inside the repo.
+        if not codebase_root:
+            return False
+        root = Path(codebase_root).resolve()
+        parent = path.parent.resolve()
+        return parent.is_dir() and (parent == root or parent.is_relative_to(root))
+    except (OSError, ValueError):
+        return False
+
+
 class OutcomeTracker:
     """Detects what the user actually did after neo's suggestions.
 
@@ -984,34 +1063,8 @@ class OutcomeTracker:
         return overlap / min(len(code_lines), len(changed_lines))
 
     def _normalize_path(self, path: str) -> str:
-        """Normalize a file path to relative form for comparison.
-
-        Handles three cases:
-        1. True absolute paths under codebase_root -> relative
-        2. Bare leading slash under codebase_root (/src/bar.py) -> src/bar.py
-        3. Everything else unchanged
-        """
-        if not path:
-            return path
-
-        if self.codebase_root:
-            try:
-                p = Path(path)
-                root = Path(self.codebase_root)
-                if p.is_absolute():
-                    return str(p.relative_to(root))
-            except (ValueError, TypeError):
-                pass
-
-            # Strip bare leading slash if the result exists relative to codebase_root
-            # (common in suggestion file_path values like "/src/foo.py")
-            if path.startswith("/"):
-                stripped = path.lstrip("/")
-                candidate = Path(self.codebase_root) / stripped
-                if candidate.exists() or candidate.parent.exists():
-                    return stripped
-
-        return path
+        """Normalize a file path to relative form for comparison."""
+        return normalize_suggestion_path(path, self.codebase_root)
 
     @staticmethod
     def _compute_diff_overlap(suggested: str, actual: str) -> float:

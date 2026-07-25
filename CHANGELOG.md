@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **The interactive learning loop was recording candidates that could never be verified, so durable promotion never fired.** The ledger showed 49 episodes and **0 acceptances**. A controlled drill proved the pipeline itself is sound end-to-end: a suggestion on a real file with suggested code, applied and re-detected, produces an `accepted` outcome carrying its `candidate_id`, moves the candidate to `supported_once`, and a second matching acceptance promotes it to `durable` with a real PATTERN fact minted. The loop was **starved, not broken** — only 23 of 65 recorded suggestions could ever be git-verified. The rest are advisory prompts where the model answers with a topical pseudo-path (`/review/commit-<sha>.md`, `/REVIEW_ONLY/no_code_change.md`) instead of an edit target, and a candidate on such a path was still minted `pattern`, leaving the ledger accruing permanently-pending episodes. Candidates are now downgraded to non-promotable `review` unless a downstream diff could confirm them (`memory.outcomes.suggestion_is_verifiable`). A not-yet-existing path still qualifies when its parent directory is inside the repo — proposing a new file is legitimate and appears in `git log` once committed. (`engine.py`, `memory/outcomes.py`)
+- **Path resolution is no longer duplicated.** `OutcomeTracker._normalize_path` now delegates to a shared `normalize_suggestion_path`, which the verifiability predicate also uses. An independent reimplementation treated bare-leading-slash paths (`/src/foo.js`) as absolute and rejected two genuinely promotable candidates on live data. (`memory/outcomes.py`)
+- **`learning-stats` could not distinguish a starved loop from a broken one.** It now reports how many recorded suggestions could ever be git-verified, and reports STARVED rather than IDLE when none can. It also no longer prints the self-contradictory "ACTIVE: 0 promoted, 0 rolled back, 0 reinforced" — `active` counts demotions, so a lone demotion flipped the verdict while every number shown was zero; demotions are now included in the line. (`subcommands.py`)
+
 ### Removed
 
 - **REVIEW → PATTERN synthesis is deleted.** `synthesize_reviews` and its whole apparatus — cluster/LLM synthesis, the triple-trigger gate, synthesis watermarks, `_hebbian_strengthen`, and the corpus-wide `_global_confidence_downscale` — are gone (467 lines from `store.py`), along with both call sites and the `SYNTHESIS_SIMILARITY` constant.
