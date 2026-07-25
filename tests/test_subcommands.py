@@ -177,8 +177,10 @@ def test_learning_stats_idle_when_no_promotions(capsys):
     assert out["interactive_loop_active"] is False
 
 
-def test_learning_stats_reports_suggestion_verifiability(tmp_path, monkeypatch):
-    """A starved loop and a broken one both read as IDLE without this."""
+def test_learning_stats_buckets_suggestions_three_ways(tmp_path, monkeypatch):
+    """Collapsing these makes the number unactionable: a prompt that legitimately
+    had no edit target is a usage property, a real code suggestion we failed to
+    attribute is a bug."""
     import json as _json
 
     from neo import subcommands
@@ -192,16 +194,48 @@ def test_learning_stats_reports_suggestion_verifiability(tmp_path, monkeypatch):
     (sessions / "session_a.json").write_text(_json.dumps({
         "codebase_root": str(repo),
         "suggestions": [
-            {"file_path": "real.py", "suggested_code": "x = 2"},          # verifiable
-            {"file_path": "/review/commit-abc.md", "suggested_code": "z"},  # invented
-            {"file_path": "real.py"},                                      # no code
+            {"file_path": "real.py", "suggested_code": "x = 2"},              # verifiable
+            {"file_path": "/REVIEW_ONLY/no_code_change.md", "suggested_code": "z"},  # advisory
+            {"file_path": "/planning/critique.md", "suggested_code": "z"},    # advisory
+            {"file_path": "NO_MODIFY", "suggested_code": "z"},                # advisory (no suffix)
+            {"file_path": "real.py"},                                         # advisory (no code)
+            {"file_path": "gone/Service.cs", "suggested_code": "z"},          # unattributable
         ],
     }))
     monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
-    assert subcommands._suggestion_verifiability() == (1, 3)
+    assert subcommands._suggestion_verifiability() == {
+        "verifiable": 1, "advisory": 4, "unattributable": 1,
+    }
+
+
+def test_classify_does_not_widen_the_production_predicate(tmp_path):
+    """The advisory rule is reporting-only. A real, unresolved SOURCE path must
+    stay 'unattributable' — otherwise a genuine attribution bug hides as usage."""
+    from neo import subcommands
+    assert subcommands._classify_suggestion(
+        "src/Thing.cs", True, str(tmp_path)) == "unattributable"
+    assert subcommands._classify_suggestion(
+        "notes/design.md", True, str(tmp_path)) == "advisory"
 
 
 def test_learning_stats_verifiability_handles_missing_sessions(tmp_path, monkeypatch):
     from neo import subcommands
     monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
-    assert subcommands._suggestion_verifiability() == (0, 0)
+    assert subcommands._suggestion_verifiability() == {
+        "verifiable": 0, "advisory": 0, "unattributable": 0,
+    }
+
+
+def test_real_extensionless_files_are_not_called_advisory(tmp_path):
+    """Makefile/Dockerfile are genuine edit targets — only ALL-CAPS sentinels
+    ("NO_MODIFY") get the advisory bucket."""
+    from neo import subcommands
+    (tmp_path / "Dockerfile").write_text("FROM scratch")
+    assert subcommands._classify_suggestion(
+        "Dockerfile", True, str(tmp_path)) == "verifiable"
+    assert subcommands._classify_suggestion(
+        "NO_MODIFY", True, str(tmp_path)) == "advisory"
+    # An existing ALL-CAPS file is a real target, not a sentinel.
+    (tmp_path / "LICENSE").write_text("MIT")
+    assert subcommands._classify_suggestion(
+        "LICENSE", True, str(tmp_path)) == "verifiable"

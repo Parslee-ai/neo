@@ -815,3 +815,55 @@ class TestModifiedOutcome:
 
         independent = [o for o in outcomes if o.outcome_type == OutcomeType.INDEPENDENT]
         assert len(independent) == 0  # bar.py skipped due to empty diff
+
+
+class TestCrossWorktreeAttribution:
+    """A suggestion must be resolved against the root it was RECORDED under.
+
+    Claude Code runs sessions in `.claude/worktrees/agent-*`. Those absolute
+    paths never `relative_to()` the main checkout, so when the next neo run
+    happened elsewhere in the same repo every suggestion silently failed to
+    match and its learning was orphaned — 14 of 65 recorded sessions on a live
+    install. `project_id` already spans worktrees and clones, so the session was
+    found; only the path root was wrong.
+    """
+
+    def _session(self, recorded_root, file_path):
+        return SessionRecord(
+            timestamp=time.time() - 60,
+            codebase_root=recorded_root,
+            project_id="shared-pid",
+            prompt="change the value",
+            suggestions=[{
+                "file_path": file_path,
+                "description": "use a constant",
+                "confidence": 0.8,
+                "suggested_code": "x = 2\n",
+                "suggested_diff": "",
+            }],
+        )
+
+    def test_path_recorded_in_another_worktree_still_matches(self):
+        tracker = OutcomeTracker(codebase_root="/repo/main")
+        session = self._session("/repo/wt/agent-1", "/repo/wt/agent-1/src/a.py")
+        outcomes = tracker._match_to_suggestions({"src/a.py"}, session)
+        assert [o.file_path for o in outcomes] == ["src/a.py"]
+
+    def test_same_root_behavior_unchanged(self):
+        tracker = OutcomeTracker(codebase_root="/repo/main")
+        session = self._session("/repo/main", "/repo/main/src/a.py")
+        outcomes = tracker._match_to_suggestions({"src/a.py"}, session)
+        assert [o.file_path for o in outcomes] == ["src/a.py"]
+
+    def test_missing_recorded_root_falls_back_to_current(self):
+        """Older session records predate the field; must not regress them."""
+        tracker = OutcomeTracker(codebase_root="/repo/main")
+        session = self._session("", "/repo/main/src/a.py")
+        outcomes = tracker._match_to_suggestions({"src/a.py"}, session)
+        assert [o.file_path for o in outcomes] == ["src/a.py"]
+
+    def test_unrelated_repo_path_does_not_match(self):
+        """Resolving against the recorded root must not become a wildcard."""
+        tracker = OutcomeTracker(codebase_root="/repo/main")
+        session = self._session("/other/project", "/other/project/src/a.py")
+        assert tracker._match_to_suggestions({"src/b.py"}, session) == []

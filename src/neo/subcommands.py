@@ -985,11 +985,18 @@ def _handle_learning_stats(args) -> None:
     print(f"    {'rollbacks':<42} {rollbacks:>5}")
     print(f"    {'demotions':<42} {demotions:>5}")
     print(f"    {'reinforcements (incl. cited-fact credit)':<42} {reinforcements:>5}")
-    verifiable, total_sugg = _suggestion_verifiability()
+    buckets = _suggestion_verifiability()
+    total_sugg = sum(buckets.values())
+    verifiable = buckets["verifiable"]
     if total_sugg:
-        print(f"  suggestion verifiability (all time, all projects): "
-              f"{verifiable}/{total_sugg} could ever be git-verified "
-              f"({verifiable * 100 // total_sugg}%)")
+        print(f"  recorded suggestions (all time, all projects): {total_sugg}")
+        print(f"    {'verifiable (real edit target)':<40} {verifiable:>5}"
+              f"   {verifiable * 100 // total_sugg}%")
+        print(f"    {'advisory (no edit target by design)':<40} "
+              f"{buckets['advisory']:>5}   {buckets['advisory'] * 100 // total_sugg}%")
+        print(f"    {'unattributable (looks real, unresolved)':<40} "
+              f"{buckets['unattributable']:>5}   "
+              f"{buckets['unattributable'] * 100 // total_sugg}%")
 
     if active:
         # Include demotions: `active` counts them, so omitting them here printed
@@ -1001,6 +1008,10 @@ def _handle_learning_stats(args) -> None:
         print("  => interactive loop is STARVED, not broken: no recorded "
               "suggestion could be git-verified, so no acceptance is detectable. "
               "Advisory/planning prompts produce pseudo-paths, not edit targets.")
+    elif total_sugg and buckets["unattributable"] > verifiable:
+        print("  => interactive loop is IDLE, and more suggestions were "
+              "unattributable than verifiable — that skew is a bug signal, not a "
+              "usage one. Check that paths resolve under the recorded root.")
     else:
         print("  => interactive loop is IDLE: episodes recorded but no accept-driven "
               "promotion / reinforcement yet — suggestions aren't being accepted "
@@ -1008,25 +1019,60 @@ def _handle_learning_stats(args) -> None:
               "mints facts on a separate path this doesn't count.)")
 
 
-def _suggestion_verifiability() -> tuple[int, int]:
-    """(verifiable, total) over recorded session suggestions, all time.
+# Extensions that mean "this suggestion was prose, not a code edit". A path that
+# does not resolve AND carries one of these is an advisory answer, not a failed
+# attribution — the distinction the report exists to make.
+_ADVISORY_SUFFIXES = frozenset({".md", ".txt", ".rst", ".adoc"})
 
-    A suggestion can only ever yield a git-verified acceptance when its path is
-    one a diff could name AND it carries code/diff to compare against. Without
-    this line a starved loop and a broken one both read as "IDLE".
 
-    Uses the same predicate as attribution and candidate minting — a private
-    copy of the rule here would gate on a different answer than the code it is
-    describing.
+def _classify_suggestion(file_path: str, has_change_text: bool, root: str) -> str:
+    """One of "verifiable" | "advisory" | "unattributable".
+
+    Reporting-only: deliberately does NOT reuse `OutcomeTracker._is_review_only_path`,
+    which drives real weak-acceptance behavior and is narrow on purpose. Widening
+    it to make a stat look tidier would change what neo learns.
     """
-    from neo.memory.outcomes import suggestion_is_verifiable
+    from neo.memory.outcomes import normalize_suggestion_path, suggestion_is_verifiable
 
+    if not file_path or not has_change_text:
+        return "advisory"
+    # Sentinel check runs BEFORE the verifiable test: an all-caps, extension-less
+    # name that resolves to nothing ("NO_MODIFY", "NO_CODE_PLANNING_ONLY") passes
+    # the plausible-new-file rule at repo root, but it is the model saying "no
+    # code change here". Requiring ALL-CAPS keeps real extension-less files
+    # (Makefile, Dockerfile) out of this bucket.
+    stem = Path(file_path).name
+    if (not Path(file_path).suffix and stem
+            and stem.replace("_", "").isupper()
+            and not (Path(root) / normalize_suggestion_path(file_path, root)).is_file()):
+        return "advisory"
+    if suggestion_is_verifiable(file_path, has_change_text, root):
+        return "verifiable"
+    normalized = normalize_suggestion_path(file_path, root)
+    if normalized.startswith("docs/") or "/docs/" in normalized:
+        return "advisory"
+    suffix = Path(file_path).suffix.lower()
+    if suffix in _ADVISORY_SUFFIXES:
+        # A doc-shaped or extension-less path that resolves to nothing is the
+        # model saying "no code change here" (/REVIEW_ONLY/..., NO_MODIFY,
+        # /planning/critique.md), not an edit we failed to find.
+        return "advisory"
+    return "unattributable"
+
+
+def _suggestion_verifiability() -> dict[str, int]:
+    """Bucket recorded session suggestions by whether learning could ever attach.
+
+    Three outcomes, because collapsing them makes the number unactionable: a
+    prompt that legitimately had no edit target is a usage property, while a real
+    code suggestion we failed to attribute is a bug worth chasing.
+    """
     sessions_dir = Path.home() / ".neo" / "sessions"
-    verifiable = total = 0
+    counts = {"verifiable": 0, "advisory": 0, "unattributable": 0}
     try:
         session_files = sorted(sessions_dir.glob("session_*.json"))
     except OSError:
-        return (0, 0)
+        return counts
     for path in session_files:
         try:
             data = json.loads(path.read_text())
@@ -1034,14 +1080,12 @@ def _suggestion_verifiability() -> tuple[int, int]:
             continue
         root = data.get("codebase_root") or ""
         for sugg in data.get("suggestions") or []:
-            total += 1
-            if suggestion_is_verifiable(
+            counts[_classify_suggestion(
                 sugg.get("file_path") or "",
                 bool(sugg.get("suggested_code") or sugg.get("suggested_diff")),
                 root,
-            ):
-                verifiable += 1
-    return (verifiable, total)
+            )] += 1
+    return counts
 
 
 def handle_memory(args):

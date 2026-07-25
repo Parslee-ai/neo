@@ -397,7 +397,15 @@
   (CAR's *default* profile without it is still latency/cost-biased). Rationale lives on
   `CarAdapter.DEFAULT_INTENT_HINT` in `adapters.py`. Observer floor is car-runtime ≥0.18.0,
   now enforced at runtime by `_require_car_runtime` (version check, not just the `agents_*`
-  attr); latest validated against car-runtime 0.27.0.
+  attr); latest validated against car-runtime **0.40.0** (full `test_car_adapter`
+  suite including the live calls, against a car-server 0.37.0 daemon). Note the
+  pin `car-runtime>=0.27.0,<1.0` lets the client drift well ahead of a daemon
+  that ships inside CarHost.app, so a client/daemon **version skew is the normal
+  state**, not a fault: car-runtime prints a warning on every invocation, both
+  sides speak wire protocol v1, and neo's usage is unaffected. Updating the
+  daemon means updating CarHost.app — there is no `car` CLI to run and nothing
+  neo can do about it. Do not paper over it with `CAR_NO_VERSION_WARNING=1`; the
+  warning is accurate.
 - Reasoning-model param compatibility (`adapters.py`): newer models reject standard
   chat params — Anthropic Opus 4.7+/Sonnet 5/Fable 5 reject `temperature`; OpenAI
   o-series/gpt-5, Azure reasoning deployments, and OpenAI-compatible reasoners (xAI

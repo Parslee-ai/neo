@@ -4,6 +4,8 @@
 
 ### Changed
 
+- **Learning stats now separate "no edit target" from "failed to verify".** The single verifiable/total ratio conflated a usage property with a bug: an advisory prompt legitimately has no file to diff, while a genuine code suggestion that didn't resolve is an attribution failure worth chasing. `learning-stats` now buckets recorded suggestions three ways — verifiable / advisory / unattributable — and flags the case where unattributable exceeds verifiable, since that skew is a bug signal rather than a usage one. The advisory rule is reporting-only and deliberately does NOT widen `OutcomeTracker._is_review_only_path`, which drives real weak-acceptance behavior; widening a production predicate to tidy a statistic would change what neo learns. (`subcommands.py`)
+
 
 
 - **Docs and the A/B harnesses caught up to the shipped `gpt-5.6` default.** The runtime has defaulted to gpt-5.6 since 0.38.0, but README/QUICKSTART/INSTALL and `tools/ab_*.py` still said `gpt-5.5`. Both harnesses now derive `DEFAULT_MODEL` from `NeoConfig` so this cannot drift again, and take `--model` so the published gpt-5.5 tiered-reasoning baseline stays exactly reproducible rather than being silently re-pointed. (`README.md`, `QUICKSTART.md`, `INSTALL.md`, `tools/ab_controlled.py`, `tools/ab_reasoning.py`)
@@ -21,6 +23,8 @@
   Deletion is bounded to the failed subsystem. `SUPERSESSION_THRESHOLD` and `_supersede`, canonical-signature dedup, the janitor chain, and the git-verified episode ledger (`_promote_repeatedly_supported_candidate`, which requires ≥2 independent verified acceptances) are untouched — regression-tested in `TestSynthesisRemoved`. Facts minted before the removal keep their `synthesized` tag and its prune immunity; nothing mints the tag now, so `PROTECTED_TAGS` is closed rather than growing. Orphaned `synthesis_watermark_*.json` files are deleted rather than migrated. The observer no longer reports a synthesized count, and `_last_cycle_count` now means facts *mined*. (`memory/store.py`, `memory/observer.py`, `memory/issues.py`, `subcommands.py`)
 
 ### Fixed
+
+- **Suggestions made inside a git worktree could never be attributed.** Outcome matching normalized a suggestion's path against the *current* run's `codebase_root` rather than the root it was recorded under. Those differ whenever the previous run happened in a different working tree of the same repo — the common case being a Claude Code session in `.claude/worktrees/agent-*`, whose absolute paths never `relative_to()` the main checkout. Every such suggestion silently failed to match and its learning was orphaned: 14 of 65 recorded sessions on a live install. `project_id` already spans worktrees and clones, so the session was found; only the path root was wrong. Verified end-to-end: a session recorded in a linked worktree, with the change landing in the main checkout, now yields an `accepted` outcome. (`memory/outcomes.py`)
 
 
 

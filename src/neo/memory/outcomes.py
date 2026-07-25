@@ -811,7 +811,11 @@ class OutcomeTracker:
         for prev in sessions:
             for sugg in prev.suggestions:
                 file_path = sugg.get("file_path", "")
-                normalized = self._normalize_path(file_path)
+                # Same reasoning as _match_to_suggestions: resolve against the
+                # root this suggestion was recorded under, not the current run's.
+                normalized = normalize_suggestion_path(
+                    file_path, prev.codebase_root or self.codebase_root
+                )
 
                 is_non_trackable = (
                     file_path in non_trackable
@@ -909,8 +913,19 @@ class OutcomeTracker:
             if not file_path:
                 continue
 
-            # Normalize: suggestions may have absolute paths, git diff has relative
-            normalized = self._normalize_path(file_path)
+            # Normalize: suggestions may have absolute paths, git diff has relative.
+            # Resolve against the root the suggestion was RECORDED under, not the
+            # current run's. They differ whenever the previous run happened in a
+            # different working tree of the same repo — the common case being a
+            # Claude Code session in `.claude/worktrees/agent-*`, whose absolute
+            # paths never relative_to() the main checkout, so every suggestion
+            # silently failed to match and its learning was orphaned (14 of 65
+            # recorded sessions on a live install). project_id already spans
+            # worktrees and clones, so the session is found; only the path root
+            # was wrong. Falls back to the current root for older records.
+            normalized = normalize_suggestion_path(
+                file_path, session.codebase_root or self.codebase_root
+            )
             suggested_files.add(normalized)
 
             if normalized in changed_files or file_path in changed_files:
