@@ -6,6 +6,16 @@ interface and adds **CAR** as the second source. (History: v1→v2 corrected
 integration claims after @neo + @linus review; Phase 0 retired the clustering
 approach; v3 pivoted to direct PATTERN/FAILURE admission.)
 
+> **Superseded in part (2026-07-25).** This document's framing — "neo's synthesis
+> engine is starved, not broken" — was measured again at scale and the verdict
+> changed: `synthesize_reviews` was **removed**. Across 15 gate-passing projects
+> not one group reached a 3-member cluster, and in four months of production it
+> minted 114 facts of which **zero** were PATTERNs, while re-consuming its own
+> summaries as evidence and decaying the whole corpus on each run. The
+> extract→verify→admit ingestion pipeline this document specifies is unaffected
+> and still in use; only its downstream synthesis consumer is gone. References
+> to `synthesize_reviews` below are historical.
+
 ## Multi-source architecture (v4)
 
 The goal is to learn from **every AI coding tool**, not just Claude Code. The

@@ -1098,8 +1098,12 @@ The 0.18 memory architecture lands deterministic techniques from a focused readi
 
 1. **SCM Sleep Memory: Sleep-Consolidation in Continual Memory**
    *Paper [2604.20943](https://arxiv.org/abs/2604.20943)*
-   - 4-D ValueTagger composite (novelty, validation, task, repetition); adaptive forgetting threshold; NREM Hebbian strengthening + global downscale; triple-trigger consolidation gate.
-   - **Implementation**: `src/neo/memory/value_score.py`, `store.synthesize_reviews`.
+   - 4-D ValueTagger composite (novelty, validation, task, repetition); adaptive forgetting threshold.
+   - **Implementation**: `src/neo/memory/value_score.py`.
+   - *Partially reverted*: the NREM Hebbian strengthening, global downscale and
+     triple-trigger consolidation gate lived in `store.synthesize_reviews`, which
+     was removed — in four months of production it minted 114 facts and not one
+     PATTERN, while decaying the whole corpus on every run. See the CHANGELOG.
 
 2. **Memory Systems Survey (1)**
    *Paper [2603.07670](https://arxiv.org/abs/2603.07670)*

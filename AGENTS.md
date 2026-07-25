@@ -22,11 +22,16 @@
   - Per-scope valid-fact caps (`SCOPE_LIMITS` in `store.py`): global=200, org=100,
     project=500, session=50. Enforced per loaded scope set (project+org+global);
     invalidated facts persist as tombstones until `purge_dead_facts` runs.
-  - Supersession & pre-write canonical-signature dedup at cosine ≥ 0.85
-    (`SYNTHESIS_SIMILARITY`, `memory.generalize`).
-  - REVIEW → PATTERN/FAILURE synthesis needs ≥20 valid REVIEWs and ≥3-member clusters;
-    triple-trigger gate fires when ANY of: count-delta ≥10, elapsed ≥1h, or
-    confidence-decile entropy >0.9.
+  - Supersession at cosine ≥ 0.85 (`SUPERSESSION_THRESHOLD`); pre-write dedup is
+    canonical-signature **equality**, not cosine (`memory.generalize`).
+  - **REVIEW → PATTERN synthesis was REMOVED.** In four months of production it
+    minted 114 facts and not one PATTERN (its PATTERN branch needed an
+    `outcome:accepted` group that never existed), while re-consuming its own
+    summaries as evidence and decaying the whole corpus on every run. A census
+    also found zero ≥3-member clusters at cosine 0.85 across all 1152 valid
+    REVIEWs, so it could not fire on real data. Durable learning now comes only
+    from the git-verified episode ledger — do NOT reintroduce an unverified
+    similarity-clustered route beside it.
   - Probation: new non-curated facts enter with a `probation` tag and a 3-day stale window
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
@@ -114,10 +119,12 @@
   JSON-RPC over its WebSocket. `neo.a2ui.DaemonClient` is that bridge.
   Activation: auto when `127.0.0.1:9100` is reachable; silent no-op
   otherwise. Adds `websockets>=12.0` to the `[car]` extra.
-- Async synthesis observer (`memory.observer`): a per-project background process
-  that runs `synthesize_reviews` on a wall-clock cadence, decoupled from the
-  request path. *Additive* — the inline triple-trigger gate keeps firing too;
-  the observer just makes synthesis more frequent. **Hard dep**: car-runtime
+- Async transcript-mining observer (`memory.observer`): a **single global**
+  background process (CAR agent `neo-observer`, `--daemon --all`) that sweeps
+  every discovered project each cycle, round-robin and watermark-gated. The
+  earlier per-project model (`neo-observer-<id12>`) is migrated away on
+  bootstrap. Container roots (`/`, `$HOME`, `~/git`) are excluded from
+  discovery. It ran `synthesize_reviews` until that subsystem was removed. **Hard dep**: car-runtime
   ≥ 0.17.0 and a running `car-server` daemon — CAR's supervisor owns the
   spawn / restart-on-failure / log redirection / clean SIGTERM shutdown.
   Spec persisted to `~/.car/agents.json` (`auto_start: true` so it comes back
