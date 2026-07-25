@@ -229,6 +229,42 @@ def build_resilient_embedder(
         return None
 
 
+#: Fields dropped from a fact when it becomes a tombstone. Nothing reads them
+#: after invalidation — dedup skips invalid facts (`_exact_canonical_match`),
+#: merge-on-save returns early for them (`_reconcile_fact`), and retrieval and
+#: clustering all pre-filter `is_valid`. Measured on a live store: 11,421
+#: tombstones held 24.7 MB, of which `body` alone was 15.8 MB, and every byte
+#: was deserialized into Python objects on every load.
+#:
+#: `subject` and `tags` are KEPT for audit, and `metadata` is KEPT because
+#: `purge_dead_facts` ages tombstones off `metadata.last_accessed` and reads
+#: `invalidation_reason`. Dropping those would strand tombstones forever.
+#: Only plain-text fields. `episode_context` is a structured `EpisodeContext`
+#: with its own `to_dict`, and blanking it to "" breaks serialization outright —
+#: caught by running this against a copy of a real store. It also contributed
+#: almost nothing to the measured bytes, so it is deliberately not stripped.
+_TOMBSTONE_DROPPED_FIELDS = ("body", "context_text", "retrieval_text")
+
+
+def _strip_tombstone_text(fact) -> bool:
+    """Blank the bulk text on an already-invalid fact. Returns True if changed.
+
+    Mirrors the embedding strip: same choke point, same rationale — a tombstone
+    is retained up to 30 days for supersession and audit, so its multi-KB body
+    is dead weight for that entire window.
+    """
+    changed = False
+    for field in _TOMBSTONE_DROPPED_FIELDS:
+        current = getattr(fact, field, None)
+        if not current or not isinstance(current, str):
+            continue  # already empty, or not the plain-text field we expect
+        # `body` is a plain `str` field; the other two are Optional[str]. Reset
+        # each to its own declared empty value rather than assuming one shape.
+        setattr(fact, field, "" if field == "body" else None)
+        changed = True
+    return changed
+
+
 class FactStore:
     """Scoped fact store with supersession-based knowledge management.
 
@@ -2657,13 +2693,23 @@ class FactStore:
         """
         stripped = 0
         for fact in self._facts:
-            if not fact.is_valid and fact.embedding is not None:
+            if fact.is_valid:
+                continue
+            changed = False
+            if fact.embedding is not None:
                 fact.embedding = None
+                changed = True
+            # Same sweep also backfills the bulk-text strip, so tombstones
+            # created before that landed (or by a peer process) are slimmed
+            # without a separate migration pass.
+            if _strip_tombstone_text(fact):
+                changed = True
+            if changed:
                 stripped += 1
         if stripped:
             if save:
                 self.save()
-            logger.info(f"Stripped embeddings from {stripped} tombstone(s)")
+            logger.info(f"Slimmed {stripped} tombstone(s)")
         return stripped
 
     def prune_stale_facts(self, save: bool = True) -> int:
@@ -3089,7 +3135,8 @@ class FactStore:
     def _invalidate(self, fact: Fact, *, cascade: bool = True) -> None:
         """Single choke point for marking a fact invalid.
 
-        Sets ``is_valid = False`` and drops the embedding at the transition: a
+        Sets ``is_valid = False``, drops the embedding, and drops the bulk text
+        at the transition: a
         tombstone is never retrieved, deduped, or clustered (all such paths
         pre-filter ``is_valid``), so its 768-dim vector is immediately dead
         weight. Stripping here keeps bloat from accumulating between the
@@ -3105,6 +3152,7 @@ class FactStore:
         """
         fact.is_valid = False
         fact.embedding = None
+        _strip_tombstone_text(fact)
         if cascade:
             self._cascade_needs_review(fact.id)
 

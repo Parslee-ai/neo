@@ -157,8 +157,19 @@
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
     `outcomes.py`) and 50/project (`MAX_INDEPENDENT_FACTS` in `store.py`).
   - Invalidation choke point: `_invalidate(fact, *, cascade=True)` is the single
-    path that sets `is_valid=False`. It **strips the 768-dim embedding at the
-    transition** — a tombstone is never retrieved/deduped/clustered (all such
+    path that sets `is_valid=False`. It **strips the 768-dim embedding AND the
+    bulk text (`body`, `context_text`, `retrieval_text`) at the transition**
+    (`_strip_tombstone_text`; measured 11,421 tombstones holding 24.7 MB, of
+    which `body` alone was 15.8 MB). `subject`/`tags` stay for audit and
+    `metadata` stays because `purge_dead_facts` ages tombstones off
+    `metadata.last_accessed` and reads `invalidation_reason` — dropping those
+    would strand tombstones forever. `episode_context` is deliberately NOT
+    stripped: it is a structured `EpisodeContext` with its own `to_dict`, and
+    blanking it to `""` breaks serialization (caught against a copy of a real
+    store). Safe because nothing reads a tombstone's text: dedup skips invalid
+    facts (`_exact_canonical_match`), merge-on-save returns early for them
+    (`_reconcile_fact`), retrieval and clustering pre-filter `is_valid`. The
+    older wording said only the embedding — a tombstone is never retrieved/deduped/clustered (all such
     paths pre-filter `is_valid`) but is retained up to 30 days for
     supersession/audit, so its embedding (~24 KB/fact) is immediate dead weight;
     stripping at the source keeps bloat from accumulating between sweeps. All six
