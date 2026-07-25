@@ -334,6 +334,22 @@
   `~/.car/logs/neo-observer.{stdout,stderr}.log`. Lifecycle/`status`/orphan-check
   all operate on the single global agent. (A2UI per-project inspector is skipped
   in global mode.)
+  **RSS bounding**: the daemon re-execs itself every
+  `NEO_OBSERVER_RECYCLE_CYCLES` cycles (default 48, ~4h; 0 disables). Its RSS is
+  peak working set plus CPython arena fragmentation — each sweep deserializes a
+  multi-MB fact file (79% of whose rows are tombstones retained by the 30-day
+  policy) and the allocator never returns those arenas. Nothing leaks; RSS
+  drifts to the high-water mark and stays (measured 0.5–0.7 GB). Embeddings are
+  NOT the cost (1.9 MB in memory; they dominate the file on *disk* only, as JSON
+  text). Re-exec, not exit-and-be-restarted: the CAR spec is
+  `restart: "on_failure"` with `max_restarts: 10`, so a clean exit(0) would
+  never restart and forcing a non-zero exit would exhaust the budget after ten
+  recycles. **Footgun**: the single-instance lock MUST be released before the
+  exec. Carrying the fd across looks safer but `flock` is owned by the open file
+  description, so the inherited fd keeps the file locked and the new image can
+  never take it — it exits as "contended" and the machine is left with no
+  observer. That failure was measured directly. The floor is one cycle's working
+  set (~380 MB), so recycling caps drift, not baseline.
   Lifecycle: `neo memory observer {start|stop|status|kick}` — `kick` maps to
   `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
   CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |
