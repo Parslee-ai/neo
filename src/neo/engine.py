@@ -2228,10 +2228,18 @@ RULES:
         )
         if not code_source:
             return ""
-        skeleton = self._extract_code_skeleton(code_source)
-        if not skeleton:
+        # Names normalized inside the extractor, before truncation — see its
+        # docstring. The rule for what survives is *bounded vocabulary*, not
+        # intuition: every other token is drawn from a fixed set (the ~11
+        # structural keywords, the 6-name method whitelist, the 9-name
+        # constructor whitelist), so it carries shape. ``def:<name>`` was the
+        # only free, user-chosen identifier in the skeleton — there is no
+        # ClassDef handler, no arg names, no bare Name loads — which is why
+        # normalizing it is both necessary and sufficient.
+        shape = self._extract_code_skeleton(code_source, normalize_names=True)
+        if not shape:
             return ""
-        return hashlib.sha256(skeleton.encode("utf-8")).hexdigest()[:12]
+        return hashlib.sha256(shape.encode("utf-8")).hexdigest()[:12]
 
     def _parse_snippet(self, code: str):
         """Best-effort ``ast.parse`` of a possibly-fragmentary code snippet.
@@ -2269,9 +2277,18 @@ RULES:
                 continue
         return None
 
-    def _extract_code_skeleton(self, code: str) -> str:
+    def _extract_code_skeleton(self, code: str, *, normalize_names: bool = False) -> str:
         """
         Extract structural pattern from code using AST analysis.
+
+        ``normalize_names=True`` emits a bare ``def`` instead of ``def:<name>``.
+        That must happen HERE, before the join and the 500-char truncation
+        below, not by rewriting the finished string: ``def:<name>`` is the only
+        unbounded-length token in the vocabulary, so long identifiers are
+        precisely what pushes a skeleton past the cut. Stripping afterwards
+        leaves two structurally identical inputs truncated at different points
+        and still hashing differently (measured: 40 identical functions, short
+        names -> 316 chars, long names -> 500, different fingerprints).
 
         Inspired by Kite's approach: analyze code structure (loops, data structures,
         function calls) rather than just text similarity. This helps Neo recognize
@@ -2325,8 +2342,11 @@ RULES:
                 skeleton_tokens.append("set-comp")
 
             # Function definitions
-            elif isinstance(node, ast.FunctionDef):
-                skeleton_tokens.append(f"def:{node.name}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # AsyncFunctionDef is NOT a subclass of FunctionDef, so `async
+                # def` previously emitted no def token at all and an async fix
+                # could never correlate with its sync twin.
+                skeleton_tokens.append("def" if normalize_names else f"def:{node.name}")
             elif isinstance(node, ast.Lambda):
                 skeleton_tokens.append("lambda")
 

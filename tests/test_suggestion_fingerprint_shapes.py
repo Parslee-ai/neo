@@ -119,3 +119,85 @@ def test_non_python_code_still_degrades_to_empty():
         unified_diff="",
     )
     assert e._suggestion_fingerprint(prose) == ""
+
+
+class TestFingerprintIsNameAgnostic:
+    """The fingerprint must capture the SHAPE of a change, not the identifier.
+
+    `_extract_code_skeleton` emits `def:<name>`, kept deliberately as readable
+    metadata on the fact. Hashing it made the identical fix to `read_text` and
+    `read_body` two different signatures, so a genuinely recurring lesson could
+    never accumulate the two acceptances promotion requires. A live drill of
+    real `neo` runs measured four git-verified acceptances and zero promotions;
+    the next pair promoted after this.
+    """
+
+    def _fp(self, code):
+        return _engine()._suggestion_fingerprint(
+            SimpleNamespace(code_block=code, unified_diff="")
+        )
+
+    def _ctx_mgr(self, name):
+        return (f"def {name}(path):\n"
+                f"    with open(path) as f:\n"
+                f"        data = f.read()\n"
+                f"    return data\n")
+
+    def test_same_shape_different_function_names_match(self):
+        a, b = self._fp(self._ctx_mgr("read_text")), self._fp(self._ctx_mgr("read_body"))
+        assert a and a == b
+
+    def test_long_names_do_not_shift_the_truncation_window(self):
+        """Names must be normalized BEFORE the 500-char cut, not after.
+
+        `def:<name>` is the only unbounded-length token, so long identifiers are
+        exactly what pushes a skeleton past the cap. Post-hoc stripping left two
+        identical shapes truncated at different points and still hashing
+        differently (measured: short names -> 316 chars, long names -> 500).
+        """
+        def module(prefix, n=40):
+            return "\n\n".join(f"def {prefix}{i}(path):\n    return path"
+                                for i in range(n))
+        assert self._fp(module("f")) == self._fp(module("a_very_long_helper_name_"))
+
+    def test_async_and_sync_variants_of_one_fix_correlate(self):
+        """`AsyncFunctionDef` is not a `FunctionDef` subclass, so `async def`
+        previously emitted no def token at all."""
+        async_form = ("async def go(path):\n"
+                      "    with open(path) as f:\n"
+                      "        data = f.read()\n"
+                      "    return data\n")
+        assert self._fp(async_form) == self._fp(self._ctx_mgr("go"))
+
+    def test_body_shape_still_discriminates(self):
+        """Renamed from "different shape": the name is held constant here, so
+        this pins body-sensitivity specifically."""
+        other_body = ("def read_text(path):\n"
+                      "    for line in open(path):\n"
+                      "        print(line)\n")
+        assert self._fp(self._ctx_mgr("read_text")) != self._fp(other_body)
+
+    def test_method_names_are_still_shape(self):
+        """`method:append` vs `method:pop` IS a structural difference — those
+        come from a bounded whitelist, unlike a free function name."""
+        a = self._fp("def f(xs):\n    out = []\n    out.append(1)\n    return out\n")
+        b = self._fp("def f(xs):\n    out = []\n    out.pop()\n    return out\n")
+        assert a != b
+
+    def test_structurally_distinct_fixes_do_not_collide(self):
+        """Guards #144's property: normalizing names must not make unrelated
+        accepted fixes merge into one over-trusted PATTERN. Shapes that differ
+        in control flow or data structures must keep distinct fingerprints even
+        with identical names.
+        """
+        shapes = [
+            "def f(xs):\n    return [x for x in xs]\n",
+            "def f(xs):\n    return {x for x in xs}\n",
+            "def f(xs):\n    d = {}\n    return d\n",
+            "def f(xs):\n    while xs:\n        xs.pop()\n    return xs\n",
+            "def f(xs):\n    for x in xs:\n        print(x)\n",
+            "def f(xs):\n    if xs:\n        return xs\n    return None\n",
+        ]
+        fps = [self._fp(c) for c in shapes]
+        assert all(fps), "every shape must fingerprint"
+        assert len(set(fps)) == len(fps), f"collision among distinct shapes: {fps}"

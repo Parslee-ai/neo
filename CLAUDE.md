@@ -37,11 +37,33 @@
     is `f"{task_type}: {prompt[:50]} [{file_path}] [fp:{hash}]"`; the `[fp:<hash>]`
     is a structural fingerprint of the suggested change
     (`engine._suggestion_fingerprint` = sha256 of the AST-shaped
-    `_extract_code_skeleton`, Python-only, "" for unparseable code → key degrades
-    to subject-only). `_split_fingerprint` pulls the fp OUT before `generalize`
+    `_extract_code_skeleton` called with `normalize_names=True`, so `def:<name>`
+    becomes bare `def`, Python-only, "" for unparseable code → key degrades
+    to subject-only). The name-normalization is load-bearing: the skeleton keeps
+    `def:<name>` by default because it doubles as readable metadata on the fact,
+    but *hashing* the name made the identical fix to `read_text` and `read_body`
+    two different signatures, so a genuinely recurring lesson could never reach
+    the two acceptances promotion requires. A live drill against real `neo` runs
+    measured four git-verified acceptances and zero promotions; normalizing
+    promoted on the next pair. It MUST happen inside the extractor, before the
+    500-char truncation — `def:<name>` is the only unbounded-length token, so
+    long identifiers are exactly what pushes a skeleton past the cut, and
+    post-hoc string stripping still left identical shapes hashing differently.
+    The rule for what survives is **bounded vocabulary**: the ~11 structural
+    keywords, the 6-name method whitelist and the 9-name constructor whitelist
+    all carry shape, while `def:<name>` was the only free user-chosen identifier
+    (there is no `ClassDef` handler, no arg names, no bare `Name` loads) — which
+    is what makes normalizing it both necessary and sufficient.
+    **Honest limit**: post-normalization skeletons are coarse — the drill's fix
+    hashes to `def return`, a guard-clause fix to `def if-stmt return` — so the
+    fingerprint discriminates far less than "diff shape" suggests, and at the
+    path-agnostic GLOBAL tier correlation is close to prompt-prefix plus a
+    near-constant token. The real anti-collision protection is the double
+    git-verified acceptance plus the kind gate, not the fingerprint;
+    `test_structurally_distinct_fixes_do_not_collide` pins what it still buys. `_split_fingerprint` pulls the fp OUT before `generalize`
     (whose `_HASH_RE` would collapse the hex to `<hash>`) and appends it RAW after
     a `\x1f` separator, so two episodes correlate only when prompt-prefix AND
-    diff-shape agree. **Two tiers**: PROJECT uses `_episode_signature`
+    diff-shape agree — read "diff-shape" with the coarseness caveat above. **Two tiers**: PROJECT uses `_episode_signature`
     (path-bearing, though `generalize` collapses deep multi-segment paths so it
     only discriminates SHALLOW `[file.py]` names); cross-project GLOBAL uses
     `_global_signature` (path-agnostic — strips all bracket qualifiers to match
