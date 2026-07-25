@@ -3071,3 +3071,69 @@ class TestSynthesisRemoved:
         """The git-verified learning path is untouched."""
         assert hasattr(FactStore, "_promote_repeatedly_supported_candidate")
         assert hasattr(FactStore, "reconcile_cross_project_promotions")
+
+
+class TestTombstoneTextStrip:
+    """Tombstones are retained up to 30 days for supersession and audit, so
+    their multi-KB bodies are dead weight for that whole window — and every
+    byte is deserialized on each load. Measured on a live store: 11,421
+    tombstones held 24.7 MB, `body` alone 15.8 MB.
+    """
+
+    def _fact(self, **kw):
+        f = Fact(subject="s", body="a long body " * 50, kind=FactKind.PATTERN,
+                 scope=FactScope.PROJECT, org_id="o", project_id="p",
+                 metadata=FactMetadata(confidence=0.5), **kw)
+        f.context_text = "ctx"
+        f.retrieval_text = "retr"
+        return f
+
+    def test_invalidate_drops_bulk_text(self, store):
+        f = self._fact()
+        store._facts.append(f)
+        store._invalidate(f)
+        assert f.is_valid is False
+        assert f.body == "" and f.context_text is None and f.retrieval_text is None
+
+    def test_audit_and_purge_fields_survive(self, store):
+        """subject/tags stay for audit; metadata stays because purge_dead_facts
+        ages tombstones off metadata.last_accessed."""
+        f = self._fact()
+        f.tags = ["outcome", "accepted"]
+        store._facts.append(f)
+        store._invalidate(f)
+        assert f.subject == "s"
+        assert f.tags == ["outcome", "accepted"]
+        assert f.metadata is not None and f.metadata.last_accessed is not None
+        assert f.id and f.kind is FactKind.PATTERN
+
+    def test_structured_episode_context_is_untouched(self):
+        """`episode_context` is an EpisodeContext with its own to_dict; blanking
+        it to "" broke serialization outright when first attempted."""
+        from neo.memory.store import _strip_tombstone_text
+        f = self._fact()
+        sentinel = object()
+        f.episode_context = sentinel
+        _strip_tombstone_text(f)
+        assert f.episode_context is sentinel
+
+    def test_strip_is_idempotent(self):
+        from neo.memory.store import _strip_tombstone_text
+        f = self._fact()
+        assert _strip_tombstone_text(f) is True
+        assert _strip_tombstone_text(f) is False
+
+    def test_valid_facts_are_never_stripped_by_the_backfill(self, store):
+        keep = self._fact()
+        store._facts.append(keep)
+        store.strip_tombstone_embeddings(save=False)
+        assert keep.is_valid and keep.body.startswith("a long body")
+
+    def test_backfill_slims_preexisting_tombstones(self, store):
+        """Tombstones created before this landed (or by a peer) get slimmed
+        without a separate migration pass."""
+        old = self._fact()
+        old.is_valid = False          # invalidated the old way: text intact
+        store._facts.append(old)
+        assert store.strip_tombstone_embeddings(save=False) == 1
+        assert old.body == ""

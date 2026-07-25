@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Tombstones no longer carry their bulk text.** An invalidated fact is retained up to 30 days for supersession and audit, and every byte of it was deserialized on each `FactStore` load — the single largest driver of observer RSS. Measured on a live store: 11,421 tombstones holding 24.7 MB, of which `body` alone was 15.8 MB. `_invalidate` now drops `body`, `context_text` and `retrieval_text` at the transition, mirroring the existing embedding strip at the same choke point, and the periodic sweep backfills tombstones created before this landed. Verified against a copy of a real 188 MB store: **zero valid facts lost or gained** at identity level, tombstone count unchanged, 15 MB reclaimed in one pass.
+
+  `subject` and `tags` are kept for audit, and `metadata` is kept because `purge_dead_facts` ages tombstones off `metadata.last_accessed` — dropping it would strand them forever. `episode_context` is deliberately not stripped: it is a structured object with its own `to_dict`, and blanking it breaks serialization outright.
+
+  The obvious bigger change — moving tombstones to a sidecar file so the hot path never parses them — was investigated and **rejected**: `_reconcile_fact` returns OURS when we hold a fact invalid, which is what makes an invalidation beat a concurrent writer's stale valid copy. Lazily-loaded tombstones would let merge-on-save silently resurrect invalidated facts. (`memory/store.py`)
+
 ## [0.40.0] - 2026-07-25
 
 ### Changed
