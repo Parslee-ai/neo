@@ -148,3 +148,50 @@ def test_compact_fact_file_dry_run_does_not_strip(tmp_path):
 
     assert stats["stripped"] == 1
     assert json.loads(path.read_text()) == original
+
+
+def test_prune_all_reaps_dead_synthesis_watermarks(tmp_path, monkeypatch, capsys):
+    """Residue from the removed REVIEW->PATTERN synthesis.
+
+    The per-project reaper on FactStore init only reaches project_ids still
+    being swept, so watermarks for deleted or no-longer-discovered projects
+    would linger forever. `prune --all` is the whole-store pass.
+    """
+    import types
+
+    from neo import subcommands
+
+    facts_dir = tmp_path / ".neo" / "facts"
+    facts_dir.mkdir(parents=True)
+    (facts_dir / "facts_global.json").write_text('{"facts": [], "version": "2.0"}')
+    dead = [facts_dir / f"synthesis_watermark_{i:016x}.json" for i in range(3)]
+    for d in dead:
+        d.write_text('{"review_count": 7}')
+
+    monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
+    args = types.SimpleNamespace(memory_action="prune", all=True, dry_run=False,
+                                 limit=None, verbose=False, max_invalid_age_days=30)
+    subcommands.handle_memory(args)
+
+    assert not any(d.exists() for d in dead)
+    assert "removed 3 dead synthesis watermark(s)" in capsys.readouterr().out
+
+
+def test_prune_dry_run_keeps_dead_watermarks(tmp_path, monkeypatch, capsys):
+    import types
+
+    from neo import subcommands
+
+    facts_dir = tmp_path / ".neo" / "facts"
+    facts_dir.mkdir(parents=True)
+    (facts_dir / "facts_global.json").write_text('{"facts": [], "version": "2.0"}')
+    dead = facts_dir / "synthesis_watermark_deadbeefdeadbeef.json"
+    dead.write_text('{"review_count": 7}')
+
+    monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
+    args = types.SimpleNamespace(memory_action="prune", all=True, dry_run=True,
+                                 limit=None, verbose=False, max_invalid_age_days=30)
+    subcommands.handle_memory(args)
+
+    assert dead.exists(), "dry run must not mutate"
+    assert "would remove 1 dead synthesis watermark(s)" in capsys.readouterr().out

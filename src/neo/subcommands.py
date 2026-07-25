@@ -1058,12 +1058,35 @@ def handle_memory(args):
                     detail += f", {verb} {stripped} tombstone embedding(s)"
                 print(f"[Neo] {detail} from {path.name}")
 
+        # Dead residue from the removed REVIEW->PATTERN synthesis. Nothing in
+        # the codebase reads or writes these any more, and the per-project
+        # reaper on FactStore init can only reach ids that are still swept —
+        # watermarks for deleted or no-longer-discovered projects would linger
+        # forever. A whole-store pass belongs in the explicit compaction command.
+        dead_watermarks = 0
+        if getattr(args, "all", False):
+            facts_dir = Path.home() / ".neo" / "facts"
+            for wm in sorted(facts_dir.glob("synthesis_watermark_*.json")):
+                if getattr(args, "dry_run", False):
+                    dead_watermarks += 1
+                    continue
+                try:
+                    wm.unlink()
+                    dead_watermarks += 1
+                except OSError as exc:
+                    print(f"[Neo] prune error {wm}: {exc}", file=sys.stderr)
+                    totals["errors"] += 1
+
         mode = "dry run" if getattr(args, "dry_run", False) else "prune"
-        print(
+        summary = (
             f"[Neo] memory {mode}: {totals['removed']} old invalid fact(s) removed, "
             f"{totals['stripped']} tombstone embedding(s) stripped "
             f"across {totals['files']} file(s)"
         )
+        if dead_watermarks:
+            verb = "would remove" if getattr(args, "dry_run", False) else "removed"
+            summary += f"; {verb} {dead_watermarks} dead synthesis watermark(s)"
+        print(summary)
         if totals["errors"]:
             print(f"[Neo] {totals['errors']} file(s) failed", file=sys.stderr)
         return
