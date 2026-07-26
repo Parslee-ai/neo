@@ -52,6 +52,12 @@ jobs:
           name: dist
           path: dist/
 
+  # NOTE: requires a Trusted Publisher configured on TestPyPI for this repo +
+  # workflow. It is NOT configured today, so a manual dispatch fails at the
+  # publish step with an OIDC "missing publisher" error — the build and the
+  # artifact round-trip still run and are still worth dispatching to smoke-test
+  # a workflow change. Configure at https://test.pypi.org/manage/account/publishing/
+  # (owner Parslee-ai, repo neo, workflow publish.yml) to make dry-runs work.
   publish-testpypi:
     needs: build
     runs-on: ubuntu-latest
