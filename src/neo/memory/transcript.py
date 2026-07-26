@@ -240,15 +240,42 @@ def build_episodes(path: Path) -> list[Episode]:
     return episodes
 
 
-def collect_episodes(codebase_root: Optional[str]) -> list[Episode]:
-    """Build episodes across all transcript files for a codebase root."""
+def collect_episodes(codebase_root: Optional[str],
+                     since: Optional[float] = None) -> list[Episode]:
+    """Build episodes across all transcript files for a codebase root.
+
+    ``since`` skips files untouched since that epoch time. Parsing dominates the
+    observer's memory: one project measured 104 MB for this source alone, and the
+    sweep does 25 projects a cycle. The watermark only gates *admission*, so
+    without this an unchanged project still paid the full parse every cycle —
+    which is what the docs' "unchanged projects do near-zero work" claimed but
+    did not do.
+    """
     tdir = resolve_transcript_dir(codebase_root)
     if tdir is None or not tdir.is_dir():
         return []
     episodes: list[Episode] = []
     for fp in sorted(tdir.glob("*.jsonl")):
+        if _unchanged_since(fp, since):
+            continue
         episodes.extend(build_episodes(fp))
     return episodes
+
+
+def _unchanged_since(path: "Path", since: Optional[float]) -> bool:
+    """True when ``path`` has not been modified since ``since``.
+
+    Conservative by construction: any error, or no ``since`` at all, returns
+    False so the file is parsed. Skipping is a pure optimization — a wrong
+    "skip" would silently drop learning, so it only ever happens on a positive
+    mtime comparison.
+    """
+    if not since:
+        return False
+    try:
+        return path.stat().st_mtime < since
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +384,9 @@ class TranscriptSource(Protocol):
 
     name: str
     scope: FactScope
+    # collect_episodes(since: Optional[float] = None) -> list[Episode]
+    # collect_episodes may optionally accept `since` (epoch seconds) to skip
+    # inputs untouched since then. Sources that omit it are called without it.
     # Optional; read via getattr in the ingester so existing sources that don't
     # define them keep the default PATTERN/FAILURE + transcript-tag behavior.
     fact_kind: Optional["FactKind"]
@@ -375,8 +405,8 @@ class ClaudeCodeSource:
     def __init__(self, codebase_root: Optional[str]):
         self.codebase_root = codebase_root
 
-    def collect_episodes(self) -> list[Episode]:
-        return collect_episodes(self.codebase_root)
+    def collect_episodes(self, since: Optional[float] = None) -> list[Episode]:
+        return collect_episodes(self.codebase_root, since=since)
 
 
 CAR_SESSIONS_DIR = Path.home() / ".car" / "sessions"
@@ -399,7 +429,9 @@ class CarSource:
     def __init__(self, sessions_dir: Optional[Path] = None):
         self._dir = sessions_dir or CAR_SESSIONS_DIR
 
-    def collect_episodes(self) -> list[Episode]:
+    def collect_episodes(self, since: Optional[float] = None) -> list[Episode]:
+        # `since` accepted for a uniform source Protocol; this corpus is ~1 MB,
+        # so skipping buys nothing and the filter would only add a failure mode.
         if not self._dir.is_dir():
             return []
         episodes: list[Episode] = []
@@ -519,12 +551,16 @@ class CodexSource:
                 and self._cwd_within_root(p, codebase_root)
             ]
 
-    def collect_episodes(self) -> list[Episode]:
+    def collect_episodes(self, since: Optional[float] = None) -> list[Episode]:
         root = self.codebase_root
         if not root or not self._dir.is_dir():
             return []
         episodes: list[Episode] = []
         for fp in sorted(self._dir.glob("**/rollout-*.jsonl")):
+            # mtime check first: it is a stat, while _owns_rollout opens the
+            # file. This source measured 224 MB for a single project's collect.
+            if _unchanged_since(fp, since):
+                continue
             if not self._owns_rollout(fp, root):
                 continue
             try:
@@ -824,7 +860,9 @@ class GitHubPRSource:
     def __init__(self, codebase_root: Optional[str]):
         self.codebase_root = codebase_root
 
-    def collect_episodes(self) -> list[Episode]:
+    def collect_episodes(self, since: Optional[float] = None) -> list[Episode]:
+        # `since` accepted for a uniform source Protocol; this source is already
+        # throttled to one `gh` fetch per repo per _GH_PR_FETCH_INTERVAL.
         repo = _owner_repo_from_remote(self.codebase_root)
         if repo is None or not _gh_available():
             return []  # non-GitHub remote / no gh on PATH → silent no-op
@@ -1086,7 +1124,7 @@ class TranscriptIngester:
                 break
             consumed = self._load_consumed(source)
             try:
-                episodes = source.collect_episodes()
+                episodes = self._collect(source)
             except Exception as e:  # one bad source must not sink the others
                 logger.warning("transcript: source %s collect failed: %s", source.name, e)
                 continue
@@ -1232,6 +1270,51 @@ class TranscriptIngester:
         else:
             suffix = "global"
         return SESSIONS_DIR / f"transcript_watermark_{source.name}_{suffix}.json"
+
+    #: Subtracted from the watermark file's mtime before using it as a skip
+    #: threshold. A transcript written *while* the previous ingest was running
+    #: could otherwise be judged "already seen" and skipped forever. One hour is
+    #: far longer than any observed ingest, and over-parsing is free where
+    #: under-parsing silently loses learning.
+    _COLLECT_SKEW_SECONDS = 3600.0
+
+    def _collect(self, source) -> list:
+        """Call a source's collector, passing ``since`` only if it accepts it.
+
+        The parameter was added later, and sources are an open interface — the
+        issues diagnostic builds its own, and third parties may too. Calling
+        with an unexpected kwarg would raise TypeError, which the caller's
+        per-source guard swallows as "source failed", silently returning zero
+        episodes. Detect support instead of relying on that.
+        """
+        import inspect
+
+        try:
+            accepts = "since" in inspect.signature(source.collect_episodes).parameters
+        except (TypeError, ValueError):  # builtins / C callables
+            accepts = False
+        if accepts:
+            return source.collect_episodes(since=self._collected_through(source))
+        return source.collect_episodes()
+
+    def _collected_through(self, source) -> Optional[float]:
+        """Epoch time before which this source's inputs are already ingested.
+
+        Derived from the watermark file's mtime rather than a stored field, so
+        no format change or migration is needed: that file is rewritten every time
+        anchors are persisted, making its mtime a lower bound on "we have
+        processed everything older than this".
+
+        Returns None when there is no watermark yet, which means parse
+        everything — the safe default for a first run.
+        """
+        path = self._watermark_path(source)
+        if path is None:
+            return None
+        try:
+            return path.stat().st_mtime - self._COLLECT_SKEW_SECONDS
+        except OSError:
+            return None
 
     def _load_consumed(self, source) -> set:
         path = self._watermark_path(source)

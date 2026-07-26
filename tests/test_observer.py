@@ -1008,7 +1008,10 @@ class TestObserverCycleUnit:
         monkeypatch.setattr("neo.memory.store.FactStore", _FakeStore)
         monkeypatch.setattr("neo.config.NeoConfig.load", staticmethod(lambda *a, **k: _Cfg()))
         monkeypatch.setattr("neo.adapters.create_adapter", lambda *a, **k: _Adapter())
-        monkeypatch.setattr(tr, "collect_episodes", lambda root: [ep])
+        # Accepts `since`: ClaudeCodeSource forwards it, and a stub that
+        # omits it raises TypeError which the per-source guard swallows as
+        # "source failed" — silently yielding zero episodes.
+        monkeypatch.setattr(tr, "collect_episodes", lambda root, since=None: [ep])
 
         observer = Observer(codebase_root="/p", config=ObserverConfig(ingest_budget=5))
         observer._cycle()

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.41.0] - 2026-07-26
+
+### Fixed
+
+- **Found and fixed the actual cause of the observer's multi-GB memory, rather than only capping it.** Cycles that mined nothing — 0.1s per project, "0 mined" — were still swinging RSS by gigabytes. The reason: `TranscriptIngester.ingest` called `source.collect_episodes()` and applied the watermark filter to the *result*. Every source fully parsed every transcript on every cycle, for every project, and `all_episodes` retained the lot. Measured on one project: **118 MB (ClaudeCodeSource) + 180 MB (CodexSource) = 298 MB**, times up to 25 projects a cycle. The documented "watermark-gated so unchanged projects do near-zero work" was simply not true — the watermark gated admission, not work.
+
+  Sources now skip inputs untouched since the watermark file's mtime (minus a 1h skew margin, since a transcript written *during* the previous ingest must never be judged already-seen). Measured after: the same project's collect goes **298 MB → 0 MB** when nothing changed. No storage format change — the watermark file's own mtime is the marker.
+
+  Every error path falls back to parsing: skipping is an optimization, but a wrong skip loses learning silently. `since` is passed only to sources whose signature accepts it, detected by inspection — sources are an open interface, and calling one with an unexpected kwarg raises a `TypeError` that the per-source guard swallows as "source failed", silently yielding zero episodes. That failure mode bit three separate test stubs during development. (`memory/transcript.py`)
+
+### Changed
+
+- **Recycle cadence 6 → 3 cycles (~15min).** With the parse spike fixed, peaks are far smaller, and a tighter cadence costs ~2s per 15min (<0.3%). (`memory/observer.py`)
+
 ## [0.40.3] - 2026-07-25
 
 ### Fixed
