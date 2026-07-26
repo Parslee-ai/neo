@@ -36,7 +36,7 @@ Tunables (env, read by the daemon child):
                                      the rate at which restarts re-
                                      trigger mining.
     NEO_OBSERVER_RECYCLE_CYCLES    — re-exec after this many cycles to
-                                     bound RSS (default 48, ~4h). 0
+                                     bound RSS (default 6, ~30min). 0
                                      disables recycling.
 """
 
@@ -281,9 +281,15 @@ class ObserverConfig:
     # transcripts since their watermark do near-zero work (ingest finds nothing).
     max_projects_per_cycle: int = 25
     # Re-exec after this many cycles to bound RSS (see Observer._should_recycle).
-    # 48 cycles is ~4h at the default 300s interval — long enough that the swap
-    # is invisible, short enough that fragmentation never compounds. 0 disables.
-    recycle_after_cycles: int = 48
+    # 6 cycles is ~30min at the default 300s interval. The first default here was
+    # 48 (~4h), chosen on the assumption that RSS creeps slowly — it does not.
+    # Measured on a live daemon: 7 cycles took it from 103 MB to 693 MB, i.e. it
+    # reaches its plateau within minutes, so a 4h cadence reset an
+    # already-plateaued process and bought nothing. Recycling caps RSS at roughly
+    # whatever it reaches in N cycles, so N is the actual tuning dial. A re-exec
+    # costs ~2s of process restart, which at 30min intervals is under 0.2%
+    # overhead. 0 disables.
+    recycle_after_cycles: int = 6
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -414,8 +420,10 @@ class Observer:
         each project sweep deserializes a multi-MB fact file (79% of whose rows
         are tombstones retained by policy), and the allocator never returns
         those arenas to the OS. Nothing leaks — RSS drifts up to the high-water
-        mark and stays there, measured at 0.5-0.7 GB. Re-exec'ing on a cadence
-        bounds it for the cost of one process image swap.
+        mark and stays there, measured at 0.5-0.7 GB — and it gets there fast:
+        a live daemon went 103 MB -> 693 MB in 7 cycles. Recycling caps RSS at
+        roughly whatever it reaches in ``recycle_after_cycles``, which is why
+        that number is the real tuning dial rather than a formality.
         """
         limit = self.config.recycle_after_cycles
         return limit > 0 and self._cycles_total >= limit
