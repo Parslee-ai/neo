@@ -281,7 +281,7 @@ class ObserverConfig:
     # transcripts since their watermark do near-zero work (ingest finds nothing).
     max_projects_per_cycle: int = 25
     # Re-exec after this many cycles to bound RSS (see Observer._should_recycle).
-    # 6 cycles is ~30min at the default 300s interval. The first default here was
+    # 3 cycles is ~15min at the default 300s interval. The first default here was
     # 48 (~4h), chosen on the assumption that RSS creeps slowly — it does not.
     # Measured on a live daemon: 7 cycles took it from 103 MB to 693 MB, i.e. it
     # reaches its plateau within minutes, so a 4h cadence reset an
@@ -289,7 +289,7 @@ class ObserverConfig:
     # whatever it reaches in N cycles, so N is the actual tuning dial. A re-exec
     # costs ~2s of process restart, which at 30min intervals is under 0.2%
     # overhead. 0 disables.
-    recycle_after_cycles: int = 6
+    recycle_after_cycles: int = 3
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":

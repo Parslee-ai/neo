@@ -315,8 +315,7 @@
 - Async transcript-mining observer (`memory.observer`): a **single global**
   background process (CAR agent `neo-observer`, daemon `--daemon --all`) that
   **sweeps all discovered projects** each cycle — round-robin/budgeted
-  (`max_projects_per_cycle`, default 25; watermark-gated so unchanged projects do
-  near-zero work) — running transcript mining per project. (It also ran
+  (`max_projects_per_cycle`, default 25; watermark- AND mtime-gated so unchanged projects do near-zero work (the watermark alone gates only *admission*: sources still parsed every transcript each cycle, measured at 298 MB for one project, which is what drove multi-GB observer RSS. `_unchanged_since` now skips files untouched since the watermark file's mtime minus a 1h skew margin; every error path falls back to parsing, because a wrong skip loses learning silently)) — running transcript mining per project. (It also ran
   `synthesize_reviews` until that subsystem was removed.) Two roots can share a `project_id` (two
   clones of one remote, e.g. `flyx/fms` + `flyx/fms2`), meaning one fact file and
   one pid-keyed watermark; the sweep keeps a per-cycle `store_cache` so such a

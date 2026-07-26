@@ -1,6 +1,7 @@
 """Tests for Claude Code transcript parsing (Stage A) and ingestion (B/C)."""
 
 import json
+import time
 import time as _time
 import types
 from dataclasses import dataclass as _dataclass
@@ -1075,3 +1076,66 @@ def test_source_without_fact_kind_defaults_to_pattern(temp_store, tmp_path, monk
     facts = [f for f in temp_store._facts if f.is_valid]
     assert facts and facts[0].kind == FactKind.PATTERN
     assert "imported:github-pr" not in facts[0].tags
+
+
+class TestSkipUnchangedInputs:
+    """Parsing dominated the observer's memory: one project measured 104 MB for
+    ClaudeCodeSource and 224 MB for CodexSource, and the sweep does 25 projects
+    a cycle. The watermark only gated *admission*, so an unchanged project still
+    paid the full parse — the opposite of the documented "near-zero work".
+    """
+
+    def test_unchanged_file_is_skipped(self, tmp_path):
+        from neo.memory.transcript import _unchanged_since
+        import os
+        f = tmp_path / "t.jsonl"
+        f.write_text("{}")
+        old = time.time() - 10_000
+        os.utime(f, (old, old))
+        assert _unchanged_since(f, time.time()) is True
+
+    def test_modified_file_is_never_skipped(self, tmp_path):
+        from neo.memory.transcript import _unchanged_since
+        f = tmp_path / "t.jsonl"
+        f.write_text("{}")
+        assert _unchanged_since(f, time.time() - 10_000) is False
+
+    def test_no_since_parses_everything(self, tmp_path):
+        """First run has no watermark — must not skip anything."""
+        from neo.memory.transcript import _unchanged_since
+        f = tmp_path / "t.jsonl"
+        f.write_text("{}")
+        assert _unchanged_since(f, None) is False
+        assert _unchanged_since(f, 0) is False
+
+    def test_unreadable_file_is_parsed_not_skipped(self, tmp_path):
+        """Skipping is an optimization; a wrong skip loses learning silently, so
+        every error path must fall back to parsing."""
+        from neo.memory.transcript import _unchanged_since
+        assert _unchanged_since(tmp_path / "gone.jsonl", time.time()) is False
+
+    def test_codex_source_skips_only_stale_rollouts(self, tmp_path):
+        import os
+        sdir = tmp_path / "codex"
+        sdir.mkdir()
+        _write_rollout(sdir / "rollout-old.jsonl", cwd="/work/proj", sid="s1",
+                       records=[_ev("user_message", message="stale")])
+        _write_rollout(sdir / "rollout-new.jsonl", cwd="/work/proj", sid="s2",
+                       records=[_ev("user_message", message="fresh")])
+        old = time.time() - 10_000
+        os.utime(sdir / "rollout-old.jsonl", (old, old))
+        eps = CodexSource(codebase_root="/work/proj",
+                          sessions_dir=sdir).collect_episodes(since=time.time() - 5_000)
+        assert [e.ask for e in eps] == ["fresh"]
+
+    def test_source_without_since_still_works(self, temp_store, tmp_path, monkeypatch):
+        """Sources are an open interface — one lacking `since` must not be
+        called with it and silently fail as 'source errored'."""
+        monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+        ad = _StubAdapter([_LESSON], keep=True)
+        legacy = _StaticSource([_ep("x1", "ask")])
+        assert "since" not in __import__("inspect").signature(
+            legacy.collect_episodes).parameters
+        stats = TranscriptIngester(store=temp_store, lm_adapter=ad,
+                                   sources=[legacy]).ingest(max_episodes=1)
+        assert stats["episodes_total"] == 1
