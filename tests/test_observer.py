@@ -1161,6 +1161,13 @@ class TestRecycleToBoundRSS:
         assert self._observer(48, 48)._should_recycle() is True
         assert self._observer(49, 48)._should_recycle() is True
 
+    def test_default_cadence_is_tight_enough_to_matter(self):
+        """RSS plateaus within minutes (measured 103 MB -> 693 MB over 7 cycles),
+        so recycling caps it at whatever N cycles reach. A cadence far above that
+        resets an already-plateaued process and buys nothing."""
+        from neo.memory.observer import ObserverConfig
+        assert ObserverConfig().recycle_after_cycles <= 12
+
     def test_does_not_recycle_early(self):
         assert self._observer(47, 48)._should_recycle() is False
         assert self._observer(0, 48)._should_recycle() is False

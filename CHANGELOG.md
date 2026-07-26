@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.40.2] - 2026-07-25
+
+### Fixed
+
+- **The observer's recycle cadence was too lax to do its job.** 0.40.0 shipped a default of 48 cycles (~4h) on the assumption that RSS creeps slowly. It does not: a live daemon went from 103 MB to **693 MB in 7 cycles**, reaching its plateau within minutes. A 4-hour cadence therefore reset an already-plateaued process and bought essentially nothing. Recycling caps RSS at roughly whatever it reaches in `recycle_after_cycles`, which makes that number the actual tuning dial rather than a formality. Default is now **6 cycles (~30min)**; a re-exec costs ~2s of process restart, under 0.2% overhead at that interval. (`memory/observer.py`)
+
 ## [0.40.1] - 2026-07-25
 
 ### Changed
