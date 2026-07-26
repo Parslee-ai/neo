@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.40.3] - 2026-07-25
+
+### Fixed
+
+- **0.40.2's cadence fix was a no-op; this makes it real.** `ObserverConfig` declared the recycle default in two places — the dataclass field and a restated literal inside `from_env`. 0.40.2 moved the field 48 → 6 and left `from_env` saying 48, and the daemon only ever reads `from_env`, so the shipped default never changed. The guard test added alongside it checked `ObserverConfig()` rather than `ObserverConfig.from_env()`, so it passed against the broken path and gave false assurance. `from_env` now derives every fallback from the dataclass defaults instead of restating them, and the test asserts both construction paths plus their equality when no env is set. (`memory/observer.py`)
+
 ## [0.40.2] - 2026-07-25
 
 ### Fixed

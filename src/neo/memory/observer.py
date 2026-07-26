@@ -303,10 +303,17 @@ class ObserverConfig:
             except ValueError:
                 return default
 
+        defaults = cls()
         return cls(
-            interval_seconds=_read("NEO_OBSERVER_INTERVAL_SECONDS", 300.0),
-            cooldown_seconds=_read("NEO_OBSERVER_COOLDOWN", 60.0),
-            recycle_after_cycles=int(_read("NEO_OBSERVER_RECYCLE_CYCLES", 48.0)),
+            # Fall back to the dataclass defaults rather than restating them.
+            # A second literal here is how 0.40.2 shipped a no-op: the field
+            # default moved 48 -> 6 while this line kept saying 48, and the
+            # daemon only ever reads from_env().
+            interval_seconds=_read("NEO_OBSERVER_INTERVAL_SECONDS", defaults.interval_seconds),
+            cooldown_seconds=_read("NEO_OBSERVER_COOLDOWN", defaults.cooldown_seconds),
+            recycle_after_cycles=int(
+                _read("NEO_OBSERVER_RECYCLE_CYCLES", defaults.recycle_after_cycles)
+            ),
         )
 
 
