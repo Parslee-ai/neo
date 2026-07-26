@@ -34,6 +34,23 @@ local linter and CI's disagree — which is exactly how a green local tree turne
 `main` red during 0.39.0. Bump the pin deliberately, in its own commit, with the
 lint delta reviewed.
 
+### Releasing
+
+Publishing is automated: creating a GitHub **Release** triggers `publish.yml`,
+which builds and uploads to PyPI via Trusted Publishers (OIDC — no token lives
+in the repo). The sequence is push → tag → release; do not run `twine` locally.
+
+Two things to know before you rely on it:
+
+- **TestPyPI is not configured.** `publish-testpypi` only runs on a manual
+  `workflow_dispatch`, and it currently fails at the publish step because no
+  Trusted Publisher exists for this repo on TestPyPI. The `build` job and the
+  artifact upload/download round-trip still execute, so dispatching is a valid
+  smoke test for a workflow change — just expect the final step to fail until
+  someone configures it at <https://test.pypi.org/manage/account/publishing/>.
+- **A version can never be replaced on PyPI**, only yanked. Verify CI is green
+  on the exact commit you are tagging, not merely on the branch.
+
 ### 3a. Enable the pre-commit hook
 
 ```bash
