@@ -1164,9 +1164,30 @@ class TestRecycleToBoundRSS:
     def test_default_cadence_is_tight_enough_to_matter(self):
         """RSS plateaus within minutes (measured 103 MB -> 693 MB over 7 cycles),
         so recycling caps it at whatever N cycles reach. A cadence far above that
-        resets an already-plateaued process and buys nothing."""
+        resets an already-plateaued process and buys nothing.
+
+        Asserts BOTH construction paths. The first version of this test checked
+        only `ObserverConfig()` while the daemon reads `from_env()`, which kept
+        its own hardcoded 48 — so 0.40.2 shipped a no-op behind a green test.
+        """
         from neo.memory.observer import ObserverConfig
         assert ObserverConfig().recycle_after_cycles <= 12
+        assert ObserverConfig.from_env().recycle_after_cycles <= 12
+
+    def test_from_env_defaults_match_the_dataclass(self, monkeypatch):
+        """No env set => from_env must equal the field defaults exactly.
+
+        Guards the duplication class directly: any default restated as a literal
+        inside from_env can drift from the field it mirrors.
+        """
+        from neo.memory.observer import ObserverConfig
+        for var in ("NEO_OBSERVER_INTERVAL_SECONDS", "NEO_OBSERVER_COOLDOWN",
+                    "NEO_OBSERVER_RECYCLE_CYCLES"):
+            monkeypatch.delenv(var, raising=False)
+        plain, from_env = ObserverConfig(), ObserverConfig.from_env()
+        assert from_env.interval_seconds == plain.interval_seconds
+        assert from_env.cooldown_seconds == plain.cooldown_seconds
+        assert from_env.recycle_after_cycles == plain.recycle_after_cycles
 
     def test_does_not_recycle_early(self):
         assert self._observer(47, 48)._should_recycle() is False
