@@ -1964,13 +1964,24 @@ def handle_config(args):
     """Handle --config flag operations."""
     from neo.config import NeoConfig, store_api_key_in_keychain
 
-    VALID_PROVIDERS = ['openai', 'anthropic', 'google', 'azure', 'ollama', 'local', 'claude-code']
+    # Mirrors the providers `adapters.create_adapter` can actually build. 'car'
+    # belongs here: it is a real static provider (CAR's router owns model
+    # selection), distinct from inference_mode='auto', which prefers CAR but
+    # falls back to the static provider when the daemon is unreachable.
+    VALID_PROVIDERS = [
+        'openai', 'anthropic', 'google', 'azure', 'ollama', 'local',
+        'claude-code', 'car',
+    ]
     VALID_MEMORY_BACKENDS = ['fact_store', 'legacy']
+    VALID_INFERENCE_MODES = ['static', 'auto']
     EXPOSED_FIELDS = [
-        'provider', 'model', 'api_key', 'base_url',
+        'provider', 'model', 'api_key', 'base_url', 'inference_mode',
         'memory_backend', 'auto_install_updates', 'constraint_auto_scan',
         'log_level', 'reasoning_effort_cap',
     ]
+    # Optional string fields an empty --config-value clears back to unset. For
+    # `model` that is the only way to say "let the provider/router choose".
+    NULLABLE_FIELDS = {'model', 'base_url'}
 
     def mask_secret(value: str) -> str:
         """Mask API keys and secrets for display."""
@@ -2029,6 +2040,12 @@ def handle_config(args):
         if args.config_key == 'memory_backend' and args.config_value not in VALID_MEMORY_BACKENDS:
             print(f"Error: Invalid memory backend. Valid values: {', '.join(VALID_MEMORY_BACKENDS)}", file=sys.stderr)
             sys.exit(1)
+        if args.config_key == 'inference_mode' and args.config_value not in VALID_INFERENCE_MODES:
+            print(
+                f"Error: Invalid inference mode. Valid values: {', '.join(VALID_INFERENCE_MODES)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if args.config_key == 'log_level':
             value_upper = str(args.config_value).upper() if args.config_value else ""
             if value_upper not in ("DEBUG", "INFO", "WARNING", "ERROR"):
@@ -2041,6 +2058,10 @@ def handle_config(args):
             if not value:
                 print("Error: API key cannot be empty", file=sys.stderr)
                 sys.exit(1)
+        elif args.config_value == "" and args.config_key in NULLABLE_FIELDS:
+            # An explicitly empty value clears the field. `--config-value ""` is
+            # distinguishable from an omitted flag (which argparse leaves None).
+            value = None
         elif not args.config_value:
             print("Error: --config-value required for this config key", file=sys.stderr)
             sys.exit(1)
@@ -2085,6 +2106,8 @@ def handle_config(args):
         config.save()
         if args.config_key == 'api_key':
             print(f"\u2713 Stored api_key in Keychain for provider {config.provider}")
+        elif value is None and args.config_key in NULLABLE_FIELDS:
+            print(f"\u2713 Cleared {args.config_key} (provider default applies)")
         else:
             print(f"\u2713 Set {args.config_key} = {value}")
 

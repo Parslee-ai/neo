@@ -312,12 +312,18 @@ class NeoConfig:
         path = Path(config_path).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Only save exposed fields (not internal settings)
+        # Only save exposed fields (not internal settings).
+        # `from_file` accepts any NeoConfig field, so anything readable but
+        # missing here is silently erased the next time a config is saved —
+        # which is exactly what happened to `inference_mode` and
+        # `reasoning_mode`. Keep this list in sync with what users can set.
         exposed_fields = {
             'provider': self.provider,
             'model': self.model,
             'api_key': self.api_key if os.environ.get("NEO_ALLOW_PLAINTEXT_API_KEY") else None,
             'base_url': self.base_url,
+            'inference_mode': self.inference_mode,
+            'reasoning_mode': self.reasoning_mode,
             'auto_install_updates': self.auto_install_updates,
             'memory_backend': self.memory_backend,
             'constraint_auto_scan': self.constraint_auto_scan,
