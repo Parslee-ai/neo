@@ -2,7 +2,40 @@
 
 ## Quick Install
 
-### Recommended: Development Mode
+### Recommended: From PyPI
+
+```bash
+# Isolated install (recommended for end users)
+pipx install neo-reasoner
+
+# Or into the current environment
+pip install neo-reasoner
+
+# Verify installation
+neo --version
+```
+
+The base install is runnable as soon as you set `OPENAI_API_KEY` — OpenAI is the
+default provider and its SDK is a core dependency. To add another provider up
+front:
+
+```bash
+pip install neo-reasoner[anthropic]  # Claude
+pip install neo-reasoner[google]     # Gemini
+pip install neo-reasoner[ollama]     # Ollama HTTP client
+pip install neo-reasoner[all]        # All LM providers
+pip install neo-reasoner[car]        # Common Agent Runtime (neo serve, observer)
+```
+
+Updating:
+
+```bash
+neo update                  # built-in updater
+pip install --upgrade neo-reasoner
+pipx upgrade neo-reasoner
+```
+
+### Development Mode (From Source)
 
 ```bash
 # Clone repository
@@ -20,7 +53,7 @@ This automatically installs:
 - Core dependencies (numpy, scikit-learn, datasketch, fastembed, faiss-cpu, jsonschema, pyyaml, tree-sitter)
 - Neo CLI command (`neo`)
 
-### Alternative: Using pyproject.toml
+### Extras (From Source)
 
 ```bash
 # Install with specific extras
@@ -151,11 +184,16 @@ neo --version
 # Should output something like:
 # "What is real? How do you define 'real'?"
 #
-# neo 0.18.1
+# neo 0.41.0
 # Provider: openai | Model: gpt-5.6
+# Storage: FactStore (path: /Users/you/.neo/facts)
+# CAR: not found
 # Stage: Sleeper | Memory: 0.0%
-# 0 facts | 0.00 avg confidence
+# 0 patterns | 0.00 avg confidence
 ```
+
+The `CAR:` line reports whatever local CAR runtime is detected — `not found` is
+the expected value unless you installed the `[car]` extra.
 
 ### Test Core Functionality
 
@@ -258,12 +296,14 @@ export PATH="${PATH}:$(pwd)"
 ### API Key Not Found
 
 ```bash
-# Verify environment variable is set
-echo $ANTHROPIC_API_KEY
+# Verify environment variable is set (OPENAI_API_KEY is the default provider's)
+echo $OPENAI_API_KEY
 
 # Or set it now
-export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
 ```
+
+Use `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` instead if you switched `provider`.
 
 ### sklearn/numpy Issues
 
@@ -331,12 +371,12 @@ If you previously installed Neo using requirements.txt:
 # Uninstall old version
 pip uninstall neo-reasoner
 
-# Remove old dependencies (optional)
-pip freeze | grep -v "^-e" | xargs pip uninstall -y
-
-# Install fresh using new method
+# Install fresh using the current method
 pip install -e .
 ```
+
+To be sure no stale dependency pins linger, do this in a fresh virtualenv rather
+than mass-uninstalling packages from a shared environment.
 
 ## Upgrading
 
@@ -360,8 +400,8 @@ pip uninstall neo-reasoner
 
 # Remove environment variables
 # Edit ~/.bashrc or ~/.zshrc and remove:
-# - ANTHROPIC_API_KEY
-# - etc.
+# - OPENAI_API_KEY (or ANTHROPIC_API_KEY / GOOGLE_API_KEY)
+# - any NEO_* overrides
 
 # Optional: Remove local data (facts, config, indexes)
 rm -rf ~/.neo
@@ -386,7 +426,7 @@ CMD ["neo", "--version"]
 docker build -t neo .
 
 # Run Neo
-docker run -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY neo "your prompt"
+docker run -e OPENAI_API_KEY=$OPENAI_API_KEY neo "your prompt"
 ```
 
 ## Next Steps
@@ -402,7 +442,7 @@ After installation:
 ## Getting Help
 
 - **Installation Issues**: Check this guide's Troubleshooting section
-- **API Key Problems**: Verify environment variables with `echo $ANTHROPIC_API_KEY`
+- **API Key Problems**: Verify environment variables with `echo $OPENAI_API_KEY`
 - **Dependencies**: Run `pip list | grep neo` to see installed packages
 - **GitHub Issues**: Report bugs at https://github.com/Parslee-ai/neo/issues
 

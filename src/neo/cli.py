@@ -240,12 +240,16 @@ def parse_args():
 
         observer_p = subparsers.add_parser(
             'observer',
-            help='Run REVIEW→PATTERN/FAILURE synthesis in a background process',
+            help='Manage the background transcript-mining observer (CAR-supervised)',
         )
         observer_p.add_argument(
             'observer_action',
             choices=('start', 'stop', 'status', 'kick'),
-            help='start: spawn; stop: SIGTERM; status: show PID/last cycle; kick: SIGUSR1 force cycle',
+            help=(
+                'start: register+start the CAR agent; stop: stop it; '
+                'status: CAR state, last cycle, orphan check; '
+                'kick: force a cycle now (agents_restart)'
+            ),
         )
         observer_p.add_argument('--cwd', help='Codebase root (defaults to current directory)')
 
@@ -400,18 +404,38 @@ def parse_args():
         return args
 
     # Default argument parser (for reasoning mode)
+    # Subcommands are dispatched by the sys.argv[1] checks above, so argparse
+    # never sees them and cannot list them. Spell them out here or they are
+    # undiscoverable from `neo --help`.
     p = argparse.ArgumentParser(
         prog="neo",
         description="Neo - Reasoning helper for coding tasks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        parents=[global_parser]
+        parents=[global_parser],
+        epilog="""subcommands (run `neo <subcommand> --help` for details):
+  neo memory <action>     replay-feedback | prune | observer | issues | rules |
+                          audit | import | explain | evaluate-learning |
+                          citation-stats | learning-stats
+  neo construct <action>  list | show | search | index
+  neo car status          report detected CAR runtime surfaces
+  neo serve               host Neo as an Agent2Agent v1.0 endpoint (needs [car])
+  neo prompt <action>     analyze | enhance | patterns | suggest | history | stats
+  neo contribute          export high-confidence patterns for the community
+  neo update              update the installed neo package
+""",
     )
 
     p.add_argument("prompt", nargs="?", help="Plain text prompt (or use stdin)")
     p.add_argument("--json", action="store_true", help="Print JSONL events and final JSON")
     p.add_argument("--output-schema", metavar="NAME_OR_PATH", help="Control final response shape")
     p.add_argument("--max-bytes", type=int, default=300_000, help="Hard cap for total context bytes")
-    p.add_argument("--max-files", type=int, default=30, help="Soft cap for number of context files")
+    # Default is None, not a number, because this flag feeds two different
+    # subsystems with different natural caps: context gathering (30) and the
+    # index build (100). A shared numeric default would silently shrink one of
+    # them; `None` lets each call site keep its own floor while an explicit
+    # value overrides both.
+    p.add_argument("--max-files", type=int, default=None,
+                   help="Cap on files: context gathering (default 30) or, with --index, the index build (default 100)")
     p.add_argument("--include", action="append", default=[], help="Allowlist glob patterns (repeatable)")
     p.add_argument("--exclude", action="append", default=[], help="Blocklist glob patterns (repeatable)")
     p.add_argument("--exts", metavar="CSV", help="Restrict to file extensions (comma-separated)")
@@ -652,7 +676,11 @@ def main():
             languages = [lang.strip() for lang in args.languages.split(',')]
             print(f"[Neo] Indexing languages: {', '.join(languages)}")
 
-        max_files = 100  # Configurable later
+        # `--max-files` is defined on the reasoning parser, so a subcommand
+        # parser that also inherits `--index` won't carry the attribute.
+        max_files = getattr(args, 'max_files', None) or 100
+        if max_files != 100:
+            print(f"[Neo] Indexing at most {max_files} files")
 
         try:
             index.build_index(languages=languages, max_files=max_files)
@@ -890,7 +918,7 @@ def main():
                 includes=args.include,
                 excludes=args.exclude,
                 max_bytes=args.max_bytes,
-                max_files=args.max_files,
+                max_files=args.max_files or 30,
                 diff_since=args.diff_since,
                 use_git=not args.no_git,
             )

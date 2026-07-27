@@ -34,7 +34,7 @@ A pull command. Pipeline (`neo/memory/issues.py`), all LM-free in v1:
 3. **Cluster** (`detect_issues`) — embed each ask (sharpened with its first
    error line when present) via the store's `_embed_text` (Jina — same vectors
    as fact retrieval, no extra model, no LM) and complete-linkage cluster at
-   `CLUSTER_SIMILARITY = 0.85` (== `store.SYNTHESIS_SIMILARITY`), reusing
+   `CLUSTER_SIMILARITY = 0.85` (the threshold the removed `store.SYNTHESIS_SIMILARITY` used; the two are no longer coupled), reusing
    `math_utils.cluster_by_similarity`.
 4. **Gate** — a cluster becomes an `Issue` only if it has **≥ `min_cluster`
    members**, spans **≥ 2 distinct sessions**, has **≥ 2 frictional members**,

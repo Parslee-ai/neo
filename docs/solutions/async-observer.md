@@ -4,20 +4,40 @@ Proposal for moving REVIEW→PATTERN/FAILURE synthesis off the hot path, modeled
 after ECC's `continuous-learning-v2` observer
 (`affaan-m/ECC:skills/continuous-learning-v2/`).
 
-> **As-built note (post-v0.19):** the first cut of this proposal rolled its own
-> daemon (`subprocess.Popen` + PID file + SIGUSR1 kick + idle-exit). That
-> implementation was replaced before any release with a port to CAR's
-> `agents_*` lifecycle API (the API landed in car-runtime 0.16.1; the
-> hard dep is ≥ 0.18.0 — see car-releases#54). The motivation, ECC
-> reference points, and design rationale below remain accurate; the
-> "Process model" section's plumbing is **superseded** — CAR's supervisor
-> owns spawn, restart-on-failure, log redirection, and clean shutdown.
-> `~/.car/agents.json` is the persisted spec; `~/.car/logs/neo-observer-<id8>.{stdout,stderr}.log`
-> is where output lands. `kick` maps to `agents_restart` since CAR has no
-> signal-passthrough primitive. See `src/neo/memory/observer.py` for the
-> current shape.
+> **As-built note — read this before the design below.** Two things have changed
+> since this was written, and the "Status quo" and "Process model" sections are
+> **superseded**:
+>
+> 1. **The workload is no longer synthesis.** `synthesize_reviews` — the
+>    triple-trigger gate, the ≥3-member clustering, the Hebbian bump, and the
+>    global 3% decay described throughout this document — was **removed**. In
+>    four months of production it minted 114 facts and not one PATTERN, and a
+>    live census found zero ≥3-member clusters at cosine 0.85 across all 1152
+>    valid REVIEWs. What the observer actually runs today is **transcript
+>    mining** (Claude Code / Codex / CAR sessions + merged GitHub PRs) via
+>    `TranscriptIngester`. Durable PATTERNs now come only from the git-verified
+>    episode ledger — see `docs/solutions/evidence-learning-episodes.md`.
+>
+> 2. **The process model is CAR's, and there is one process, not one per
+>    project.** The first cut rolled its own daemon (`subprocess.Popen` + PID
+>    file + SIGUSR1 kick + idle-exit); that was replaced before any release with
+>    a port to CAR's `agents_*` lifecycle API (the API landed in car-runtime
+>    0.16.1; the hard dep is ≥ 0.18.0 — see car-releases#54). CAR's supervisor
+>    owns spawn, restart-on-failure, log redirection, and clean shutdown.
+>    A **single global** agent (`neo-observer`, run as `--daemon --all`) sweeps
+>    every discovered project each cycle, budgeted by `max_projects_per_cycle`
+>    (default 25) and gated on both the watermark and file mtimes.
+>    `~/.car/agents.json` is the persisted spec; output lands in
+>    `~/.car/logs/neo-observer.{stdout,stderr}.log`. `kick` maps to
+>    `agents_restart` since CAR has no signal-passthrough primitive. The daemon
+>    also holds a cross-process single-instance lock and re-execs itself every
+>    `NEO_OBSERVER_RECYCLE_CYCLES` cycles (default 48) to bound RSS drift.
+>
+> The motivation and ECC reference points below remain the useful part. See
+> `src/neo/memory/observer.py` for the current shape, and `CLAUDE.md` for the
+> maintained description.
 
-## Status quo
+## Status quo (historical — describes the since-removed synthesis path)
 
 Synthesis runs inline in `memory/store.py:1722-1765` under a triple-trigger gate
 (any of: `count_delta ≥ 10`, `elapsed ≥ 1h`, `entropy > 0.9`). It fires on the

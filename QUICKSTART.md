@@ -27,16 +27,23 @@ Add to `~/.bashrc` or `~/.zshrc` for persistence.
 neo --version
 ```
 
-Expected output:
+Expected output on a fresh install (the version number tracks the release you
+installed):
 ```
 "What is real? How do you define 'real'?"
 
-neo 0.18.1
+neo 0.41.0
 Provider: openai | Model: gpt-5.6
+Storage: FactStore (path: /Users/you/.neo/facts)
+CAR: not found
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-0 facts | 0.00 avg confidence
+0 patterns | 0.00 avg confidence
 ```
+
+The first run downloads the Jina embedding model (~400 MB) into
+`~/.cache/neo/fastembed`, so expect it to take a minute. Subsequent runs reuse
+the cache.
 
 ## 4. Try a Simple Query
 
@@ -157,10 +164,13 @@ neo --config set --config-key model --config-value gemini-2.0-flash
 
 ### Local (Ollama)
 ```bash
-pip install neo-reasoner
+pip install neo-reasoner[ollama]
 ollama serve
 neo --config set --config-key provider --config-value ollama
 neo --config set --config-key base_url --config-value http://localhost:11434
+neo --config set --config-key model --config-value llama3   # default is llama2
 ```
+
+No API key needed — Ollama is reached over HTTP on the `base_url` above.
 
 That's it! You're ready to use Neo.

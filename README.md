@@ -32,6 +32,7 @@ Neo is **_the missing context layer_** for AI Code Assistants. It retrieves rele
 
 - [Design Philosophy](#design-philosophy)
 - [How It Works](#how-it-works)
+- [The Construct](#the-construct)
 - [Quick Start](#quick-start)
 - [Run as an Agent (CAR / A2A)](#run-as-an-agent-car--a2a)
 - [Claude Code Plugin](#claude-code-plugin)
@@ -39,21 +40,35 @@ Neo is **_the missing context layer_** for AI Code Assistants. It retrieves rele
 - [Works Alongside Your AI Tools](#works-alongside-your-ai-tools)
 - [Installation](#installation)
   - [From PyPI (Recommended)](#from-pypi-recommended)
+  - [Updating Neo](#updating-neo)
   - [From Source (Development)](#from-source-development)
   - [Dependencies](#dependencies)
-  - [Optional: LM Provider](#optional-lm-provider)
+  - [Optional: Additional LM Providers](#optional-additional-lm-providers)
 - [Usage](#usage)
   - [CLI Interface](#cli-interface)
+  - [Command Reference](#command-reference)
+  - [Operating Modes](#operating-modes)
+  - [Goal-aware agent-loop envelope](#goal-aware-agent-loop-envelope)
+  - [Memory Maintenance](#memory-maintenance)
+  - [Background Observer](#background-observer)
+  - [Memory Diagnostics](#memory-diagnostics)
   - [Timeout Requirements](#timeout-requirements)
   - [Output Format](#output-format)
   - [Personality System](#personality-system)
+  - [Load Program — Training Neo's Memory](#load-program---training-neos-memory)
 - [Architecture](#architecture)
   - [Fact-Based Memory](#fact-based-memory)
   - [Output Schemas](#output-schemas)
+  - [Code Smell Detection in Context Assembly](#code-smell-detection-in-context-assembly)
+  - [Smart File Selection](#smart-file-selection)
+  - [Learning Feedback Loop](#learning-feedback-loop)
   - [Storage Architecture](#storage-architecture)
 - [Performance](#performance)
+  - [Memory-Driven Reasoning Effort](#memory-driven-reasoning-effort-gpt-5-models)
+  - [Architectural Quality Feedback Loop](#architectural-quality-feedback-loop)
 - [Configuration](#configuration)
   - [CLI Configuration Management](#cli-configuration-management)
+  - [Secure API Key Storage](#secure-api-key-storage)
   - [Environment Variables](#environment-variables)
 - [LM Adapters](#lm-adapters)
   - [OpenAI (Default)](#openai-default)
@@ -104,6 +119,44 @@ applies learned patterns, generates solutions, and stores new facts for continuo
     This model runs locally on your machine to generate vector embeddings.
 
 
+
+2. When you ask Neo for help:
+    - Your query is embedded locally using the Jina model
+    - Neo searches the fact store for relevant knowledge (using cosine similarity)
+    - Retrieved facts are organized into layers: constraints, relevant knowledge, recent changes, known unknowns
+    - This combined context is sent to your chosen LLM API (OpenAI/Anthropic/Google)
+    - The LLM generates a solution informed by both your query and past facts
+    - The result is stored back as a new fact in local memory for future use
+
+Local storage:
+  ~/.neo/facts/facts_global.json       ← Global-scoped facts
+  ~/.neo/facts/facts_org_{id}.json     ← Organization-scoped facts
+  ~/.neo/facts/facts_project_{id}.json ← Project-scoped facts
+
+Privacy:
+  - Your code never leaves your machine during embedding/search
+  - Only your prompt + retrieved facts are sent to the LLM API
+  - This is the same as using the LLM directly, but with added context from something akin to memory.
+
+ ```
+   Your Prompt
+      ↓
+  Local Jina Embedding (768-dim vector)
+      ↓
+  Cosine Similarity Search (finds relevant facts)
+      ↓
+  Retrieve Facts from ~/.neo/facts/
+      ↓
+  Assemble Context: Constraints → Knowledge → Recent Changes → Known Unknowns
+      ↓
+  →→→ NETWORK CALL →→→ LLM API (OpenAI/Anthropic/etc.)
+      ↓
+  Solution Generated
+      ↓
+  Store as New Fact in Local Memory
+ ```
+
+
 ## The Construct
 
 Neo includes **The Construct** - a curated library of architecture and design patterns with semantic search capabilities. Think of it as your personal reference library for common engineering patterns, indexed and searchable using the same embedding technology that powers Neo's reasoning memory.
@@ -151,41 +204,7 @@ All patterns must:
 
 See `/construct/README.md` for contribution guidelines.
 
-2. When you ask Neo for help:
-    - Your query is embedded locally using the Jina model
-    - Neo searches the fact store for relevant knowledge (using cosine similarity)
-    - Retrieved facts are organized into layers: constraints, relevant knowledge, recent changes, known unknowns
-    - This combined context is sent to your chosen LLM API (OpenAI/Anthropic/Google)
-    - The LLM generates a solution informed by both your query and past facts
-    - The result is stored back as a new fact in local memory for future use
 
-Local storage:
-  ~/.neo/facts/facts_global.json       ← Global-scoped facts
-  ~/.neo/facts/facts_org_{id}.json     ← Organization-scoped facts
-  ~/.neo/facts/facts_project_{id}.json ← Project-scoped facts
-
-Privacy:
-  - Your code never leaves your machine during embedding/search
-  - Only your prompt + retrieved facts are sent to the LLM API
-  - This is the same as using the LLM directly, but with added context from something akin to memory.
-
- ```
-   Your Prompt
-      ↓
-  Local Jina Embedding (768-dim vector)
-      ↓
-  Cosine Similarity Search (finds relevant facts)
-      ↓
-  Retrieve Facts from ~/.neo/facts/
-      ↓
-  Assemble Context: Constraints → Knowledge → Recent Changes → Known Unknowns
-      ↓
-  →→→ NETWORK CALL →→→ LLM API (OpenAI/Anthropic/etc.)
-      ↓
-  Solution Generated
-      ↓
-  Store as New Fact in Local Memory
- ```
 
 ## Quick Start
 
@@ -243,17 +262,43 @@ neo serve
 
 ### Outbound: use CAR as Neo's inference layer
 
+Outbound routing is controlled by the `inference_mode` config field, **not** by
+`provider`:
+
+| `inference_mode` | Behavior |
+|------------------|----------|
+| `static` (default) | Always use the configured `provider` / `model`. CAR is never called. |
+| `auto`             | Use CAR's adaptive router when `car-runtime` is importable **and** the daemon is reachable; fall back to the static provider on absence or runtime failure. |
+
+The default is `static` until a CAR release verifies the router's quality
+behavior (see the known limitation below). Opt in persistently or per-shell:
+
 ```bash
-# Switch Neo's default provider
+# Persistently: prefer CAR's router, fall back to the static provider
+neo --config set --config-key inference_mode --config-value auto
+
+# Or per-invocation / per-shell
+export NEO_INFERENCE_MODE=auto
+```
+
+To pin CAR as the **only** backend (no static fallback), set the provider
+itself. Clear `model` so CAR's router chooses per call, or set it to pin one
+backend:
+
+```bash
 neo --config set --config-key provider --config-value car
 
-# Let CAR's adaptive router pick the backend per call (recommended)
+# Let the router pick per call (an empty value clears the field)
 neo --config set --config-key model --config-value ""
 
-# Or pin a specific model — local or remote
+# Or pin a specific backend — local or remote
 neo --config set --config-key model --config-value qwen3-32b
-neo --config set --config-key model --config-value gpt-5
 ```
+
+Environment overrides work the same way: `NEO_PROVIDER=car`, `NEO_MODEL=...`.
+Note that with `provider=car`, whatever `model` holds is passed straight to CAR
+as a pin — leaving it at the default `gpt-5.6` pins that model rather than
+letting the router choose, which is why clearing it matters.
 
 The CAR daemon must be running (`car-server` / `python -m car_runtime.server`). From Python:
 
@@ -455,10 +500,10 @@ When enabled, Neo will:
 ```bash
 $ neo "your query"
 
-⚡ Auto-installing neo update: 0.18.0 → 0.18.1
+⚡ Auto-installing neo update: 0.40.0 → 0.41.0
    This happens in the background. Please wait...
 
-✓ Auto-update completed: 0.18.1
+✓ Auto-update completed: 0.41.0
    Restart neo to use the new version.
 
 [Neo] Processing your query...
@@ -545,6 +590,49 @@ neo --version
 # Inspect detected local CAR runtime surfaces
 neo car status
 ```
+
+### Command Reference
+
+Neo is one binary with a plain-text prompt plus a handful of subcommands. Run
+`neo --help` for the flag list.
+
+**Subcommands**
+
+| Command | Purpose |
+|---------|---------|
+| `neo "<prompt>"` | Reason about a prompt in the current repo (the default path) |
+| `neo memory <action>` | Memory maintenance, diagnostics, and the background observer — see [Memory Maintenance](#memory-maintenance) |
+| `neo construct <action>` | The Construct pattern library: `list`, `show`, `search`, `index` |
+| `neo car status` | Report detected CAR CLI / server / Python bindings / daemon |
+| `neo serve` | Host Neo as an A2A endpoint (`--a2a-bind`, `--public-url`, `--agent-name`) |
+| `neo prompt <action>` | Prompt-effectiveness tooling: `analyze`, `enhance`, `patterns`, `suggest`, `history`, `stats` |
+| `neo contribute` | Export high-confidence patterns for community contribution |
+| `neo update` | Update the installed `neo` package in place |
+
+**Global flags**
+
+| Flag | Purpose |
+|------|---------|
+| `--cwd PATH` | Working-directory override (which repo Neo reasons about) |
+| `--mode {advise,patch,verify,learn,agent}` | Operating mode; default `learn` — see [Operating Modes](#operating-modes) |
+| `--fast` / `--deep` | Force the single-call path / force multi-agent deliberation (default is `auto`, which gates on novelty + CAR availability) |
+| `--dry-run` | Assemble and print the full context, then exit without an LLM call |
+| `--json` | Emit JSONL progress events plus a final JSON object (also the JSON *input* path) |
+| `--output-schema NAME_OR_PATH` | Constrain the shape of the final JSON response |
+| `--index` / `--update` / `--languages CSV` | Build, incrementally refresh, and scope the per-project semantic index |
+| `--semantic` | Use the semantic index for file selection (requires `.neo/index.json`) |
+| `--max-bytes N` | Hard cap on total context bytes (default 300000) |
+| `--max-files N` | Cap on files: context gathering (default 30), or the index build when passed with `--index` (default 100) |
+| `--include GLOB` / `--exclude GLOB` | Allow/block file patterns; both repeatable |
+| `--exts CSV` | Restrict context to these file extensions |
+| `--diff-since REV` | Prioritize files changed since a git rev or duration |
+| `--no-git` / `--no-scan` | Skip git heuristics / skip the directory scan entirely |
+| `--stdin-json` / `--stdin-text` | Force the stdin input mode instead of auto-detecting |
+| `--verbose` / `--debug` | INFO / DEBUG logging to stderr |
+| `--allow-write-path GLOB` / `--allow-command CMD` | `agent`-mode authority grants (repeatable) |
+| `--config {list,get,set,reset}` | Configuration management — see [Configuration](#configuration) |
+| `--load-program DATASET_ID` | Import a HuggingFace dataset into memory — see [Load Program](#load-program---training-neos-memory) |
+| `--regenerate-embeddings` | Rebuild legacy `ReasoningMemory` embeddings with the current model (automatic backup) |
 
 ### Operating Modes
 
@@ -640,6 +728,92 @@ quality, harmful-memory, unsupported-promotion, repeat-error, isolation, latency
 model-call, and token metrics, and exits nonzero if any safety scenario or threshold
 fails. See [the evaluation contract](docs/solutions/evidence-learning-evaluation.md).
 
+**Is it actually learning?** Two read-only commands answer that without an LM
+call — one for the retrieve side, one for the promote side:
+
+```bash
+# Retrieval side: were retrieved facts actually used, and which detector earned the credit?
+neo memory citation-stats --since 7d
+
+# Promotion side: episodes, outcomes, candidate statuses, promotions/rollbacks
+neo memory learning-stats --since 7d
+```
+
+`citation-stats` summarizes the `citation_survival` metric from
+`~/.neo/metrics.jsonl` (retrieved / included / used, split by
+`by_marker` / `by_self_report` / `by_overlap`). `learning-stats` reads the
+episode ledger in `~/.neo/episodes`. Both take `--json`. Note that
+`learning-stats` covers only the **interactive, attributed** path: an `IDLE`
+reading means suggestions aren't being accepted downstream, not that Neo has
+stopped learning — the background observer mints facts with no episode
+footprint.
+
+```bash
+# Re-run implicit-feedback processing over linked session outcomes
+neo memory replay-feedback              # current project
+neo memory replay-feedback --all        # every local project Neo has touched
+neo memory replay-feedback --dry-run    # report what would change, mutate nothing
+```
+
+Use `replay-feedback` after a memory-loop fix, to re-apply confidence and
+`success_count` updates from already-recorded ACCEPTED / MODIFIED / UNVERIFIED
+outcomes. It only touches linked, non-independent outcomes.
+`--include-legacy-fallback` also inspects legacy `session_*.json` files (which
+may re-replay already-processed sessions); `--limit N` bounds `--all`.
+
+### Background Observer
+
+Transcript mining runs out-of-band in a single global background process
+supervised by CAR, so it never sits on the request path. It sweeps every
+discovered project each cycle, mining lessons from Claude Code, Codex, and CAR
+transcripts plus merged GitHub PRs.
+
+```bash
+neo memory observer status   # CAR-reported state + orphaned-process check
+neo memory observer start
+neo memory observer stop
+neo memory observer kick     # force a cycle now (maps to CAR agents_restart)
+```
+
+It **autostarts** whenever `car-server` is reachable — opt out with
+`NEO_OBSERVER_AUTOSTART=0`. With no CAR present it prints a one-time hint and
+stays silent. Requires the `[car]` extra and a running `car-server`
+(car-runtime ≥ 0.18.0). Logs land in
+`~/.car/logs/neo-observer.{stdout,stderr}.log`. Tunables:
+`NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
+(default 60), `NEO_OBSERVER_RECYCLE_CYCLES` (default 48 — the daemon re-execs
+itself to bound RSS drift; 0 disables). See
+[the observer design note](docs/solutions/async-observer.md).
+
+### Memory Diagnostics
+
+Read-only, flag-and-propose commands that inspect your rules and your other
+tools' memory rather than Neo's own facts:
+
+```bash
+# Recurring frictions mined from transcript history, as ranked evidence-cited issues
+neo memory issues --since 14d --min-cluster 3
+neo memory issues --suggest-rules          # adds a bounded LM call per issue
+
+# Drift between AGENTS.md / CLAUDE.md / GEMINI.md (gaps + LM-judged conflicts)
+neo memory rules
+neo memory rules --no-conflicts            # skip the LM conflict pass
+
+# Malformed entries, near-duplicates, conflicts, and index drift in Claude Code's memory/*.md
+neo memory audit
+
+# Ingest a peer tool's memory files into Neo as REVIEW facts on probation
+neo memory import --dry-run
+```
+
+All four take `--json` (except `import`, which takes `--dry-run` and
+`--confidence`). `issues` reuses the ingester's transcript episodes but never
+admits facts or moves the ingest watermark, so it is idempotent and decoupled
+from fact admission. See
+[conversation-mined issues](docs/solutions/conversation-mined-issues.md),
+[rule-file sync](docs/solutions/rule-file-sync.md), and
+[memory audit](docs/solutions/memory-audit.md).
+
 
 ### Timeout Requirements
 
@@ -671,15 +845,38 @@ def solution():
 
 Neo responds with personality _(Matrix-inspired quotes)_ when displaying version info:
 
+On a fresh install:
+
 ```bash
 $ neo --version
 "What is real? How do you define 'real'?"
 
-neo 0.18.1
+neo 0.41.0
 Provider: openai | Model: gpt-5.6
+Storage: FactStore (path: /Users/you/.neo/facts)
+CAR: not found
 Stage: Sleeper | Memory: 0.0%
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-0 facts | 0.00 avg confidence
+0 patterns | 0.00 avg confidence
+```
+
+Once memory has built up, the quote, the stage (`Sleeper` → `Glitch` →
+`Unplugged` → `Training` → `The One`), and the bar all move, and a line about
+patterns approaching community contribution appears:
+
+```bash
+$ neo --version
+"I can see it now. The code is showing me."
+
+neo 0.41.0
+Provider: openai | Model: gpt-5.6
+Storage: FactStore (path: /Users/you/.neo/facts)
+CAR: python binding car_runtime | daemon running
+Stage: Unplugged | Memory: 49.7%
+███████████████████░░░░░░░░░░░░░░░░░░░░░
+521 patterns | 0.64 avg confidence
+
+⚡ 6 pattern(s) approaching contribution (need 0.8 confidence + 3 successes)
 ```
 
 ### Load Program - Training Neo's Memory
@@ -746,9 +943,9 @@ Neo uses a **scoped, supersession-based fact store** with **Jina Code v2** embed
 1. **Typed Facts**: Eight kinds — CONSTRAINT, ARCHITECTURE, DECISION, PATTERN, REVIEW, FAILURE, KNOWN_UNKNOWN, and EPISODE (instance-specific events with `{when, where, why, with_whom}` context).
 2. **Scoped Organization**: Facts are scoped to global, organization, or project level, with per-scope valid-fact caps (200 / 100 / 500 / 50). Org and project are auto-detected from git remotes.
 3. **Supersession & Pre-Write Dedup**: New facts with cosine similarity ≥ 0.85 to an existing fact short-circuit (bump the existing fact's access count) or supersede it. The pre-write canonical-signature check uses entity abstraction + verb-synonym folding to catch near-duplicates before they hit the store.
-4. **Confidence + Effectiveness Ranking**: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f + provenance_bonus`. The Ebbinghaus recall-probability transform gives frequently-recalled facts slower decay; LessonL-style effectiveness (`c/n` over reuse outcomes) multiplies the success bonus. Curated facts (CONSTRAINT/ARCHITECTURE/DECISION and `seed`/`community`/`synthesized`-tagged facts) bypass decay.
+4. **Confidence + Effectiveness Ranking**: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f + provenance_bonus`. The Ebbinghaus recall-probability transform gives frequently-recalled facts slower decay; LessonL-style effectiveness (`c/n` over reuse outcomes) multiplies the success bonus. Curated facts (CONSTRAINT/ARCHITECTURE/DECISION and `seed`/`community`/`synthesized`-tagged facts) bypass decay. (Nothing mints the `synthesized` tag anymore — facts carrying it predate the removal of REVIEW→PATTERN synthesis and keep their immunity.)
 5. **Hybrid Retrieval**: 0.7·dense (Jina) + 0.3·BM25. Half the result slots ranked by full `rank_score`, half by raw cosine — novel-but-relevant facts aren't crowded out by validated winners.
-6. **Triple-Trigger Consolidation**: REVIEW facts cluster into PATTERN / FAILURE archetypes when ANY of count-delta ≥10, elapsed ≥1h, or confidence-decile entropy >0.9 fires. Clusters of ≥3 get an NREM-style Hebbian confidence bump; non-curated facts decay 3% globally after each pass.
+6. **Evidence-Gated Promotion**: a suggestion is recorded as a *candidate*, not a fact. It only becomes a durable PATTERN after **two independent, git-verified acceptances** whose task prompt and diff shape agree (`_episode_signature` for project scope, the path-agnostic `_global_signature` for cross-repo lessons), and only when its kind is promotable — `algorithm` / `bugfix` classify to `pattern`; `feature`, `refactor`, and `explanation` deliberately do not. Unverifiable suggestions (no path a diff could ever name) are downgraded to non-promotable `review` at mint. There is **no** similarity-clustered promotion path: the older REVIEW→PATTERN synthesis (`synthesize_reviews`, with its triple-trigger gate, Hebbian bump, and global decay) was removed after four months in which it minted 114 facts and not one PATTERN. See [evidence-learning episodes](docs/solutions/evidence-learning-episodes.md).
 7. **Dual-Buffer Probation**: New non-curated facts enter with a `probation` tag and a 3-day stale window (vs 7/14 normal); promoted automatically on `access_count ≥ 2` or `success_count > 0` — quietly evicts noise while keeping real signal.
 8. **Four-Layer Context**: Retrieved facts are organized into constraints, relevant knowledge, recent changes, and known unknowns. The four-layer state model is from *Beyond Conversation: A State-Based Context Architecture for Enterprise AI Agents* (Liotta, 2025) — see [`papers/state-based-context-architecture.pdf`](papers/state-based-context-architecture.pdf). The token-budget enforcement in `memory/context.py` is ported from the engine described in *Memgine: A Deterministic Memory Engine for Stateful AI Agents* (Liotta, 2026) — see [`papers/memgine-deterministic-memory-engine.pdf`](papers/memgine-deterministic-memory-engine.pdf). Both are evaluated by [StateBench](https://github.com/parslee-ai/statebench); the 95.8% decision-accuracy result on the v1.0 development split is what drove Neo's move from a separate "Recently Changed" section to inline `(changed from: X)` annotations.
 
@@ -913,16 +1110,25 @@ neo --config set --config-key api_key --config-value sk-ant-...
 neo --config reset
 ```
 
-**Exposed Configuration Fields:**
-- `provider` - LM provider (openai, anthropic, google, azure, ollama, local)
-- `model` - Model name (e.g., gpt-5.6, claude-sonnet-4-5-20250929)
+**Exposed Configuration Fields** (the only keys `--config get/set` accepts):
+- `provider` - LM provider: `openai` (default), `anthropic`, `google`, `azure`, `ollama`, `local`, `claude-code`, `car`
+- `model` - Model name (default `gpt-5.6`; e.g. `claude-sonnet-4-5-20250929`). Pass an empty value (`--config-value ""`) to clear it and let the provider or CAR's router choose
 - `api_key` - API key for the chosen provider
-- `base_url` - Base URL for local/Ollama endpoints
-- `memory_backend` - Memory backend: "fact_store" (default) or "legacy"
+- `base_url` - Base URL for local/Ollama endpoints (also clearable with an empty value)
+- `inference_mode` - `static` (default) or `auto` — see [Outbound: use CAR as Neo's inference layer](#outbound-use-car-as-neos-inference-layer)
+- `memory_backend` - Memory backend: `fact_store` (default) or `legacy`
 - `auto_install_updates` - Automatically install updates in background (true/false)
 - `constraint_auto_scan` - Auto-scan CLAUDE.md for constraints (true/false, default: true)
 - `log_level` - Logging level: DEBUG, INFO, WARNING, or ERROR
 - `reasoning_effort_cap` - Optional cap for OpenAI gpt-5 reasoning effort
+
+**Other fields in `~/.neo/config.json`** — real settings, but not reachable
+through `--config set`; edit the file or use the environment variable:
+- `reasoning_mode` - `auto` (default), `fast`, or `deep`. Per-run equivalents: `--fast` / `--deep`
+- `default_temperature` / `default_max_tokens` - Env: `NEO_TEMPERATURE` / `NEO_MAX_TOKENS`
+- `exemplar_dir` - Env: `NEO_EXEMPLAR_DIR`
+- `enable_ruff` / `enable_pyright` / `enable_mypy` / `enable_eslint` - static-analysis toggles
+- `safe_read_patterns` / `forbidden_paths` - file allowlist and blocklist
 
 Configuration is stored in `~/.neo/config.json`. Environment variables override
 stored config values for the current process.
@@ -961,12 +1167,27 @@ export NEO_BASE_URL=http://localhost:11434       # for Ollama/local endpoints
 **Behavior**
 
 ```bash
+export NEO_INFERENCE_MODE=auto                    # prefer CAR's router, fall back to the static provider
 export NEO_REASONING_EFFORT=high                  # cap auto-effort selection
 export NEO_AUTO_INSTALL_UPDATES=1                 # auto-install background updates
 export NEO_SKIP_UPDATE_CHECK=1                    # disable update checks entirely
 export NEO_LOG_LEVEL=INFO                         # DEBUG/INFO/WARNING/ERROR
 export NEO_TEMPERATURE=0.7                        # generation temperature
 export NEO_MAX_TOKENS=4096                        # per-call max output tokens
+export NEO_EXEMPLAR_DIR=/path/to/exemplars        # override the exemplar store location
+export NEO_FASTEMBED_CACHE_DIR=/path/to/cache     # Jina model cache (default ~/.cache/neo/fastembed)
+export NEO_STDIN_TIMEOUT_SECONDS=5                # wait for stdin to be readable (default 1.0)
+export NEO_CAR_TIMEOUT_SECONDS=300                # per-call CAR watchdog deadline (default 240)
+export NEO_ALLOW_PLAINTEXT_API_KEY=1              # permit storing api_key in config.json (see above)
+```
+
+**Background observer**
+
+```bash
+export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer
+export NEO_OBSERVER_INTERVAL_SECONDS=300          # sweep interval
+export NEO_OBSERVER_COOLDOWN=60                   # per-process cooldown between cycles
+export NEO_OBSERVER_RECYCLE_CYCLES=48             # re-exec after N cycles to bound RSS (0 disables)
 ```
 
 ### Install Sanity
@@ -983,10 +1204,21 @@ python3 -c "import neo; print(neo.__file__)"
 **Observability**
 
 ```bash
-export NEO_METRICS=off                            # disable ~/.neo/metrics.jsonl writes
+export NEO_PROFILE=standard                       # off | minimal | standard (default) | strict
+export NEO_METRICS=off                            # hard kill-switch; overrides NEO_PROFILE
 ```
 
 Neo writes structured per-operation events (retrieve / add_fact / lm_call / overseer_tick) to `~/.neo/metrics.jsonl` and per-session manifests + JSONL outcome logs to `~/.neo/sessions/`.
+
+`NEO_PROFILE` selects which events are emitted: `off` emits nothing, `minimal`
+emits only `lm_call`, `standard` emits everything, and `strict` is reserved for
+future verbose events (identical to `standard` today). `NEO_METRICS=off` (or
+`0`/`false`/`no`) is the legacy hard kill-switch and wins over `NEO_PROFILE`.
+
+The log rotates to `metrics.jsonl.1` at 32 MB with one generation retained. The
+readers (`memory citation-stats`, `memory learning-stats`) window by `--since`
+and read only the active file — a `--since` older than the last rotation
+silently sees less history.
 
 ## LM Adapters
 
@@ -997,7 +1229,11 @@ from neo.adapters import OpenAIAdapter
 adapter = OpenAIAdapter(model="gpt-5.6", api_key="sk-...")
 ```
 
-Default model: `gpt-5.6`. GPT-5/Codex models use the `/v1/responses` endpoint automatically.
+Neo's configured default model is `gpt-5.6` (`NeoConfig.model`), which is what
+the CLI uses. Constructing an adapter directly without a `model` falls back to
+the adapter's own default of `gpt-4`, so pass the model explicitly when you
+bypass `NeoConfig`. GPT-5/Codex models use the `/v1/responses` endpoint
+automatically.
 
 ### Anthropic
 
@@ -1108,12 +1344,12 @@ The 0.18 memory architecture lands deterministic techniques from a focused readi
 2. **Memory Systems Survey (1)**
    *Paper [2603.07670](https://arxiv.org/abs/2603.07670)*
    - Provenance taxonomy (`STRUCTURAL > OBSERVED > INFERRED`); dual-buffer / probation consolidation; Layer-1/2/3 observability split.
-   - **Implementation**: `src/neo/memory/models.py:42`, `store.py` (probation tag), `memory/metrics.py`.
+   - **Implementation**: `Provenance` in `src/neo/memory/models.py`, `store.py` (probation tag), `memory/metrics.py`.
 
 3. **Memory Survey 2 — Zep / AriGraph bi-temporal pattern**
    *Paper [2512.13564](https://arxiv.org/abs/2512.13564) §5.2.2*
    - Bi-temporal stamps (`event_time` / `event_time_end` / `ingest_time`); supersession via soft-delete.
-   - **Implementation**: `src/neo/memory/models.py:241`.
+   - **Implementation**: the `event_time` / `event_time_end` / `ingest_time` fields on `FactMetadata` in `src/neo/memory/models.py`.
 
 4. **Trajectory Memory — Canonical-signature dedup**
    *Paper [2603.10600](https://arxiv.org/abs/2603.10600) §7*
@@ -1133,22 +1369,22 @@ The 0.18 memory architecture lands deterministic techniques from a focused readi
 7. **LessonL — Effectiveness multiplier on reuse outcomes**
    *Paper [2505.23946](https://arxiv.org/abs/2505.23946)*
    - Per-fact `c/n` effectiveness as a success-bonus multiplier; half-by-rank / half-by-cosine slot allocation (Algorithm 1).
-   - **Implementation**: `src/neo/memory/models.py:130, 233`; `store.retrieve_relevant`.
+   - **Implementation**: `EFFECTIVENESS_EPSILON` and `FactMetadata.effectiveness_f` in `src/neo/memory/models.py`; `store.retrieve_relevant`.
 
 8. **Ebbinghaus Recall — Spaced-repetition decay for retrieval**
    *Hou et al., paper [2404.00573](https://arxiv.org/abs/2404.00573)*
    - Recall-probability transform `p_n(t) = (1 − exp(−r·exp(−t/g_n))) / (1 − e⁻¹)` applied to similarity scores for fluid facts.
-   - **Implementation**: `src/neo/math_utils.py:40`, `models.rank_score`.
+   - **Implementation**: `math_utils.recall_probability`, `models.rank_score`.
 
 9. **Episodic Memory — Five-property episodic context**
    *Paper [2502.06975](https://arxiv.org/abs/2502.06975) Table 1*
    - `{when, where, why, with_whom}` instance-specific event context.
-   - **Implementation**: `src/neo/memory/models.py:320` `EpisodeContext`.
+   - **Implementation**: `EpisodeContext` in `src/neo/memory/models.py`.
 
 10. **Multiple Memory Systems — Retrieval / context unit split**
     *Paper [2508.15294](https://arxiv.org/abs/2508.15294) §3*
     - Embed concise keywords (`retrieval_text`); inject full narrative (`context_text`) — same fact, two surfaces.
-    - **Implementation**: `src/neo/memory/models.py:373`.
+    - **Implementation**: the `retrieval_text` / `context_text` split on `Fact` in `src/neo/memory/models.py`.
 
 **Engine & multi-agent reasoning**
 
@@ -1160,12 +1396,12 @@ The 0.18 memory architecture lands deterministic techniques from a focused readi
 12. **CodeSim — MODIFY / NO_MODIFY decision token**
     *Hou et al., paper [2502.05664](https://arxiv.org/abs/2502.05664)*
     - Simulator emits an explicit "no modification needed" token; planner uses it as an override on the agreement-of-outputs heuristic. (Distinct from the 2023 ACM CodeSim paper of the same name.)
-    - **Implementation**: `src/neo/engine.py:427`.
+    - **Implementation**: `NeoEngine._simulation_consensus` / `_extract_plan_decision` in `src/neo/engine.py`.
 
 13. **SICA — Asynchronous structured-output watchdog & cache-hit observability**
     *Paper [2504.15228](https://arxiv.org/abs/2504.15228) §A.2, Table 1*
     - Daemon-thread tick loop emitting `overseer_tick` events; loop detection via 5-identical-actions-in-a-row; LM-call cache-hit-rate tracking.
-    - **Implementation**: `src/neo/overseer.py`, `src/neo/adapters.py:237`.
+    - **Implementation**: `src/neo/overseer.py`; cache-hit-rate tracking in `src/neo/adapters.py`.
 
 **In-house papers (Parslee)** — the foundational research behind Neo's context architecture
 
