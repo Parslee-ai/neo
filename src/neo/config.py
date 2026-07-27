@@ -8,13 +8,18 @@ import os
 import platform
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
 
 KEYCHAIN_SERVICE_PREFIX = "neo-reasoner"
 logger = logging.getLogger(__name__)
+
+#: Fields the generic save path must never write. `save` handles `api_key`
+#: explicitly, gated on NEO_ALLOW_PLAINTEXT_API_KEY. Anything added here needs
+#: the same treatment or it will simply stop being persisted.
+_SECRET_FIELDS = frozenset({"api_key"})
 
 
 def _keychain_service(provider: str) -> str:
@@ -302,8 +307,45 @@ class NeoConfig:
 
         return config
 
+    def _changed_from_defaults(self) -> dict:
+        """Fields whose value differs from the dataclass default.
+
+        Derived from the dataclass rather than a hand-maintained allow-list.
+        The old list-based approach silently erased any field it omitted,
+        because ``from_file`` accepts *every* field the class defines: a value
+        could be hand-edited into config.json, read back correctly, then
+        dropped by the next unrelated ``--config set``. That happened to
+        ``inference_mode`` and ``reasoning_mode``, and would have happened to
+        the six other fields nothing writes yet.
+
+        Fields still at their default are omitted rather than written out.
+        Persisting defaults would freeze today's values into every user's file,
+        so a future change to a default would never reach anyone who had ever
+        run ``--config set`` — the exact failure the ``auto_install_updates``
+        migration in ``from_file`` exists to undo.
+
+        ``api_key`` is excluded here and handled explicitly by ``save``: it is
+        the one secret, and ``load()`` populates it from the environment or
+        Keychain, so a generic diff-from-default pass would spill it to disk.
+        """
+        changed = {}
+        for f in fields(self):
+            if f.name in _SECRET_FIELDS:
+                continue
+            if f.default is not MISSING:
+                default = f.default
+            elif f.default_factory is not MISSING:
+                default = f.default_factory()
+            else:
+                changed[f.name] = getattr(self, f.name)
+                continue
+            value = getattr(self, f.name)
+            if value != default:
+                changed[f.name] = value
+        return changed
+
     def save(self, config_path: Optional[str] = None):
-        """Save configuration to file (only exposed fields)."""
+        """Save configuration to file (user-set fields only)."""
         if not config_path:
             config_dir = Path.home() / ".neo"
             config_dir.mkdir(exist_ok=True)
@@ -312,24 +354,14 @@ class NeoConfig:
         path = Path(config_path).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Only save exposed fields (not internal settings).
-        # `from_file` accepts any NeoConfig field, so anything readable but
-        # missing here is silently erased the next time a config is saved —
-        # which is exactly what happened to `inference_mode` and
-        # `reasoning_mode`. Keep this list in sync with what users can set.
-        exposed_fields = {
-            'provider': self.provider,
-            'model': self.model,
-            'api_key': self.api_key if os.environ.get("NEO_ALLOW_PLAINTEXT_API_KEY") else None,
-            'base_url': self.base_url,
-            'inference_mode': self.inference_mode,
-            'reasoning_mode': self.reasoning_mode,
-            'auto_install_updates': self.auto_install_updates,
-            'memory_backend': self.memory_backend,
-            'constraint_auto_scan': self.constraint_auto_scan,
-            'log_level': self.log_level,
-            'reasoning_effort_cap': self.reasoning_effort_cap,
-        }
+        exposed_fields = self._changed_from_defaults()
+
+        # The secret. Written unconditionally — as an explicit null when
+        # plaintext storage is not enabled — so that a stale plaintext key
+        # left in the file is actively cleared rather than merely omitted.
+        exposed_fields['api_key'] = (
+            self.api_key if os.environ.get("NEO_ALLOW_PLAINTEXT_API_KEY") else None
+        )
 
         # Mark explicit opt-out so migration doesn't override it
         if self.auto_install_updates is False:
