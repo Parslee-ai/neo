@@ -44,7 +44,7 @@ The resulting index lives at `.neo/index.json` inside the target repo and powers
 
 ### Supported Languages
 
-The canonical map lives in `src/neo/languages.py:30-54`.
+The canonical map is `EXTENSION_TO_LANGUAGE` in `src/neo/languages.py`.
 
 | Language   | Extensions                  |
 |------------|-----------------------------|
@@ -91,7 +91,7 @@ Per-subsystem coverage isn't uniform. For example, `code_smells` empty-catch det
 ## Operational Notes
 
 - Use `neo --update` instead of `--index` after the first build — it re-embeds only changed files.
-- `neo --index --max-files N` caps the walk when you only care about the active subtree.
+- The index build caps at **100 files** per run by default. Override it with `neo --index --max-files N`; the same flag caps *context gathering* at 30 by default when used without `--index`, so each subsystem keeps its own floor.
 - Neo honors `.gitignore` by default; double-check large generated dirs aren't tracked.
 - `MAX_CHUNK_LENGTH` is set to **2000 characters** (defined in both `language_parser.py` and `project_index.py` — keep them in sync if you change one).
 - Malformed code returns empty chunks by design (better than half-parsed garbage propagating into embeddings).

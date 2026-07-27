@@ -36,10 +36,13 @@
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
     `outcomes.py`) and 50/project (`MAX_INDEPENDENT_FACTS` in `store.py`).
-  - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` run on every
-    cold start (`store.py:190-192`). For on-demand compaction of tombstone bloat in a
-    specific project's fact file, use `neo memory prune [--all] [--dry-run]`
-    (`subcommands.py:_compact_fact_file`).
+  - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` →
+    `strip_tombstone_embeddings` run on every cold start, each with `save=False` so
+    the chain flushes one merge-on-save instead of four. `_invalidate` already strips
+    a tombstone's embedding and bulk text at the transition, so the final step is a
+    backfill for tombstones minted off that path. For on-demand compaction of
+    tombstone bloat in a specific project's fact file, use
+    `neo memory prune [--all] [--dry-run]` (`subcommands.py:_compact_fact_file`).
   - Diagnostics (read-only, flag-and-propose): `neo memory issues [--since 14d]
     [--min-cluster 3] [--suggest-rules] [--json]` surfaces recurring frictions mined from
     transcript history (Claude Code / Codex / CAR) as ranked, evidence-cited issues
@@ -67,7 +70,7 @@
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the
   suggested vocabulary, but any string is valid. `retrieve_relevant(..., domain=...)`
   filters by exact match; `domain=None` returns all facts including unset ones.
-- Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`, ~`store.py:806-900`):
+- Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`):
   ACCEPTED/MODIFIED act on a linked legacy fact with confidence +0.2 / −0.2
   (±arch_mod); ACCEPTED bumps `success_count`. New suggestions remain episode-local
   candidates until independently accepted twice; deterministic verification failure

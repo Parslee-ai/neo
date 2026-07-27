@@ -34,23 +34,6 @@ local linter and CI's disagree — which is exactly how a green local tree turne
 `main` red during 0.39.0. Bump the pin deliberately, in its own commit, with the
 lint delta reviewed.
 
-### Releasing
-
-Publishing is automated: creating a GitHub **Release** triggers `publish.yml`,
-which builds and uploads to PyPI via Trusted Publishers (OIDC — no token lives
-in the repo). The sequence is push → tag → release; do not run `twine` locally.
-
-Two things to know before you rely on it:
-
-- **TestPyPI is not configured.** `publish-testpypi` only runs on a manual
-  `workflow_dispatch`, and it currently fails at the publish step because no
-  Trusted Publisher exists for this repo on TestPyPI. The `build` job and the
-  artifact upload/download round-trip still execute, so dispatching is a valid
-  smoke test for a workflow change — just expect the final step to fail until
-  someone configures it at <https://test.pypi.org/manage/account/publishing/>.
-- **A version can never be replaced on PyPI**, only yanked. Verify CI is green
-  on the exact commit you are tagging, not merely on the branch.
-
 ### 3a. Enable the pre-commit hook
 
 ```bash
@@ -118,6 +101,23 @@ ruff check src/ tests/
 mypy src/
 ```
 
+## Releasing
+
+Publishing is automated: creating a GitHub **Release** triggers `publish.yml`,
+which builds and uploads to PyPI via Trusted Publishers (OIDC — no token lives
+in the repo). The sequence is push → tag → release; do not run `twine` locally.
+
+Two things to know before you rely on it:
+
+- **TestPyPI is not configured.** `publish-testpypi` only runs on a manual
+  `workflow_dispatch`, and it currently fails at the publish step because no
+  Trusted Publisher exists for this repo on TestPyPI. The `build` job and the
+  artifact upload/download round-trip still execute, so dispatching is a valid
+  smoke test for a workflow change — just expect the final step to fail until
+  someone configures it at <https://test.pypi.org/manage/account/publishing/>.
+- **A version can never be replaced on PyPI**, only yanked. Verify CI is green
+  on the exact commit you are tagging, not merely on the branch.
+
 ## Project Structure
 
 ```
@@ -131,7 +131,7 @@ neo/
 │       ├── engine.py               # MapCoder/CodeSim orchestration
 │       ├── memory/                 # Fact-based memory system
 │       │   ├── models.py           #   Fact, FactKind, FactScope, rank_score
-│       │   ├── store.py            #   FactStore + supersession + synthesis
+│       │   ├── store.py            #   FactStore + supersession + evidence promotion
 │       │   ├── context.py          #   Four-layer context assembly (memgine-ported)
 │       │   ├── outcomes.py         #   Feedback-loop classification
 │       │   ├── bm25.py             #   Sparse channel for hybrid retrieval
@@ -263,8 +263,9 @@ No framework-specific code, focus on generic approach.
 #### Contribution Process
 
 1. **Choose a Domain**:
-   - Existing: `rate-limiting`, `caching`, `resilience`, `observability`
-   - Propose new domain via GitHub issue
+   - Existing (have patterns today): `rate-limiting`, `caching`
+   - Approved but still empty: `resilience`, `observability` — first pattern welcome
+   - Propose a new domain via GitHub issue
 
 2. **Write the Pattern**:
    - Use template above
@@ -352,7 +353,7 @@ See existing patterns for reference:
 - Update `README.md` for user-facing changes
 - Update `QUICKSTART.md` if the 5-minute setup flow changes
 - Update `INSTALL.md` for setup changes (extras, dependencies, integration surfaces)
-- Update `CLAUDE.md` and `AGENTS.md` together — they are kept identical so Claude Code and AGENTS.md-spec tools (Codex, etc.) see the same project rules
+- Update `CLAUDE.md` and `AGENTS.md` together. `CLAUDE.md` is the long-form source of truth; `AGENTS.md` is a **condensed** mirror for AGENTS.md-spec tools (Codex, etc.). They are not byte-identical, but they must never contradict each other — `neo memory rules` flags exactly that kind of drift
 - When touching plugin sources, update the relevant plugin manifest and keep the **Claude Code** (`.claude-plugin/`) and **Codex** (`plugins/neo/`) surfaces in sync — the same six commands are exposed on both
 - When touching CAR (`src/neo/car_*.py`), document any schema or behavior change in the README's "Run as an Agent (CAR / A2A)" section
 - Add docstrings to new functions

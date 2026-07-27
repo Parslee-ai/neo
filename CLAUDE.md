@@ -22,11 +22,13 @@
   - Per-scope valid-fact caps (`SCOPE_LIMITS` in `store.py`): global=200, org=100,
     project=500, session=50. Enforced per loaded scope set (project+org+global);
     invalidated facts persist as tombstones until `purge_dead_facts` runs.
-  - Supersession at cosine ≥ 0.85 (`SUPERSESSION_THRESHOLD`, `store.py:3017`);
+  - Supersession at cosine ≥ 0.85 (`SUPERSESSION_THRESHOLD`, `store.py:59`);
     pre-write dedup is canonical-signature **equality**, not cosine
-    (`memory.generalize`). `SYNTHESIS_SIMILARITY` is a *separate* constant that
-    happens to equal 0.85 and is used only by REVIEW clustering
-    (`store.py:3381`) — the two can be tuned independently.
+    (`memory.generalize`). `SYNTHESIS_SIMILARITY` was a *separate* constant that
+    happened to equal 0.85 and gated REVIEW clustering; it went away with
+    `synthesize_reviews` (see below). The only 0.85 left in `store.py` is
+    supersession. `memory.issues` keeps its own `CLUSTER_SIMILARITY = 0.85`,
+    tunable independently.
   - Episode-derived promotion correlation (`store._episode_signature` /
     `_global_signature`): a candidate promotes to a durable fact only when ≥2
     independent verified-accepted episodes share a **correlation signature**. That
@@ -181,7 +183,7 @@
     (`--regenerate-embeddings` targets the legacy ReasoningMemory cache), so the
     strip is one-way in practice.
   - `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` →
-    `strip_tombstone_embeddings` run on every cold start (`store.py:190-192`),
+    `strip_tombstone_embeddings` run on every cold start (in `FactStore.initialize`),
     each taking `save=False` so the chain flushes **one** merge-on-save instead
     of four. `strip_tombstone_embeddings` is now a **backfill** — it only catches
     tombstones minted off the `_invalidate` path (an ingester superseding a fact;
@@ -236,7 +238,7 @@
       touches the `transcript_watermark_*` watermark — decoupled from fact admission and
       idempotent (`find_issues`). Gate mirrors the old synthesis discipline (≥`min_cluster`
       members, ≥2 sessions, ≥2 frictional, verbatim evidence); clusters at
-      `SYNTHESIS_SIMILARITY` via the shared `math_utils.cluster_by_similarity`. See
+      `issues.CLUSTER_SIMILARITY` via the shared `math_utils.cluster_by_similarity`. See
       `docs/solutions/conversation-mined-issues.md` and `docs/solutions/rule-file-sync.md`.
 - Transcript sources (`memory.transcript`, the `TranscriptSource` Protocol): the
   `TranscriptIngester` mines lessons from four sources by default —
@@ -264,13 +266,18 @@
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the
   suggested vocabulary, but any string is valid. `retrieve_relevant(..., domain=...)`
   filters by exact match; `domain=None` returns all facts including unset ones.
-- Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`, ~`store.py:806-900`):
-  ACCEPTED/MODIFIED/UNVERIFIED act on the linked original fact when present —
-  confidence +0.2 / −0.2 / +0.1 (all ±arch_mod), and bump `success_count` (except
-  MODIFIED). MODIFIED also writes a REVIEW at confidence 0.4; ACCEPTED falls back to a
-  REVIEW (`suggestion_confidence + 0.1`) when no link is found; UNVERIFIED never creates
-  a REVIEW. INDEPENDENT writes a REVIEW at confidence 0.2. **Footgun**: if you add a new
-  `OutcomeType`, update both `outcomes.py` and `store.detect_implicit_feedback`.
+- Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`):
+  ACCEPTED/MODIFIED act on the linked original fact when present — confidence
+  +0.2 / −0.2 (both ±arch_mod); ACCEPTED also bumps `success_count` and sets
+  effectiveness "better", MODIFIED sets "worse". **UNVERIFIED mutates nothing**:
+  absence of verification is not success, so the evidence is preserved in the
+  learning episode (candidate status → `unverified`) and neither confidence nor
+  `success_count` moves — the live path and `replay_linked_feedback` share that
+  invariant (`store.py:2148`, `store.py:2301`). MODIFIED also writes a REVIEW at
+  confidence 0.4; ACCEPTED falls back to a REVIEW (`suggestion_confidence + 0.1`)
+  when no link is found; UNVERIFIED never creates a REVIEW. INDEPENDENT writes a
+  REVIEW at confidence 0.2. **Footgun**: if you add a new `OutcomeType`, update
+  both `outcomes.py` and `store.detect_implicit_feedback`.
 - Retrieval: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f
   + provenance_bonus`. `memory.models.rank_score` is the single source of truth — if you
   change the formula, audit `ContextAssembler._score_facts` too. Cosine is batched via
