@@ -113,7 +113,7 @@ dev = [
     # rule set and rule behavior in minor bumps, so a range means a contributor's
     # local ruff and CI's can disagree — which is how a green local tree pushed a
     # red main in 0.39.0. Bump this deliberately, with the lint delta reviewed.
-    "ruff==0.16.0",
+    "ruff==0.16.1",
     "mypy>=1.0.0",
 ]
 
