@@ -12,7 +12,8 @@
 | Engine emission at phase boundaries | `engine.py` (`_emit`, `_begin_phase`, `_end_phase`, `_current_phase`) | `test_orchestrator_events.py` |
 | Derived host summary | `engine.py` (`_build_orchestrator_message`), `models.py` (`OrchestratorMessage`) | `test_orchestrator_events.py` |
 | CLI stream split | `cli.py` (`--json` → `JsonlSink(sys.stderr)`) | (live-verified; see below) |
-| Beat surface metadata | `config/beats/neo_matrix.yaml`, `engine._orchestrator_beat` | `test_orchestrator_events.py` |
+| Staged voice + beat surface metadata | `config/beats/neo_matrix.yaml` (`orchestrator_voice`), `engine._voice` / `_voice_stage` / `_orchestrator_beat` | `test_orchestrator_events.py` |
+| Progress-notice suppression (`--quiet`) | `progress.py`, `cli.py`, `context_gatherer.py` | `test_progress_quiet.py` |
 | Plugin presentation contract | `.claude-plugin/agents/neo.md`, `commands/*.md` | — |
 
 ## The problem
@@ -50,10 +51,20 @@ used to promise "JSONL events and final JSON" on one stream; honoring that
 literally would have broken every existing `neo --json | jq` consumer. The help
 text was corrected to describe the split.
 
-stderr is a **mixed** stream — it also carries `[Neo] …` progress lines from
-`context_gatherer`, library warnings, and CAR version notices. Hosts parse
-lines beginning with `{` and ignore the rest. (`--quiet` exists in `cli.py` but
-is never read; suppressing those lines is a separate fix.)
+`--json` implies `--quiet`, so Neo's own `[Neo] …` progress notices are
+suppressed and stderr is essentially pure JSONL. It is not *guaranteed* pure —
+Python logging warnings and CAR version notices can still land there — so hosts
+still parse lines beginning with `{` and ignore the rest.
+
+`--quiet` had been declared in the parser and never read, so those notices
+could not be turned off at all. They are now routed through `neo.progress`
+(`note()` / `set_quiet()`) rather than bare `print(..., file=sys.stderr)` calls
+scattered across `context_gatherer`. The suppression flag is process-global
+rather than a threaded parameter: it is a display setting fixed once from argv
+and read by leaf functions five layers below the CLI, and passing it down would
+put a presentation argument into the signature of every scoring helper it
+crosses. Index-command *errors* deliberately stay unsuppressed — `--quiet`
+silences progress, not failures.
 
 ## Phase records and ordering
 
@@ -97,6 +108,47 @@ third-party sink bug must degrade to "no progress reporting", never to a failed
 reasoning run — the observer must not take down the thing it observes. The
 default sink is `NullSink`, so an unobserved run costs exactly what it did
 before events existed.
+
+## Voice: staged, and authored in the deck
+
+Neo speaks in the first person. Narrating himself in the third person ("Neo
+reasoned over the request and proposes 1 change(s)") reads like a status board,
+not like the character the beat deck already defines — and the summary is the
+line a host is told to lead with, so it sets the register for the whole
+response.
+
+Two rules make that more than a find-and-replace:
+
+**The register follows memory level.** `_voice_stage()` reads
+`_memory_level_to_stage()` and selects an opener, a hedge, and a terseness flag
+from `orchestrator_voice.stages`. The same facts render as
+`Don't know this code. I'd change 1 thing(s) in src/parser.py, maybe.
+Confidence 0.88.` at stage 1 and `src/parser.py. 1 change(s). 0.88.` at stage 5.
+A single fixed register would have been a regression dressed as a feature: it
+throws away a signal the system already computes, and the hedge at stage 1 is
+genuinely informative — it tells the user Neo has no history here.
+
+**No prose lives in `engine.py`.** Every user-facing string comes from
+`orchestrator_voice.lines` via `_voice(key, **fmt)`, so the character can be
+retuned by editing a YAML file. `test_engine_holds_no_prose_of_its_own` pins
+that: a string literal in the engine is a personality change hidden inside a
+code diff nobody reviews as one. A missing key or a bad placeholder degrades to
+`""` rather than raising — a formatting slip in a personality file must never
+take down a reasoning run — and `_cap_cautions` drops blanks so a failed
+template can't become an empty bullet a host dutifully relays.
+
+**Deliberate asymmetry: cautions do not vary by stage.** A host is instructed
+never to drop a caution, so a warning must read the same whether Neo is a
+Sleeper or The One. Voice is not licence to soften a fact. Same for phase and
+lifecycle messages — they stay in Neo's voice but at one register, because five
+variants of "Reading the code." would be upkeep with no reader-visible payoff.
+
+An LM-voiced summary was considered and rejected for now: it would cost a call
+and latency on every run and could fabricate or drop a claim — exactly the
+"narrator that lies" failure the first review caught. The system prompts
+(`_get_planning_system_prompt` and friends) already inject Neo's personality
+into the model, so the plan descriptions and rationales the LM returns are
+voiced by inference; only the derived scaffolding is templated.
 
 ## Personality is gated, not decorative
 
@@ -229,7 +281,11 @@ proven non-None at that point.
 - `_timeout_response` builds a bare `NeoOutput` and so carries an empty
   orchestrator envelope. It is currently unreachable (neither it nor
   `_check_timeout` has a caller); wire the message in if it is ever revived.
-- `--quiet` is defined but never read, so `[Neo]` progress lines cannot be
-  suppressed under `--json`.
 - `JsonlSink` is not thread-safe; interleaved writes could split a line. Only
   the main thread emits today.
+- stderr is *essentially* pure JSONL under `--json`, not guaranteed pure:
+  Python logging warnings and CAR version notices still land there. Those are
+  diagnostics, not progress, and `--quiet` correctly leaves them alone.
+- The staged voice is templated, not generated. Within a stage the phrasing is
+  fixed; only the stage varies. An LM-voiced summary would be more varied at
+  the cost of a call per run and a fabrication risk.

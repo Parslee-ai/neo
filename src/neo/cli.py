@@ -37,6 +37,7 @@ from neo.models import (  # noqa: E402, F401
     CodeSuggestion, StaticCheckResult, NeoOutput, RegenerateStats, LMAdapter,
     ProposedChange, classify_task_type,
 )
+from neo import progress  # noqa: E402
 from neo.operating_mode import AuthorityPolicy, OperatingMode  # noqa: E402
 from neo.execution_context import execution_fields_from_dict  # noqa: E402
 
@@ -450,7 +451,8 @@ def parse_args():
     p.add_argument("--split", default="train", help="Dataset split (train/test/validation)")
     p.add_argument("--columns", metavar="JSON", help="Column mapping JSON (e.g., '{\"text\":\"pattern\"}')")
     p.add_argument("--limit", type=int, default=1000, help="Max samples to import (default: 1000)")
-    p.add_argument("--quiet", action="store_true", help="Suppress progress output")
+    p.add_argument("--quiet", action="store_true",
+                   help="Suppress [Neo] progress notices on stderr (implied by --json)")
     return p.parse_args()
 
 
@@ -575,6 +577,14 @@ def main():
 
     # Configure logging early so all subsequent code can log
     _configure_logging(args)
+
+    # Progress notices are prose for a human. `--json` means the caller is a
+    # program, and the JSONL event stream already carries this information in a
+    # parseable form on the same stream — leaving the prose in would force every
+    # host to filter it back out.
+    progress.set_quiet(
+        bool(getattr(args, "quiet", False) or getattr(args, "json", False))
+    )
 
     # Check for updates (non-blocking, silent on failure)
     # Skip if running certain commands to avoid noise
@@ -805,7 +815,7 @@ def main():
                 greeting = base.get("internal", "")
 
             if greeting:
-                print(f"[Neo] {greeting}", file=sys.stderr)
+                progress.note(greeting)
 
         except Exception:
             pass  # Greeting is cosmetic — never block the pipeline
@@ -942,8 +952,8 @@ def main():
 
             # Print summary to stderr
             total_bytes = sum(gf.bytes for gf in gathered)
-            print(f"[Neo] Gathered {len(gathered)} files ({total_bytes:,} bytes)", file=sys.stderr)
-            print("[Neo] Invoking LLM inference...", file=sys.stderr)
+            progress.note(f"Gathered {len(gathered)} files ({total_bytes:,} bytes)")
+            progress.note("Invoking LLM inference...")
 
             if args.dry_run:
                 print("\n=== DRY RUN: Context that would be sent ===\n", file=sys.stderr)

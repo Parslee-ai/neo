@@ -628,6 +628,7 @@ Neo is one binary with a plain-text prompt plus a handful of subcommands. Run
 | `--diff-since REV` | Prioritize files changed since a git rev or duration |
 | `--no-git` / `--no-scan` | Skip git heuristics / skip the directory scan entirely |
 | `--stdin-json` / `--stdin-text` | Force the stdin input mode instead of auto-detecting |
+| `--quiet` | Suppress the `[Neo]` progress notices on stderr (implied by `--json`) |
 | `--verbose` / `--debug` | INFO / DEBUG logging to stderr |
 | `--allow-write-path GLOB` / `--allow-command CMD` | `agent`-mode authority grants (repeatable) |
 | `--config {list,get,set,reset}` | Configuration management — see [Configuration](#configuration) |
@@ -686,8 +687,16 @@ Phase names are stable: `context`, `reasoning`, `static_checks`. `context`
 covers file gathering only — fact retrieval runs during `reasoning`, which is
 why `memory_found` above carries `phase: reasoning`.
 
-stderr is a **mixed** stream — it also carries `[Neo]` progress lines and
-library warnings. Parse lines beginning with `{` and ignore the rest.
+`--json` implies `--quiet`, so the `[Neo]` progress lines are suppressed and
+stderr is essentially pure JSONL. Logging warnings can still appear there, so
+parse lines beginning with `{` and ignore the rest.
+
+Neo's wording shifts with how much he remembers about the project — the same
+run reads `Don't know this code. I'd change 1 thing(s) in src/parser.py, maybe.
+Confidence 0.88.` at memory stage 1 and `src/parser.py. 1 change(s). 0.88.` at
+stage 5. All of it is authored in
+[`neo_matrix.yaml`](src/neo/config/beats/neo_matrix.yaml) under
+`orchestrator_voice`, not in code.
 
 The stdout document adds an `orchestrator` object stating what the run did, so
 a host doesn't have to infer presentation from raw plans and traces:

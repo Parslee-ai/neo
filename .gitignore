@@ -21,6 +21,10 @@ wheels/
 *.egg
 
 # Virtual environments
+# `.venv/` needs its own entry: `venv/` does not match it, and the Makefile and
+# pre-commit hook both look for `.venv/bin/python` — so the project's own
+# convention was one `git add -A` away from committing an entire interpreter.
+.venv/
 venv/
 env/
 ENV/

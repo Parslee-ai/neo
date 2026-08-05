@@ -428,10 +428,15 @@
   `--json` writes **two streams**: stdout is exactly ONE JSON document (now with
   an `orchestrator` key), stderr is JSONL events. They are deliberately NOT
   interleaved — the old `--json` help text promised events on one stream, and
-  honoring that literally would break every `neo --json | jq` consumer. stderr
-  is **mixed** (also `[Neo]` progress lines, library + CAR warnings), so hosts
-  parse lines starting with `{` and skip the rest; `--quiet` is defined in
-  `cli.py` but never read, so those lines can't currently be suppressed.
+  honoring that literally would break every `neo --json | jq` consumer.
+  `--json` implies `--quiet`, so stderr is *essentially* pure JSONL; logging
+  warnings and CAR notices can still land there, so hosts parse lines starting
+  with `{` and skip the rest. `--quiet` had been declared and never read — the
+  `[Neo]` notices now route through `neo.progress` (`note()`/`set_quiet()`)
+  instead of bare `print(file=sys.stderr)` calls scattered through
+  `context_gatherer`. The flag is process-global on purpose (a display setting
+  fixed once from argv, read five layers down); index-command **errors** stay
+  unsuppressed, because `--quiet` silences progress, not failures.
   `safe_emit` swallows sink exceptions — an observer must never take down the
   run it observes — logging the FIRST at WARNING and the rest at DEBUG so a
   broken sink stays findable; `NullSink` is the default, so an unobserved run
@@ -463,6 +468,23 @@
   remedies) and is CAPPED — a host is told never to drop one, so the list must
   stay relayable; anything dropped is reported as a count. `phase_summary`
   copies each record, not just the list (live engine state, foreign consumer).
+  **Voice is staged and lives in the deck, NOT in code.** Every user-facing
+  string comes from `orchestrator_voice.lines` in `neo_matrix.yaml` via
+  `engine._voice(key, **fmt)`; `_voice_stage()` picks opener/hedge/terseness
+  from `orchestrator_voice.stages` keyed on `_memory_level_to_stage()`, so the
+  same facts read `Don't know this code. … , maybe. Confidence 0.88.` at stage 1
+  and `src/parser.py. 1 change(s). 0.88.` at stage 5. A single fixed register
+  throws away a signal the system already computes.
+  `test_engine_holds_no_prose_of_its_own` pins the no-literals rule — a string
+  in `engine.py` is a personality change hidden in a code diff. `_voice`
+  degrades to `""` on a missing key/bad placeholder (a YAML slip must not kill a
+  run) and `_cap_cautions` drops blanks so a failed template isn't relayed as an
+  empty bullet. **Deliberate asymmetry**: cautions and progress messages do NOT
+  vary by stage — a host is told never to drop a caution, so a warning must read
+  the same at every stage; voice is not licence to soften a fact. LM-voiced
+  summaries were considered and rejected (a call per run + fabrication risk);
+  the system prompts already inject personality, so LM-authored prose is voiced
+  by inference and only the derived scaffolding is templated.
   Beat surface metadata (`surface`/`importance`/`requires_finding`/
   `orchestrator_line` in `neo_matrix.yaml`) gates personality: `requires_finding`
   beats stay silent unless the run actually found something, and there is NO

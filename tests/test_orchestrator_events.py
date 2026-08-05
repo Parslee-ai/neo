@@ -224,8 +224,9 @@ def test_verify_mode_does_not_claim_neo_reasoned_or_proposed():
     ))
 
     summary = output.orchestrator.summary
-    assert "caller-supplied" in summary
-    assert "reasoned over the request" not in summary
+    assert "You gave me" in summary
+    assert "I didn't write them" in summary
+    assert "I read it" not in summary
     assert "proposes" not in summary
 
 
@@ -240,7 +241,7 @@ def test_verify_mode_does_not_tell_the_caller_to_verify_its_own_verification():
             file_path="src/example.py", code_block="value = 1",
         )],
     ))
-    assert not any("Verify before acting" in c for c in output.orchestrator.cautions)
+    assert not any("Don't take it on trust" in c for c in output.orchestrator.cautions)
 
 
 def test_skipped_static_checks_still_open_the_phase_they_close(monkeypatch):
@@ -273,8 +274,8 @@ def test_skipped_static_checks_caution_names_the_budget_not_missing_tools(monkey
     engine = NeoEngine(lm_adapter=FakeLM(_response()), enable_persistent_memory=False)
     monkeypatch.setattr(engine, "_get_time_budget", lambda difficulty: 0.0)
     output = engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
-    assert any("skipped for time budget" in c for c in output.orchestrator.cautions)
-    assert not any("tools were available" in c for c in output.orchestrator.cautions)
+    assert any("ran out of time" in c for c in output.orchestrator.cautions)
+    assert not any("No checkers on this machine" in c for c in output.orchestrator.cautions)
 
 
 def test_panel_fallback_closes_its_phase_and_opens_a_second_one(monkeypatch):
@@ -362,7 +363,7 @@ def test_a_failed_run_leaves_no_phase_stuck_running():
 def test_summary_names_what_ran_and_what_it_produced():
     output, _ = _run(_response())
     summary = output.orchestrator.summary
-    assert "1 change(s)" in summary
+    assert "1 thing(s)" in summary
     assert "src/parser.py" in summary
     assert f"{output.confidence:.2f}" in summary
 
@@ -376,18 +377,135 @@ def test_phase_summary_mirrors_the_phase_events():
 
 def test_low_confidence_becomes_a_caution():
     output, _ = _run(_response(confidence=0.2))
-    assert any("Verify before acting" in c for c in output.orchestrator.cautions)
+    assert any("Don't take it on trust" in c for c in output.orchestrator.cautions)
 
 
 def test_simulation_issues_become_a_caution():
     output, _ = _run(_response(issues=["callers may not handle None"]))
-    assert any("Simulation surfaced" in c for c in output.orchestrator.cautions)
+    assert any("problem(s) with my own approach" in c for c in output.orchestrator.cautions)
 
 
 def test_narration_carries_only_closed_phases():
     output, _ = _run(_response())
     assert output.orchestrator.recommended_narration
     assert all(line for line in output.orchestrator.recommended_narration)
+
+
+# ---------------------------------------------------------------- voice
+
+
+class _Memory:
+    """Just enough persistent-memory surface to drive the stage lookup."""
+
+    def __init__(self, level):
+        self._level = level
+
+    def memory_level(self):
+        return self._level
+
+
+def _summary_at(level, *, mode="fast", confidence=0.88):
+    from neo.models import CodeSuggestion, PlanStep
+
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+    engine.persistent_memory = _Memory(level)
+    engine.context = NeoInput(prompt="fix the parser crash")
+    engine.last_reasoning_mode = mode
+    message = engine._build_orchestrator_message(
+        plan=[PlanStep(description="Add a guard", rationale="crash")],
+        simulation_traces=[],
+        code_suggestions=[CodeSuggestion(
+            file_path="src/parser.py", unified_diff="", description="guard",
+            confidence=confidence,
+        )],
+        static_checks=[],
+        next_questions=[],
+        confidence=confidence,
+        early_exit=False,
+    )
+    return message
+
+
+# 0.1 Sleeper, 0.3 Glitch, 0.5 Unplugged, 0.7 Training, 0.9 The One
+_LEVELS = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+
+def test_voice_changes_with_memory_level():
+    """Neo's certainty grows with what he remembers, so the same facts must not
+    produce the same sentence at every stage."""
+    summaries = [_summary_at(level).summary for level in _LEVELS]
+    assert len(set(summaries)) == len(_LEVELS)
+
+
+def test_early_stages_hedge_and_the_one_does_not():
+    assert _summary_at(0.1).summary.endswith("Confidence 0.88.")
+    assert ", maybe" in _summary_at(0.1).summary
+    assert ", maybe" not in _summary_at(0.9).summary
+
+
+def test_the_one_drops_the_opener_and_leads_with_the_fact():
+    """Stage 5 is two words where stage 1 is a paragraph."""
+    terse = _summary_at(0.9).summary
+    assert terse.startswith("src/parser.py")
+    assert "Confidence" not in terse  # the number alone
+    assert len(terse) < len(_summary_at(0.1).summary)
+
+
+def test_every_stage_still_states_the_facts():
+    """Voice may vary; the numbers may not go missing."""
+    for level in _LEVELS:
+        summary = _summary_at(level).summary
+        assert "0.88" in summary, level
+        assert "src/parser.py" in summary, level
+
+
+def test_the_panel_opener_differs_from_the_solo_one():
+    for level in _LEVELS:
+        solo = _summary_at(level, mode="fast").summary
+        panel = _summary_at(level, mode="multi_agent").summary
+        assert solo != panel, level
+
+
+def test_cautions_do_not_vary_by_stage():
+    """A host is told never to drop a caution, so a warning must read the same
+    whether Neo is a Sleeper or The One. Voice is not licence to soften."""
+    cautions = [tuple(_summary_at(level, confidence=0.4).cautions) for level in _LEVELS]
+    assert len(set(cautions)) == 1
+    assert any("Don't take it on trust" in c for c in cautions[0])
+
+
+def test_engine_holds_no_prose_of_its_own():
+    """All wording lives in the beat deck so the character can be retuned
+    without editing code. A literal here is a personality change hidden in a
+    diff nobody reads as one."""
+    from pathlib import Path
+
+    # Comments may quote the wording to explain a decision; only executable
+    # lines are the concern, since those are what actually reach a user.
+    source = "\n".join(
+        line for line in Path("src/neo/engine.py").read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for phrase in ("I'd change", "Reading the code", "Don't take it on trust",
+                   "Running the checkers", "I remember"):
+        assert phrase not in source, phrase
+
+
+def test_a_broken_voice_template_degrades_to_silence():
+    """A formatting slip in a personality file must not take down a run."""
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+    engine.beat_deck["orchestrator_voice"]["lines"]["started"] = "{nonexistent}"
+    assert engine._voice("started") == ""
+    assert engine._voice("no_such_key_at_all") == ""
+
+
+def test_voice_falls_back_when_the_stage_is_missing():
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+    engine.beat_deck["orchestrator_voice"]["stages"] = {
+        3: {"opener_solo": "I read it.", "hedge": "", "confidence_lead": "Confidence"}
+    }
+    engine.persistent_memory = _Memory(0.95)  # stage 5, absent from the deck
+    assert engine._voice_stage()["opener_solo"] == "I read it."
 
 
 # ---------------------------------------------------------------- personality

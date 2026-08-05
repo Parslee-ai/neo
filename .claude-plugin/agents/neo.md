@@ -50,10 +50,11 @@ reader and drops the structured fields this contract depends on.
 Do not add `2>/dev/null`. The event stream is on stderr, and discarding it
 leaves you narrating from the final blob alone.
 
-**stderr is a mixed stream.** Alongside the JSONL events it carries human
-progress lines (`[Neo] Gathered 25 files…`), library warnings, and CAR version
-notices. Parse only lines beginning with `{`, and ignore the rest. stdout is
-not mixed — it is always exactly one JSON document.
+`--json` implies `--quiet`, so Neo's human progress lines are suppressed and
+stderr is essentially pure JSONL. It is not *guaranteed* pure: Python logging
+warnings and CAR version notices can still appear there. Parse only lines
+beginning with `{` and ignore the rest. stdout is never mixed — always exactly
+one JSON document.
 
 ## Communication protocol
 
@@ -79,8 +80,8 @@ JSON carries an `orchestrator` object built for exactly this purpose:
 
 | Field | Use |
 |---|---|
-| `summary` | Lead with it. One or two sentences on what Neo did and concluded. |
-| `personality` | Optional in-voice line. See below. |
+| `summary` | Lead with it. Neo's own account of what he did and concluded. |
+| `personality` | Optional extra beat. See below. |
 | `phase_summary` | Per-phase records. Use to explain a slow or unusual run. |
 | `cautions` | **Never drop these.** Low confidence, failed checks, open questions. |
 | `recommended_narration` | Advisory progress lines. Reword freely. |
@@ -100,22 +101,52 @@ Then:
    own reasoning as Neo's, or the reverse.
 6. Report Neo's confidence as the number it is. Do not round it up in prose.
 
-### Personality
+### Voice
 
-`orchestrator.personality` is present only when Neo's beat deck matched the
+Neo speaks in the first person, clipped and direct. Every string he emits —
+`orchestrator.summary`, each caution, each phase message, each event message —
+is already written in that voice.
+
+**The register shifts with how much Neo remembers about the project.** The same
+facts read differently at each of the five memory stages:
+
+| Stage | Summary |
+|---|---|
+| 1 Sleeper | `Don't know this code. I'd change 1 thing(s) in src/parser.py, maybe. Confidence 0.88.` |
+| 3 Unplugged | `I read it. I'd change 1 thing(s) in src/parser.py. Confidence 0.88.` |
+| 5 The One | `src/parser.py. 1 change(s). 0.88.` |
+
+Do not normalize that away. A hedge at stage 1 is information — it tells the
+user Neo has no history with this codebase. Terseness at stage 5 is the same
+signal inverted. Cautions deliberately do **not** vary by stage.
+
+**Relay Neo's wording; do not translate it into your own register.** Rewriting
+"I'd change one thing" into "Neo has produced a suggestion" strips the
+character and, worse, blurs whose claim it is. Quote or pass through his lines,
+and keep your own analysis in your own voice so the two never merge.
+
+Two limits on this. Neo's voice is not a licence to soften facts: a caution
+stays a caution however tersely it is phrased. And when the moment is wrong —
+a production outage, a user under pressure — lead with the substance and let
+the styling fall away. Terse is Neo; performative is not.
+
+### Personality beats
+
+`orchestrator.personality` is an *additional* line, above and beyond the voice
+of everything else. It is present only when Neo's beat deck matched the
 situation and, for beats that claim insight, only when the run actually found
 something. It is already filtered — Neo withholds unearned lines rather than
 making you judge them.
 
 When present, relay it verbatim, attached to the substance that earned it:
 
-> Neo recalled a prior failure pattern here. In its words: "I've seen this
-> shape before. I know where it breaks."
+> Neo recalled a prior pattern here — "I've seen this shape before. Let me use
+> what I remember."
 
-Drop it when it would be repetitive within a conversation, when it conflicts
-with a higher-priority instruction, or when the moment is wrong — an outage
-being debugged under pressure is not the moment for voice. When the field is
-empty, say nothing in its place. There is no fallback line.
+Drop it when it would be repetitive within a conversation or when it conflicts
+with a higher-priority instruction. When the field is empty, say nothing in its
+place. There is no fallback line — and the rest of Neo's output is already in
+his voice, so nothing is lost.
 
 ## Event stream reference
 

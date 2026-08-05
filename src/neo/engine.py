@@ -237,6 +237,44 @@ class NeoEngine:
             **data,
         )
 
+    # Last-resort wording if the beat deck is missing or malformed. Neutral on
+    # purpose: a run must still be able to describe itself, but this is not
+    # where the character is authored — `orchestrator_voice.lines` is.
+    _VOICE_FALLBACK = "{event}"
+
+    def _voice(self, key: str, **fmt: Any) -> str:
+        """Render one user-facing line from the beat deck.
+
+        All prose Neo emits is authored in `orchestrator_voice.lines`, so the
+        character can be retuned without editing code. A missing key or a
+        template whose placeholders don't match degrades to "" rather than
+        raising — a formatting slip in a personality file must never take down
+        a reasoning run.
+        """
+        try:
+            lines = self.beat_deck.get("orchestrator_voice", {}).get("lines", {})
+            template = lines.get(key)
+            if not template:
+                return ""
+            return str(template).format(**fmt)
+        except Exception as exc:
+            logger.debug("voice template %r failed: %s", key, exc)
+            return ""
+
+    def _voice_stage(self) -> dict[str, Any]:
+        """Per-stage register (opener, hedge, terseness) for the current
+        memory level. Neo's certainty grows with what he remembers, so the
+        summary's phrasing follows `_memory_level_to_stage`."""
+        memory_level = 0.0
+        if self.persistent_memory:
+            try:
+                memory_level = self.persistent_memory.memory_level()
+            except Exception:
+                memory_level = 0.0
+        stage = self._memory_level_to_stage(memory_level)
+        stages = self.beat_deck.get("orchestrator_voice", {}).get("stages", {})
+        return stages.get(stage) or stages.get(3) or {}
+
     def _current_phase(self) -> str:
         """Name of the phase currently running, or "" outside any phase.
 
@@ -318,7 +356,7 @@ class NeoEngine:
         self._log_action("process.start", neo_input.prompt[:60])
         self._emit(
             NeoEventType.STARTED,
-            message="Neo started reasoning about the request.",
+            message=self._voice("started"),
             operating_mode=neo_input.operating_mode.value,
             task_type=getattr(neo_input.task_type, "value", ""),
         )
@@ -327,7 +365,7 @@ class NeoEngine:
             output = self._process_inner(neo_input, start_time)
             self._emit(
                 NeoEventType.COMPLETED,
-                message=output.orchestrator.summary or "Neo finished reasoning.",
+                message=output.orchestrator.summary or self._voice("completed_fallback"),
                 confidence=round(output.confidence, 3),
                 elapsed_seconds=round(time.time() - start_time, 2),
             )
@@ -343,7 +381,7 @@ class NeoEngine:
             self._emit(
                 NeoEventType.FAILED,
                 phase=failed_in,
-                message=f"Neo failed during this run: {type(exc).__name__}.",
+                message=self._voice("failed", error_type=type(exc).__name__),
                 error_type=type(exc).__name__,
                 elapsed_seconds=round(time.time() - start_time, 2),
             )
@@ -486,10 +524,7 @@ class NeoEngine:
             self._emit(
                 NeoEventType.MEMORY_FOUND,
                 phase=self._current_phase(),
-                message=(
-                    f"Recalled {len(fact_context.valid_facts)} relevant "
-                    f"fact(s) from memory."
-                ),
+                message=self._voice("memory_found", count=len(fact_context.valid_facts)),
                 count=len(fact_context.valid_facts),
                 subjects=subjects,
             )
@@ -767,14 +802,14 @@ class NeoEngine:
 
         # Phase 1: Retrieve additional context
         self._log_action("retrieve_context", neo_input.prompt[:60])
-        self._begin_phase(PHASE_CONTEXT, "Gathering code context.")
+        self._begin_phase(PHASE_CONTEXT, self._voice("phase_context"))
         enriched_context = self._retrieve_context(neo_input)
         file_count = len(neo_input.context_files) + len(
             enriched_context.get("additional_files", []) or []
         )
         self._end_phase(
             PHASE_CONTEXT,
-            f"Read {file_count} file(s) of context.",
+            self._voice("phase_context_done", count=file_count),
             file_count=file_count,
         )
 
@@ -815,16 +850,17 @@ class NeoEngine:
             self._log_action("deliberate", neo_input.prompt[:60])
             self._begin_phase(
                 PHASE_REASONING,
-                "Running a multi-model panel: solver, critic, verifier.",
+                self._voice("phase_panel"),
             )
             plan, simulation_traces, code_suggestions, deliberation = self._deliberate(
                 enriched_context, route_fn
             )
             if deliberation is not None and deliberation.confidence > 0.0 and code_suggestions:
                 self.last_deliberation = deliberation
-                reasoning_summary = (
-                    f"Panel reached {deliberation.consensus:.0%} consensus "
-                    f"over {deliberation.rounds} round(s)."
+                reasoning_summary = self._voice(
+                    "phase_panel_done",
+                    consensus=f"{deliberation.consensus:.0%}",
+                    rounds=deliberation.rounds,
                 )
                 reasoning_data = {
                     "consensus": round(deliberation.consensus, 3),
@@ -839,23 +875,24 @@ class NeoEngine:
                 plan = None
                 self._end_phase(
                     PHASE_REASONING,
-                    "Panel produced no usable result; falling back to the single-model path.",
+                    self._voice("phase_panel_fallback"),
                     status="fallback",
                 )
                 self._emit(
                     NeoEventType.HYPOTHESIS_REJECTED,
                     phase=PHASE_REASONING,
-                    message="Discarded the panel's output — no usable suggestion survived.",
+                    message=self._voice("panel_rejected"),
                 )
 
         if plan is None:
             # Fast path (default, or fallback from a failed panel).
             self._log_action("lm_call", neo_input.prompt[:60])
-            self._begin_phase(PHASE_REASONING, "Planning, simulating, and drafting changes.")
+            self._begin_phase(PHASE_REASONING, self._voice("phase_reasoning"))
             plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
-            reasoning_summary = (
-                f"Produced a {len(plan)}-step plan and "
-                f"{len(code_suggestions)} suggested change(s)."
+            reasoning_summary = self._voice(
+                "phase_reasoning_done",
+                steps=len(plan),
+                count=len(code_suggestions),
             )
             reasoning_data = {
                 "plan_steps": len(plan),
@@ -895,7 +932,7 @@ class NeoEngine:
         static_checks = []
         if elapsed < time_budget * self.STATIC_CHECK_BUFFER:
             self._begin_phase(
-                PHASE_STATIC_CHECKS, "Running static analysis on the proposed changes."
+                PHASE_STATIC_CHECKS, self._voice("phase_checks")
             )
             static_checks = self._run_static_checks(code_suggestions, extracted_constraints)
             statuses = [self._static_check_status(check) for check in static_checks]
@@ -913,11 +950,14 @@ class NeoEngine:
                 )
                 self._note_finding(f"{check.tool_name} reported errors")
             if not static_checks:
-                summary = "No static analysis tools were available."
+                summary = self._voice("phase_checks_none")
             elif failed:
-                summary = f"{len(failed)} of {len(static_checks)} check(s) reported errors."
+                summary = self._voice(
+                    "phase_checks_failed",
+                    failed=len(failed), count=len(static_checks),
+                )
             else:
-                summary = f"All {len(static_checks)} check(s) passed."
+                summary = self._voice("phase_checks_clean", count=len(static_checks))
             self._end_phase(
                 PHASE_STATIC_CHECKS,
                 summary,
@@ -932,10 +972,10 @@ class NeoEngine:
             # Opened even though nothing runs: a phase that closes without
             # opening leaves a host tracking a close for a phase it never saw
             # start. "Started then skipped" is both true and well-formed.
-            self._begin_phase(PHASE_STATIC_CHECKS, "Considering static analysis.")
+            self._begin_phase(PHASE_STATIC_CHECKS, self._voice("phase_checks_considering"))
             self._end_phase(
                 PHASE_STATIC_CHECKS,
-                "Skipped static analysis — the time budget was already spent.",
+                self._voice("phase_checks_skipped"),
                 status="skipped",
             )
 
@@ -2363,48 +2403,72 @@ RULES:
         mode = self.last_reasoning_mode
         verification_only = mode == "verification_only"
 
-        # Summary: what ran, what it produced, how sure it is.
+        # Summary: what I did, what I found, how sure I am.
         #
-        # VERIFY is its own sentence, not a variation on the others. That path
-        # makes no LM call and its `code_suggestions` are the CALLER's
-        # proposed_changes echoed back for checking — saying "Neo reasoned" or
-        # "Neo proposes" there attributes the caller's work to Neo, and a host
-        # is told to lead with this line verbatim.
+        # First person, and terse. Neo narrating himself in the third person
+        # ("Neo reasoned over the request") reads like a status board, not like
+        # the character the beat deck defines — and this is the line a host is
+        # told to lead with, so it sets the voice for the whole response.
+        # Voice is not licence: every claim below is still derived from state
+        # already computed, and VERIFY still gets its own sentence.
+        #
+        # VERIFY makes no LM call and its `code_suggestions` are the CALLER's
+        # proposed_changes echoed back for checking. Saying "I looked at this"
+        # or "I'd change" there claims the caller's work as mine.
         if verification_only:
-            checked = len(code_suggestions)
             verdict = (
-                f"{len(failed_checks)} check(s) reported errors" if failed_checks
-                else "no check reported errors" if static_checks
-                else "no checks could run"
+                self._voice("verify_failed", count=len(failed_checks)) if failed_checks
+                else self._voice("verify_clean") if static_checks
+                else self._voice("verify_none")
             )
-            summary = (
-                f"Neo statically checked {checked} caller-supplied change(s) "
-                f"without reasoning about them: {verdict}."
+            summary = self._voice(
+                "verify", count=len(code_suggestions), verdict=verdict,
             )
         else:
-            parts: list[str] = []
-            if mode == ReasoningMode.MULTI_AGENT.value:
-                parts.append("Neo ran a multi-model panel")
-            else:
-                parts.append("Neo reasoned over the request")
+            stage = self._voice_stage()
+            terse = bool(stage.get("terse"))
+            suffix = "_terse" if terse else ""
+
+            target = target_bare = ""
             if code_suggestions:
                 files = {s.file_path for s in code_suggestions if s.file_path}
                 if len(files) > 1:
-                    target = f" across {len(files)} file(s)"
+                    target = self._voice("target_many", count=len(files))
+                    target_bare = f"{len(files)} files. "
                 elif files:
-                    target = f" in {next(iter(files))}"
-                else:
-                    target = ""
-                parts.append(
-                    f"and proposes {len(code_suggestions)} change(s){target}"
+                    path = next(iter(files))
+                    target = self._voice("target_one", path=path)
+                    target_bare = f"{path}. "
+                action = self._voice(
+                    f"action_change{suffix}",
+                    count=len(code_suggestions), target=target, target_bare=target_bare,
                 )
             elif plan:
-                parts.append(f"and returned a {len(plan)}-step plan without code changes")
+                action = self._voice(f"action_plan{suffix}", steps=len(plan))
             else:
-                parts.append("but produced no actionable plan")
-            summary = " ".join(parts) + f". Confidence {confidence:.2f}."
+                action = self._voice(f"action_none{suffix}")
+
+            # A Sleeper hedges and a Sleeper's opener says so; The One drops the
+            # opener entirely and leads with the fact. Same data, different
+            # certainty — which is the whole point of the stage model.
+            opener = stage.get(
+                "opener_panel" if mode == ReasoningMode.MULTI_AGENT.value
+                else "opener_solo", ""
+            )
+            confidence_lead = stage.get("confidence_lead", "")
+            confidence_text = (
+                f"{confidence_lead} {confidence:.2f}." if confidence_lead
+                else f"{confidence:.2f}."
+            )
+            summary = " ".join(
+                part for part in (
+                    opener,
+                    f"{action}{stage.get('hedge', '')}." if action else "",
+                    confidence_text,
+                ) if part
+            )
             if early_exit:
-                summary += " It exited early — high confidence and clean static checks."
+                summary += self._voice("early_exit")
 
         # Cautions: what a confident-sounding answer must not bury.
         cautions: list[str] = []
@@ -2413,15 +2477,15 @@ RULES:
         # would be both circular and wrong.
         if not verification_only and confidence < self.LOW_CONFIDENCE:
             cautions.append(
-                f"Confidence is {confidence:.2f}. Verify before acting on this."
+                self._voice("caution_low_confidence", confidence=f"{confidence:.2f}")
             )
         for check in failed_checks:
-            cautions.append(f"{check.tool_name} reported errors: {check.summary}")
+            cautions.append(self._voice(
+                "caution_check_failed", tool=check.tool_name, summary=check.summary,
+            ))
         issue_count = sum(len(t.issues_found) for t in simulation_traces or [])
         if issue_count:
-            cautions.append(
-                f"Simulation surfaced {issue_count} issue(s) with the proposed approach."
-            )
+            cautions.append(self._voice("caution_sim_issues", count=issue_count))
         if code_suggestions and not static_checks:
             # Two different facts with two different remedies: install a linter
             # versus give the run more time. The phase record already knows
@@ -2430,15 +2494,12 @@ RULES:
                 record["name"] == PHASE_STATIC_CHECKS and record["status"] == "skipped"
                 for record in self._phase_records
             )
-            cautions.append(
-                "Static analysis was skipped for time budget, so the suggested "
-                "code is unverified."
-                if skipped else
-                "No static analysis tools were available, so the suggested "
-                "code is unverified."
-            )
+            cautions.append(self._voice(
+                "caution_unverified_skipped" if skipped
+                else "caution_unverified_no_tools"
+            ))
         for question in next_questions[:3]:
-            cautions.append(f"Open question: {question}")
+            cautions.append(self._voice("caution_open_question", question=question))
 
         # Narration: phase-by-phase, in the order it happened.
         narration = [
@@ -2464,25 +2525,25 @@ RULES:
     MAX_CAUTIONS = 8
     MAX_CAUTION_CHARS = 300
 
-    @classmethod
-    def _cap_cautions(cls, cautions: list[str]) -> list[str]:
+    def _cap_cautions(self, cautions: list[str]) -> list[str]:
         """Bound both the number of cautions and the length of each one.
 
         Truncation is explicit: a dropped caution is reported as a count, never
         silently discarded, because "there are more problems" is itself one of
         the things a host must not bury.
         """
+        # Drop blanks: a voice template that failed to render must not become an
+        # empty bullet a host dutifully relays.
         capped = [
-            item if len(item) <= cls.MAX_CAUTION_CHARS
-            else item[: cls.MAX_CAUTION_CHARS - 1].rstrip() + "…"
-            for item in cautions
+            item if len(item) <= self.MAX_CAUTION_CHARS
+            else item[: self.MAX_CAUTION_CHARS - 1].rstrip() + "…"
+            for item in cautions if item
         ]
-        if len(capped) <= cls.MAX_CAUTIONS:
+        if len(capped) <= self.MAX_CAUTIONS:
             return capped
-        dropped = len(capped) - (cls.MAX_CAUTIONS - 1)
-        return capped[: cls.MAX_CAUTIONS - 1] + [
-            f"({dropped} further caution(s) not shown — see the full output.)"
-        ]
+        dropped = len(capped) - (self.MAX_CAUTIONS - 1)
+        overflow = self._voice("caution_overflow", count=dropped)
+        return capped[: self.MAX_CAUTIONS - 1] + ([overflow] if overflow else [])
 
     def _generate_notes(
         self,
