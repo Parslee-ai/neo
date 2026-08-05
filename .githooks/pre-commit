@@ -37,7 +37,7 @@ if [ -n "$PINNED_RUFF" ] && [ "$PINNED_RUFF" != "$LOCAL_RUFF" ]; then
 fi
 
 echo "Running ruff lint (same command as CI)..."
-"$PYTHON_BIN" -m ruff check src/ tests/
+"$PYTHON_BIN" -m ruff check src/ tests/ tools/
 
 echo "Running tests (same command as CI)..."
 "$PYTHON_BIN" -m pytest tests/ -q --tb=line

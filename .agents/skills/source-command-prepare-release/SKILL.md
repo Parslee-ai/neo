@@ -24,11 +24,9 @@ Updates version numbers, CHANGELOG.md, and builds distributions for a new releas
 1. **Validates** the new version is higher than current and follows semver format
 2. **Reviews** commits since last release tag
 3. **Updates** CHANGELOG.md with new version section and categorized changes
-4. **Updates** version in:
-   - `pyproject.toml` (line 7)
-   - `src/neo/__init__.py` (line 5)
-   - `.claude-plugin/plugin.json`
-   - `plugins/neo/.codex-plugin/plugin.json`
+4. **Updates** the version in `pyproject.toml`, then runs `make sync-version`
+   to propagate it to the three derived files (`src/neo/__init__.py`, both
+   plugin manifests)
 5. **Syncs** the local editable install metadata so `importlib.metadata.version("neo-reasoner")` matches the new version
 6. **Builds** wheel and sdist distributions
 7. **Reports** what was done and next steps
@@ -71,11 +69,20 @@ Add new section at top of `CHANGELOG.md`:
 
 ### Step 4: Update Versions
 
-Update version string in all four files:
-- `pyproject.toml`: Change `version = "X.Y.Z"`
-- `src/neo/__init__.py`: Change `__version__ = "X.Y.Z"`
-- `.claude-plugin/plugin.json`: Change `"version": "X.Y.Z"`
-- `plugins/neo/.codex-plugin/plugin.json`: Change `"version": "X.Y.Z"`
+Edit **one** file, then propagate:
+
+- `pyproject.toml`: change `version = "X.Y.Z"` — this is the source of truth.
+
+```bash
+make sync-version
+```
+
+That rewrites `src/neo/__init__.py`, `.claude-plugin/plugin.json`, and
+`plugins/neo/.codex-plugin/plugin.json` to match. Do **not** hand-edit those
+three: this step used to be "update the version string in all four files", and
+the manifests silently drifted to 0.37.0 and 0.19.0 while the package was at
+0.41.0. `tests/test_host_adapter_parity.py` fails if they are out of sync, and
+`python tools/sync_version.py --check` reports drift without writing.
 
 ### Step 5: Sync Local Editable Metadata
 

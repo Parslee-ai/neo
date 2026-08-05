@@ -519,7 +519,17 @@
   actually exist in `events.py`. It also pins that both plugin manifests match
   the `pyproject.toml` version — `prepare-release` documents bumping them, but
   a documented step with no enforcement gets skipped (they had reached 0.19.0 /
-  0.37.0 / 0.41.0). Role differs even though protocol does not: Claude Code
+  0.37.0 / 0.41.0). **The version is now single-sourced**: `pyproject.toml` is
+  the truth and `tools/sync_version.py` (`make sync-version`) propagates it to
+  `src/neo/__init__.py` and both manifests. Release bumps edit ONE file; never
+  hand-edit the derived three. `--check` reports drift without writing. Edits
+  are surgical regex replacements, not `json.dumps` re-serialization — a
+  version bump must stay a one-line diff or it becomes unreviewable — and only
+  the FIRST `"version"` key is rewritten so a nested one can't be clobbered.
+  `tools/` is now covered by lint; it never was, which is why a dead import sat
+  in `ab_controlled.py`. The ruff invocation is duplicated in `Makefile`
+  (`lint` + `ci-local`), `.github/workflows/ci.yml` and `.githooks/pre-commit`
+  — all four MUST stay identical or local green stops predicting CI green. Role differs even though protocol does not: Claude Code
   delegates to Neo as a subagent (visible boundary), Codex calls Neo mid-loop
   (no boundary), so the Codex skills carry stronger attribution wording and an
   explicit "Neo's result is an input, not the deliverable".
