@@ -82,19 +82,24 @@ class _StripDeferred(ast.NodeTransformer):
         return ast.Constant(value=None)
 
 
-# The spellings of "the user's home" that appear in this codebase. `Path.home()`
-# was the only one the first version knew, which let
-# `observer._CAR_HINT_FLAG = os.path.expanduser("~/.neo/...")` and
-# `observer._LOCK_PATH` sit unprotected while this test reported success.
+# The spellings of "the user's home". `Path.home()` was the only one the first
+# version knew, which let `observer._CAR_HINT_FLAG = os.path.expanduser(...)`
+# and `observer._LOCK_PATH` sit unprotected while this test reported success.
+#
+# Matched against `ast.unparse` output, which normalizes string quotes to
+# SINGLE — so a double-quoted variant here would never fire. An earlier draft
+# listed both and looked like it covered twice as much as it did; single-quoted
+# forms match double-quoted source too.
 _HOME_SPELLINGS = (
     "Path.home()",
     "expanduser(",
     "environ['HOME']",
-    'environ["HOME"]',
     "environ.get('HOME'",
-    'environ.get("HOME"',
     "getenv('HOME'",
-    'getenv("HOME"',
+    # Windows: no $HOME, and `expanduser` consults USERPROFILE there.
+    "environ['USERPROFILE']",
+    "environ.get('USERPROFILE'",
+    "getenv('USERPROFILE'",
 )
 
 
@@ -133,6 +138,18 @@ def _home_constants_in_source() -> set[tuple[str, str]]:
                         scan(handler.body)
                     scan(node.orelse)
                     scan(node.finalbody)
+                    continue
+                # `with` / `for` / `match` bodies also execute at import.
+                if isinstance(node, (ast.With, ast.AsyncWith)):
+                    scan(node.body)
+                    continue
+                if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                    scan(node.body)
+                    scan(node.orelse)
+                    continue
+                if isinstance(node, ast.Match):
+                    for case in node.cases:
+                        scan(case.body)
                     continue
                 if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                     continue
@@ -186,6 +203,60 @@ def test_the_lookup_table_covers_every_import_time_home_constant():
         "conftest.HOME_PATH_CONSTANTS, so tests will write to the real home:\n  "
         + "\n  ".join(f"{m}.{a}" for m, a in sorted(missing))
     )
+
+
+def test_every_spelling_can_actually_match():
+    """`ast.unparse` normalizes quotes to single, so a double-quoted spelling
+    is inert. An earlier draft carried four such entries and looked like it
+    covered twice the surface it did."""
+    for spelling in _HOME_SPELLINGS:
+        assert '"' not in spelling, (
+            f"{spelling!r} can never match: ast.unparse emits single quotes"
+        )
+
+
+@pytest.mark.parametrize("source", [
+    'X = Path.home() / ".neo" / "x"',
+    'X = os.path.expanduser("~/.neo/x")',
+    'X = os.environ["HOME"] + "/.neo"',
+    'X = os.getenv("HOME")',
+    'X = os.environ["USERPROFILE"]',
+])
+def test_the_scan_recognizes_each_home_spelling(source):
+    """Double-quoted source must still be caught — the point of matching on
+    unparse output rather than raw text."""
+    node = ast.parse(source).body[0]
+    assert _evaluates_home_at_import(node.value), source
+
+
+@pytest.mark.parametrize("wrapper", [
+    "if True:\n    {stmt}",
+    "try:\n    {stmt}\nexcept Exception:\n    pass",
+    "with open('f') as fh:\n    {stmt}",
+    "for _ in range(1):\n    {stmt}",
+])
+def test_the_scan_recurses_into_module_level_blocks(wrapper, tmp_path):
+    """These all execute at import, so a constant inside one escapes just the
+    same as a top-level assignment."""
+    src = wrapper.format(stmt='LEAKY = Path.home() / ".neo" / "x"')
+    tree = ast.parse(src)
+
+    found = []
+
+    def scan(body):
+        for node in body:
+            if isinstance(node, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                scan(node.body)
+                for handler in getattr(node, "handlers", []):
+                    scan(handler.body)
+                scan(getattr(node, "orelse", []))
+                scan(getattr(node, "finalbody", []))
+                continue
+            if isinstance(node, ast.Assign) and _evaluates_home_at_import(node.value):
+                found.extend(t.id for t in node.targets if isinstance(t, ast.Name))
+
+    scan(tree.body)
+    assert found == ["LEAKY"], f"not caught inside: {wrapper}"
 
 
 def test_the_lookup_table_has_no_stale_entries():
