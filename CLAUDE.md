@@ -266,6 +266,29 @@
   `workflow`, `security`, `file-patterns`, `architecture`, `performance` are the
   suggested vocabulary, but any string is valid. `retrieve_relevant(..., domain=...)`
   filters by exact match; `domain=None` returns all facts including unset ones.
+- **Pending sessions are RETAINED, not cleared** (`outcomes.collect_outcomes`).
+  A session whose files haven't changed yet is kept in the log so a later run
+  can still attribute the acceptance; only sessions that produced an outcome
+  (git-matched, or a review-only weak UNVERIFIED) are dropped, plus anything
+  past `PENDING_SESSION_TTL_SECONDS` (14d) so the log stays bounded. This used
+  to clear the WHOLE log whenever any session existed — so any neo invocation
+  between "neo suggests X" and "user applies X" silently destroyed the pending
+  suggestion. The multi-session read in `collect_outcomes` exists to prevent
+  exactly that loss and the unconditional clear defeated it one level up.
+  **Measured**: 30d of real traffic = 108 episodes, 58 stuck at
+  `suggested_pending_downstream_outcome`, **zero `accepted` outcomes ever** —
+  so the promote path (needs 2 git-verified acceptances) could never fire no
+  matter how correct its own gates were. The July drill only worked because the
+  operator applied the diff with no intervening run. Retention **rewrites** the
+  log (`_rewrite_session_log`, temp + `os.replace`) rather than appending, or
+  one suggestion would accrue a copy per invocation and bump its fact once per
+  copy. `_is_non_git_trackable` is shared by the weak-acceptance detector and
+  the retention rule so they can't disagree about what's still worth waiting on.
+  **Test footgun**: `outcomes.SESSIONS_DIR` is resolved at IMPORT time from
+  `Path.home()`, so conftest's per-test home patch does NOT redirect it — every
+  test shares one sessions dir. Tests must use a unique `project_id` or they
+  read each other's leftover session logs (this passed in isolation and failed
+  in the full suite until scoped).
 - Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`):
   ACCEPTED/MODIFIED act on the linked original fact when present — confidence
   +0.2 / −0.2 (both ±arch_mod); ACCEPTED also bumps `success_count` and sets
