@@ -63,13 +63,12 @@ class _Suggestion:
 def _tracker(repo, project_id=None):
     """One tracker per test, scoped to a unique project_id.
 
-    `outcomes.SESSIONS_DIR` is resolved at import time from `Path.home()`, so
-    conftest's per-test home patch cannot redirect it — every test in the run
-    shares one sessions directory. A fixed project_id would therefore let one
-    test read another's leftover session log, which is exactly what happened:
-    these tests passed in isolation and failed in the full suite, because a
-    stale pending session from the previous test carried a timestamp old enough
-    to match the next test's repo-init commit.
+    conftest now redirects `outcomes.SESSIONS_DIR` to a per-test fake home, but
+    that is one directory shared by every test in the run. A fixed project_id
+    would still let one test read another's leftover session log — which is
+    exactly what happened before this was scoped: these tests passed in
+    isolation and failed in the full suite, because a stale pending session
+    carried a timestamp old enough to match the next test's repo-init commit.
     """
     if project_id is None:
         # tmp_path is unique per test, so its leaf name is a safe scope key.
@@ -82,6 +81,77 @@ def _apply_the_suggestion(repo):
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "applied")
     time.sleep(TICK)
+
+
+def test_acceptance_survives_a_dirty_working_tree(repo):
+    """The case the first fix missed, and the only case that actually occurs.
+
+    `_get_changed_files_since` reports every file changed anywhere in the repo,
+    not files related to the suggestion. The first version asked "is
+    changed_files empty?" — true only in a repo with no commits and a spotless
+    tree since the suggestion. One unrelated dirty file dropped the session and
+    lost the acceptance exactly as before the fix. Every other test in this file
+    runs against a pristine tree, which is the one state neo is never invoked in.
+    """
+    tracker = _tracker(repo)
+    tracker.save_session([_Suggestion("src/foo.py")], "fix foo",
+                         {"src/foo.py": "fact-1"})
+    time.sleep(TICK)
+
+    # Ordinary working state: something unrelated is dirty.
+    (repo / "src" / "unrelated.py").write_text("x = 2\n")
+
+    outcomes, _ = tracker.detect_outcomes()
+    assert not any(o.outcome_type is OutcomeType.ACCEPTED for o in outcomes)
+    assert Path(tracker._session_log_path).exists(), (
+        "an unrelated dirty file destroyed the pending suggestion"
+    )
+
+    _apply_the_suggestion(repo)
+
+    outcomes, fact_ids = tracker.detect_outcomes()
+    assert any(o.outcome_type is OutcomeType.ACCEPTED for o in outcomes)
+    assert fact_ids.get("src/foo.py") == "fact-1"
+
+
+def test_a_resolved_suggestion_is_dropped_from_a_partly_pending_session(repo):
+    """A session suggesting two files, one of which lands, must retain only the
+    other — or the landed one re-fires its outcome on every later run."""
+    tracker = _tracker(repo)
+    tracker.save_session(
+        [_Suggestion("src/foo.py"), _Suggestion("src/bar.py")], "fix both", {},
+    )
+    time.sleep(TICK)
+
+    _apply_the_suggestion(repo)  # touches src/foo.py only
+
+    tracker.detect_outcomes()
+
+    log = Path(tracker._session_log_path)
+    assert log.exists()
+    retained = json.loads(log.read_text().strip())
+    paths = [s["file_path"] for s in retained["suggestions"]]
+    assert paths == ["src/bar.py"], f"expected only the unresolved path, got {paths}"
+
+
+def test_a_review_only_path_does_not_re_emit_forever(repo):
+    """Mixed session: the docs path produced its weak UNVERIFIED on the first
+    pass and must not produce it again on every subsequent invocation."""
+    tracker = _tracker(repo)
+    tracker.save_session(
+        [_Suggestion("src/foo.py"), _Suggestion("docs/guide.md")], "both", {},
+    )
+    time.sleep(TICK)
+
+    first, _ = tracker.detect_outcomes()
+    assert any(o.outcome_type is OutcomeType.UNVERIFIED for o in first)
+
+    for _ in range(3):
+        later, _ = tracker.detect_outcomes()
+        assert not any(
+            o.outcome_type is OutcomeType.UNVERIFIED and o.file_path.endswith(".md")
+            for o in later
+        ), "the review-only outcome re-fired"
 
 
 def test_acceptance_survives_intervening_runs(repo):
@@ -164,6 +234,117 @@ def test_sessions_with_no_suggestions_are_not_retained(repo):
     tracker.detect_outcomes()
 
     assert not Path(tracker._session_log_path).exists()
+
+
+def test_an_accepted_suggestion_never_comes_back_as_independent(repo):
+    """The regression the reduction introduced.
+
+    Resolved suggestions are dropped from the retained record so they cannot
+    re-match. But `_match_to_suggestions` builds its "ours" set from that same
+    list, and the scan anchor stayed pinned to the original session — so on the
+    next run git still reported the file changed, it was no longer recognized
+    as suggested, and it landed in the independent branch. neo then recorded
+    "user changed a file neo didn't suggest" about a file neo suggested and the
+    user demonstrably applied, on every invocation until the 14-day TTL.
+
+    Only a SECOND detect_outcomes() call exposes it; every earlier retention
+    test stopped after one round.
+    """
+    tracker = _tracker(repo)
+    (repo / "src" / "bar.py").write_text("def g():\n    return 2\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add bar")
+    time.sleep(TICK)
+
+    tracker.save_session(
+        [_Suggestion("src/foo.py"), _Suggestion("src/bar.py")], "fix both", {},
+    )
+    time.sleep(TICK)
+    _apply_the_suggestion(repo)  # applies src/foo.py only
+
+    first, _ = tracker.detect_outcomes()
+    assert any(
+        o.outcome_type is OutcomeType.ACCEPTED and o.file_path == "src/foo.py"
+        for o in first
+    )
+
+    for round_number in (2, 3):
+        later, _ = tracker.detect_outcomes()
+        offenders = [
+            o.file_path for o in later
+            if o.outcome_type is OutcomeType.INDEPENDENT
+            and o.file_path.endswith("foo.py")
+        ]
+        assert not offenders, (
+            f"round {round_number}: accepted suggestion re-reported as "
+            f"independent: {offenders}"
+        )
+
+
+def test_the_scan_anchor_advances_so_work_does_not_repeat(repo):
+    """The other half of the same root cause.
+
+    A retained record kept querying from the original suggestion time, so every
+    later invocation re-scanned the whole window and re-forked git per changed
+    file — measured at seconds per invocation, persisting for the full TTL,
+    where before the (buggy) clearing made it decay to zero.
+    """
+    tracker = _tracker(repo)
+    tracker.save_session(
+        [_Suggestion("src/foo.py"), _Suggestion("src/bar.py")], "fix both", {},
+    )
+    time.sleep(TICK)
+    _apply_the_suggestion(repo)
+
+    tracker.detect_outcomes()
+
+    retained = json.loads(Path(tracker._session_log_path).read_text().strip())
+    assert retained["scanned_through"] > retained["timestamp"], (
+        "the scan anchor never advanced; the window re-scans forever"
+    )
+    assert "src/foo.py" in retained["resolved_paths"]
+
+
+def test_a_weak_outcome_cannot_overwrite_a_verified_one():
+    """`final_outcome` must report the strongest evidence in the batch.
+
+    One invocation commonly suggests a code edit *and* a review/docs path, and
+    `_dedup_outcomes` keys by path, so both survive. Assigning unconditionally
+    let dict order decide: the weak UNVERIFIED from the docs path landed after
+    the git-verified ACCEPTED, and the episode reported "unverified" for a run
+    whose code suggestion was demonstrably applied. Review paths are neo's most
+    common suggestion shape, so that under-reported acceptance in the very
+    ledger `neo memory learning-stats` reads.
+    """
+    from neo.memory.store import FactStore
+
+    rank = FactStore._outcome_rank
+    assert rank(OutcomeType.ACCEPTED) > rank(OutcomeType.UNVERIFIED)
+    assert rank(OutcomeType.MODIFIED) > rank(OutcomeType.INDEPENDENT)
+    assert rank(OutcomeType.INDEPENDENT) > rank(OutcomeType.UNVERIFIED)
+    # An unknown/absent prior outcome must lose to anything real.
+    assert rank(None) == 0
+    assert rank(OutcomeType.UNVERIFIED) > rank(None)
+
+
+def test_session_expiry_is_exercised_directly(repo):
+    """`_session_expired` in isolation.
+
+    The end-to-end expiry test below reaches the same postcondition through the
+    git path (ageing the record makes the fixture's own init commit look
+    "changed since"), so it passed while `_session_expired` was never called
+    once. Assert the predicate itself, or the TTL is untested.
+    """
+    from neo.memory.outcomes import SessionRecord
+
+    tracker = _tracker(repo)
+    fresh = SessionRecord(timestamp=time.time())
+    stale = SessionRecord(
+        timestamp=time.time() - tracker.PENDING_SESSION_TTL_SECONDS - 60
+    )
+
+    assert not tracker._session_expired(fresh)
+    assert tracker._session_expired(stale)
 
 
 def test_abandoned_suggestions_expire(repo):

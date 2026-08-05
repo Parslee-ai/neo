@@ -267,10 +267,27 @@
   suggested vocabulary, but any string is valid. `retrieve_relevant(..., domain=...)`
   filters by exact match; `domain=None` returns all facts including unset ones.
 - **Pending sessions are RETAINED, not cleared** (`outcomes.collect_outcomes`).
-  A session whose files haven't changed yet is kept in the log so a later run
-  can still attribute the acceptance; only sessions that produced an outcome
-  (git-matched, or a review-only weak UNVERIFIED) are dropped, plus anything
-  past `PENDING_SESSION_TTL_SECONDS` (14d) so the log stays bounded. This used
+  **Pendingness is per SUGGESTED PATH, not per session** — this is the whole
+  subtlety. `_get_changed_files_since` returns every file changed anywhere in
+  the repo, so the first version's `if not changed_files: pending.append(...)`
+  only retained anything in a repo with no commits AND a spotless working tree
+  since the suggestion. One unrelated dirty file dropped the session and lost
+  the acceptance exactly as before the fix; every test passed because they all
+  ran on a pristine tree, the one state neo is never invoked in.
+  `_unresolved_suggestions` now keeps a **reduced** record holding only the
+  suggestions still outstanding — git-trackable paths git hasn't touched yet.
+  Resolved paths are removed so they can't re-emit, and review-only paths are
+  removed because their weak UNVERIFIED already fired (retaining them re-emitted
+  it every invocation, growing `VerificationEvidence` per episode without bound).
+  Anything past `PENDING_SESSION_TTL_SECONDS` (14d) is dropped so the log stays
+  bounded. `_get_working_tree_changes` is hoisted OUT of the per-session loop:
+  it's timestamp-independent, and re-forking it per retained session measured
+  0.88s of pure `git` forking at 40 pending sessions, on the request hot path,
+  growing linearly.
+  **`replay_linked_feedback` must use `consume_sessions_keeping_pending()`**,
+  never a wholesale delete — it is the documented repair command for a broken
+  memory loop, so nuking the log there destroyed every pending suggestion the
+  moment you ran it. `_clear_session_log` is deleted; do not reintroduce it. This used
   to clear the WHOLE log whenever any session existed — so any neo invocation
   between "neo suggests X" and "user applies X" silently destroyed the pending
   suggestion. The multi-session read in `collect_outcomes` exists to prevent
@@ -284,11 +301,11 @@
   one suggestion would accrue a copy per invocation and bump its fact once per
   copy. `_is_non_git_trackable` is shared by the weak-acceptance detector and
   the retention rule so they can't disagree about what's still worth waiting on.
-  **Test footgun**: `outcomes.SESSIONS_DIR` is resolved at IMPORT time from
-  `Path.home()`, so conftest's per-test home patch does NOT redirect it — every
-  test shares one sessions dir. Tests must use a unique `project_id` or they
-  read each other's leftover session logs (this passed in isolation and failed
-  in the full suite until scoped).
+  **Test note**: `outcomes.SESSIONS_DIR` is resolved at IMPORT time from
+  `Path.home()`. conftest now re-points it (and every other import-time home
+  constant) at the fake home per test — see the home-isolation entry below —
+  but tests sharing a fixed `project_id` still read each other's session logs
+  within a run, so scope by a unique id.
 - Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`):
   ACCEPTED/MODIFIED act on the linked original fact when present — confidence
   +0.2 / −0.2 (both ±arch_mod); ACCEPTED also bumps `success_count` and sets
@@ -525,6 +542,35 @@
   needs session state that doesn't exist. The plugin contract that consumes all
   this lives in `.claude-plugin/agents/neo.md`. See
   `docs/solutions/orchestrator-communication.md`.
+- **Test home isolation is enforced by a table, not by `Path.home()` alone.**
+  conftest patches `Path.home()`, but ~20 constants across the codebase capture
+  their path at IMPORT time (`SESSIONS_DIR = Path.home() / ".neo" / "sessions"`)
+  and pytest imports every module during collection — *before* any fixture
+  runs. The fixture's docstring promise was therefore false, and measurably so:
+  one run of test_outcomes + test_fact_store + test_transcript wrote
+  `~/.neo/constraints/checksums.json` and
+  `~/.neo/sessions/watermark_testproj1234.json` into live developer state.
+  `conftest.HOME_PATH_CONSTANTS` re-points each one at the fake home.
+  **Adding a new import-time `Path.home()` constant WILL fail
+  `test_home_isolation.py`** — that test AST-scans `src/` and asserts the table
+  is complete, which is the durable half; the table alone would rot. The scan
+  strips `lambda`/deferred subtrees, because a `default_factory=lambda:
+  Path.home() / …` resolves at instantiation and is already covered by the
+  `Path.home()` patch (`prompt.scanner.claude_home` is the live example).
+  `store.FASTEMBED_CACHE_DIR` is deliberately EXEMPT — a ~400 MB read-mostly
+  model cache pinned to the real cache so it isn't re-downloaded per run.
+  The scan knows FOUR spellings of "home" (`Path.home()`, `expanduser`,
+  `environ["HOME"]`, `getenv("HOME")`) and recurses into module-level
+  `if`/`try`; knowing only the first let `observer._CAR_HINT_FLAG` and
+  `observer._LOCK_PATH` sit unprotected while the test reported success. It
+  still CANNOT see derived constants (`CHECKSUM_FILE = CHECKSUM_DIR / ...`),
+  re-imported bindings (`from ...outcomes import SESSIONS_DIR`), aliased
+  imports, or non-`Name` targets — that limit is written into the test
+  docstring rather than papered over.
+  Note `transcript` does `from ...outcomes import SESSIONS_DIR`, binding a
+  SECOND name that must be patched separately. **Do not** verify isolation by
+  watching the filesystem: the observer daemon writes to `~/.neo` on its own
+  schedule and will produce false positives (it did during this work).
 - **`NeoEngine` is one-request-at-a-time, enforced.** `process()` takes a
   non-blocking `threading.Lock` and raises `EngineBusyError` (a `RuntimeError`
   subclass, so broad handlers still catch it) on overlap; the body moved to

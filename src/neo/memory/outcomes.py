@@ -18,7 +18,7 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -206,6 +206,19 @@ class SessionRecord:
     repository_revision: str = ""
     retrieved_fact_ids: list[str] = field(default_factory=list)
     used_fact_ids: list[str] = field(default_factory=list)
+    # How far this record has already been scanned for outcomes. Set when a
+    # partially-resolved session is retained; queries then start here rather
+    # than at `timestamp`. Without it a retained record re-scans the whole
+    # window since the suggestion on every invocation, forever, because the
+    # anchor never advances — measured at ~8s per invocation, persisting for
+    # the full 14-day TTL.
+    scanned_through: float = 0.0
+    # Paths this session suggested that already produced an outcome. Retained
+    # even though their suggestions are dropped, so the independent-change
+    # detector still recognizes them as ours. Otherwise an ACCEPTED suggestion
+    # comes back as INDEPENDENT — "user changed a file neo didn't suggest" —
+    # naming a file neo suggested and the user demonstrably applied.
+    resolved_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -323,6 +336,10 @@ class OutcomeTracker:
         self._session_path = self._get_session_path()
         self._session_log_path = self._get_session_log_path()
         self._suggestion_ledger_path = self._get_suggestion_ledger_path()
+        # Sessions still awaiting user action after the last collect_outcomes.
+        # Lets a caller that inspected with clear_processed=False consume the
+        # log afterwards without re-running git or nuking pending work.
+        self._last_pending: list[SessionRecord] = []
 
     def _get_session_path(self) -> Optional[Path]:
         if not self.project_id:
@@ -595,10 +612,25 @@ class OutcomeTracker:
         sessions = self._load_unprocessed_sessions(include_fallback=include_fallback)
         if not sessions:
             logger.debug("No unprocessed sessions found for outcome detection")
+            # Reset explicitly: a stale _last_pending from an earlier call would
+            # otherwise be what a later consume_sessions_keeping_pending() writes
+            # back. Unreachable today only because replay gates on non-zero
+            # stats — make it structural, not incidental.
+            self._last_pending = []
             return [], {}
 
         all_outcomes: list[Outcome] = []
         merged_fact_ids: dict[str, str] = {}
+        # The working-tree half of the changed-file query is timestamp
+        # independent, so it is computed ONCE rather than per session. Retention
+        # means the log now holds many sessions; recomputing it per session cost
+        # a measured 0.88s of pure `git` forking at 40 pending sessions, on the
+        # request hot path, growing linearly.
+        working_tree = self._get_working_tree_changes()
+        # Watermark stamped onto retained records. Backed off a little because
+        # `git log --since` is second-granular: anchoring exactly at "now"
+        # could skip a commit made in this same second.
+        scan_started = time.time() - self.SCAN_WATERMARK_SKEW_SECONDS
         # Sessions whose suggestions are still awaiting a user action. Retained
         # rather than cleared — see the note at the clearing step below.
         pending: list[SessionRecord] = []
@@ -613,9 +645,31 @@ class OutcomeTracker:
             # sessions never reach the git-matching branch.
             merged_fact_ids.update(prev.suggestion_fact_ids)
 
-            changed_files = self._get_changed_files_since(prev.timestamp)
+            # Start from how far this record has already been scanned, not from
+            # when the suggestion was made. A retained record's anchor never
+            # advances otherwise: it re-queries the whole window every run.
+            since = max(prev.timestamp, prev.scanned_through)
+            changed_files = self._get_changed_files_since(
+                since, working_tree=working_tree
+            )
+
+            # Retain a REDUCED record holding only what is still outstanding.
+            # Keeping the whole session would re-emit an outcome for every
+            # already-resolved suggestion on each later invocation.
+            remaining = self._unresolved_suggestions(prev, changed_files)
+            if remaining and not self._session_expired(prev):
+                resolved_now = [
+                    s.get("file_path", "") for s in prev.suggestions
+                    if s.get("file_path") and s not in remaining
+                ]
+                pending.append(replace(
+                    prev,
+                    suggestions=remaining,
+                    scanned_through=scan_started,
+                    resolved_paths=sorted(set(prev.resolved_paths) | set(resolved_now)),
+                ))
+
             if not changed_files:
-                pending.append(prev)
                 continue
 
             suggested = [s.get("file_path", "") for s in prev.suggestions]
@@ -654,12 +708,11 @@ class OutcomeTracker:
         #
         # A session is processed once its files have changed (git-matched) or
         # it produced a non-git outcome; anything else is still pending.
+        # Remembered so `replay_linked_feedback` can consume the log with the
+        # same retention rule instead of deleting it wholesale.
+        self._last_pending = pending
         if clear_processed:
-            keep = [
-                s for s in pending
-                if self._session_awaits_user_action(s) and not self._session_expired(s)
-            ]
-            self._rewrite_session_log(keep)
+            self._rewrite_session_log(pending)
 
         accepted = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.ACCEPTED)
         modified = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.MODIFIED)
@@ -731,23 +784,17 @@ class OutcomeTracker:
 
         return sessions
 
-    def _clear_session_log(self) -> None:
-        """Clear processed session state after outcomes have been processed."""
-        log_path = self._session_log_path
-        if log_path and log_path.exists():
-            try:
-                log_path.unlink()
-            except OSError:
-                pass
-        # The single-session file is a backward-compat fallback when the
-        # append-only log is missing. Remove it too, otherwise the same
-        # processed session can replay on the next invocation.
-        session_path = self._session_path
-        if session_path and session_path.exists():
-            try:
-                session_path.unlink()
-            except OSError:
-                pass
+    def consume_sessions_keeping_pending(self) -> None:
+        """Rewrite the log, retaining whatever the last collect_outcomes found
+        still outstanding.
+
+        For callers that inspect with `clear_processed=False` and then decide to
+        consume. `replay_linked_feedback` did this by calling the old
+        `_clear_session_log`, which deleted everything — so the documented
+        repair command for a broken memory loop destroyed every pending
+        suggestion the moment you ran it.
+        """
+        self._rewrite_session_log(self._last_pending)
 
     @staticmethod
     def _is_review_only_path(file_path: str) -> bool:
@@ -816,6 +863,12 @@ class OutcomeTracker:
     # retaining it would grow the log without bound.
     PENDING_SESSION_TTL_SECONDS = 14 * 24 * 3600
 
+    # `git log --since` resolves to whole seconds, so a watermark set at exactly
+    # "now" can miss a commit landing in the same second. Back it off slightly;
+    # the cost of overlap is re-seeing a change, which `resolved_paths` and the
+    # per-path resolution check already absorb.
+    SCAN_WATERMARK_SKEW_SECONDS = 2
+
     _NON_TRACKABLE_PATHS = frozenset({"/dev/null"})
 
     def _is_non_git_trackable(self, file_path: str, normalized: str) -> bool:
@@ -832,61 +885,115 @@ class OutcomeTracker:
             or self._is_review_only_path(file_path)
         )
 
-    def _session_awaits_user_action(self, session: SessionRecord) -> bool:
-        """True when this session still has a suggestion git could confirm.
+    def _unresolved_suggestions(
+        self, session: SessionRecord, changed_files: set[str]
+    ) -> list[dict]:
+        """The suggestions in `session` that are still waiting on the user.
 
-        Sessions whose suggestions are all review-only have already produced
-        their (weak, UNVERIFIED) outcome and must not be replayed. A session
-        with no suggestions at all has nothing to wait for.
+        Pendingness is a property of **each suggested path**, not of "did the
+        repository move at all". The first version of this asked whether
+        `changed_files` was empty, which is only true in a repo with no commits
+        and a spotless working tree since the suggestion — so one unrelated
+        dirty file dropped the whole session and the acceptance was lost
+        exactly as before the fix. Every test passed because they all ran
+        against a pristine tree, which is the one state neo is never invoked in.
+
+        Dropped here, and therefore NOT retained:
+          - paths git has since touched (they produced their outcome this round)
+          - review-only / docs / /dev/null paths (their weak UNVERIFIED already
+            fired; retaining them re-emits it on every later invocation)
         """
+        remaining: list[dict] = []
         for sugg in session.suggestions:
             file_path = sugg.get("file_path", "")
+            if not file_path:
+                continue
             normalized = normalize_suggestion_path(
                 file_path, session.codebase_root or self.codebase_root
             )
-            if not self._is_non_git_trackable(file_path, normalized):
-                return True
-        return False
+            if self._is_non_git_trackable(file_path, normalized):
+                continue
+            # Same predicate _match_to_suggestions uses, so "resolved" here and
+            # "matched" there cannot drift apart.
+            if normalized in changed_files or file_path in changed_files:
+                continue
+            remaining.append(sugg)
+        return remaining
 
     def _session_expired(self, session: SessionRecord) -> bool:
         return (time.time() - session.timestamp) > self.PENDING_SESSION_TTL_SECONDS
 
     def _rewrite_session_log(self, keep: list[SessionRecord]) -> None:
-        """Replace the log with `keep`, atomically.
+        """Replace the log with `keep`.
 
-        Writes through a temp file so a crash mid-rewrite cannot leave a
-        truncated log — losing pending suggestions is the exact failure this
-        whole change exists to stop.
+        Read-modify-write across processes, so it holds the same per-scope lock
+        `FactStore.save()` uses. That serializes rewrite against rewrite.
+
+        It does NOT close the read-modify-write window: `_load_unprocessed_sessions`
+        reads without the lock and `save_session` appends without it, so a peer
+        process saving a session between another's read and its replace is still
+        erased. Closing that needs the lock extended over the read and taken by
+        `save_session` too — deliberately not done here, because it widens a
+        lock across LM-bound work in `replay_linked_feedback`. Documented rather
+        than silently overclaimed.
+
+        Durability: temp file + `os.replace`, with `flush`+`fsync` before the
+        rename so a machine crash can't leave a rename pointing at unwritten
+        data. `mkstemp` rather than a fixed `.tmp` name, since two concurrent
+        rewrites would otherwise interleave into one file — the same reason
+        `FactStore._save_file` uses it.
         """
         log_path = self._session_log_path
         if not log_path:
             return
+
+        # Imported here, not at module scope: `store` imports this module, so a
+        # top-level import would be circular. `scope_file_lock` is already
+        # best-effort — it proceeds unlocked when fcntl is unavailable — so it
+        # needs no fallback of its own.
+        from neo.memory.store import scope_file_lock
+
+        with scope_file_lock(log_path):
+            self._rewrite_session_log_locked(log_path, keep)
+
+    def _rewrite_session_log_locked(
+        self, log_path: Path, keep: list[SessionRecord]
+    ) -> None:
         # The single-session file is a backward-compat fallback that
         # `_load_unprocessed_sessions` reads only when the log is absent.
-        # Always drop it: its content is either represented in `keep` or has
-        # been processed.
+        # Removed only AFTER the log is safely in place: unlinking first and
+        # then failing the write would drop both copies.
         session_path = self._session_path
-        if session_path and session_path.exists():
-            try:
-                session_path.unlink()
-            except OSError:
-                pass
-
-        if not keep:
-            if log_path.exists():
-                try:
-                    log_path.unlink()
-                except OSError:
-                    pass
-            return
 
         try:
-            tmp = log_path.with_name(log_path.name + ".tmp")
-            with open(tmp, "w") as f:
-                for session in keep:
-                    f.write(json.dumps(asdict(session)) + "\n")
-            os.replace(tmp, log_path)
-            logger.info("Retained %d pending session(s) awaiting user action", len(keep))
+            if keep:
+                import tempfile
+
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=str(log_path.parent), prefix=log_path.name + ".", suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        for session in keep:
+                            f.write(json.dumps(asdict(session)) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_name, log_path)
+                except BaseException:
+                    # Includes SIGINT/SIGTERM-driven exits: leave no stray temp.
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                    raise
+                logger.info(
+                    "Retained %d pending session(s) awaiting user action", len(keep)
+                )
+            elif log_path.exists():
+                log_path.unlink()
+
+            if session_path and session_path.exists():
+                session_path.unlink()
         except OSError as e:
             logger.warning(f"Failed to rewrite session log: {e}")
 
@@ -946,10 +1053,37 @@ class OutcomeTracker:
 
         return outcomes
 
-    def _get_changed_files_since(self, since_timestamp: float) -> set[str]:
+    def _get_working_tree_changes(self) -> set[str]:
+        """Files dirty in the working tree right now.
+
+        Split out because it does not depend on a session timestamp: callers
+        iterating many sessions compute it once and pass it in.
+        """
+        if not self.codebase_root:
+            return set()
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD"],
+                cwd=self.codebase_root,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return set()
+            return {line.strip() for line in result.stdout.strip().split("\n") if line.strip()}
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
+            logger.debug(f"Git working-tree query failed (non-fatal): {e}")
+            return set()
+
+    def _get_changed_files_since(
+        self, since_timestamp: float, working_tree: Optional[set[str]] = None
+    ) -> set[str]:
         """Get files that changed in git since a timestamp.
 
         Uses git log --since with ISO timestamp for reliable cross-platform behavior.
+        `working_tree` lets a caller supply the timestamp-independent half once
+        instead of re-forking `git diff` for every session.
         """
         if not self.codebase_root:
             return set()
@@ -976,22 +1110,10 @@ class OutcomeTracker:
                     if line.strip()
                 }
 
-            # Also get currently staged/unstaged changes
-            result2 = subprocess.run(
-                ["git", "diff", "--name-only", "HEAD"],
-                cwd=self.codebase_root,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                timeout=10,
+            working = (
+                working_tree if working_tree is not None
+                else self._get_working_tree_changes()
             )
-            working = set()
-            if result2.returncode == 0:
-                working = {
-                    line.strip()
-                    for line in result2.stdout.strip().split("\n")
-                    if line.strip()
-                }
-
             return committed | working
 
         except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
@@ -1065,10 +1187,19 @@ class OutcomeTracker:
         # Detect independent changes (user changed files neo didn't suggest).
         # Rate-limited: keep only the top MAX_INDEPENDENT_OUTCOMES by diff size
         # to avoid flooding facts with low-value noise in active repos.
+        # Paths already resolved for this session count as ours. They are no
+        # longer in `session.suggestions` (dropped on retention so they cannot
+        # re-match), so without this an ACCEPTED suggestion reappears here as
+        # INDEPENDENT — a record asserting neo never suggested a file it did.
+        known_ours = set(suggested_files)
+        for path in session.resolved_paths:
+            known_ours.add(path)
+            known_ours.add(self._normalize_path(path))
+
         independent_candidates: list[Outcome] = []
         for changed in changed_files:
             normalized = self._normalize_path(changed)
-            if normalized not in suggested_files and changed not in suggested_files:
+            if normalized not in known_ours and changed not in known_ours:
                 if self._is_code_file(changed):
                     diff = self._get_file_diff_since(changed, session.timestamp)
                     if not diff:

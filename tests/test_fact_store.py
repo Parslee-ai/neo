@@ -2093,12 +2093,16 @@ class TestOutcomeLinkage:
         with (
             patch.object(store._outcome_tracker, "collect_outcomes",
                          return_value=(outcomes, {"src/foo.py": original.id})) as collect,
-            patch.object(store._outcome_tracker, "_clear_session_log") as clear,
+            patch.object(store._outcome_tracker,
+                         "consume_sessions_keeping_pending") as consume,
         ):
             stats = store.replay_linked_feedback()
 
         collect.assert_called_once_with(clear_processed=False, include_fallback=False)
-        clear.assert_called_once()
+        # Retention-aware consume, NOT the old wholesale delete: replay is the
+        # documented repair command for a broken memory loop, so clearing the
+        # whole log here destroyed every pending suggestion the moment you ran it.
+        consume.assert_called_once()
         assert stats["linked_updates"] == 1
         assert stats["skipped_independent"] == 1
         assert original.metadata.confidence == pytest.approx(0.8)
@@ -2126,11 +2130,12 @@ class TestOutcomeLinkage:
         with (
             patch.object(store._outcome_tracker, "collect_outcomes",
                          return_value=(outcomes, {"src/foo.py": original.id})),
-            patch.object(store._outcome_tracker, "_clear_session_log") as clear,
+            patch.object(store._outcome_tracker,
+                         "consume_sessions_keeping_pending") as consume,
         ):
             stats = store.replay_linked_feedback(dry_run=True)
 
-        clear.assert_not_called()
+        consume.assert_not_called()
         assert stats["linked_updates"] == 1
         assert stats["modified"] == 1
         assert original.metadata.confidence == pytest.approx(0.6)

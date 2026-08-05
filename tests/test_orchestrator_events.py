@@ -491,6 +491,41 @@ def test_engine_holds_no_prose_of_its_own():
         assert phrase not in source, phrase
 
 
+def test_an_empty_or_malformed_deck_does_not_kill_the_run(tmp_path, monkeypatch):
+    """`yaml.safe_load` returns None for an empty file and a list for a
+    malformed one. An unguarded return made `beat_deck` None and every
+    non-VERIFY run died in `_voice_stage` — the wrong failure mode for a file
+    users are invited to edit."""
+    import yaml
+
+    for payload in (None, [], "just a string", 42):
+        monkeypatch.setattr(yaml, "safe_load", lambda _f, p=payload: p)
+        engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+
+        assert isinstance(engine.beat_deck, dict)
+        engine.context = NeoInput(prompt="fix the parser")
+        # Must not raise, and must stay silent rather than invent a line.
+        assert engine._voice_stage() == {} or isinstance(engine._voice_stage(), dict)
+        assert engine._voice("started") == ""
+        assert engine._orchestrator_beat(0.9) == ""
+
+
+def test_the_fallback_deck_is_not_shared_between_engines():
+    """A class-level default would leak mutations across instances."""
+    import yaml
+
+    original = yaml.safe_load
+    try:
+        yaml.safe_load = lambda _f: None
+        first = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+        second = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+    finally:
+        yaml.safe_load = original
+
+    first.beat_deck["beats"].append({"beat_id": "injected"})
+    assert second.beat_deck["beats"] == []
+
+
 def test_a_broken_voice_template_degrades_to_silence():
     """A formatting slip in a personality file must not take down a run."""
     engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)

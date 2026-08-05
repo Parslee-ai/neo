@@ -58,6 +58,22 @@ EMBEDDING_CACHE_MAX_SIZE = 500
 MAX_TEXT_LENGTH = 32000
 SUPERSESSION_THRESHOLD = 0.85  # Cosine similarity threshold for supersession
 
+# How strong each outcome is as evidence, for deciding which one an episode
+# reports as its final_outcome when a single invocation produced several.
+# Same VALUES as the priority map in `OutcomeTracker._dedup_outcomes` (asserted
+# by a test), but deliberately not the same tie-breaking: dedup uses strict `>`
+# so the first of equal rank wins per path, while the episode check below uses
+# `>=` so the last wins. That is what lets a later REGRESSION supersede an
+# earlier ACCEPTED instead of being masked by it.
+_OUTCOME_RANK = {
+    OutcomeType.ACCEPTED: 3,
+    OutcomeType.MODIFIED: 3,
+    OutcomeType.REGRESSION: 3,
+    OutcomeType.INDEPENDENT: 2,
+    OutcomeType.UNVERIFIED: 1,
+}
+_OUTCOME_VALUES = {member.value for member in OutcomeType}
+
 # Per-scope capacity limits
 SCOPE_LIMITS: dict[str, int] = {
     FactScope.GLOBAL.value: 200,    # Cross-project patterns, grows slowly
@@ -1055,6 +1071,11 @@ class FactStore:
 
         return 1.0 - 1.0 / (1.0 + total_quality / reference_quality)
 
+    @staticmethod
+    def _outcome_rank(outcome_type) -> int:
+        """Evidence strength; unknown/absent ranks below everything."""
+        return _OUTCOME_RANK.get(outcome_type, 0)
+
     def _record_attributed_episode_outcome(
         self, outcome, *, fact_id: str = "", operation: str = "",
         append_verification: bool = True,
@@ -1108,12 +1129,36 @@ class FactStore:
                     summary=outcome.outcome_type.value,
                     repository_revision=outcome.repository_revision,
                 ))
-            episode.final_outcome = outcome.outcome_type.value
-            episode.outcome_details.update({
-                "suggestion_id": outcome.suggestion_id,
-                "file_path": outcome.file_path,
-                "repository_revision": outcome.repository_revision,
-            })
+            # Strongest signal wins. One neo invocation commonly suggests both a
+            # code edit and a review/docs path, and `_dedup_outcomes` keys by
+            # path — so BOTH survive into this loop. Assigning unconditionally
+            # let whichever landed last win: dict insertion order puts the weak
+            # UNVERIFIED from the docs path after the git-verified ACCEPTED, and
+            # the episode then reported "unverified" for a run whose code
+            # suggestion was demonstrably accepted. Since review paths are neo's
+            # most common suggestion shape, that under-reported acceptance in
+            # exactly the ledger `neo memory learning-stats` reads — the metric
+            # being used to judge whether the loop works at all.
+            # (Promotion is unaffected: candidate status is matched per
+            # candidate further down, not off final_outcome.)
+            supersedes = self._outcome_rank(outcome.outcome_type) >= self._outcome_rank(
+                OutcomeType(episode.final_outcome)
+                if episode.final_outcome in _OUTCOME_VALUES else None
+            )
+            if supersedes:
+                episode.final_outcome = outcome.outcome_type.value
+            # Guarded by the same rank check as `final_outcome`. Updating
+            # unconditionally produced a self-contradicting record: an episode
+            # reading `final_outcome: "accepted"` while `outcome_details`
+            # named the docs path from the weak UNVERIFIED that lost the
+            # comparison. Half the record describing a different event than the
+            # other half is worse than either half alone.
+            if supersedes:
+                episode.outcome_details.update({
+                    "suggestion_id": outcome.suggestion_id,
+                    "file_path": outcome.file_path,
+                    "repository_revision": outcome.repository_revision,
+                })
             if outcome.outcome_type == OutcomeType.REGRESSION and outcome.diff_summary:
                 episode.outcome_details.update({
                     "evidence_summary": redact_sensitive_text(outcome.diff_summary)[:500],
@@ -2316,7 +2361,10 @@ class FactStore:
         if not dry_run and (stats["linked_updates"] or stats["recorded_without_update"]):
             if stats["linked_updates"]:
                 self.save()
-            self._outcome_tracker._clear_session_log()
+            # Retention-aware: deleting the whole log here would destroy every
+            # pending suggestion, which is the exact failure this command exists
+            # to recover from.
+            self._outcome_tracker.consume_sessions_keeping_pending()
 
         return stats
 

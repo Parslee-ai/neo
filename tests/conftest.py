@@ -3,11 +3,86 @@
 Prevents all tests from touching ~/.neo/ by redirecting Path.home()
 to a temporary directory. This stops tests from corrupting live
 memory files (global_memory.json, local_*.json, facts/).
+
+Patching `Path.home()` is NOT sufficient on its own. Modules across the
+codebase capture their paths in constants evaluated at IMPORT time
+(`SESSIONS_DIR = Path.home() / ".neo" / "sessions"`), and pytest imports every
+module during collection — before any fixture runs. Those constants therefore
+keep pointing at the real home no matter what the fixture does to `Path.home()`.
+
+That was not hypothetical: a run of test_outcomes + test_fact_store +
+test_transcript wrote `~/.neo/constraints/checksums.json` and
+`~/.neo/sessions/watermark_testproj1234.json` into the developer's live state.
+
+`HOME_PATH_CONSTANTS` below re-points each captured constant at the fake home.
+`test_home_isolation.py` asserts the table stays complete, so a newly added
+`Path.home()` constant fails the suite instead of silently leaking.
 """
 
+import importlib
 import site
 import pytest
 from pathlib import Path
+
+# Captured before any fixture patches `Path.home()` or `$HOME`, so tests can
+# still tell where the developer's real state lives.
+REAL_HOME = Path.home()
+
+# (module, attribute, path relative to home). Class attributes use
+# "Class.ATTR" in the attribute slot.
+#
+# Deliberately absent: `store.FASTEMBED_CACHE_DIR`. That is a read-mostly
+# ~400 MB model cache, not neo state — redirecting it to a throwaway home
+# would re-download the model on every test run. `isolate_neo_home` pins it to
+# the real cache on purpose.
+HOME_PATH_CONSTANTS: list[tuple[str, str, str]] = [
+    ("neo.memory.outcomes", "SESSIONS_DIR", ".neo/sessions"),
+    # transcript does `from ...outcomes import SESSIONS_DIR`, which binds a
+    # SECOND name at import time; patching only outcomes leaves this one live.
+    ("neo.memory.transcript", "SESSIONS_DIR", ".neo/sessions"),
+    ("neo.memory.transcript", "CLAUDE_PROJECTS_DIR", ".claude/projects"),
+    ("neo.memory.transcript", "CAR_SESSIONS_DIR", ".car/sessions"),
+    ("neo.memory.transcript", "CODEX_SESSIONS_DIR", ".codex/sessions"),
+    ("neo.memory.store", "FACTS_DIR", ".neo/facts"),
+    ("neo.memory.constraints", "CHECKSUM_DIR", ".neo/constraints"),
+    ("neo.memory.constraints", "CHECKSUM_FILE", ".neo/constraints/checksums.json"),
+    ("neo.memory.seed", "CHECKSUM_DIR", ".neo/constraints"),
+    ("neo.memory.seed", "CHECKSUM_FILE", ".neo/constraints/checksums.json"),
+    ("neo.memory.claude_memory", "CLAUDE_PROJECTS_DIR", ".claude/projects"),
+    ("neo.memory.claude_memory", "CHECKSUM_DIR", ".neo/constraints"),
+    ("neo.memory.claude_memory", "CHECKSUM_FILE", ".neo/constraints/checksums.json"),
+    ("neo.memory.community", "CACHE_DIR", ".neo"),
+    ("neo.memory.community", "CACHE_FILE", ".neo/community_facts_cache.json"),
+    ("neo.memory.community", "CHECKSUM_DIR", ".neo/constraints"),
+    ("neo.memory.community", "CHECKSUM_FILE", ".neo/constraints/checksums.json"),
+    ("neo.prompt.evolution", "EvolutionTracker.EVOLUTION_FILE",
+     ".neo/prompt_evolutions.json"),
+    ("neo.prompt.knowledge_base", "PromptKnowledgeBase.STORAGE_FILE",
+     ".neo/prompt_knowledge.json"),
+    ("neo.prompt.change_detector", "ChangeDetector.WATERMARK_FILE",
+     ".neo/prompt_watermarks.json"),
+    # `os.path.expanduser`, not `Path.home()` — same escape, different spelling.
+    # `_LOCK_PATH` is the observer's cross-process flock target, so a test
+    # reaching `run_daemon` would contend with the developer's live daemon.
+    ("neo.memory.observer", "_CAR_HINT_FLAG", ".neo/.car_observer_hint_shown"),
+    ("neo.memory.observer", "_LOCK_PATH", ".neo/observer.lock"),
+]
+
+# Constants stored as `str`, not `Path`. Patching them with a Path would break
+# callers doing string operations, so the fixture writes back the same type.
+STR_PATH_CONSTANTS = {
+    ("neo.memory.observer", "_CAR_HINT_FLAG"),
+    ("neo.memory.observer", "_LOCK_PATH"),
+}
+
+
+def _resolve_target(module_name: str, attribute: str):
+    """Return (owner, attr_name) so class attributes patch on the class."""
+    owner = importlib.import_module(module_name)
+    *outer, attr_name = attribute.split(".")
+    for part in outer:
+        owner = getattr(owner, part)
+    return owner, attr_name
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +107,18 @@ def isolate_neo_home(tmp_path, monkeypatch):
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("HOME", str(fake_home))  # Also patch $HOME for expanduser()
+
+    # Re-point every path constant captured at import time. Without this the
+    # fixture's promise is false for any module already imported — which, at
+    # collection time, is all of them.
+    for module_name, attribute, relative in HOME_PATH_CONSTANTS:
+        owner, attr_name = _resolve_target(module_name, attribute)
+        value = fake_home / relative
+        if (module_name, attribute) in STR_PATH_CONSTANTS:
+            value = str(value)
+        monkeypatch.setattr(owner, attr_name, value)
+
+    return fake_home
 
 
 @pytest.fixture(autouse=True)
