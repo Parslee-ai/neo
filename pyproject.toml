@@ -135,6 +135,11 @@ packages = ["src/neo"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
+    # Redundant since 0.42.0 — `.coverage` is untracked and gitignored, so it
+    # can no longer reach an sdist. Kept as belt-and-suspenders: this entry was
+    # added to stop a tracked coverage database shipping in the tarball, and
+    # dropping it would silently re-open that path if the file is ever
+    # re-added.
     "/.coverage",
     "/papers",
 ]

@@ -20,6 +20,16 @@ wheels/
 .installed.cfg
 *.egg
 
+# Test and coverage artifacts
+# `.coverage` was tracked from Nov 2025 until 0.42.0 — a 53 KB binary database
+# rewritten on every coverage run. The sdist `exclude` in pyproject exists only
+# because of that; it stays as belt-and-suspenders but is now redundant.
+# `.pytest_cache/` and `.ruff_cache/` are absent here on purpose: each writes
+# its own `.gitignore` containing `*`, so they already self-manage.
+.coverage
+.coverage.*
+htmlcov/
+
 # Virtual environments
 # `.venv/` needs its own entry: `venv/` does not match it, and the Makefile and
 # pre-commit hook both look for `.venv/bin/python` — so the project's own
