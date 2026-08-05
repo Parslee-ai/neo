@@ -284,11 +284,11 @@
   one suggestion would accrue a copy per invocation and bump its fact once per
   copy. `_is_non_git_trackable` is shared by the weak-acceptance detector and
   the retention rule so they can't disagree about what's still worth waiting on.
-  **Test footgun**: `outcomes.SESSIONS_DIR` is resolved at IMPORT time from
-  `Path.home()`, so conftest's per-test home patch does NOT redirect it — every
-  test shares one sessions dir. Tests must use a unique `project_id` or they
-  read each other's leftover session logs (this passed in isolation and failed
-  in the full suite until scoped).
+  **Test note**: `outcomes.SESSIONS_DIR` is resolved at IMPORT time from
+  `Path.home()`. conftest now re-points it (and every other import-time home
+  constant) at the fake home per test — see the home-isolation entry below —
+  but tests sharing a fixed `project_id` still read each other's session logs
+  within a run, so scope by a unique id.
 - Outcomes (`memory.outcomes` + `store.detect_implicit_feedback`):
   ACCEPTED/MODIFIED act on the linked original fact when present — confidence
   +0.2 / −0.2 (both ±arch_mod); ACCEPTED also bumps `success_count` and sets
@@ -525,6 +525,27 @@
   needs session state that doesn't exist. The plugin contract that consumes all
   this lives in `.claude-plugin/agents/neo.md`. See
   `docs/solutions/orchestrator-communication.md`.
+- **Test home isolation is enforced by a table, not by `Path.home()` alone.**
+  conftest patches `Path.home()`, but ~20 constants across the codebase capture
+  their path at IMPORT time (`SESSIONS_DIR = Path.home() / ".neo" / "sessions"`)
+  and pytest imports every module during collection — *before* any fixture
+  runs. The fixture's docstring promise was therefore false, and measurably so:
+  one run of test_outcomes + test_fact_store + test_transcript wrote
+  `~/.neo/constraints/checksums.json` and
+  `~/.neo/sessions/watermark_testproj1234.json` into live developer state.
+  `conftest.HOME_PATH_CONSTANTS` re-points each one at the fake home.
+  **Adding a new import-time `Path.home()` constant WILL fail
+  `test_home_isolation.py`** — that test AST-scans `src/` and asserts the table
+  is complete, which is the durable half; the table alone would rot. The scan
+  strips `lambda`/deferred subtrees, because a `default_factory=lambda:
+  Path.home() / …` resolves at instantiation and is already covered by the
+  `Path.home()` patch (`prompt.scanner.claude_home` is the live example).
+  `store.FASTEMBED_CACHE_DIR` is deliberately EXEMPT — a ~400 MB read-mostly
+  model cache pinned to the real cache so it isn't re-downloaded per run.
+  Note `transcript` does `from ...outcomes import SESSIONS_DIR`, binding a
+  SECOND name that must be patched separately. **Do not** verify isolation by
+  watching the filesystem: the observer daemon writes to `~/.neo` on its own
+  schedule and will produce false positives (it did during this work).
 - **`NeoEngine` is one-request-at-a-time, enforced.** `process()` takes a
   non-blocking `threading.Lock` and raises `EngineBusyError` (a `RuntimeError`
   subclass, so broad handlers still catch it) on overlap; the body moved to
