@@ -149,6 +149,7 @@ def run_server(
             return json.dumps({
                 "error": "MalformedCall",
                 "message": f"daemon delivered non-JSON call payload: {e}",
+                "error_type": type(e).__name__,
             })
 
         tool = call.get("tool")
@@ -156,6 +157,7 @@ def run_server(
             return json.dumps({
                 "error": "UnknownTool",
                 "message": f"this handler only serves {TOOL_NAME!r}, got {tool!r}",
+                "error_type": "UnknownTool",
             })
 
         params = call.get("params") or {}
@@ -163,6 +165,7 @@ def run_server(
             return json.dumps({
                 "error": "BadParams",
                 "message": f"params must be an object, got {type(params).__name__}",
+                "error_type": "TypeError",
             })
 
         try:
@@ -179,6 +182,7 @@ def run_server(
             return json.dumps({
                 "error": "BadParams",
                 "message": "prompt is required and must be a non-empty string",
+                "error_type": "ValueError",
             })
 
         working_dir = neo_input.working_directory or os.getcwd()
@@ -214,9 +218,8 @@ def run_server(
                     "Neo is already processing a request for this working "
                     "directory. Retry when it completes."
                 ),
-                # Carried so a peer can branch on the machine-readable type.
-                # (BadParams and SerializationError still omit it — worth
-                # aligning, but that is a separate change to their contracts.)
+                # Every error response from this handler carries error_type,
+                # so a peer can branch on it without special-casing paths.
                 "error_type": "EngineBusyError",
                 "retryable": True,
                 "working_directory": working_dir,
@@ -236,6 +239,7 @@ def run_server(
             return json.dumps({
                 "error": "SerializationError",
                 "message": str(e),
+                "error_type": type(e).__name__,
             })
 
     cr.register_tool_handler(_handle_call)

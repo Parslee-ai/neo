@@ -3070,56 +3070,6 @@ RULES:
             raise ValueError(f"Invalid time budget for difficulty '{difficulty}': {budget}")
         return budget
 
-    def _check_timeout(self, start_time: float, time_budget: float, phase: str) -> bool:
-        """Return True if timeout exceeded."""
-        elapsed = time.time() - start_time
-        return elapsed > time_budget
-
-    def _timeout_response(
-        self,
-        neo_input: NeoInput,
-        elapsed: float,
-        time_budget: float,
-        phase: str = "unknown"
-    ) -> NeoOutput:
-        """
-        Generate response when time budget is exceeded.
-
-        Provides actionable guidance to user about what to do next.
-
-        Args:
-            neo_input: Original input
-            elapsed: Time elapsed in seconds
-            time_budget: Allocated time budget in seconds
-            phase: Which phase timed out (planning/simulation/etc)
-
-        Design decision: Provide helpful guidance rather than just failing
-        """
-        questions = [
-            f"Time budget exceeded after {elapsed:.1f}s (budget: {time_budget}s)",
-            f"Timeout occurred during: {phase}",
-            "Consider:",
-            "1. Breaking problem into smaller pieces",
-            "2. Providing more specific requirements",
-            "3. Simplifying constraints"
-        ]
-
-        return NeoOutput(
-            plan=[],
-            simulation_traces=[],
-            code_suggestions=[],
-            static_checks=[],
-            next_questions=questions,
-            confidence=0.0,
-            notes=f"Timeout during {phase} phase ({elapsed:.1f}s / {time_budget}s budget)",
-            metadata={
-                "timeout": True,
-                "phase": phase,
-                "elapsed": elapsed,
-                "budget": time_budget
-            }
-        )
-
     def _log_metrics(
         self,
         difficulty: str,
