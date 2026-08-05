@@ -43,7 +43,7 @@ dependencies = [
     # extraction all depend on it. Pinned to the 0.x line of
     # tree-sitter-language-pack — 1.x changed the Parser.parse and
     # Tree.root_node APIs in incompatible ways.
-    "tree-sitter>=0.23,<0.26",
+    "tree-sitter>=0.23,<0.27",
     "tree-sitter-language-pack>=0.13.0,<1.0",
 ]
 
