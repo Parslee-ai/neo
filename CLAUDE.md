@@ -502,6 +502,23 @@
   needs session state that doesn't exist. The plugin contract that consumes all
   this lives in `.claude-plugin/agents/neo.md`. See
   `docs/solutions/orchestrator-communication.md`.
+- **`NeoEngine` is one-request-at-a-time, enforced.** `process()` takes a
+  non-blocking `threading.Lock` and raises `EngineBusyError` (a `RuntimeError`
+  subclass, so broad handlers still catch it) on overlap; the body moved to
+  `_process_guarded`. Nearly all run state lives on the instance
+  (`context`, `current_learning_episode`, `_phase_records`, `_findings`,
+  `_selected_beat`, `resolved_execution_context`, `last_applied_actions`), so
+  concurrent calls would cross-attribute suggestions/facts/episodes between
+  unrelated requests — **silently**, which is why this fails loudly instead.
+  Non-blocking is deliberate: queueing would hide a caller's design bug behind
+  a latency mystery. **This is not theoretical** — `car_host._get_or_create_engine`
+  caches engines per working-dir and REUSES them across calls, relying on CAR's
+  drain task being single-threaded (its own comment calls that "an
+  implementation detail", i.e. upstream and not ours to guarantee). `_handle_call`
+  therefore maps `EngineBusyError` to a distinct retryable `EngineBusy`
+  response — a peer that sees generic `ProcessingError` assumes its own request
+  was malformed and stops retrying. The lock releases in a `finally`, so a
+  failed run doesn't leave the engine permanently busy (pinned by a test).
 - **Host adapters must stay in parity.** There are TWO checked-in integration
   surfaces, and they are easy to miss: `.claude-plugin/` (agent + 6 slash
   commands) and **`plugins/neo/`** (Codex CLI plugin + 6 skills, manifest at

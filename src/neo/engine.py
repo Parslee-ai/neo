@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import textwrap
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -61,6 +62,16 @@ if TYPE_CHECKING:
 
 # Initialize logger
 logger = logging.getLogger(__name__)
+
+
+class EngineBusyError(RuntimeError):
+    """Raised when a second request overlaps on one NeoEngine instance.
+
+    Subclasses `RuntimeError` so existing broad handlers keep working, while
+    callers that can do something smarter — an A2A host answering a peer, say —
+    can catch this specifically and report a retryable condition instead of a
+    malformed-request error.
+    """
 
 
 class NeoEngine:
@@ -121,6 +132,14 @@ class NeoEngine:
         self._selected_beat: Optional[dict[str, Any]] = None
         self._beat_selected = False
         self._recalled_fact_count = 0
+        # One request at a time per engine. Nearly everything a run needs is
+        # per-request instance state (`context`, `current_learning_episode`,
+        # `_phase_records`, `last_applied_actions`, …), so two concurrent
+        # `process()` calls on one instance would interleave into each other —
+        # cross-attributing suggestions, facts and learning episodes between
+        # unrelated requests. That corruption is silent, which is why this
+        # fails loudly instead.
+        self._process_lock = threading.Lock()
 
         # Load beat deck for personality templates (no LLM call)
         self.beat_deck = self._load_beat_deck()
@@ -312,7 +331,30 @@ class NeoEngine:
         7. Run static checks (if time permits)
         8. Store reasoning in persistent memory
         9. Return structured output
+
+        **One request at a time per engine instance.** A run keeps its state on
+        `self`, so overlapping calls would interleave — two requests sharing one
+        learning episode, suggestions attributed to the wrong prompt. Callers
+        serving concurrent requests must construct one engine per in-flight
+        request, or serialize them. Overlap raises `RuntimeError` rather than
+        corrupting quietly.
         """
+        # Non-blocking: a caller that overlaps requests has a design bug, and
+        # silently queueing would hide it behind a latency mystery instead.
+        if not self._process_lock.acquire(blocking=False):
+            raise EngineBusyError(
+                "NeoEngine.process() is already running on this instance. "
+                "A NeoEngine handles one request at a time — its per-request "
+                "state lives on the instance. Construct one engine per "
+                "concurrent request, or serialize the calls."
+            )
+        try:
+            return self._process_guarded(neo_input)
+        finally:
+            self._process_lock.release()
+
+    def _process_guarded(self, neo_input: NeoInput) -> NeoOutput:
+        """`process()` body, with the single-request lock already held."""
         self._validate_operating_mode(neo_input)
         from neo.execution_context import resolve_execution_context
         self.resolved_execution_context = resolve_execution_context(neo_input)
@@ -325,6 +367,7 @@ class NeoEngine:
         self._beat_selected = False
         self._recalled_fact_count = 0
         self.last_applied_actions: list[AppliedAction] = []
+
         self.current_learning_episode = self._begin_learning_episode(neo_input)
         from neo.memory.metrics import record as record_memory_metric
         record_memory_metric(
