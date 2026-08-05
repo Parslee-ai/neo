@@ -1,4 +1,4 @@
-.PHONY: help install install-dev test format lint hooks ci-local clean
+.PHONY: help install install-dev test format lint hooks ci-local clean sync-version
 
 # Prefer the project venv over whatever happens to be on PATH. A system-wide
 # `ruff` is routinely a different version from the pinned one, and linting with
@@ -13,6 +13,7 @@ help:
 	@echo "  make test          - Run all tests"
 	@echo "  make format        - Format code with black"
 	@echo "  make lint          - Lint code with ruff"
+	@echo "  make sync-version  - Propagate pyproject's version to the derived files"
 	@echo "  make hooks         - Enable the pre-commit hook (run once per clone)"
 	@echo "  make ci-local      - Run exactly what CI runs, before pushing"
 	@echo "  make clean         - Clean up generated files"
@@ -30,14 +31,19 @@ format:
 	$(PYTHON) -m black src/ tests/
 
 lint:
-	$(PYTHON) -m ruff check src/ tests/
+	$(PYTHON) -m ruff check src/ tests/ tools/
+
+# Bump `version` in pyproject.toml, then run this. The plugin manifests and
+# __version__ are derived, never hand-edited.
+sync-version:
+	$(PYTHON) tools/sync_version.py
 
 hooks:
 	git config core.hooksPath .githooks
 	@echo "pre-commit hook enabled (.githooks). It runs the same lint + tests as CI."
 
 ci-local:
-	$(PYTHON) -m ruff check src/ tests/
+	$(PYTHON) -m ruff check src/ tests/ tools/
 	$(PYTHON) -m pytest -q
 
 clean:
