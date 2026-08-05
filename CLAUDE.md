@@ -502,6 +502,27 @@
   needs session state that doesn't exist. The plugin contract that consumes all
   this lives in `.claude-plugin/agents/neo.md`. See
   `docs/solutions/orchestrator-communication.md`.
+- **Host adapters must stay in parity.** There are TWO checked-in integration
+  surfaces, and they are easy to miss: `.claude-plugin/` (agent + 6 slash
+  commands) and **`plugins/neo/`** (Codex CLI plugin + 6 skills, manifest at
+  `plugins/neo/.codex-plugin/plugin.json`, registered by
+  `.agents/plugins/marketplace.json`). `.agents/skills/` holds RELEASE
+  maintenance skills, not the Neo capabilities — looking there and concluding
+  the Codex plugin is missing is a documented wrong turn. Neither adapter owns
+  an output format: both invoke `neo --json` and read the same `orchestrator`
+  envelope. When the contract changes, BOTH change — the Codex skills sat on
+  "parse the four structured sections: CONFIDENCE, PLAN, SIMULATIONS, CODE
+  SUGGESTIONS" while the Claude side had already moved to `--json`.
+  `tests/test_host_adapter_parity.py` pins it: both surfaces expose the same
+  six capabilities, invoke `--json`, teach `orchestrator.summary`/`cautions`,
+  document the error shape and attribution, and use phase/event names that
+  actually exist in `events.py`. It also pins that both plugin manifests match
+  the `pyproject.toml` version — `prepare-release` documents bumping them, but
+  a documented step with no enforcement gets skipped (they had reached 0.19.0 /
+  0.37.0 / 0.41.0). Role differs even though protocol does not: Claude Code
+  delegates to Neo as a subagent (visible boundary), Codex calls Neo mid-loop
+  (no boundary), so the Codex skills carry stronger attribution wording and an
+  explicit "Neo's result is an input, not the deliverable".
 - CarAdapter defaults `intent_hint={"task":"code","prefer_quality":True}` so CAR's router
   routes neo to the most capable model, not the chat/cost default. This is the *intended*
   router API, not a hack:

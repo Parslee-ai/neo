@@ -18,7 +18,7 @@ When the user invokes this skill (`$neo-pattern <code reference or description>`
 4. **Invoke Neo with a pattern-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo --mode learn <<'QUERY'
+   neo --json --mode learn <<'QUERY'
    <Extract a reusable pattern from> | <Find code matching this pattern>:
 
    <code or description here>
@@ -28,6 +28,32 @@ When the user invokes this skill (`$neo-pattern <code reference or description>`
    ```
 
 5. **Present the pattern with concrete examples.** A named pattern with two example sites is more useful than an abstract description of one.
+
+## Reading Neo's output
+
+Invoke with `--json`. stdout is exactly one JSON document; stderr is JSONL
+progress events (parse lines starting with `{`, ignore the rest). Never parse
+the human-readable text output. On failure stdout is `{"error": ...}` with no
+`orchestrator` key — check for `error` first.
+
+Lead with `orchestrator.summary`, surface every entry in
+`orchestrator.cautions`, and relay `orchestrator.personality` verbatim when
+present. Neo writes in the first person and his register shifts with how much
+he remembers about this project — keep his wording rather than translating it
+into yours. See the `$neo` skill for the full contract.
+
+**Attribute explicitly and keep going.** You are calling Neo inside your own
+coding loop, so nothing marks where his reasoning ends and yours begins — say
+"Neo found …" and keep your own analysis in your own voice. His result is an
+input, not the deliverable: continue the task and report the combined outcome.
+
+For pattern extraction specifically: cite the instances the pattern was drawn
+from — a "pattern" with one example is an anecdote, so say how many occurrences
+Neo actually saw. Report `memory_found` when the pattern matched something Neo
+already knew; recurrence across sessions is the strongest signal available here.
+Be accurate about learning: this run records an episode **candidate**, not a
+durable fact. Promotion needs two independent git-verified acceptances. Do not
+tell the user Neo "learned" this.
 
 ## Notes
 

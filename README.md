@@ -399,6 +399,16 @@ The plugin wraps the local `neo` CLI, so the binary must be installed first (`pi
 
 Plugin sources live under [`plugins/neo/`](plugins/neo/) — see the manifest and skill definitions.
 
+Both plugins consume the **same host-neutral contract**: the skills invoke
+`neo --json` and read the `orchestrator` envelope described under
+[Orchestrator output](#orchestrator-output). Neither hosts its own output
+format, and `tests/test_host_adapter_parity.py` fails if one surface teaches a
+contract the other does not. The difference is role, not protocol — under
+Claude Code, Neo is usually a delegated subagent with a visible boundary;
+under Codex, Neo is a step inside the same coding loop, which is why the Codex
+skills insist on explicit attribution and on continuing the task rather than
+treating Neo's answer as the deliverable.
+
 
 ## Works Alongside Your AI Tools
 
