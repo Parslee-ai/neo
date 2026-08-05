@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.42.0] - 2026-08-05
+
+### Added
+
+- **Neo can now tell a host what it is doing.** `engine.py` previously made *zero* `print`/stderr calls, so an orchestrator (Claude Code, Codex, an IDE, an MCP server) saw nothing between invoking Neo and receiving the final `NeoOutput`. Worse, the Claude Code plugin instructed the agent to parse Neo's **human-readable text output** — reverse-engineering presentation out of terminal formatting while a fully structured document sat one flag away.
+
+  New `neo.events` module: `NeoEventType`, `NeoEvent`, a `NeoEventSink` Protocol, and `Null`/`Recording`/`Jsonl` sinks. `NeoOutput` gains an `orchestrator` envelope (`summary`, `personality`, `phase_summary`, `cautions`, `recommended_narration`) derived from state already computed — no LM call, no new analysis. The governing rule is that **Neo reports facts about its process and the host decides how and when they become conversation**; no host-specific wording lives in the engine.
+
+  `--json` now writes two streams: stdout is exactly **one** JSON document (so `neo --json | jq` keeps working) and stderr is JSONL progress events. They are deliberately not interleaved — the old `--json` help text promised events on one stream and honoring that literally would have broken every existing consumer. (`events.py`, `engine.py`, `models.py`, `cli.py`)
+
+- **Four invariants over the event stream**, each pinned by a test: findings are emitted *before* their phase closes; no event may claim a phase that has already closed; every `phase_completed` has a matching `phase_started`; and every run terminates with exactly one `completed` or `failed`. Emitting `started` and then going silent was worse than emitting nothing — a host cannot distinguish a crash from a hang.
+
+- **Neo speaks as Neo, and the register follows memory level.** All user-facing wording now comes from `orchestrator_voice` in `neo_matrix.yaml` via `_voice(key, **fmt)`; `engine.py` holds no prose of its own, so the character can be retuned without editing code (`test_engine_holds_no_prose_of_its_own` pins that). The same facts render as `Don't know this code. I'd change 1 thing(s) in src/parser.py, maybe. Confidence 0.88.` at memory stage 1 and `src/parser.py. 1 change(s). 0.88.` at stage 5. Cautions and progress messages deliberately do **not** vary by stage: a host is told never to drop a caution, so a warning must read the same however terse Neo is. Voice is not licence to soften a fact.
+
+### Fixed
+
+- **`repair_loop` had been dead since the initial public release.** It imported `structured_parser` and `schemas` *unqualified*, which can never resolve inside the installed package. Every repair attempt died on `ModuleNotFoundError` — and the attempt loop's `except` swallowed it into a generic "failed to repair after 2 attempts", so the feature looked ineffective rather than broken. Nothing tested it; `tests/test_repair_loop.py` now does. (`repair_loop.py`)
+
+- **The Codex plugin never learned the new contract.** All six skills under `plugins/neo/` still ran `neo --mode advise` and told the model to parse "four structured sections: `CONFIDENCE`, `PLAN`, `SIMULATIONS`, `CODE SUGGESTIONS`" out of terminal-formatted prose — the exact anti-pattern removed from the Claude side. One adapter got the change and the other silently did not. The contract itself was already host-neutral, so only the adapter needed updating. `tests/test_host_adapter_parity.py` now fails if one surface teaches a contract the other does not. (`plugins/neo/skills/*`)
+
+- **`--quiet` was declared and never read**, so the `[Neo]` progress notices could not be turned off — which is why stderr under `--json` was a mixed stream every host had to filter. Notices now route through the new `neo.progress` module instead of bare `print(file=sys.stderr)` calls scattered across `context_gatherer`, and `--json` implies `--quiet`. Index-command *errors* stay unsuppressed: `--quiet` silences progress, not failures. (`progress.py`, `cli.py`, `context_gatherer.py`)
+
+- **Concurrent `process()` calls on one `NeoEngine` are now rejected instead of corrupting state.** Nearly all run state lives on the instance, so overlapping calls cross-attributed suggestions, facts and learning episodes between unrelated requests — silently. `process()` takes a non-blocking lock and raises `EngineBusyError`; the lock releases in a `finally` so a failed run leaves the engine reusable. This is not theoretical: `car_host` caches engines per working directory and reuses them, relying on CAR's drain task being single-threaded, which its own comment calls "an implementation detail". The A2A host now answers an overlap with a retryable `EngineBusy` response rather than a stack trace — a peer seeing a generic `ProcessingError` would assume its own request was malformed and stop retrying. (`engine.py`, `car_host.py`)
+
+- **The version is single-sourced.** It was written down in four files and `prepare-release` asked a human to edit all four by hand, which is how the package, the Claude manifest and the Codex manifest reached 0.41.0 / 0.37.0 / 0.19.0. `pyproject.toml` is now the source of truth and `make sync-version` propagates it; a release bump edits one file. Edits are surgical regex replacements rather than `json.dumps` re-serialization, so a version bump stays a one-line diff instead of a whole-file reformat, and only the first `"version"` key is rewritten so a nested one cannot be clobbered. (`tools/sync_version.py`)
+
+- Guarded an unreachable-but-fatal `elapsed / time_budget` division in the static-check skip log. A zero budget is not reachable through `_get_time_budget` today, but a *log line* must never be what crashes a run. (`engine.py`)
+
+### Changed
+
+- `tools/` is now covered by lint. The Makefile, CI and the pre-commit hook all ran `ruff check src/ tests/`, so a dead `import time` had been sitting in `tools/ab_controlled.py` — and `tools/` is where the new release script lives. All four invocations must stay identical or local green stops predicting CI green. (`Makefile`, `.github/workflows/ci.yml`, `.githooks/pre-commit`)
+
+- `.gitignore` gained `.venv/`. Only `venv/` was listed, which does not match it, while the Makefile and the pre-commit hook both look for `.venv/bin/python` — the project's own convention was one `git add -A` away from committing an entire interpreter.
+
+- The first pipeline phase is named `context`, not `retrieval`: it covers file gathering only, and fact retrieval actually runs while `reasoning` is open. A phase whose name overstates its span forces every emitter inside it to either lie or compensate.
+
 ## [0.41.0] - 2026-07-26
 
 ### Fixed

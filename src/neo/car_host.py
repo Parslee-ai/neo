@@ -111,6 +111,14 @@ def run_server(
     # resolved working_directory string; lock-guarded for the rare
     # concurrent first-call case (CAR's drain task is single-threaded
     # today but that's an implementation detail).
+    #
+    # That last point is load-bearing and NOT ours to guarantee: engines are
+    # reused across calls, and `NeoEngine.process()` handles one request at a
+    # time because a run's state lives on the instance. If CAR ever drains
+    # concurrently, the second overlapping call for the same cwd raises
+    # `EngineBusyError` rather than interleaving two requests' learning
+    # episodes; `_handle_call` turns that into a retryable `EngineBusy`
+    # response instead of a stack trace.
     engines: dict[str, "NeoEngine"] = {}
     engines_lock = threading.Lock()
 
@@ -175,9 +183,29 @@ def run_server(
 
         working_dir = neo_input.working_directory or os.getcwd()
 
+        # Imported here, not at module scope: `neo.engine` is heavy and this
+        # host defers it (see the TYPE_CHECKING guard above). By this point the
+        # engine factory has already imported it, so this is a dict lookup.
+        from neo.engine import EngineBusyError
+
         try:
             engine = _get_or_create_engine(working_dir)
             output = engine.process(neo_input)
+        except EngineBusyError:
+            # Engines are cached per cwd, so an overlapping call for the same
+            # codebase hits the single-request guard. Report it as a distinct,
+            # retryable condition — a peer that sees "ProcessingError" will
+            # assume its own request was malformed and stop retrying.
+            logger.warning("concurrent request for %s rejected as busy", working_dir)
+            return json.dumps({
+                "error": "EngineBusy",
+                "message": (
+                    "Neo is already processing a request for this working "
+                    "directory. Retry when it completes."
+                ),
+                "retryable": True,
+                "working_directory": working_dir,
+            })
         except Exception as e:
             logger.exception("NeoEngine.process raised")
             return json.dumps({

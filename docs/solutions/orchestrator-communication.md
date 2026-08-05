@@ -312,12 +312,20 @@ proven non-None at that point.
 - A `Bash` tool call does not stream, so JSONL buys accurate **post-hoc**
   narration, not a live progress bar. Nothing short of a hook or an MCP server
   changes that. `JsonlSink` still flushes per event, for hosts that can stream.
-- `NeoEngine` is single-request-at-a-time. `_phase_records` / `_findings` /
+- `NeoEngine` is single-request-at-a-time, and this is now **enforced**, not
+  merely documented: `process()` takes a non-blocking lock and raises
+  `EngineBusyError` on overlap. `_phase_records` / `_findings` /
   `_selected_beat` are per-request instance state, following the same pattern as
-  `self.context`, `last_applied_actions`, and `current_learning_episode` — so
-  this adds no new class of bug, but hosts are exactly the population likely to
-  share one engine across a thread pool. The `StructuredOverseer` watchdog is
-  *not* a hazard: it only reads `action_log`.
+  `self.context`, `last_applied_actions`, and `current_learning_episode`, so
+  overlapping runs would cross-attribute suggestions and learning episodes
+  between unrelated requests — silently. `neo.car_host` caches engines per
+  working directory and reuses them, relying on CAR's drain task being
+  single-threaded, which its own comment calls "an implementation detail"; that
+  detail is upstream and not ours to guarantee, so the host now answers an
+  overlap with a retryable `EngineBusy` response rather than a stack trace.
+  Non-blocking on purpose: queueing would hide a caller's design bug behind a
+  latency mystery. The `StructuredOverseer` watchdog is *not* a hazard — it only
+  reads `action_log`.
 - `_timeout_response` builds a bare `NeoOutput` and so carries an empty
   orchestrator envelope. It is currently unreachable (neither it nor
   `_check_timeout` has a caller); wire the message in if it is ever revived.
