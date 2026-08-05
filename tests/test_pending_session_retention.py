@@ -236,6 +236,75 @@ def test_sessions_with_no_suggestions_are_not_retained(repo):
     assert not Path(tracker._session_log_path).exists()
 
 
+def test_an_accepted_suggestion_never_comes_back_as_independent(repo):
+    """The regression the reduction introduced.
+
+    Resolved suggestions are dropped from the retained record so they cannot
+    re-match. But `_match_to_suggestions` builds its "ours" set from that same
+    list, and the scan anchor stayed pinned to the original session — so on the
+    next run git still reported the file changed, it was no longer recognized
+    as suggested, and it landed in the independent branch. neo then recorded
+    "user changed a file neo didn't suggest" about a file neo suggested and the
+    user demonstrably applied, on every invocation until the 14-day TTL.
+
+    Only a SECOND detect_outcomes() call exposes it; every earlier retention
+    test stopped after one round.
+    """
+    tracker = _tracker(repo)
+    (repo / "src" / "bar.py").write_text("def g():\n    return 2\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add bar")
+    time.sleep(TICK)
+
+    tracker.save_session(
+        [_Suggestion("src/foo.py"), _Suggestion("src/bar.py")], "fix both", {},
+    )
+    time.sleep(TICK)
+    _apply_the_suggestion(repo)  # applies src/foo.py only
+
+    first, _ = tracker.detect_outcomes()
+    assert any(
+        o.outcome_type is OutcomeType.ACCEPTED and o.file_path == "src/foo.py"
+        for o in first
+    )
+
+    for round_number in (2, 3):
+        later, _ = tracker.detect_outcomes()
+        offenders = [
+            o.file_path for o in later
+            if o.outcome_type is OutcomeType.INDEPENDENT
+            and o.file_path.endswith("foo.py")
+        ]
+        assert not offenders, (
+            f"round {round_number}: accepted suggestion re-reported as "
+            f"independent: {offenders}"
+        )
+
+
+def test_the_scan_anchor_advances_so_work_does_not_repeat(repo):
+    """The other half of the same root cause.
+
+    A retained record kept querying from the original suggestion time, so every
+    later invocation re-scanned the whole window and re-forked git per changed
+    file — measured at seconds per invocation, persisting for the full TTL,
+    where before the (buggy) clearing made it decay to zero.
+    """
+    tracker = _tracker(repo)
+    tracker.save_session(
+        [_Suggestion("src/foo.py"), _Suggestion("src/bar.py")], "fix both", {},
+    )
+    time.sleep(TICK)
+    _apply_the_suggestion(repo)
+
+    tracker.detect_outcomes()
+
+    retained = json.loads(Path(tracker._session_log_path).read_text().strip())
+    assert retained["scanned_through"] > retained["timestamp"], (
+        "the scan anchor never advanced; the window re-scans forever"
+    )
+    assert "src/foo.py" in retained["resolved_paths"]
+
+
 def test_a_weak_outcome_cannot_overwrite_a_verified_one():
     """`final_outcome` must report the strongest evidence in the batch.
 

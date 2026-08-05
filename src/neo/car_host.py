@@ -214,8 +214,9 @@ def run_server(
                     "Neo is already processing a request for this working "
                     "directory. Retry when it completes."
                 ),
-                # Every other error path carries error_type; a peer parsing
-                # them uniformly shouldn't hit a missing key on this one.
+                # Carried so a peer can branch on the machine-readable type.
+                # (BadParams and SerializationError still omit it — worth
+                # aligning, but that is a separate change to their contracts.)
                 "error_type": "EngineBusyError",
                 "retryable": True,
                 "working_directory": working_dir,

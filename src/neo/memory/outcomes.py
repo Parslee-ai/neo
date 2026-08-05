@@ -206,6 +206,19 @@ class SessionRecord:
     repository_revision: str = ""
     retrieved_fact_ids: list[str] = field(default_factory=list)
     used_fact_ids: list[str] = field(default_factory=list)
+    # How far this record has already been scanned for outcomes. Set when a
+    # partially-resolved session is retained; queries then start here rather
+    # than at `timestamp`. Without it a retained record re-scans the whole
+    # window since the suggestion on every invocation, forever, because the
+    # anchor never advances — measured at ~8s per invocation, persisting for
+    # the full 14-day TTL.
+    scanned_through: float = 0.0
+    # Paths this session suggested that already produced an outcome. Retained
+    # even though their suggestions are dropped, so the independent-change
+    # detector still recognizes them as ours. Otherwise an ACCEPTED suggestion
+    # comes back as INDEPENDENT — "user changed a file neo didn't suggest" —
+    # naming a file neo suggested and the user demonstrably applied.
+    resolved_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -599,6 +612,11 @@ class OutcomeTracker:
         sessions = self._load_unprocessed_sessions(include_fallback=include_fallback)
         if not sessions:
             logger.debug("No unprocessed sessions found for outcome detection")
+            # Reset explicitly: a stale _last_pending from an earlier call would
+            # otherwise be what a later consume_sessions_keeping_pending() writes
+            # back. Unreachable today only because replay gates on non-zero
+            # stats — make it structural, not incidental.
+            self._last_pending = []
             return [], {}
 
         all_outcomes: list[Outcome] = []
@@ -609,6 +627,10 @@ class OutcomeTracker:
         # a measured 0.88s of pure `git` forking at 40 pending sessions, on the
         # request hot path, growing linearly.
         working_tree = self._get_working_tree_changes()
+        # Watermark stamped onto retained records. Backed off a little because
+        # `git log --since` is second-granular: anchoring exactly at "now"
+        # could skip a commit made in this same second.
+        scan_started = time.time() - self.SCAN_WATERMARK_SKEW_SECONDS
         # Sessions whose suggestions are still awaiting a user action. Retained
         # rather than cleared — see the note at the clearing step below.
         pending: list[SessionRecord] = []
@@ -623,8 +645,12 @@ class OutcomeTracker:
             # sessions never reach the git-matching branch.
             merged_fact_ids.update(prev.suggestion_fact_ids)
 
+            # Start from how far this record has already been scanned, not from
+            # when the suggestion was made. A retained record's anchor never
+            # advances otherwise: it re-queries the whole window every run.
+            since = max(prev.timestamp, prev.scanned_through)
             changed_files = self._get_changed_files_since(
-                prev.timestamp, working_tree=working_tree
+                since, working_tree=working_tree
             )
 
             # Retain a REDUCED record holding only what is still outstanding.
@@ -632,7 +658,16 @@ class OutcomeTracker:
             # already-resolved suggestion on each later invocation.
             remaining = self._unresolved_suggestions(prev, changed_files)
             if remaining and not self._session_expired(prev):
-                pending.append(replace(prev, suggestions=remaining))
+                resolved_now = [
+                    s.get("file_path", "") for s in prev.suggestions
+                    if s.get("file_path") and s not in remaining
+                ]
+                pending.append(replace(
+                    prev,
+                    suggestions=remaining,
+                    scanned_through=scan_started,
+                    resolved_paths=sorted(set(prev.resolved_paths) | set(resolved_now)),
+                ))
 
             if not changed_files:
                 continue
@@ -828,6 +863,12 @@ class OutcomeTracker:
     # retaining it would grow the log without bound.
     PENDING_SESSION_TTL_SECONDS = 14 * 24 * 3600
 
+    # `git log --since` resolves to whole seconds, so a watermark set at exactly
+    # "now" can miss a commit landing in the same second. Back it off slightly;
+    # the cost of overlap is re-seeing a change, which `resolved_paths` and the
+    # per-path resolution check already absorb.
+    SCAN_WATERMARK_SKEW_SECONDS = 2
+
     _NON_TRACKABLE_PATHS = frozenset({"/dev/null"})
 
     def _is_non_git_trackable(self, file_path: str, normalized: str) -> bool:
@@ -886,10 +927,15 @@ class OutcomeTracker:
         """Replace the log with `keep`.
 
         Read-modify-write across processes, so it holds the same per-scope lock
-        `FactStore.save()` uses. Two `neo` invocations on one project otherwise
-        interleave, and a `save_session` append landing between another
-        process's read and its replace is erased without trace — precisely the
-        loss this whole change exists to prevent.
+        `FactStore.save()` uses. That serializes rewrite against rewrite.
+
+        It does NOT close the read-modify-write window: `_load_unprocessed_sessions`
+        reads without the lock and `save_session` appends without it, so a peer
+        process saving a session between another's read and its replace is still
+        erased. Closing that needs the lock extended over the read and taken by
+        `save_session` too — deliberately not done here, because it widens a
+        lock across LM-bound work in `replay_linked_feedback`. Documented rather
+        than silently overclaimed.
 
         Durability: temp file + `os.replace`, with `flush`+`fsync` before the
         rename so a machine crash can't leave a rename pointing at unwritten
@@ -1141,10 +1187,19 @@ class OutcomeTracker:
         # Detect independent changes (user changed files neo didn't suggest).
         # Rate-limited: keep only the top MAX_INDEPENDENT_OUTCOMES by diff size
         # to avoid flooding facts with low-value noise in active repos.
+        # Paths already resolved for this session count as ours. They are no
+        # longer in `session.suggestions` (dropped on retention so they cannot
+        # re-match), so without this an ACCEPTED suggestion reappears here as
+        # INDEPENDENT — a record asserting neo never suggested a file it did.
+        known_ours = set(suggested_files)
+        for path in session.resolved_paths:
+            known_ours.add(path)
+            known_ours.add(self._normalize_path(path))
+
         independent_candidates: list[Outcome] = []
         for changed in changed_files:
             normalized = self._normalize_path(changed)
-            if normalized not in suggested_files and changed not in suggested_files:
+            if normalized not in known_ours and changed not in known_ours:
                 if self._is_code_file(changed):
                     diff = self._get_file_diff_since(changed, session.timestamp)
                     if not diff:
