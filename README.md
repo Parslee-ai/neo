@@ -371,15 +371,23 @@ Plugin sources live under [`.claude-plugin/`](.claude-plugin/) — `plugin.json`
 
 ## Codex Plugin
 
-Neo ships as a **Codex plugin** with the same six skills, packaged for [OpenAI Codex CLI](https://developers.openai.com/codex/plugins). Add the marketplace and install Neo from Codex's plugin directory:
+Neo ships as a **Codex plugin** with the same six skills, packaged for [OpenAI Codex CLI](https://developers.openai.com/codex/plugins). Installing takes **two** steps — registering the marketplace does not install the plugin:
 
 ```bash
-# Add Parslee's hosted marketplace
+# 1. Register the marketplace (names it `neo-local`)
 codex plugin marketplace add Parslee-ai/neo
 
-# Or, from a local checkout, point Codex at the in-tree marketplace
+# ...or, from a local checkout, point Codex at the in-tree marketplace
 codex plugin marketplace add ./
+
+# 2. Install the plugin from it
+codex plugin add neo@neo-local
 ```
+
+Verify with `codex plugin list` — you want `neo@neo-local  installed, enabled`.
+Stopping after step 1 leaves a registered marketplace and **no installed
+plugin**, which looks like success and provides no skills. The subcommand is
+`add`, not `install`.
 
 Once installed:
 
