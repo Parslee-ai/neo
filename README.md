@@ -617,7 +617,7 @@ Neo is one binary with a plain-text prompt plus a handful of subcommands. Run
 | `--mode {advise,patch,verify,learn,agent}` | Operating mode; default `learn` — see [Operating Modes](#operating-modes) |
 | `--fast` / `--deep` | Force the single-call path / force multi-agent deliberation (default is `auto`, which gates on novelty + CAR availability) |
 | `--dry-run` | Assemble and print the full context, then exit without an LLM call |
-| `--json` | Emit JSONL progress events plus a final JSON object (also the JSON *input* path) |
+| `--json` | JSONL progress events on **stderr**, one final JSON object on **stdout** (also the JSON *input* path) — see [Orchestrator output](#orchestrator-output) |
 | `--output-schema NAME_OR_PATH` | Constrain the shape of the final JSON response |
 | `--index` / `--update` / `--languages CSV` | Build, incrementally refresh, and scope the per-project semantic index |
 | `--semantic` | Use the semantic index for file selection (requires `.neo/index.json`) |
@@ -655,6 +655,61 @@ workspace-rooted authority policy and a host-provided execution adapter. Neo has
 no built-in shell or repository executor, never invokes generated command
 strings, and the standalone CLI fails closed for `agent`. See the
 [operating-mode contract](docs/solutions/operating-modes.md).
+
+### Orchestrator output
+
+`--json` writes two streams so a host can narrate a run instead of waiting on a
+black box:
+
+- **stdout** — exactly one JSON document. Safe to pipe: `neo --json … | jq`.
+- **stderr** — JSONL lifecycle events, one object per line, flushed as they happen.
+
+```bash
+neo --json --mode advise "why is the parser crashing on empty input?"
+```
+
+```jsonc
+// stderr, as the run progresses
+{"type":"phase_completed","phase":"context","message":"Read 25 file(s) of context.","data":{"status":"complete"}}
+{"type":"phase_started","phase":"reasoning","message":"Planning, simulating, and drafting changes."}
+{"type":"memory_found","phase":"reasoning","message":"Recalled 20 relevant fact(s) from memory.","data":{"count":20}}
+{"type":"risk_found","phase":"reasoning","message":"callers may not handle None","data":{"source":"simulation"}}
+{"type":"completed","message":"…","data":{"confidence":0.9,"elapsed_seconds":25.98}}
+```
+
+Event types: `started`, `phase_started`, `phase_completed`, `memory_found`,
+`hypothesis_formed`, `hypothesis_rejected`, `risk_found`, `personality_beat`,
+`completed`, `failed`. Exactly one of `completed` or `failed` terminates every
+run; on `failed`, stdout is an `{"error": …}` object with no `orchestrator` key.
+
+Phase names are stable: `context`, `reasoning`, `static_checks`. `context`
+covers file gathering only — fact retrieval runs during `reasoning`, which is
+why `memory_found` above carries `phase: reasoning`.
+
+stderr is a **mixed** stream — it also carries `[Neo]` progress lines and
+library warnings. Parse lines beginning with `{` and ignore the rest.
+
+The stdout document adds an `orchestrator` object stating what the run did, so
+a host doesn't have to infer presentation from raw plans and traces:
+
+```json
+{
+  "orchestrator": {
+    "summary": "Neo reasoned over the request and proposes 1 change(s) in src/parser.py. Confidence 0.90.",
+    "personality": "I've seen this shape before. Let me use what I remember.",
+    "phase_summary": [{"name": "reasoning", "status": "complete", "message": "…"}],
+    "cautions": ["Simulation surfaced 1 issue(s) with the proposed approach."],
+    "recommended_narration": ["Read 25 file(s) of context.", "…"]
+  }
+}
+```
+
+`cautions` is the field to never drop — low confidence, failed checks, and open
+questions live there. `personality` is present only when a beat matched and,
+for beats that claim insight, only when the run actually found something; there
+is no fallback line. Embedding hosts should read
+[the presentation contract](.claude-plugin/agents/neo.md) and
+[the design notes](docs/solutions/orchestrator-communication.md).
 
 ### Goal-aware agent-loop envelope
 

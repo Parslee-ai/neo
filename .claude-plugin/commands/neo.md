@@ -35,6 +35,20 @@ Neo will:
 This command uses `advise` mode. It reads and retrieves memory but does not create
 learning candidates, modify repository files, or execute commands.
 
+## Presentation
+
+Invoke with `--json` and follow the agent's communication protocol
+(`agents/neo.md`):
+
+- Say what you are asking Neo before invoking it.
+- Lead with `orchestrator.summary`, then the answer.
+- Surface every entry in `orchestrator.cautions`.
+- Relay `orchestrator.personality` verbatim when present, attached to the
+  finding that earned it. Say nothing in its place when it is absent.
+- Attribute clearly. "Neo found…" and "Looking at this myself…" are different
+  claims with different reliability, and the user needs to be able to tell
+  them apart.
+
 ## Parameters
 
 - `<question>` - Your question or task description (required)

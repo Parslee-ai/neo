@@ -283,6 +283,32 @@ class StaticCheckResult:
 
 
 @dataclass
+class OrchestratorMessage:
+    """What a host should say about this run, derived from what Neo did.
+
+    Everything here is redundant with the rest of NeoOutput — that is the
+    point. Without it a host has to reverse-engineer presentation out of raw
+    plans and simulation traces, and each host reinvents that badly. Neo states
+    the facts about its own process once; the host decides which reach the user.
+    """
+
+    summary: str = ""
+    """One or two sentences: what Neo did and what it concluded."""
+
+    personality: str = ""
+    """An in-voice line, present only when a beat is tied to a real finding."""
+
+    phase_summary: list[dict[str, Any]] = field(default_factory=list)
+    """Per-phase {name, status, message} records, in execution order."""
+
+    cautions: list[str] = field(default_factory=list)
+    """Things a host should not let a confident-sounding answer bury."""
+
+    recommended_narration: list[str] = field(default_factory=list)
+    """Suggested progress lines. Advisory — the host owns final wording."""
+
+
+@dataclass
 class NeoOutput:
     """Output payload back to the CLI tool."""
     plan: list[PlanStep]
@@ -296,6 +322,7 @@ class NeoOutput:
     goal_assessment: Optional[GoalAssessment] = None
     strategy_assessment: Optional[StrategyAssessment] = None
     recommended_next_action: dict[str, Any] = field(default_factory=dict)
+    orchestrator: OrchestratorMessage = field(default_factory=OrchestratorMessage)
 
 
 class RegenerateStats(TypedDict):

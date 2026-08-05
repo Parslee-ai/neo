@@ -426,7 +426,8 @@ def parse_args():
     )
 
     p.add_argument("prompt", nargs="?", help="Plain text prompt (or use stdin)")
-    p.add_argument("--json", action="store_true", help="Print JSONL events and final JSON")
+    p.add_argument("--json", action="store_true",
+                   help="Emit JSONL progress events on stderr and the final JSON result on stdout")
     p.add_argument("--output-schema", metavar="NAME_OR_PATH", help="Control final response shape")
     p.add_argument("--max-bytes", type=int, default=300_000, help="Hard cap for total context bytes")
     # Default is None, not a number, because this flag feeds two different
@@ -1007,10 +1008,15 @@ def main():
 
     # Create engine and process (with codebase root for per-codebase learning)
     try:
+        # Progress events go to stderr, never stdout. stdout stays exactly one
+        # JSON document so `neo --json | jq` and every existing consumer keeps
+        # working; a host that wants live progress reads the other stream.
+        from neo.events import JsonlSink
         engine = NeoEngine(
             lm_adapter=adapter,
             codebase_root=neo_input.working_directory,
-            config=config
+            config=config,
+            event_sink=JsonlSink(sys.stderr) if args.json else None,
         )
         output = engine.process(neo_input)
     except TimeoutError as e:
@@ -1140,6 +1146,7 @@ def main():
                 if output.strategy_assessment else None
             ),
             "recommended_next_action": output.recommended_next_action,
+            "orchestrator": asdict(output.orchestrator),
         }
 
         # Add confidence interpretation for better UX
@@ -1160,6 +1167,14 @@ def main():
             print("\n" + "="*80)
             print(f"CONFIDENCE: {output.confidence:.2f}")
             print("="*80)
+
+            # The same summary a host would relay, so the terminal reader and
+            # the orchestrated reader are told the same story.
+            if output.orchestrator.summary:
+                print(f"\n{output.orchestrator.summary}")
+            if output.orchestrator.cautions:
+                for caution in output.orchestrator.cautions:
+                    print(f"  ! {caution}")
 
             if output.notes:
                 print(f"\n{output.notes}\n")

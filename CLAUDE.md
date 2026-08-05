@@ -420,6 +420,66 @@
   fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
   the LM, then exits without making the LLM call. Faster iteration on context-gatherer
   and retrieval changes than waiting for an inference round trip.
+- Host communication (`neo.events` + `models.OrchestratorMessage`): the engine
+  reports lifecycle facts so a host (Claude Code, MCP, an IDE) doesn't have to
+  reverse-engineer presentation from raw plans. **Governing rule: Neo reports
+  facts about its process; the host decides how and when they become
+  conversation** — never put host-specific wording in `engine.py`.
+  `--json` writes **two streams**: stdout is exactly ONE JSON document (now with
+  an `orchestrator` key), stderr is JSONL events. They are deliberately NOT
+  interleaved — the old `--json` help text promised events on one stream, and
+  honoring that literally would break every `neo --json | jq` consumer. stderr
+  is **mixed** (also `[Neo]` progress lines, library + CAR warnings), so hosts
+  parse lines starting with `{` and skip the rest; `--quiet` is defined in
+  `cli.py` but never read, so those lines can't currently be suppressed.
+  `safe_emit` swallows sink exceptions — an observer must never take down the
+  run it observes — logging the FIRST at WARNING and the rest at DEBUG so a
+  broken sink stays findable; `NullSink` is the default, so an unobserved run
+  costs what it always did. Four **invariants**, all test-pinned: (1) findings
+  (`hypothesis_formed`/`risk_found`) are emitted BEFORE their phase closes;
+  (2) no event may claim a closed phase — `MEMORY_FOUND` fires from
+  `_capture_retrieval_context` (the funnel all fact-retrieval paths pass
+  through) which runs while REASONING is open, so it labels itself via
+  `_current_phase()`; (3) every `phase_completed` has a `phase_started` —
+  the budget-skip branch OPENS the phase before closing it `skipped`, and
+  `_end_phase`'s synthesize-on-missing fallback logs a WARNING so the next
+  caller bug is findable; (4) every run terminates with `completed` or
+  `FAILED` — `process()` emits `FAILED` from its except branch and marks
+  still-`running` records `failed`, because STARTED-then-silence is worse than
+  no events (a host can't tell a crash from a hang). The first phase is
+  `context` (file gathering), deliberately NOT `retrieval` — fact retrieval
+  happens during REASONING, and the old name forced every emitter inside it to
+  work around the overstatement. `_end_phase` reverse-searches for the newest
+  open record because a failed panel closes `reasoning` as `fallback` and the
+  fast path opens a second one.
+  `_build_orchestrator_message` is **pure derivation** — no LM call, no new
+  analysis; every claim must be defensible from the rest of the `NeoOutput`.
+  **VERIFY mode gets its own sentence**: it makes no LM call and its
+  `code_suggestions` are the CALLER's `proposed_changes` echoed back, so the
+  generic "Neo reasoned … and proposes N change(s)" credited Neo with the
+  caller's work; it also suppresses the low-confidence caution (VERIFY
+  confidence is a pass/fail verdict, so "verify before acting" is circular).
+  `cautions` distinguishes no-tools from skipped-for-budget (different
+  remedies) and is CAPPED — a host is told never to drop one, so the list must
+  stay relayable; anything dropped is reported as a count. `phase_summary`
+  copies each record, not just the list (live engine state, foreign consumer).
+  Beat surface metadata (`surface`/`importance`/`requires_finding`/
+  `orchestrator_line` in `neo_matrix.yaml`) gates personality: `requires_finding`
+  beats stay silent unless the run actually found something, and there is NO
+  fallback line — silence is the default. **One beat per run** (`_run_beat`
+  selects once and caches): `_generate_notes` and `_orchestrator_beat` both read
+  it, and `--json` carries both, so independent selection let one character
+  speak with two voices. `_select_beat` derives `memory_hit`/`no_memory_match`
+  from real recall state — without them `unfamiliar_codebase` was configured,
+  surfaceable and **unreachable**, i.e. dead text that a "declares its wording"
+  test can't catch; `test_every_declared_beat_can_actually_fire` pins
+  reachability itself. Beat lines must not outrun their trigger (a single
+  traceback is not "multiple failures"; the keyword *fix* does not establish
+  something "used to work"). No `cooldown`/`max_uses`: one process
+  selects at most one beat, so in-process cooldown is a no-op and cross-run
+  needs session state that doesn't exist. The plugin contract that consumes all
+  this lives in `.claude-plugin/agents/neo.md`. See
+  `docs/solutions/orchestrator-communication.md`.
 - CarAdapter defaults `intent_hint={"task":"code","prefer_quality":True}` so CAR's router
   routes neo to the most capable model, not the chat/cost default. This is the *intended*
   router API, not a hack:

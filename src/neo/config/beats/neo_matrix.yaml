@@ -36,10 +36,37 @@ base_expressions:
     notes_tone: "Done."
 
 # Dramatic beats (situational personality moments)
+#
+# Surface metadata (read by engine._orchestrator_beat):
+#   surface           where the beat may appear. "internal" = notes only.
+#                     "orchestrator" = a host (Claude Code, an IDE) may also
+#                     relay it to the user. Absent means internal.
+#   importance        low | medium | high. Advisory ranking for hosts that
+#                     surface at most one line.
+#   requires_finding  when true the beat is withheld unless the run actually
+#                     produced a finding (a recalled fact, a simulation issue,
+#                     a failed check). Beats that CLAIM insight must earn it;
+#                     beats that merely describe the situation need not.
+#   orchestrator_line the host-facing wording. One line per beat rather than
+#                     one per memory stage: the situation carries the meaning,
+#                     and five near-identical variants would be upkeep with no
+#                     reader-visible payoff.
+#
+# No cooldown/max_uses field. Each `neo` invocation is a fresh process that
+# selects at most one beat, so an in-process cooldown would be a no-op and a
+# cross-run one would need session state that does not exist. Better absent
+# than faked.
 beats:
   # DOUBT category (triggered by failures, low confidence)
   - beat_id: "error_cascade"
     category: "doubt"
+    surface: "orchestrator"
+    importance: "high"
+    # A single traceback is the common case here, and the line must not assert
+    # a cascade the run has not established. Gated on a finding AND worded to
+    # what one traceback actually supports.
+    requires_finding: true
+    orchestrator_line: "There's a failure here. I'm looking for what's underneath it."
     trigger_contexts:
       - "error_trace_present"
       - "multiple_failures"
@@ -62,6 +89,10 @@ beats:
 
   - beat_id: "unfamiliar_codebase"
     category: "doubt"
+    surface: "orchestrator"
+    importance: "medium"
+    requires_finding: false
+    orchestrator_line: "I have no memory of this codebase. Treat what follows as a first read."
     trigger_contexts:
       - "first_time_codebase"
       - "unfamiliar_domain"
@@ -84,6 +115,13 @@ beats:
   # CHALLENGE category (high-stakes debugging, complex problems)
   - beat_id: "critical_bug"
     category: "challenge"
+    surface: "orchestrator"
+    importance: "high"
+    # Fires on a prompt keyword alone ("fix", "bug", "error"), which does not
+    # establish that anything previously worked. Worded to the ask, not to an
+    # assumed history.
+    requires_finding: false
+    orchestrator_line: "You're chasing a break. Let's find where it actually starts."
     trigger_contexts:
       - "bugfix"
       - "error_trace"
@@ -106,6 +144,11 @@ beats:
 
   - beat_id: "complex_refactor"
     category: "challenge"
+    surface: "orchestrator"
+    importance: "medium"
+    # Fires on the word "refactor" alone, which says nothing about coupling.
+    requires_finding: false
+    orchestrator_line: "Refactors live or die on the seams. Let me look there first."
     trigger_contexts:
       - "refactor"
       - "architecture"
@@ -128,6 +171,10 @@ beats:
   # BREAKTHROUGH category (algorithmic insights, pattern recognition)
   - beat_id: "algorithm_insight"
     category: "breakthrough"
+    surface: "orchestrator"
+    importance: "high"
+    requires_finding: true
+    orchestrator_line: "The obvious answer is probably the wrong one here."
     trigger_contexts:
       - "algorithm"
       - "optimization"
@@ -150,6 +197,13 @@ beats:
   # RECOGNITION category (high confidence, proven patterns)
   - beat_id: "pattern_match"
     category: "recognition"
+    surface: "orchestrator"
+    importance: "medium"
+    # The gate proves something was recalled, not that the recalled thing is
+    # about failure — so the line claims recognition, not knowledge of the
+    # break. "I know where it breaks" was earned by remembering a style rule.
+    requires_finding: true
+    orchestrator_line: "I've seen this shape before. Let me use what I remember."
     trigger_contexts:
       - "high_confidence"
       - "familiar_pattern"

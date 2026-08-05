@@ -32,6 +32,21 @@ Neo will:
 3. Search memory for similar debugging scenarios
 4. Suggest debugging strategies and fixes with confidence scores
 
+## Presentation
+
+Invoke with `--json` and follow the agent's communication protocol
+(`agents/neo.md`). For debugging specifically:
+
+- Lead with `orchestrator.summary`, then the leading hypothesis.
+- Report what was **ruled out**, not just what was concluded. Every
+  `hypothesis_rejected` event and every simulation issue in `risk_found`
+  narrows the search for the user — that is the substance of a debugging
+  session.
+- Say what evidence supports the leading hypothesis and what would falsify it.
+- If `memory_found` fired, say so: a prior occurrence of this failure is the
+  single most useful thing Neo can contribute.
+- Never present a hypothesis as a diagnosis. Neo does not run the code.
+
 ## Parameters
 
 This command uses read-only `advise` mode. It does not apply fixes, execute
