@@ -2316,7 +2316,10 @@ class FactStore:
         if not dry_run and (stats["linked_updates"] or stats["recorded_without_update"]):
             if stats["linked_updates"]:
                 self.save()
-            self._outcome_tracker._clear_session_log()
+            # Retention-aware: deleting the whole log here would destroy every
+            # pending suggestion, which is the exact failure this command exists
+            # to recover from.
+            self._outcome_tracker.consume_sessions_keeping_pending()
 
         return stats
 

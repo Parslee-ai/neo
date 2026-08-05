@@ -256,11 +256,6 @@ class NeoEngine:
             **data,
         )
 
-    # Last-resort wording if the beat deck is missing or malformed. Neutral on
-    # purpose: a run must still be able to describe itself, but this is not
-    # where the character is authored — `orchestrator_voice.lines` is.
-    _VOICE_FALLBACK = "{event}"
-
     def _voice(self, key: str, **fmt: Any) -> str:
         """Render one user-facing line from the beat deck.
 
@@ -2282,33 +2277,56 @@ RULES:
 
         return max(0.0, min(1.0, avg_confidence - issue_penalty - check_penalty))
 
-    def _load_beat_deck(self) -> dict[str, Any]:
-        """Load Neo's beat deck for personality templates."""
-        import yaml
+    # Used whenever the deck is missing, empty, or the wrong shape. Every
+    # consumer (`_voice`, `_voice_stage`, `_generate_notes`) assumes a mapping,
+    # so this must always be one.
+    _BEAT_DECK_FALLBACK: dict[str, Any] = {
+        'base_expressions': {
+            1: {'notes_tone': 'What am I missing?'},
+            2: {'notes_tone': 'This feels familiar.'},
+            3: {'notes_tone': 'I see it.'},
+            4: {'notes_tone': 'Seen this fail before.'},
+            5: {'notes_tone': 'Already fixed.'},
+        },
+        'beats': [],
+    }
 
-        # Get the script directory
+    def _load_beat_deck(self) -> dict[str, Any]:
+        """Load Neo's beat deck for personality templates.
+
+        Always returns a mapping. `yaml.safe_load` yields None for an empty or
+        comment-only file and a list/scalar for a malformed one, and the
+        `except` below catches load *errors*, not "loaded to the wrong shape" —
+        so an unguarded return made `self.beat_deck` None and killed every
+        non-VERIFY run inside `_voice_stage`. Prose living in a data file is the
+        whole point of the deck; hard-failing on that file's empty state is the
+        wrong failure mode for the person editing it.
+        """
+        import yaml
+        import copy
+
         script_dir = Path(__file__).parent
         beat_deck_path = script_dir / "config" / "beats" / "neo_matrix.yaml"
 
         try:
             if beat_deck_path.exists():
-                with open(beat_deck_path, 'r') as f:
-                    return yaml.safe_load(f)
+                with open(beat_deck_path, 'r', encoding='utf-8') as f:
+                    deck = yaml.safe_load(f)
+                if isinstance(deck, dict):
+                    return deck
+                logger.warning(
+                    "Beat deck at %s loaded as %s, expected a mapping — "
+                    "using the built-in fallback",
+                    beat_deck_path, type(deck).__name__,
+                )
             else:
-                # Fallback to simple base expressions if beat deck not found
-                return {
-                    'base_expressions': {
-                        1: {'notes_tone': 'What am I missing?'},
-                        2: {'notes_tone': 'This feels familiar.'},
-                        3: {'notes_tone': 'I see it.'},
-                        4: {'notes_tone': 'Seen this fail before.'},
-                        5: {'notes_tone': 'Already fixed.'}
-                    },
-                    'beats': []
-                }
+                logger.warning("Beat deck not found at %s", beat_deck_path)
         except Exception as e:
             logger.warning(f"Failed to load beat deck: {e}")
-            return {'base_expressions': {1: {'notes_tone': ''}}, 'beats': []}
+        # Copied: callers mutate their deck (tests do, and `_run_beat` reads
+        # nested dicts), and a shared class-level default would leak between
+        # engine instances.
+        return copy.deepcopy(self._BEAT_DECK_FALLBACK)
 
     def _memory_level_to_stage(self, memory_level: float) -> int:
         """Convert memory level (0.0-1.0) to personality stage (1-5)."""

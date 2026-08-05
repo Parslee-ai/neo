@@ -82,9 +82,27 @@ class _StripDeferred(ast.NodeTransformer):
         return ast.Constant(value=None)
 
 
+# The spellings of "the user's home" that appear in this codebase. `Path.home()`
+# was the only one the first version knew, which let
+# `observer._CAR_HINT_FLAG = os.path.expanduser("~/.neo/...")` and
+# `observer._LOCK_PATH` sit unprotected while this test reported success.
+_HOME_SPELLINGS = (
+    "Path.home()",
+    "expanduser(",
+    "environ['HOME']",
+    'environ["HOME"]',
+    "environ.get('HOME'",
+    'environ.get("HOME"',
+    "getenv('HOME'",
+    'getenv("HOME"',
+)
+
+
 def _evaluates_home_at_import(value: ast.AST) -> bool:
-    stripped = _StripDeferred().visit(ast.parse(ast.unparse(value), mode="eval"))
-    return "Path.home()" in ast.unparse(stripped)
+    stripped = ast.unparse(
+        _StripDeferred().visit(ast.parse(ast.unparse(value), mode="eval"))
+    )
+    return any(spelling in stripped for spelling in _HOME_SPELLINGS)
 
 
 def _home_constants_in_source() -> set[tuple[str, str]]:
@@ -96,13 +114,25 @@ def _home_constants_in_source() -> set[tuple[str, str]]:
     """
     found: set[tuple[str, str]] = set()
     for py in SRC.rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         module_name = _module_name_for(py)
 
         def scan(body):
             for node in body:
                 if isinstance(node, ast.ClassDef):
                     scan(node.body)
+                    continue
+                # Module-level conditionals still execute at import.
+                if isinstance(node, ast.If):
+                    scan(node.body)
+                    scan(node.orelse)
+                    continue
+                if isinstance(node, ast.Try):
+                    scan(node.body)
+                    for handler in node.handlers:
+                        scan(handler.body)
+                    scan(node.orelse)
+                    scan(node.finalbody)
                     continue
                 if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                     continue
@@ -118,10 +148,28 @@ def _home_constants_in_source() -> set[tuple[str, str]]:
 
 
 def test_the_lookup_table_covers_every_import_time_home_constant():
-    """The durable half.
+    """The durable half — but a partial one. Know its limits.
 
-    Anyone adding `X = Path.home() / ".neo" / ...` at module or class level
-    gets a failure here instead of a silent leak into real state.
+    Anyone adding `X = Path.home() / ".neo" / ...` (or an `expanduser`/`$HOME`
+    spelling) at module or class level, including inside a module-level `if`
+    or `try`, gets a failure here instead of a silent leak into real state.
+
+    It CANNOT catch, and no AST grep of this shape could:
+
+      - **Derived constants.** `CHECKSUM_FILE = CHECKSUM_DIR / "checksums.json"`
+        unparses to a `Name`; nothing in it says "home". Those entries are in
+        the table because a human put them there, and a new sibling would be
+        invisible here.
+      - **Re-imported bindings.** `from ...outcomes import SESSIONS_DIR` is an
+        `ImportFrom`, never an `Assign` — and that is precisely the case the
+        conftest comment records as having bitten us before.
+      - **Aliased imports.** `from pathlib import Path as P` then `P.home()`.
+      - **Non-`Name` targets.** `Foo.BAR = Path.home() / ...` at module level,
+        or tuple unpacking.
+
+    So treat a pass here as "no NEW constant of the common shape slipped in",
+    not as proof of completeness. The two runtime assertions above are the
+    ones that actually verify isolation for what is in the table.
     """
     declared = {(m, a.split(".")[-1]) for m, a, _ in HOME_PATH_CONSTANTS}
     in_source = {

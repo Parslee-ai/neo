@@ -61,7 +61,19 @@ HOME_PATH_CONSTANTS: list[tuple[str, str, str]] = [
      ".neo/prompt_knowledge.json"),
     ("neo.prompt.change_detector", "ChangeDetector.WATERMARK_FILE",
      ".neo/prompt_watermarks.json"),
+    # `os.path.expanduser`, not `Path.home()` — same escape, different spelling.
+    # `_LOCK_PATH` is the observer's cross-process flock target, so a test
+    # reaching `run_daemon` would contend with the developer's live daemon.
+    ("neo.memory.observer", "_CAR_HINT_FLAG", ".neo/.car_observer_hint_shown"),
+    ("neo.memory.observer", "_LOCK_PATH", ".neo/observer.lock"),
 ]
+
+# Constants stored as `str`, not `Path`. Patching them with a Path would break
+# callers doing string operations, so the fixture writes back the same type.
+STR_PATH_CONSTANTS = {
+    ("neo.memory.observer", "_CAR_HINT_FLAG"),
+    ("neo.memory.observer", "_LOCK_PATH"),
+}
 
 
 def _resolve_target(module_name: str, attribute: str):
@@ -101,7 +113,10 @@ def isolate_neo_home(tmp_path, monkeypatch):
     # collection time, is all of them.
     for module_name, attribute, relative in HOME_PATH_CONSTANTS:
         owner, attr_name = _resolve_target(module_name, attribute)
-        monkeypatch.setattr(owner, attr_name, fake_home / relative)
+        value = fake_home / relative
+        if (module_name, attribute) in STR_PATH_CONSTANTS:
+            value = str(value)
+        monkeypatch.setattr(owner, attr_name, value)
 
     return fake_home
 

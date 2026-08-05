@@ -183,10 +183,21 @@ def run_server(
 
         working_dir = neo_input.working_directory or os.getcwd()
 
-        # Imported here, not at module scope: `neo.engine` is heavy and this
-        # host defers it (see the TYPE_CHECKING guard above). By this point the
-        # engine factory has already imported it, so this is a dict lookup.
-        from neo.engine import EngineBusyError
+        # `neo.engine` is heavy and this host defers importing it (see the
+        # TYPE_CHECKING guard above), so on the FIRST request this line does
+        # the full import. It gets its own try: an import failure must return
+        # JSON like every other path here, and it cannot live in the block
+        # below — `except EngineBusyError` would then evaluate an unbound name
+        # and raise NameError while handling the original error.
+        try:
+            from neo.engine import EngineBusyError
+        except Exception as e:
+            logger.exception("importing neo.engine failed")
+            return json.dumps({
+                "error": "ProcessingError",
+                "message": str(e),
+                "error_type": type(e).__name__,
+            })
 
         try:
             engine = _get_or_create_engine(working_dir)
