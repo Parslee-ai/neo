@@ -14,7 +14,7 @@ When the user invokes this skill (`$neo-architect <question>`), do the following
 3. **Invoke Neo with an architecture-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo --mode advise <<'QUERY'
+   neo --json --mode advise <<'QUERY'
    Architectural decision: <restate the question with constraints>.
 
    Current state of the codebase:
@@ -27,6 +27,31 @@ When the user invokes this skill (`$neo-architect <question>`), do the following
 4. **Present Neo's plan and simulations together.** Architecture answers benefit from the SIMULATIONS section especially — those describe how the recommendation would actually play out.
 
 5. **Surface any architectural facts Neo retrieved from memory.** If past projects had similar decisions, Neo references them — those are higher-trust than fresh reasoning.
+
+## Reading Neo's output
+
+Invoke with `--json`. stdout is exactly one JSON document; stderr is JSONL
+progress events (parse lines starting with `{`, ignore the rest). Never parse
+the human-readable text output. On failure stdout is `{"error": ...}` with no
+`orchestrator` key — check for `error` first.
+
+Lead with `orchestrator.summary`, surface every entry in
+`orchestrator.cautions`, and relay `orchestrator.personality` verbatim when
+present. Neo writes in the first person and his register shifts with how much
+he remembers about this project — keep his wording rather than translating it
+into yours. See the `$neo` skill for the full contract.
+
+**Attribute explicitly and keep going.** You are calling Neo inside your own
+coding loop, so nothing marks where his reasoning ends and yours begins — say
+"Neo found …" and keep your own analysis in your own voice. His result is an
+input, not the deliverable: continue the task and report the combined outcome.
+
+For architecture specifically: name the **alternatives considered and why each
+lost** — a recommendation without its rejected options is an opinion, not
+guidance, and `hypothesis_rejected` events plus the plan's rationale fields
+carry it. State the tradeoff Neo accepted in the user's terms: what gets harder
+if they follow this advice. Be explicit that this is advice — context Neo
+cannot see (team, timeline, politics) routinely dominates.
 
 ## Notes
 

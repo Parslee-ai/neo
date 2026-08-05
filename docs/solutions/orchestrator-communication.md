@@ -233,6 +233,46 @@ not bury the reasons to doubt it. Two consequences:
 `phase_summary` copies each record, not just the list. These dicts are live
 engine state and the object is handed to foreign consumers.
 
+## One contract, two adapters
+
+The contract is host-neutral by construction: `events.py` and
+`OrchestratorMessage` know nothing about who is consuming them, and the
+per-host wording lives entirely in the adapters.
+
+| Surface | Location | Shape |
+|---|---|---|
+| Claude Code | `.claude-plugin/` | agent + 6 slash commands |
+| Codex CLI | `plugins/neo/` | plugin manifest + 6 skills |
+| CAR / A2A | `neo.a2ui`, `neo serve` | A2A status + artifact events |
+
+(`.agents/skills/` holds *release-maintenance* skills, not Neo capabilities.
+Looking there for the Codex plugin and concluding it is missing is an easy
+wrong turn — the manifest is at `plugins/neo/.codex-plugin/plugin.json`,
+registered by `.agents/plugins/marketplace.json`.)
+
+**Adapters drift, and drift is invisible.** The Codex skills instructed the
+model to parse "four structured sections: `CONFIDENCE`, `PLAN`, `SIMULATIONS`,
+`CODE SUGGESTIONS`" out of terminal-formatted prose — the exact anti-pattern
+the Claude side had just stopped doing. One adapter got the contract change;
+the other did not, and nothing failed. `test_host_adapter_parity.py` now pins
+the invariant: same six capabilities on both surfaces, both invoking `--json`,
+both teaching `orchestrator.summary`/`cautions`, both documenting the error
+shape and attribution, and every documented phase/event name checked against
+`events.py` rather than against prose.
+
+The same test pins manifest versions against `pyproject.toml`. `prepare-release`
+documents bumping both plugin manifests, but a documented step with no
+enforcement is a step that gets skipped: the package, the Claude manifest, and
+the Codex manifest had reached 0.41.0 / 0.37.0 / 0.19.0.
+
+**Role differs even though protocol does not.** Under Claude Code, Neo is
+usually a delegated subagent — the user can see the boundary. Under Codex, Neo
+is a step inside the same coding loop: Codex calls Neo, reads the result, then
+edits files and runs tests in the same breath. Nothing marks where Neo's
+reasoning ends and Codex's begins, so the Codex skills carry stronger
+attribution wording ("Neo found …") and an explicit instruction that Neo's
+result is an input, not the deliverable.
+
 ## Sink failures are findable
 
 `safe_emit` logs the **first** failure at WARNING and the rest at DEBUG. Logging

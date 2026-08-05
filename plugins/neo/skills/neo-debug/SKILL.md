@@ -14,7 +14,7 @@ When the user invokes this skill (`$neo-debug <bug description>`), do the follow
 3. **Invoke Neo with a debug-framed prompt.** Allow up to 5 minutes.
 
    ```bash
-   neo --mode advise <<'QUERY'
+   neo --json --mode advise <<'QUERY'
    Debug this issue: <user's description>
 
    Symptoms: <what happens>
@@ -32,6 +32,32 @@ When the user invokes this skill (`$neo-debug <bug description>`), do the follow
 4. **Present Neo's hypotheses ranked by confidence.** Lead with the verification step the user can take next — debugging is an iterative loop, not a one-shot answer.
 
 5. **If Neo returns multiple competing hypotheses, surface them all.** Don't collapse to "the most likely one" — concurrent-systems bugs often have multiple contributing causes.
+
+## Reading Neo's output
+
+Invoke with `--json`. stdout is exactly one JSON document; stderr is JSONL
+progress events (parse lines starting with `{`, ignore the rest). Never parse
+the human-readable text output. On failure stdout is `{"error": ...}` with no
+`orchestrator` key — check for `error` first.
+
+Lead with `orchestrator.summary`, surface every entry in
+`orchestrator.cautions`, and relay `orchestrator.personality` verbatim when
+present. Neo writes in the first person and his register shifts with how much
+he remembers about this project — keep his wording rather than translating it
+into yours. See the `$neo` skill for the full contract.
+
+**Attribute explicitly and keep going.** You are calling Neo inside your own
+coding loop, so nothing marks where his reasoning ends and yours begins — say
+"Neo found …" and keep your own analysis in your own voice. His result is an
+input, not the deliverable: continue the task and report the combined outcome.
+
+For debugging specifically: report what was **ruled out**, not just what was
+concluded. Every `hypothesis_rejected` event and every simulation issue in
+`risk_found` narrows the search — that is the substance of a debugging session.
+Say what evidence supports the leading hypothesis and what would falsify it. If
+`memory_found` fired, say so: a prior occurrence of this failure is the single
+most useful thing Neo can contribute. Never present a hypothesis as a
+diagnosis — Neo does not run the code, so verifying it is your job.
 
 ## Notes
 
