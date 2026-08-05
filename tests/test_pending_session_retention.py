@@ -305,6 +305,58 @@ def test_the_scan_anchor_advances_so_work_does_not_repeat(repo):
     assert "src/foo.py" in retained["resolved_paths"]
 
 
+def test_a_peer_process_save_is_not_erased_by_our_rewrite(repo):
+    """The lost update.
+
+    `collect_outcomes` reads the log, then does git and LM work, then rewrites.
+    A second neo process saving a session inside that window used to be erased
+    without trace — the rewrite wrote back a view of the file predating their
+    save. Locking only the write did not fix it; the rewrite has to re-read
+    under the lock and preserve what it never processed.
+
+    Fixed by merge-on-write rather than a wider lock: holding the lock across
+    the reasoning work would let a slow run block another process's save.
+    """
+    ours = _tracker(repo, project_id="peer-test-shared")
+    peer = _tracker(repo, project_id="peer-test-shared")
+
+    ours.save_session([_Suggestion("src/foo.py")], "ours", {})
+    time.sleep(1)
+
+    # Our read-modify-write begins.
+    sessions = ours._load_unprocessed_sessions()
+    ours._last_pending = list(sessions)
+    ours._last_loaded_keys = {ours._session_key(s) for s in sessions}
+
+    # A peer saves while we are still working.
+    peer.save_session([_Suggestion("src/peer.py")], "theirs", {})
+
+    # We complete our rewrite.
+    ours.consume_sessions_keeping_pending()
+
+    log = Path(ours._session_log_path)
+    survivors = sorted(
+        json.loads(line)["suggestions"][0]["file_path"]
+        for line in log.read_text().strip().splitlines()
+    )
+    assert "src/peer.py" in survivors, "the peer's session was erased"
+    assert "src/foo.py" in survivors, "our own pending session was dropped"
+    assert len(survivors) == len(set(survivors)), "merge duplicated a session"
+
+
+def test_the_merge_does_not_resurrect_processed_sessions(repo):
+    """The other direction: a session we DID process must not come back just
+    because it is still in the file when we re-read."""
+    tracker = _tracker(repo)
+    tracker.save_session([_Suggestion("docs/guide.md")], "review only", {})
+    time.sleep(TICK)
+
+    tracker.detect_outcomes()  # review-only resolves and is not retained
+
+    log = Path(tracker._session_log_path)
+    assert not log.exists(), "a processed session was written back by the merge"
+
+
 def test_a_weak_outcome_cannot_overwrite_a_verified_one():
     """`final_outcome` must report the strongest evidence in the batch.
 

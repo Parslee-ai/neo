@@ -340,6 +340,10 @@ class OutcomeTracker:
         # Lets a caller that inspected with clear_processed=False consume the
         # log afterwards without re-running git or nuking pending work.
         self._last_pending: list[SessionRecord] = []
+        # Identities of the sessions that collect_outcomes actually read. The
+        # rewrite keeps anything NOT in this set, so a session appended by a
+        # peer process after the read survives instead of being erased.
+        self._last_loaded_keys: set[tuple] = set()
 
     def _get_session_path(self) -> Optional[Path]:
         if not self.project_id:
@@ -520,11 +524,19 @@ class OutcomeTracker:
         try:
             atomic_write_json(self._session_path, asdict(session), indent=2)
 
-            # Also append to session log so we don't lose prior sessions
+            # Also append to session log so we don't lose prior sessions.
+            # Locked: `_rewrite_session_log` replaces this file wholesale, so an
+            # unlocked append can land between that rewrite's re-read and its
+            # `os.replace` and vanish. The lock is held for one line of I/O.
             log_path = self._session_log_path
             if log_path:
-                with open(log_path, "a") as f:
-                    f.write(json.dumps(asdict(session)) + "\n")
+                from neo.memory.store import scope_file_lock
+
+                with scope_file_lock(log_path):
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(asdict(session)) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
 
             # Durable ledger for async transcript outcome mining (survives the
             # session-log clearing done by git-based outcome detection).
@@ -617,6 +629,7 @@ class OutcomeTracker:
             # back. Unreachable today only because replay gates on non-zero
             # stats — make it structural, not incidental.
             self._last_pending = []
+            self._last_loaded_keys = set()
             return [], {}
 
         all_outcomes: list[Outcome] = []
@@ -711,6 +724,9 @@ class OutcomeTracker:
         # Remembered so `replay_linked_feedback` can consume the log with the
         # same retention rule instead of deleting it wholesale.
         self._last_pending = pending
+        # Recorded from what we actually read, so the rewrite can distinguish
+        # "processed by us" from "appended by a peer since".
+        self._last_loaded_keys = {self._session_key(s) for s in sessions}
         if clear_processed:
             self._rewrite_session_log(pending)
 
@@ -920,22 +936,42 @@ class OutcomeTracker:
             remaining.append(sugg)
         return remaining
 
+    @staticmethod
+    def _session_key(session: SessionRecord) -> tuple:
+        """Stable identity for one saved session.
+
+        Used to tell "a record this process already read and processed" from
+        "a record some other process appended while we were working". No
+        `session_id` field exists on the record, and adding one would not help
+        for entries written by an older neo — `time.time()` is microsecond
+        resolution, so two sessions of the same project colliding here is not a
+        realistic possibility.
+        """
+        return (
+            round(session.timestamp, 6),
+            session.learning_episode_id,
+            session.prompt,
+        )
+
     def _session_expired(self, session: SessionRecord) -> bool:
         return (time.time() - session.timestamp) > self.PENDING_SESSION_TTL_SECONDS
 
     def _rewrite_session_log(self, keep: list[SessionRecord]) -> None:
         """Replace the log with `keep`.
 
-        Read-modify-write across processes, so it holds the same per-scope lock
-        `FactStore.save()` uses. That serializes rewrite against rewrite.
+        Read-modify-write across processes, so it takes the same per-scope lock
+        `FactStore.save()` uses — and, crucially, **re-reads the log under that
+        lock** and preserves anything it did not itself process.
 
-        It does NOT close the read-modify-write window: `_load_unprocessed_sessions`
-        reads without the lock and `save_session` appends without it, so a peer
-        process saving a session between another's read and its replace is still
-        erased. Closing that needs the lock extended over the read and taken by
-        `save_session` too — deliberately not done here, because it widens a
-        lock across LM-bound work in `replay_linked_feedback`. Documented rather
-        than silently overclaimed.
+        Locking the write alone was not enough. Between one process's read and
+        its replace, a peer's `save_session` append was erased without trace
+        (reproduced). The fix is merge-on-write rather than a wider lock: the
+        lock is held only for re-read + write, never across the git and LM work
+        in `collect_outcomes` / `replay_linked_feedback`, so a slow reasoning
+        run cannot block another process's save.
+
+        `save_session` takes the same lock for its append, so an append can
+        never interleave with this rewrite.
 
         Durability: temp file + `os.replace`, with `flush`+`fsync` before the
         rename so a machine crash can't leave a rename pointing at unwritten
@@ -956,9 +992,46 @@ class OutcomeTracker:
         with scope_file_lock(log_path):
             self._rewrite_session_log_locked(log_path, keep)
 
+    def _sessions_appended_since_read(self, log_path: Path) -> list[SessionRecord]:
+        """Records now in the log that this process never read.
+
+        Called under the lock, immediately before the rewrite. Anything whose
+        identity is absent from `_last_loaded_keys` arrived from a peer while we
+        were doing git and LM work, and must survive our write.
+        """
+        if not log_path.exists():
+            return []
+        fresh: list[SessionRecord] = []
+        try:
+            with open(log_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = SessionRecord(**json.loads(line))
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if self._session_key(record) not in self._last_loaded_keys:
+                        fresh.append(record)
+        except OSError as e:
+            # Better to skip the merge than to lose the rewrite entirely; the
+            # worst case degrades to the previous behavior.
+            logger.warning(f"Could not re-read session log before rewrite: {e}")
+            return []
+        if fresh:
+            logger.info(
+                "Preserving %d session(s) appended by another process", len(fresh)
+            )
+        return fresh
+
     def _rewrite_session_log_locked(
         self, log_path: Path, keep: list[SessionRecord]
     ) -> None:
+        # Merge in anything a peer appended after our read. Without this the
+        # rewrite is a lost update: we would write back a view of the file that
+        # predates their save.
+        keep = list(keep) + self._sessions_appended_since_read(log_path)
         # The single-session file is a backward-compat fallback that
         # `_load_unprocessed_sessions` reads only when the log is absent.
         # Removed only AFTER the log is safely in place: unlinking first and

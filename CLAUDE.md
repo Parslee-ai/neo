@@ -284,6 +284,16 @@
   it's timestamp-independent, and re-forking it per retained session measured
   0.88s of pure `git` forking at 40 pending sessions, on the request hot path,
   growing linearly.
+  **The session log is merge-on-write, not last-writer-wins.**
+  `_rewrite_session_log` takes `store.scope_file_lock`, then RE-READS the log
+  under it and preserves every record whose `_session_key` is absent from
+  `_last_loaded_keys` — i.e. appended by a peer since our read. Locking the
+  write alone was NOT enough and the loss was reproduced: a second neo process
+  saving between one process's read and its `os.replace` was erased without
+  trace. `save_session` takes the same lock for its append. Merge-on-write
+  rather than a wider lock on purpose — holding the lock across the git and LM
+  work in `collect_outcomes`/`replay_linked_feedback` would let a slow
+  reasoning run block another process's save.
   **`replay_linked_feedback` must use `consume_sessions_keeping_pending()`**,
   never a wholesale delete — it is the documented repair command for a broken
   memory loop, so nuking the log there destroyed every pending suggestion the
