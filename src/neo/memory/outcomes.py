@@ -13,6 +13,7 @@ import datetime
 import enum
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -598,6 +599,9 @@ class OutcomeTracker:
 
         all_outcomes: list[Outcome] = []
         merged_fact_ids: dict[str, str] = {}
+        # Sessions whose suggestions are still awaiting a user action. Retained
+        # rather than cleared — see the note at the clearing step below.
+        pending: list[SessionRecord] = []
 
         for prev in sessions:
             if prev.project_id != self.project_id:
@@ -611,6 +615,7 @@ class OutcomeTracker:
 
             changed_files = self._get_changed_files_since(prev.timestamp)
             if not changed_files:
+                pending.append(prev)
                 continue
 
             suggested = [s.get("file_path", "") for s in prev.suggestions]
@@ -632,9 +637,29 @@ class OutcomeTracker:
         # the same fact from a single user action.
         all_outcomes = self._dedup_outcomes(all_outcomes)
 
-        # Clear processed sessions from the log
-        if clear_processed and (all_outcomes or sessions):
-            self._clear_session_log()
+        # Clear PROCESSED sessions, keep the ones still waiting on the user.
+        #
+        # This used to delete the whole log whenever any session existed, even
+        # when nothing had changed and no outcome was produced. That silently
+        # destroyed every pending suggestion the moment neo was invoked again
+        # before the user acted — which is the normal way people use it. The
+        # multi-session read directly above was added to prevent exactly that
+        # loss, and the unconditional clear defeated it one level up.
+        #
+        # Measured consequence over 30 days of real traffic: 108 episodes, 58
+        # stuck at `suggested_pending_downstream_outcome`, and ZERO `accepted`
+        # outcomes ever recorded — so the promote path, which needs two
+        # git-verified acceptances, could never fire no matter how correct its
+        # own gates were.
+        #
+        # A session is processed once its files have changed (git-matched) or
+        # it produced a non-git outcome; anything else is still pending.
+        if clear_processed:
+            keep = [
+                s for s in pending
+                if self._session_awaits_user_action(s) and not self._session_expired(s)
+            ]
+            self._rewrite_session_log(keep)
 
         accepted = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.ACCEPTED)
         modified = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.MODIFIED)
@@ -786,6 +811,85 @@ class OutcomeTracker:
                 best[key] = o
         return list(best.values())
 
+    # A pending suggestion is kept alive across invocations, but not forever:
+    # a suggestion nobody acted on in this long is abandoned, not pending, and
+    # retaining it would grow the log without bound.
+    PENDING_SESSION_TTL_SECONDS = 14 * 24 * 3600
+
+    _NON_TRACKABLE_PATHS = frozenset({"/dev/null"})
+
+    def _is_non_git_trackable(self, file_path: str, normalized: str) -> bool:
+        """True when git can never show us what the user did with this path.
+
+        Shared by the non-git weak-acceptance detector and the pending-session
+        retention rule, so the two cannot disagree about which suggestions are
+        still worth waiting on.
+        """
+        return (
+            file_path in self._NON_TRACKABLE_PATHS
+            or normalized.startswith("docs/")
+            or "/docs/" in normalized
+            or self._is_review_only_path(file_path)
+        )
+
+    def _session_awaits_user_action(self, session: SessionRecord) -> bool:
+        """True when this session still has a suggestion git could confirm.
+
+        Sessions whose suggestions are all review-only have already produced
+        their (weak, UNVERIFIED) outcome and must not be replayed. A session
+        with no suggestions at all has nothing to wait for.
+        """
+        for sugg in session.suggestions:
+            file_path = sugg.get("file_path", "")
+            normalized = normalize_suggestion_path(
+                file_path, session.codebase_root or self.codebase_root
+            )
+            if not self._is_non_git_trackable(file_path, normalized):
+                return True
+        return False
+
+    def _session_expired(self, session: SessionRecord) -> bool:
+        return (time.time() - session.timestamp) > self.PENDING_SESSION_TTL_SECONDS
+
+    def _rewrite_session_log(self, keep: list[SessionRecord]) -> None:
+        """Replace the log with `keep`, atomically.
+
+        Writes through a temp file so a crash mid-rewrite cannot leave a
+        truncated log — losing pending suggestions is the exact failure this
+        whole change exists to stop.
+        """
+        log_path = self._session_log_path
+        if not log_path:
+            return
+        # The single-session file is a backward-compat fallback that
+        # `_load_unprocessed_sessions` reads only when the log is absent.
+        # Always drop it: its content is either represented in `keep` or has
+        # been processed.
+        session_path = self._session_path
+        if session_path and session_path.exists():
+            try:
+                session_path.unlink()
+            except OSError:
+                pass
+
+        if not keep:
+            if log_path.exists():
+                try:
+                    log_path.unlink()
+                except OSError:
+                    pass
+            return
+
+        try:
+            tmp = log_path.with_name(log_path.name + ".tmp")
+            with open(tmp, "w") as f:
+                for session in keep:
+                    f.write(json.dumps(asdict(session)) + "\n")
+            os.replace(tmp, log_path)
+            logger.info("Retained %d pending session(s) awaiting user action", len(keep))
+        except OSError as e:
+            logger.warning(f"Failed to rewrite session log: {e}")
+
     def _detect_non_git_outcomes(
         self, sessions: list[SessionRecord]
     ) -> list[Outcome]:
@@ -806,7 +910,6 @@ class OutcomeTracker:
             return []
 
         outcomes: list[Outcome] = []
-        non_trackable = {"/dev/null"}
 
         for prev in sessions:
             for sugg in prev.suggestions:
@@ -817,13 +920,7 @@ class OutcomeTracker:
                     file_path, prev.codebase_root or self.codebase_root
                 )
 
-                is_non_trackable = (
-                    file_path in non_trackable
-                    or normalized.startswith("docs/")
-                    or "/docs/" in normalized
-                    or self._is_review_only_path(file_path)
-                )
-                if not is_non_trackable:
+                if not self._is_non_git_trackable(file_path, normalized):
                     continue
 
                 # User came back and ran neo again — weak acceptance signal.
