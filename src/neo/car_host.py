@@ -214,6 +214,9 @@ def run_server(
                     "Neo is already processing a request for this working "
                     "directory. Retry when it completes."
                 ),
+                # Every other error path carries error_type; a peer parsing
+                # them uniformly shouldn't hit a missing key on this one.
+                "error_type": "EngineBusyError",
                 "retryable": True,
                 "working_directory": working_dir,
             })

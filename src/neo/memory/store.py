@@ -58,6 +58,19 @@ EMBEDDING_CACHE_MAX_SIZE = 500
 MAX_TEXT_LENGTH = 32000
 SUPERSESSION_THRESHOLD = 0.85  # Cosine similarity threshold for supersession
 
+# How strong each outcome is as evidence, for deciding which one an episode
+# reports as its final_outcome when a single invocation produced several.
+# Mirrors the priority map in `OutcomeTracker._dedup_outcomes` so a batch that
+# collapses one way per path cannot rank the other way per episode.
+_OUTCOME_RANK = {
+    OutcomeType.ACCEPTED: 3,
+    OutcomeType.MODIFIED: 3,
+    OutcomeType.REGRESSION: 3,
+    OutcomeType.INDEPENDENT: 2,
+    OutcomeType.UNVERIFIED: 1,
+}
+_OUTCOME_VALUES = {member.value for member in OutcomeType}
+
 # Per-scope capacity limits
 SCOPE_LIMITS: dict[str, int] = {
     FactScope.GLOBAL.value: 200,    # Cross-project patterns, grows slowly
@@ -1055,6 +1068,11 @@ class FactStore:
 
         return 1.0 - 1.0 / (1.0 + total_quality / reference_quality)
 
+    @staticmethod
+    def _outcome_rank(outcome_type) -> int:
+        """Evidence strength; unknown/absent ranks below everything."""
+        return _OUTCOME_RANK.get(outcome_type, 0)
+
     def _record_attributed_episode_outcome(
         self, outcome, *, fact_id: str = "", operation: str = "",
         append_verification: bool = True,
@@ -1108,7 +1126,23 @@ class FactStore:
                     summary=outcome.outcome_type.value,
                     repository_revision=outcome.repository_revision,
                 ))
-            episode.final_outcome = outcome.outcome_type.value
+            # Strongest signal wins. One neo invocation commonly suggests both a
+            # code edit and a review/docs path, and `_dedup_outcomes` keys by
+            # path — so BOTH survive into this loop. Assigning unconditionally
+            # let whichever landed last win: dict insertion order puts the weak
+            # UNVERIFIED from the docs path after the git-verified ACCEPTED, and
+            # the episode then reported "unverified" for a run whose code
+            # suggestion was demonstrably accepted. Since review paths are neo's
+            # most common suggestion shape, that under-reported acceptance in
+            # exactly the ledger `neo memory learning-stats` reads — the metric
+            # being used to judge whether the loop works at all.
+            # (Promotion is unaffected: candidate status is matched per
+            # candidate further down, not off final_outcome.)
+            if self._outcome_rank(outcome.outcome_type) >= self._outcome_rank(
+                OutcomeType(episode.final_outcome)
+                if episode.final_outcome in _OUTCOME_VALUES else None
+            ):
+                episode.final_outcome = outcome.outcome_type.value
             episode.outcome_details.update({
                 "suggestion_id": outcome.suggestion_id,
                 "file_path": outcome.file_path,

@@ -236,6 +236,28 @@ def test_sessions_with_no_suggestions_are_not_retained(repo):
     assert not Path(tracker._session_log_path).exists()
 
 
+def test_a_weak_outcome_cannot_overwrite_a_verified_one():
+    """`final_outcome` must report the strongest evidence in the batch.
+
+    One invocation commonly suggests a code edit *and* a review/docs path, and
+    `_dedup_outcomes` keys by path, so both survive. Assigning unconditionally
+    let dict order decide: the weak UNVERIFIED from the docs path landed after
+    the git-verified ACCEPTED, and the episode reported "unverified" for a run
+    whose code suggestion was demonstrably applied. Review paths are neo's most
+    common suggestion shape, so that under-reported acceptance in the very
+    ledger `neo memory learning-stats` reads.
+    """
+    from neo.memory.store import FactStore
+
+    rank = FactStore._outcome_rank
+    assert rank(OutcomeType.ACCEPTED) > rank(OutcomeType.UNVERIFIED)
+    assert rank(OutcomeType.MODIFIED) > rank(OutcomeType.INDEPENDENT)
+    assert rank(OutcomeType.INDEPENDENT) > rank(OutcomeType.UNVERIFIED)
+    # An unknown/absent prior outcome must lose to anything real.
+    assert rank(None) == 0
+    assert rank(OutcomeType.UNVERIFIED) > rank(None)
+
+
 def test_session_expiry_is_exercised_directly(repo):
     """`_session_expired` in isolation.
 

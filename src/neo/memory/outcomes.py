@@ -883,41 +883,71 @@ class OutcomeTracker:
         return (time.time() - session.timestamp) > self.PENDING_SESSION_TTL_SECONDS
 
     def _rewrite_session_log(self, keep: list[SessionRecord]) -> None:
-        """Replace the log with `keep`, atomically.
+        """Replace the log with `keep`.
 
-        Writes through a temp file so a crash mid-rewrite cannot leave a
-        truncated log — losing pending suggestions is the exact failure this
-        whole change exists to stop.
+        Read-modify-write across processes, so it holds the same per-scope lock
+        `FactStore.save()` uses. Two `neo` invocations on one project otherwise
+        interleave, and a `save_session` append landing between another
+        process's read and its replace is erased without trace — precisely the
+        loss this whole change exists to prevent.
+
+        Durability: temp file + `os.replace`, with `flush`+`fsync` before the
+        rename so a machine crash can't leave a rename pointing at unwritten
+        data. `mkstemp` rather than a fixed `.tmp` name, since two concurrent
+        rewrites would otherwise interleave into one file — the same reason
+        `FactStore._save_file` uses it.
         """
         log_path = self._session_log_path
         if not log_path:
             return
+
+        # Imported here, not at module scope: `store` imports this module, so a
+        # top-level import would be circular. `scope_file_lock` is already
+        # best-effort — it proceeds unlocked when fcntl is unavailable — so it
+        # needs no fallback of its own.
+        from neo.memory.store import scope_file_lock
+
+        with scope_file_lock(log_path):
+            self._rewrite_session_log_locked(log_path, keep)
+
+    def _rewrite_session_log_locked(
+        self, log_path: Path, keep: list[SessionRecord]
+    ) -> None:
         # The single-session file is a backward-compat fallback that
         # `_load_unprocessed_sessions` reads only when the log is absent.
-        # Always drop it: its content is either represented in `keep` or has
-        # been processed.
+        # Removed only AFTER the log is safely in place: unlinking first and
+        # then failing the write would drop both copies.
         session_path = self._session_path
-        if session_path and session_path.exists():
-            try:
-                session_path.unlink()
-            except OSError:
-                pass
-
-        if not keep:
-            if log_path.exists():
-                try:
-                    log_path.unlink()
-                except OSError:
-                    pass
-            return
 
         try:
-            tmp = log_path.with_name(log_path.name + ".tmp")
-            with open(tmp, "w") as f:
-                for session in keep:
-                    f.write(json.dumps(asdict(session)) + "\n")
-            os.replace(tmp, log_path)
-            logger.info("Retained %d pending session(s) awaiting user action", len(keep))
+            if keep:
+                import tempfile
+
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=str(log_path.parent), prefix=log_path.name + ".", suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        for session in keep:
+                            f.write(json.dumps(asdict(session)) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_name, log_path)
+                except BaseException:
+                    # Includes SIGINT/SIGTERM-driven exits: leave no stray temp.
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                    raise
+                logger.info(
+                    "Retained %d pending session(s) awaiting user action", len(keep)
+                )
+            elif log_path.exists():
+                log_path.unlink()
+
+            if session_path and session_path.exists():
+                session_path.unlink()
         except OSError as e:
             logger.warning(f"Failed to rewrite session log: {e}")
 
