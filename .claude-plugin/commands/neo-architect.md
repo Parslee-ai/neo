@@ -32,6 +32,22 @@ Neo will:
 3. Search memory for similar architectural decisions
 4. Provide recommendations with confidence scores and risk analysis
 
+## Presentation
+
+Invoke with `--json` and follow the agent's communication protocol
+(`agents/neo.md`). For architecture specifically:
+
+- Lead with `orchestrator.summary`, then the recommendation.
+- Name the **alternatives considered and why each lost**. An architectural
+  recommendation without its rejected options is an opinion, not guidance.
+  `hypothesis_rejected` events and the plan's rationale fields carry this.
+- State the tradeoff Neo accepted, in the user's terms: what gets harder if
+  they follow this advice.
+- Surface `orchestrator.cautions` in full. Architecture mistakes are the
+  expensive kind to reverse.
+- Be explicit that this is advice, not a decision. Architectural context Neo
+  cannot see — team, timeline, politics — routinely dominates.
+
 ## Parameters
 
 This command uses `advise` mode. Architecture guidance is not automatically

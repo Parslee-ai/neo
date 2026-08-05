@@ -19,6 +19,17 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from neo.events import (
+    PHASE_FINALIZE,
+    PHASE_REASONING,
+    PHASE_CONTEXT,
+    PHASE_STATIC_CHECKS,
+    NeoEvent,
+    NeoEventSink,
+    NeoEventType,
+    NullSink,
+    safe_emit,
+)
 from neo.models import (
     AppliedAction,
     CodeSuggestion,
@@ -26,6 +37,7 @@ from neo.models import (
     LMAdapter,
     NeoInput,
     NeoOutput,
+    OrchestratorMessage,
     PlanStep,
     SimulationTrace,
     StaticCheckResult,
@@ -68,6 +80,10 @@ class NeoEngine:
     # Constants for magic numbers (Phase 5)
     EARLY_EXIT_CONFIDENCE = 0.8  # Skip static checks if confidence above this
     STATIC_CHECK_BUFFER = 0.9    # Reserve 10% of budget for static checks
+    # Below this, a result is worth flagging rather than acting on. Applies to
+    # both a single suggestion's confidence and the run's overall confidence;
+    # the plugin docs quote the same threshold to users.
+    LOW_CONFIDENCE = 0.7
 
     def __init__(
         self,
@@ -77,6 +93,7 @@ class NeoEngine:
         codebase_root: Optional[str] = None,  # Root directory of the codebase being analyzed
         config: Optional[Any] = None,  # NeoConfig instance
         execution_adapter: Optional[ExecutionAdapter] = None,
+        event_sink: Optional[NeoEventSink] = None,
     ):
         self.lm = lm_adapter
         self.exemplar_index = exemplar_index
@@ -85,6 +102,25 @@ class NeoEngine:
         self.codebase_root = codebase_root
         self.config = config  # NeoConfig | None (kept for downstream lookups like reasoning_effort_cap)
         self.execution_adapter = execution_adapter
+
+        # Lifecycle observer. Defaults to discarding, so an unobserved run is
+        # exactly as expensive as it was before events existed.
+        # `is None`, not `or`: a sink that buffers and defines __len__ would be
+        # falsy when empty and get silently replaced.
+        self.event_sink: NeoEventSink = NullSink() if event_sink is None else event_sink
+        # Phase records accumulated during a run, replayed into
+        # OrchestratorMessage.phase_summary at finalize. Reset per request.
+        self._phase_records: list[dict[str, Any]] = []
+        self._findings: list[str] = []
+        # Set per request before any finalize; initialized so the orchestrator
+        # summary can read it directly instead of guessing via getattr.
+        self.last_reasoning_mode: str = "fast"
+        # One beat per run, chosen once and reused by every surface. Selecting
+        # independently per surface let the terminal notes and the host-facing
+        # line disagree — same character, two voices, one response.
+        self._selected_beat: Optional[dict[str, Any]] = None
+        self._beat_selected = False
+        self._recalled_fact_count = 0
 
         # Load beat deck for personality templates (no LLM call)
         self.beat_deck = self._load_beat_deck()
@@ -147,6 +183,121 @@ class NeoEngine:
         self.episode_store = LearningEpisodeStore(episode_project_id or "unscoped")
         self.current_learning_episode = None
 
+    def _emit(
+        self,
+        event_type: NeoEventType,
+        *,
+        phase: str = "",
+        message: str = "",
+        **data: Any,
+    ) -> None:
+        """Report one fact about this run to whatever is observing."""
+        safe_emit(
+            self.event_sink,
+            NeoEvent(type=event_type, phase=phase, message=message, data=data),
+        )
+
+    def _begin_phase(self, phase: str, message: str = "") -> None:
+        self._phase_records.append(
+            {"name": phase, "status": "running", "message": message}
+        )
+        self._emit(NeoEventType.PHASE_STARTED, phase=phase, message=message)
+
+    def _end_phase(
+        self, phase: str, message: str = "", status: str = "complete", **data: Any
+    ) -> None:
+        """Close the most recent open record for `phase`.
+
+        Searched in reverse because a phase can legitimately run more than once
+        (a failed panel falls back to the fast path); the newest open record is
+        always the one being closed.
+        """
+        for record in reversed(self._phase_records):
+            if record["name"] == phase and record["status"] == "running":
+                record["status"] = status
+                record["message"] = message or record["message"]
+                break
+        else:
+            # Every phase_completed must have an opening phase_started, or a
+            # host tracking boundaries sees a close for something it never saw
+            # open. Synthesizing a record silently would hide that caller bug,
+            # so it is recorded AND reported.
+            logger.warning(
+                "phase %r closed without a matching _begin_phase; "
+                "the event stream for this run is malformed", phase
+            )
+            self._phase_records.append(
+                {"name": phase, "status": status, "message": message}
+            )
+        self._emit(
+            NeoEventType.PHASE_COMPLETED,
+            phase=phase,
+            message=message,
+            status=status,
+            **data,
+        )
+
+    # Last-resort wording if the beat deck is missing or malformed. Neutral on
+    # purpose: a run must still be able to describe itself, but this is not
+    # where the character is authored — `orchestrator_voice.lines` is.
+    _VOICE_FALLBACK = "{event}"
+
+    def _voice(self, key: str, **fmt: Any) -> str:
+        """Render one user-facing line from the beat deck.
+
+        All prose Neo emits is authored in `orchestrator_voice.lines`, so the
+        character can be retuned without editing code. A missing key or a
+        template whose placeholders don't match degrades to "" rather than
+        raising — a formatting slip in a personality file must never take down
+        a reasoning run.
+        """
+        try:
+            lines = self.beat_deck.get("orchestrator_voice", {}).get("lines", {})
+            template = lines.get(key)
+            if not template:
+                return ""
+            return str(template).format(**fmt)
+        except Exception as exc:
+            logger.debug("voice template %r failed: %s", key, exc)
+            return ""
+
+    def _voice_stage(self) -> dict[str, Any]:
+        """Per-stage register (opener, hedge, terseness) for the current
+        memory level. Neo's certainty grows with what he remembers, so the
+        summary's phrasing follows `_memory_level_to_stage`."""
+        memory_level = 0.0
+        if self.persistent_memory:
+            try:
+                memory_level = self.persistent_memory.memory_level()
+            except Exception:
+                memory_level = 0.0
+        stage = self._memory_level_to_stage(memory_level)
+        stages = self.beat_deck.get("orchestrator_voice", {}).get("stages", {})
+        return stages.get(stage) or stages.get(3) or {}
+
+    def _current_phase(self) -> str:
+        """Name of the phase currently running, or "" outside any phase.
+
+        Used by emitters that do not sit inside a single phase and so cannot
+        name theirs statically. Labeling such an event with a fixed phase
+        name produces a stream where an event claims a phase that already
+        closed — the retrieval of facts, for instance, actually happens while
+        the reasoning phase is open.
+        """
+        for record in reversed(self._phase_records):
+            if record["status"] == "running":
+                return str(record["name"])
+        return ""
+
+    def _note_finding(self, text: str) -> None:
+        """Record something Neo learned that a host may want to surface.
+
+        Findings gate personality: a beat only reaches the orchestrator when
+        it has substance to attach to.
+        """
+        if text and text not in self._findings:
+            self._findings.append(text)
+
     def process(self, neo_input: NeoInput) -> NeoOutput:
         """
         Main entry point: process input and return structured output.
@@ -168,6 +319,11 @@ class NeoEngine:
         self.context = neo_input
         start_time = time.time()
         self.action_log.clear()
+        self._phase_records = []
+        self._findings = []
+        self._selected_beat = None
+        self._beat_selected = False
+        self._recalled_fact_count = 0
         self.last_applied_actions: list[AppliedAction] = []
         self.current_learning_episode = self._begin_learning_episode(neo_input)
         from neo.memory.metrics import record as record_memory_metric
@@ -198,10 +354,37 @@ class NeoEngine:
         )
         overseer.start()
         self._log_action("process.start", neo_input.prompt[:60])
+        self._emit(
+            NeoEventType.STARTED,
+            message=self._voice("started"),
+            operating_mode=neo_input.operating_mode.value,
+            task_type=getattr(neo_input.task_type, "value", ""),
+        )
 
         try:
-            return self._process_inner(neo_input, start_time)
+            output = self._process_inner(neo_input, start_time)
+            self._emit(
+                NeoEventType.COMPLETED,
+                message=output.orchestrator.summary or self._voice("completed_fallback"),
+                confidence=round(output.confidence, 3),
+                elapsed_seconds=round(time.time() - start_time, 2),
+            )
+            return output
         except Exception as exc:
+            # A terminal event on every path. Emitting STARTED and then going
+            # silent is worse than never emitting: a host cannot tell a crash
+            # from a hang, and any open phase stays "running" forever.
+            failed_in = self._current_phase()  # read before clearing "running"
+            for record in self._phase_records:
+                if record["status"] == "running":
+                    record["status"] = "failed"
+            self._emit(
+                NeoEventType.FAILED,
+                phase=failed_in,
+                message=self._voice("failed", error_type=type(exc).__name__),
+                error_type=type(exc).__name__,
+                elapsed_seconds=round(time.time() - start_time, 2),
+            )
             episode = self.current_learning_episode
             if episode is not None:
                 episode.completed_at = time.time()
@@ -331,6 +514,23 @@ class NeoEngine:
 
     def _capture_retrieval_context(self, fact_context, *, included: bool) -> None:
         """Record retrieved fact IDs and scores without changing fact authority."""
+        # Emitted from the funnel every fact-retrieval path passes through
+        # rather than from a phase boundary, because retrieval does not sit
+        # inside one: it runs while REASONING is open. `_current_phase()` keeps
+        # the label honest wherever a future call site puts it.
+        if included and fact_context.valid_facts:
+            self._recalled_fact_count += len(fact_context.valid_facts)
+            subjects = [f.subject for f in fact_context.valid_facts[:3] if f.subject]
+            self._emit(
+                NeoEventType.MEMORY_FOUND,
+                phase=self._current_phase(),
+                message=self._voice("memory_found", count=len(fact_context.valid_facts)),
+                count=len(fact_context.valid_facts),
+                subjects=subjects,
+            )
+            if subjects:
+                self._note_finding(f"prior knowledge: {subjects[0]}")
+
         episode = self.current_learning_episode
         if episode is None:
             return
@@ -602,7 +802,16 @@ class NeoEngine:
 
         # Phase 1: Retrieve additional context
         self._log_action("retrieve_context", neo_input.prompt[:60])
+        self._begin_phase(PHASE_CONTEXT, self._voice("phase_context"))
         enriched_context = self._retrieve_context(neo_input)
+        file_count = len(neo_input.context_files) + len(
+            enriched_context.get("additional_files", []) or []
+        )
+        self._end_phase(
+            PHASE_CONTEXT,
+            self._voice("phase_context_done", count=file_count),
+            file_count=file_count,
+        )
 
         # Include difficulty in context for planning
         enriched_context["difficulty"] = difficulty
@@ -632,22 +841,81 @@ class NeoEngine:
         logger.info("Reasoning mode: %s — %s", decision.mode.value, decision.reason)
 
         plan = simulation_traces = code_suggestions = None
+        # Held so the reasoning phase closes AFTER its findings are emitted —
+        # a host replaying the stream should see what was found before it is
+        # told the phase is done.
+        reasoning_summary = ""
+        reasoning_data: dict[str, Any] = {}
         if decision.mode is ReasoningMode.MULTI_AGENT:
             self._log_action("deliberate", neo_input.prompt[:60])
+            self._begin_phase(
+                PHASE_REASONING,
+                self._voice("phase_panel"),
+            )
             plan, simulation_traces, code_suggestions, deliberation = self._deliberate(
                 enriched_context, route_fn
             )
             if deliberation is not None and deliberation.confidence > 0.0 and code_suggestions:
                 self.last_deliberation = deliberation
+                reasoning_summary = self._voice(
+                    "phase_panel_done",
+                    consensus=f"{deliberation.consensus:.0%}",
+                    rounds=deliberation.rounds,
+                )
+                reasoning_data = {
+                    "consensus": round(deliberation.consensus, 3),
+                    "rounds": deliberation.rounds,
+                }
+                self._note_finding(
+                    f"panel consensus {deliberation.consensus:.0%}"
+                )
             else:
                 logger.warning("Deliberation yielded no usable result; falling back to fast path")
                 self.last_reasoning_mode = "fast"  # honest metadata: we fell back
                 plan = None
+                self._end_phase(
+                    PHASE_REASONING,
+                    self._voice("phase_panel_fallback"),
+                    status="fallback",
+                )
+                self._emit(
+                    NeoEventType.HYPOTHESIS_REJECTED,
+                    phase=PHASE_REASONING,
+                    message=self._voice("panel_rejected"),
+                )
 
         if plan is None:
             # Fast path (default, or fallback from a failed panel).
             self._log_action("lm_call", neo_input.prompt[:60])
+            self._begin_phase(PHASE_REASONING, self._voice("phase_reasoning"))
             plan, simulation_traces, code_suggestions = self._process_combined(enriched_context)
+            reasoning_summary = self._voice(
+                "phase_reasoning_done",
+                steps=len(plan),
+                count=len(code_suggestions),
+            )
+            reasoning_data = {
+                "plan_steps": len(plan),
+                "suggestions": len(code_suggestions),
+            }
+
+        if plan:
+            self._emit(
+                NeoEventType.HYPOTHESIS_FORMED,
+                phase=PHASE_REASONING,
+                message=plan[0].description,
+                plan_steps=len(plan),
+            )
+        for trace in simulation_traces or []:
+            for issue in trace.issues_found:
+                self._emit(
+                    NeoEventType.RISK_FOUND,
+                    phase=PHASE_REASONING,
+                    message=issue,
+                    source="simulation",
+                )
+                self._note_finding(issue)
+        self._end_phase(PHASE_REASONING, reasoning_summary, **reasoning_data)
         self._capture_detectable_fact_use(plan, simulation_traces, code_suggestions)
         code_suggestions = self._apply_role_boundary(code_suggestions)
         self.last_simulation_traces = simulation_traces
@@ -663,9 +931,53 @@ class NeoEngine:
         elapsed = time.time() - start_time
         static_checks = []
         if elapsed < time_budget * self.STATIC_CHECK_BUFFER:
+            self._begin_phase(
+                PHASE_STATIC_CHECKS, self._voice("phase_checks")
+            )
             static_checks = self._run_static_checks(code_suggestions, extracted_constraints)
+            statuses = [self._static_check_status(check) for check in static_checks]
+            failed = [
+                check for check, status in zip(static_checks, statuses)
+                if status == "failed"
+            ]
+            for check in failed:
+                self._emit(
+                    NeoEventType.RISK_FOUND,
+                    phase=PHASE_STATIC_CHECKS,
+                    message=f"{check.tool_name}: {check.summary}",
+                    source="static_check",
+                    tool=check.tool_name,
+                )
+                self._note_finding(f"{check.tool_name} reported errors")
+            if not static_checks:
+                summary = self._voice("phase_checks_none")
+            elif failed:
+                summary = self._voice(
+                    "phase_checks_failed",
+                    failed=len(failed), count=len(static_checks),
+                )
+            else:
+                summary = self._voice("phase_checks_clean", count=len(static_checks))
+            self._end_phase(
+                PHASE_STATIC_CHECKS,
+                summary,
+                checks=len(static_checks),
+                failed=len(failed),
+            )
         else:
-            logger.info(f"Skipping static checks (at {elapsed/time_budget*100:.0f}% budget utilization)")
+            # Guarded: a zero budget is not reachable through _get_time_budget
+            # today, but a *log line* must never be what crashes a run.
+            utilization = (elapsed / time_budget * 100) if time_budget else float("inf")
+            logger.info(f"Skipping static checks (at {utilization:.0f}% budget utilization)")
+            # Opened even though nothing runs: a phase that closes without
+            # opening leaves a host tracking a close for a phase it never saw
+            # start. "Started then skipped" is both true and well-formed.
+            self._begin_phase(PHASE_STATIC_CHECKS, self._voice("phase_checks_considering"))
+            self._end_phase(
+                PHASE_STATIC_CHECKS,
+                self._voice("phase_checks_skipped"),
+                status="skipped",
+            )
 
         # Early exit only when BOTH signals agree: high self-confidence AND no
         # error-severity diagnostics. An objective signal (static analysis
@@ -888,6 +1200,22 @@ class NeoEngine:
             recommended_next_action["suggestion_id"] = code_suggestions[0].suggestion_id
             recommended_next_action["file_path"] = code_suggestions[0].file_path
 
+        orchestrator = self._build_orchestrator_message(
+            plan=plan,
+            simulation_traces=simulation_traces,
+            code_suggestions=code_suggestions,
+            static_checks=static_checks,
+            next_questions=next_questions,
+            confidence=confidence,
+            early_exit=early_exit,
+        )
+        if orchestrator.personality:
+            self._emit(
+                NeoEventType.PERSONALITY_BEAT,
+                phase=PHASE_FINALIZE,
+                message=orchestrator.personality,
+            )
+
         output = NeoOutput(
             plan=plan,
             simulation_traces=simulation_traces,
@@ -900,6 +1228,7 @@ class NeoEngine:
             goal_assessment=goal_assessment,
             strategy_assessment=strategy_assessment,
             recommended_next_action=recommended_next_action,
+            orchestrator=orchestrator,
         )
         self._log_usage_telemetry(output, neo_input)
         return output
@@ -1877,7 +2206,7 @@ RULES:
                 )
 
         # Questions from low-confidence suggestions
-        low_confidence = [s for s in suggestions if s.confidence < 0.7]
+        low_confidence = [s for s in suggestions if s.confidence < self.LOW_CONFIDENCE]
         if low_confidence:
             questions.append(
                 f"{len(low_confidence)} suggestions have low confidence - "
@@ -1979,6 +2308,15 @@ RULES:
         if context.get('high_confidence'):
             triggers.add('high_confidence')
 
+        # Memory state. Without these two, every beat keyed on recall was
+        # unreachable — `unfamiliar_codebase` could never fire at all, and its
+        # configured line was dead text that no test could catch.
+        if context.get('memory_hit'):
+            triggers.add('memory_hit')
+            triggers.add('familiar_pattern')
+        elif context.get('memory_checked'):
+            triggers.add('no_memory_match')
+
         # Find beats with most matching triggers
         best_match = None
         best_score = 0
@@ -1992,6 +2330,220 @@ RULES:
                 best_match = beat
 
         return best_match if best_score > 0 else None
+
+    def _run_beat(self, confidence: Optional[float] = None) -> Optional[dict[str, Any]]:
+        """The one beat this run speaks with, selected once and cached.
+
+        Both the terminal notes and the host-facing line read from here. When
+        each surface selected independently they could pick different beats
+        from the same run — one character speaking with two voices in a single
+        response, since `--json` carries both.
+
+        `confidence` is only available at finalize, so the first caller to know
+        it decides the beat; callers without it (notes) reuse that choice.
+        """
+        if self._beat_selected:
+            return self._selected_beat
+        if not self.context:
+            return None
+        self._selected_beat = self._select_beat({
+            "prompt": self.context.prompt,
+            "error_trace": self.context.error_trace,
+            "high_confidence": (
+                confidence is not None and confidence >= self.EARLY_EXIT_CONFIDENCE
+            ),
+            "memory_hit": self._recalled_fact_count > 0,
+            # Distinguishes "memory was consulted and came back empty" from
+            # "memory was never consulted" (disabled, or a mode that skips it).
+            # Only the first justifies saying Neo has no memory of this code.
+            "memory_checked": self.persistent_memory is not None,
+        })
+        self._beat_selected = True
+        return self._selected_beat
+
+    def _orchestrator_beat(self, confidence: float) -> str:
+        """Return the host-facing personality line, or "" to stay silent.
+
+        Silence is the default and the safe answer. A beat is relayed only when
+        the deck marked it surfaceable and, for beats that claim insight, only
+        when the run actually produced something to be insightful about.
+        Unattached flavor text is what makes a tool feel like theater.
+        """
+        beat = self._run_beat(confidence)
+        if not beat or beat.get("surface") != "orchestrator":
+            return ""
+        if beat.get("requires_finding", False) and not self._findings:
+            return ""
+        return str(beat.get("orchestrator_line", "") or "")
+
+    def _build_orchestrator_message(
+        self,
+        *,
+        plan: list[PlanStep],
+        simulation_traces: list[SimulationTrace],
+        code_suggestions: list[CodeSuggestion],
+        static_checks: list[StaticCheckResult],
+        next_questions: list[str],
+        confidence: float,
+        early_exit: bool,
+    ) -> OrchestratorMessage:
+        """State what this run did, so a host doesn't have to infer it.
+
+        Pure derivation from state already computed — no LM call, no new
+        analysis. Every claim here must be defensible from the rest of the
+        NeoOutput, because a host that repeats an unearned summary is worse
+        than one that says nothing.
+        """
+        from neo.reasoning_mode import ReasoningMode
+
+        failed_checks = [
+            check for check in static_checks
+            if self._static_check_status(check) == "failed"
+        ]
+        mode = self.last_reasoning_mode
+        verification_only = mode == "verification_only"
+
+        # Summary: what I did, what I found, how sure I am.
+        #
+        # First person, and terse. Neo narrating himself in the third person
+        # ("Neo reasoned over the request") reads like a status board, not like
+        # the character the beat deck defines — and this is the line a host is
+        # told to lead with, so it sets the voice for the whole response.
+        # Voice is not licence: every claim below is still derived from state
+        # already computed, and VERIFY still gets its own sentence.
+        #
+        # VERIFY makes no LM call and its `code_suggestions` are the CALLER's
+        # proposed_changes echoed back for checking. Saying "I looked at this"
+        # or "I'd change" there claims the caller's work as mine.
+        if verification_only:
+            verdict = (
+                self._voice("verify_failed", count=len(failed_checks)) if failed_checks
+                else self._voice("verify_clean") if static_checks
+                else self._voice("verify_none")
+            )
+            summary = self._voice(
+                "verify", count=len(code_suggestions), verdict=verdict,
+            )
+        else:
+            stage = self._voice_stage()
+            terse = bool(stage.get("terse"))
+            suffix = "_terse" if terse else ""
+
+            target = target_bare = ""
+            if code_suggestions:
+                files = {s.file_path for s in code_suggestions if s.file_path}
+                if len(files) > 1:
+                    target = self._voice("target_many", count=len(files))
+                    target_bare = f"{len(files)} files. "
+                elif files:
+                    path = next(iter(files))
+                    target = self._voice("target_one", path=path)
+                    target_bare = f"{path}. "
+                action = self._voice(
+                    f"action_change{suffix}",
+                    count=len(code_suggestions), target=target, target_bare=target_bare,
+                )
+            elif plan:
+                action = self._voice(f"action_plan{suffix}", steps=len(plan))
+            else:
+                action = self._voice(f"action_none{suffix}")
+
+            # A Sleeper hedges and a Sleeper's opener says so; The One drops the
+            # opener entirely and leads with the fact. Same data, different
+            # certainty — which is the whole point of the stage model.
+            opener = stage.get(
+                "opener_panel" if mode == ReasoningMode.MULTI_AGENT.value
+                else "opener_solo", ""
+            )
+            confidence_lead = stage.get("confidence_lead", "")
+            confidence_text = (
+                f"{confidence_lead} {confidence:.2f}." if confidence_lead
+                else f"{confidence:.2f}."
+            )
+            summary = " ".join(
+                part for part in (
+                    opener,
+                    f"{action}{stage.get('hedge', '')}." if action else "",
+                    confidence_text,
+                ) if part
+            )
+            if early_exit:
+                summary += self._voice("early_exit")
+
+        # Cautions: what a confident-sounding answer must not bury.
+        cautions: list[str] = []
+        # VERIFY reports confidence as a pass/fail verdict (0.0 on any failure),
+        # not as self-assessed certainty, so the "verify this yourself" advice
+        # would be both circular and wrong.
+        if not verification_only and confidence < self.LOW_CONFIDENCE:
+            cautions.append(
+                self._voice("caution_low_confidence", confidence=f"{confidence:.2f}")
+            )
+        for check in failed_checks:
+            cautions.append(self._voice(
+                "caution_check_failed", tool=check.tool_name, summary=check.summary,
+            ))
+        issue_count = sum(len(t.issues_found) for t in simulation_traces or [])
+        if issue_count:
+            cautions.append(self._voice("caution_sim_issues", count=issue_count))
+        if code_suggestions and not static_checks:
+            # Two different facts with two different remedies: install a linter
+            # versus give the run more time. The phase record already knows
+            # which one happened — don't collapse them here.
+            skipped = any(
+                record["name"] == PHASE_STATIC_CHECKS and record["status"] == "skipped"
+                for record in self._phase_records
+            )
+            cautions.append(self._voice(
+                "caution_unverified_skipped" if skipped
+                else "caution_unverified_no_tools"
+            ))
+        for question in next_questions[:3]:
+            cautions.append(self._voice("caution_open_question", question=question))
+
+        # Narration: phase-by-phase, in the order it happened.
+        narration = [
+            record["message"]
+            for record in self._phase_records
+            if record.get("message") and record.get("status") != "running"
+        ]
+
+        return OrchestratorMessage(
+            summary=summary,
+            personality=self._orchestrator_beat(confidence),
+            # Copy each record, not just the list. These dicts are live engine
+            # state, and this object is handed to foreign consumers.
+            phase_summary=[dict(record) for record in self._phase_records],
+            cautions=self._cap_cautions(cautions),
+            recommended_narration=narration,
+        )
+
+    # A host is instructed never to drop a caution, so this list must stay
+    # relayable. Failed checks and simulation issues are raw LM prose of
+    # unbounded length and count; without a cap the contract asks a host to
+    # surface an arbitrarily large wall of text.
+    MAX_CAUTIONS = 8
+    MAX_CAUTION_CHARS = 300
+
+    def _cap_cautions(self, cautions: list[str]) -> list[str]:
+        """Bound both the number of cautions and the length of each one.
+
+        Truncation is explicit: a dropped caution is reported as a count, never
+        silently discarded, because "there are more problems" is itself one of
+        the things a host must not bury.
+        """
+        # Drop blanks: a voice template that failed to render must not become an
+        # empty bullet a host dutifully relays.
+        capped = [
+            item if len(item) <= self.MAX_CAUTION_CHARS
+            else item[: self.MAX_CAUTION_CHARS - 1].rstrip() + "…"
+            for item in cautions if item
+        ]
+        if len(capped) <= self.MAX_CAUTIONS:
+            return capped
+        dropped = len(capped) - (self.MAX_CAUTIONS - 1)
+        overflow = self._voice("caution_overflow", count=dropped)
+        return capped[: self.MAX_CAUTIONS - 1] + ([overflow] if overflow else [])
 
     def _generate_notes(
         self,
@@ -2011,15 +2563,9 @@ RULES:
             memory_level = self.persistent_memory.memory_level()
         stage = self._memory_level_to_stage(memory_level)
 
-        # Try to select a beat based on context
-        context = {}
-        if self.context:
-            context = {
-                'prompt': self.context.prompt,
-                'error_trace': self.context.error_trace,
-            }
-
-        beat = self._select_beat(context)
+        # The run's single beat — the same one the host-facing line reads, so
+        # the terminal and the orchestrator never speak as different characters.
+        beat = self._run_beat()
 
         # Get the template
         if beat and 'expressions' in beat and stage in beat['expressions']:

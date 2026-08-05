@@ -15,11 +15,12 @@ import json
 import os
 import re
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from neo import progress
 
 # Constants
 MIN_SCORE_THRESHOLD = 0.2  # Filter files with very low relevance (was 0.3, reduced for broad prompts)
@@ -390,10 +391,7 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
             # the user can opt into. Cheap, silent on subsequent runs (we only
             # print when the snapshot file is genuinely missing, not just empty).
             if not index.snapshot_path.exists():
-                print(
-                    "[Neo] Tip: run 'neo --index' to enable semantic file selection",
-                    file=sys.stderr,
-                )
+                progress.note("Tip: run 'neo --index' to enable semantic file selection")
             return {}
         chunks = index.retrieve(prompt, k=k)
 
@@ -425,10 +423,7 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
             prev = boost.get(rel, 0.0)
             boost[rel] = max(prev, sim)
         if boost:
-            print(
-                f"[Neo] ProjectIndex boost: {len(boost)} files matched semantically",
-                file=sys.stderr,
-            )
+            progress.note(f"ProjectIndex boost: {len(boost)} files matched semantically")
         return boost
     except Exception:  # missing index, faiss unavailable, etc.
         # Quiet — index is opt-in, must-not-break path.
@@ -468,10 +463,7 @@ def _history_boost(root: str, prompt: str, k: int = 10) -> dict[str, float]:
         if not counts:
             return {}
         boost = {p: min(0.5, n * 0.15) for p, n in counts.items()}
-        print(
-            f"[Neo] EPISODE-history boost: {len(boost)} files seen in past similar runs",
-            file=sys.stderr,
-        )
+        progress.note(f"EPISODE-history boost: {len(boost)} files seen in past similar runs")
         return boost
     except Exception:
         # FactStore missing, fact_store init crashed, etc. — never break gather.
@@ -541,7 +533,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
 
     # Calculate adaptive file limit based on prompt specificity
     adaptive_limit = calculate_adaptive_limit(config.prompt, config.max_files)
-    print(f"[Neo] Adaptive limit: {adaptive_limit} files (based on prompt specificity)", file=sys.stderr)
+    progress.note(f"Adaptive limit: {adaptive_limit} files (based on prompt specificity)")
 
     # ProjectIndex semantic boost (uses pre-built tree-sitter + FAISS index
     # if present in .neo/). Computed once up front — boosts apply to
@@ -593,16 +585,16 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
             # Remove duplicates while preserving order
             seen = set()
             scored_filtered = [x for x in scored_filtered if not (x[1] in seen or seen.add(x[1]))]
-            print(f"[Neo] Broad prompt detected: including {len(arch_files[:5])} architectural files", file=sys.stderr)
+            progress.note(f"Broad prompt detected: including {len(arch_files[:5])} architectural files")
 
     # If no files pass threshold, keep top 10 anyway to avoid empty results
     if not scored_filtered and scored_before_filter > 0:
-        print(f"[Neo] Warning: All files scored below {MIN_SCORE_THRESHOLD}, using top 10", file=sys.stderr)
+        progress.note(f"Warning: All files scored below {MIN_SCORE_THRESHOLD}, using top 10")
         scored = scored[:10]
     else:
         filtered_count = scored_before_filter - len(scored_filtered)
         if filtered_count > 0:
-            print(f"[Neo] Filtered {filtered_count} low-relevance files (score < {MIN_SCORE_THRESHOLD})", file=sys.stderr)
+            progress.note(f"Filtered {filtered_count} low-relevance files (score < {MIN_SCORE_THRESHOLD})")
         scored = scored_filtered
 
     # Re-rank pass: union in ProjectIndex semantic hits, then layer
@@ -654,10 +646,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         final_score = base_score + pi + hist + sym
         enriched.append((abs_path, rel_path, size, final_score))
     if symbol_hit_count:
-        print(
-            f"[Neo] Symbol-relevance boost applied to {symbol_hit_count} files",
-            file=sys.stderr,
-        )
+        progress.note(f"Symbol-relevance boost applied to {symbol_hit_count} files")
 
     enriched.sort(key=lambda x: x[3], reverse=True)
     scored = enriched
@@ -685,7 +674,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
                 size_kb = len(content) / 1024
                 if size_kb > 50:
                     if rel_path not in large_files_warned:
-                        print(f"[Neo] Warning: {rel_path} is {size_kb:.0f}KB - consider refactoring into smaller modules", file=sys.stderr)
+                        progress.note(f"Warning: {rel_path} is {size_kb:.0f}KB - consider refactoring into smaller modules")
                         large_files_warned.append(rel_path)
 
                 chunks = select_chunks(content, prompt_tokens)
@@ -823,8 +812,8 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
 
     # Check if index exists
     if not index_path.exists():
-        print(f"[Neo] No semantic index found at {index_path}", file=sys.stderr)
-        print("[Neo] Falling back to keyword search. Run 'neo index' to build semantic index.", file=sys.stderr)
+        progress.note(f"No semantic index found at {index_path}")
+        progress.note("Falling back to keyword search. Run 'neo index' to build semantic index.")
         return gather_context(config)
 
     # Load ProjectIndex
@@ -838,8 +827,8 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
         chunks = index.retrieve(config.prompt, k=100)
 
         if not chunks:
-            print("[Neo] No chunks found in semantic index", file=sys.stderr)
-            print("[Neo] Falling back to keyword search", file=sys.stderr)
+            progress.note("No chunks found in semantic index")
+            progress.note("Falling back to keyword search")
             return gather_context(config)
 
         # Pack chunks using MMR for diversity
@@ -875,17 +864,17 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
             root=root
         )
 
-        print(f"[Neo] Semantic search: {len(selected_chunks)} chunks from {len(set(cf.rel_path for cf in context_files))} files in {elapsed*1000:.0f}ms", file=sys.stderr)
+        progress.note(f"Semantic search: {len(selected_chunks)} chunks from {len(set(cf.rel_path for cf in context_files))} files in {elapsed*1000:.0f}ms")
 
         return context_files
 
     except ImportError as e:
-        print(f"[Neo] Failed to load ProjectIndex: {e}", file=sys.stderr)
-        print("[Neo] Falling back to keyword search", file=sys.stderr)
+        progress.note(f"Failed to load ProjectIndex: {e}")
+        progress.note("Falling back to keyword search")
         return gather_context(config)
     except Exception as e:
-        print(f"[Neo] Semantic search error: {e}", file=sys.stderr)
-        print("[Neo] Falling back to keyword search", file=sys.stderr)
+        progress.note(f"Semantic search error: {e}")
+        progress.note("Falling back to keyword search")
         return gather_context(config)
 
 
@@ -922,4 +911,4 @@ def log_context_metrics(method: str, elapsed_ms: float, chunks_retrieved: int,
             f.write(json.dumps(metric) + '\n')
     except Exception as e:
         # Don't fail on metrics logging errors
-        print(f"[Neo] Warning: Failed to log metrics: {e}", file=sys.stderr)
+        progress.note(f"Warning: Failed to log metrics: {e}")

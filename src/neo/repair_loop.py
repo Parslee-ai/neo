@@ -146,8 +146,8 @@ def repair_response(
             )
 
             # Parse the repaired response
-            from structured_parser import parse_structured_response
-            from schemas import (
+            from neo.structured_parser import parse_structured_response
+            from neo.schemas import (
                 PLAN_STEP_SCHEMA,
                 SIMULATION_TRACE_SCHEMA,
                 CODE_SUGGESTION_SCHEMA
