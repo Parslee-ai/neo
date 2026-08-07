@@ -31,7 +31,29 @@
     tunable independently.
   - Episode-derived promotion correlation (`store._episode_signature` /
     `_global_signature`): a candidate promotes to a durable fact only when ≥2
-    independent verified-accepted episodes share a **correlation signature**. That
+    verified-accepted episodes share a **correlation signature** AND those
+    episodes span ≥2 distinct `repository_revision`s
+    (`_supporting_episodes_span_distinct_revisions`). The revision requirement is
+    what "independent" actually means here: distinct episode ids alone is no test
+    at all, since every invocation mints a fresh one, so one operator applying the
+    same patch twice minutes apart at the same HEAD promoted a durable PATTERN
+    whose content was wrong (reproduced live). **A session-id fallback for non-git
+    projects was written and REMOVED — do not reintroduce it.**
+    `LearningEpisode.session_id` is a per-episode `uuid4()` that nothing ever
+    assigns from a real session (121 episodes on a live ledger → 121 distinct
+    ids), so "≥2 distinct sessions" was the very gate being replaced, renamed;
+    and since acceptance detection is entirely git-based, a genuinely non-git
+    project can never record an ACCEPTED outcome and could not reach the fallback
+    anyway. Its only reachable trigger was a transient `rev-parse` failure, which
+    made BOTH failing promote while ONE failing blocked — load-dependent
+    non-determinism in the durable memory path. It now fails closed on a blank
+    revision. Two accepted costs, documented on the predicate: the revision is
+    captured when the episode BEGINS (HEAD when advice was asked for, not the
+    commit the fix landed in), and applying one lesson across several files in a
+    single sitting records ONE revision and promotes nothing (40% of
+    revision-bearing episodes share a HEAD with another). Keying on the
+    acceptance-carrying sha — already walked by `_get_changed_files_since` — is
+    the obvious improvement. That
     signature is keyed on the candidate SUBJECT, never the body — the body is the
     LM's run-varying Reasoning/Suggestion prose, and including it (the old
     `generalize(subject+body)`) gave two acceptances of one task different
@@ -123,8 +145,8 @@
     vs 29 raw), and every run multiplied the whole corpus by 0.97. A live census
     also showed zero ≥3-member clusters at cosine 0.85 across all 1152 valid
     REVIEWs, so it could not fire on real data anyway. The git-verified episode
-    ledger (`_promote_repeatedly_supported_candidate`, ≥2 independent verified
-    acceptances) is the learning path that remains — do not reintroduce an
+    ledger (`_promote_repeatedly_supported_candidate`, ≥2 verified acceptances
+    spanning ≥2 revisions) is the learning path that remains — do not reintroduce an
     unverified similarity-clustered route beside it. Facts minted before the
     removal keep their `synthesized` tag and prune immunity; nothing mints it
     now. `SUPERSESSION_THRESHOLD` (0.85) and canonical-signature dedup are
@@ -151,9 +173,35 @@
     from a real new file and is admitted. That asymmetry is deliberate —
     `kind` is frozen at mint, so under-admitting permanently kills a real
     lesson, while over-admitting only leaves a candidate pending.
-    `neo memory learning-stats` reports the verifiable/total ratio and says
-    STARVED (rather than IDLE) when nothing is verifiable, so a starved loop is
-    distinguishable from a broken one.
+    `neo memory learning-stats` buckets recorded suggestions FOUR ways
+    (`subcommands._classify_suggestion`): `verifiable`, `advisory`,
+    `unattributable` (the bug signal) and `root_unavailable`. The fourth exists
+    because every resolution test runs against the LIVE filesystem, so a recorded
+    `codebase_root` that no longer exists — mostly deleted Claude Code agent
+    worktrees — makes them all meaningless; counted as unattributable those
+    buried the one number the report exists to make actionable. **Ordering rule**:
+    only the empty-input test is decidable from the arguments alone, so the root
+    check runs immediately after it and every filesystem-dependent branch runs
+    below. Placing the prose-suffix/sentinel/`docs/` branches above it looked
+    string-decidable and was not — under a dead root all three degrade to "does
+    not exist" and silently return advisory, which under-reported the integrity
+    signal by 43% (8 against 14 real) and inflated `measurable` by the difference.
+    Verdicts (ACTIVE / UNMEASURABLE / STARVED / IDLE) are computed over
+    `measurable = total - root_unavailable`, never against a content bucket: the
+    first version compared `root_unavailable > verifiable`, so a single dead root
+    suppressed STARVED entirely and claimed "most recorded suggestions" off a
+    count of one. An integrity note discloses the unmeasured share in EVERY
+    branch, ACTIVE included. The bug signal is keyed on `_SOURCE_SUFFIXES`, not on
+    a leading slash — slash-keying split `/review/x.json` from `review/x.json` on
+    LM formatting alone and buried two real defects (a model-emitted
+    `<placeholder>` segment and a new module in a new directory). This classifier
+    is **reporting-only and deliberately stricter than
+    `suggestion_is_verifiable`**, which stays untouched: its bias toward admitting
+    a doubtful path is correct because `kind` is frozen at mint, while
+    over-admitting in a report costs only an inaccurate number. Measured: the
+    prose-suffix-before-verifiable ordering corrected `verifiable` from 21 to 10,
+    11 of which were invented review docs (`/ARCHITECTURAL_REVIEW.md`) that the
+    plausible-new-file rule had granted because their parent IS the repo root.
   - Probation: new non-curated facts enter with a `probation` tag and a 3-day stale window
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
@@ -469,7 +517,42 @@
 - Debugging: `neo --dry-run "your query"` assembles the full context (file selection,
   fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
   the LM, then exits without making the LLM call. Faster iteration on context-gatherer
-  and retrieval changes than waiting for an inference round trip.
+  and retrieval changes than waiting for an inference round trip. **Use it before
+  believing any claim about what Neo "saw"** — the two defects below were both
+  invisible from the outside and presented as the model being unhelpful.
+- Context selection (`context_gatherer`): **a path named in the prompt is pinned**
+  (`EXPLICIT_PATH_BOOST=10.0`, chosen to exceed every organic signal combined —
+  filename overlap caps at +1.8, the re-rank boosts at +1.0 and +1.2). Without it a
+  spelled-out path competed on generic filename-token overlap and lost:
+  `src/neo/subcommands.py` ranked **163rd of 296** on a prompt naming it, below its
+  own test file, because an 86KB file takes a heavy size penalty. The file never
+  reached context, so the model correctly refused to patch code it had not seen and
+  emitted NO diff — and a suggestion with no diff text can never be git-verified,
+  which is a major reason only ~32% of suggestions were verifiable.
+  `matches_explicit_path` tests containment in BOTH directions (an absolute path —
+  what tracebacks, IDE copy-path and Neo's own output emit — must match the
+  repo-relative candidate) and anchors on `/` so bare `subcommands.py` hits
+  `src/neo/subcommands.py` but NOT `tests/test_subcommands.py`. A named path that
+  matched nothing emits a WARNING; silence there is indistinguishable from "no path
+  mentioned".
+  `select_chunks` ranks windows by **per-file document frequency** and **matched-token
+  length**, not file order or match count. It used to take `matching_idxs[:5]` — the
+  first five matching lines in FILE ORDER — and since matching is a substring test and
+  `extract_prompt_tokens` emits every 3+ character word, `"in"` matched
+  `int`/`using`/`point` and virtually every line qualified. "First five matches"
+  therefore meant **lines 1-5 for any prompt against any large file**: every large file
+  contributed its import block, twice, as overlapping near-duplicates that consumed
+  both slots of `MAX_CHUNKS_PER_FILE`. A length cutoff for "discriminative" is
+  INVERTED on real prompts (English stopwords are long, identifiers are short — it
+  keeps `does`/`here` and drops `db`/`fs`/`os`), hence document frequency
+  (`DISCRIMINATIVE_MAX_LINE_FRACTION=0.25`). Length weighting matters because match
+  COUNT let a keyword-bearing module docstring tie with the function body and win on
+  the file-order tie-break. Window merging is bounded by `MAX_MERGED_WINDOW_LINES`:
+  unbounded chain-merging measured **8.3× over `max_chunk_bytes`**, and because the
+  caller admits a chunk all-or-nothing, an oversized chunk that no longer fits the
+  global budget is DROPPED — the original bug returning through a different door.
+  `_fit_to_budget` shrinks outward from the window's best line so truncation can never
+  discard the line that earned the window.
 - Host communication (`neo.events` + `models.OrchestratorMessage`): the engine
   reports lifecycle facts so a host (Claude Code, MCP, an IDE) doesn't have to
   reverse-engineer presentation from raw plans. **Governing rule: Neo reports
