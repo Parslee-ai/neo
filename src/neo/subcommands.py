@@ -988,8 +988,14 @@ def _handle_learning_stats(args) -> None:
     buckets = _suggestion_verifiability()
     total_sugg = sum(buckets.values())
     verifiable = buckets["verifiable"]
+    # Verdicts are computed over what could actually be classified. Comparing an
+    # unmeasurable count against a content bucket mixes unlike quantities: it let
+    # a single dead root suppress STARVED entirely and print "most recorded
+    # suggestions" off a count of one.
+    unavailable = buckets["root_unavailable"]
+    measurable = total_sugg - unavailable
     if total_sugg:
-        print(f"  recorded suggestions (all time, all projects): {total_sugg}")
+        print(f"  recorded suggestions (latest session per project): {total_sugg}")
         print(f"    {'verifiable (real edit target)':<40} {verifiable:>5}"
               f"   {verifiable * 100 // total_sugg}%")
         print(f"    {'advisory (no edit target by design)':<40} "
@@ -997,6 +1003,9 @@ def _handle_learning_stats(args) -> None:
         print(f"    {'unattributable (looks real, unresolved)':<40} "
               f"{buckets['unattributable']:>5}   "
               f"{buckets['unattributable'] * 100 // total_sugg}%")
+        if unavailable:
+            print(f"    {'unmeasurable (recorded root unavailable)':<40} "
+                  f"{unavailable:>5}   {unavailable * 100 // total_sugg}%")
 
     if active:
         # Include demotions: `active` counts them, so omitting them here printed
@@ -1004,11 +1013,19 @@ def _handle_learning_stats(args) -> None:
         print(f"  => interactive loop is ACTIVE: {promotions} promoted, "
               f"{rollbacks} rolled back, {demotions} demoted, "
               f"{reinforcements} reinforced")
-    elif total_sugg and verifiable == 0:
+    elif total_sugg and measurable == 0:
+        # Checked before STARVED: "never measured" and "measured and empty" have
+        # opposite remedies. The predicate is exact — every recorded suggestion
+        # is unclassifiable — rather than a ratio against a content bucket.
+        print("  => interactive loop is UNMEASURABLE: every recorded suggestion "
+              "points at a codebase root that no longer exists, so acceptance "
+              "could never be detected. Usual cause is neo being run inside an "
+              "ephemeral worktree that was deleted before the attributing run.")
+    elif measurable and verifiable == 0:
         print("  => interactive loop is STARVED, not broken: no recorded "
               "suggestion could be git-verified, so no acceptance is detectable. "
               "Advisory/planning prompts produce pseudo-paths, not edit targets.")
-    elif total_sugg and buckets["unattributable"] > verifiable:
+    elif measurable and buckets["unattributable"] > verifiable:
         print("  => interactive loop is IDLE, and more suggestions were "
               "unattributable than verifiable — that skew is a bug signal, not a "
               "usage one. Check that paths resolve under the recorded root.")
@@ -1017,6 +1034,14 @@ def _handle_learning_stats(args) -> None:
               "promotion / reinforcement yet — suggestions aren't being accepted "
               "downstream. (Does NOT mean neo isn't learning: transcript mining "
               "mints facts on a separate path this doesn't count.)")
+    if unavailable:
+        # Every branch, ACTIVE included: measurement integrity is orthogonal to
+        # the verdict, so a partially-unmeasured corpus must qualify a healthy
+        # reading as much as an unhealthy one.
+        print(f"  note: {unavailable} of {total_sugg} recorded suggestion(s) could "
+              "not be classified because the recorded codebase root is gone; the "
+              "verdict above is computed over the remaining "
+              f"{measurable}.")
 
 
 # Extensions that mean "this suggestion was prose, not a code edit". A path that
@@ -1024,51 +1049,135 @@ def _handle_learning_stats(args) -> None:
 # attribution — the distinction the report exists to make.
 _ADVISORY_SUFFIXES = frozenset({".md", ".txt", ".rst", ".adoc"})
 
+# Extensions that make an unresolved path a real BUG SIGNAL rather than an
+# advisory answer. Deliberately an allowlist of code: the bucket's claim is "a
+# genuine code suggestion we failed to attribute", so only a path that could
+# plausibly BE code earns it. A missing entry (some new language) merely
+# under-reports into `advisory`, the same rot direction _ADVISORY_SUFFIXES
+# already has.
+#
+# Keyed on extension rather than on a leading slash. An earlier version treated
+# any unrelativizable "/foo/bar" as advisory, which buried two real defects: a
+# model-emitted placeholder segment ("/dotnet/src/<entitlements>/Store.cs") and
+# a genuine new module in a new directory ("/src/newpkg/handler.py") — both code,
+# both invisible to `suggestion_is_verifiable`, both exactly what this bucket
+# exists to surface. It also split "/review/x.json" from "review/x.json", which
+# mean the same thing to a human, on nothing but LM formatting.
+_SOURCE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".cs", ".java", ".kt", ".go",
+    ".rb", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".swift",
+    ".php", ".scala", ".sh", ".bash", ".zsh", ".sql", ".vue", ".svelte",
+    # Markup/config that is still an edit target. `.razor` is not speculative:
+    # it appears in the live suggestion corpus, so omitting it would have turned
+    # a real unresolved component path into "advisory".
+    ".razor", ".cshtml", ".xaml", ".html", ".scss", ".css", ".lua", ".dart",
+    ".ps1", ".proto", ".gradle", ".tf", ".toml", ".yaml", ".yml",
+})
+
 
 def _classify_suggestion(file_path: str, has_change_text: bool, root: str) -> str:
-    """One of "verifiable" | "advisory" | "unattributable".
+    """One of "verifiable" | "advisory" | "unattributable" | "root_unavailable".
 
     Reporting-only: deliberately does NOT reuse `OutcomeTracker._is_review_only_path`,
     which drives real weak-acceptance behavior and is narrow on purpose. Widening
-    it to make a stat look tidier would change what neo learns.
+    it to make a stat look tidier would change what neo learns. For the same
+    reason it does not touch `suggestion_is_verifiable`, whose bias toward
+    ADMITTING a doubtful path is deliberate (kind is frozen at mint, so
+    under-admitting there permanently kills a real lesson). Over-admitting in a
+    *report* costs nothing but an inaccurate number, so this is stricter.
+
+    Ordering rule: anything decidable from the arguments alone is decided BEFORE
+    the filesystem is consulted, so a dead root cannot change an answer that
+    never needed the disk. Only the empty-input test qualifies — every other
+    branch stats the disk, including the prose-suffix one, which must ask
+    whether the file exists (see below). An earlier version placed three
+    stat-ing branches above the root check on the theory that they were
+    string-decidable; they are not, and under a dead root all three degrade to
+    "does not exist" and silently return advisory. Measured: that reported 8 of
+    14 dead-root suggestions as unavailable and absorbed the other 6 into
+    advisory, so the integrity note under-counted by 43% and `measurable`
+    over-counted by the same 6.
     """
     from neo.memory.outcomes import normalize_suggestion_path, suggestion_is_verifiable
 
     if not file_path or not has_change_text:
         return "advisory"
-    # Sentinel check runs BEFORE the verifiable test: an all-caps, extension-less
-    # name that resolves to nothing ("NO_MODIFY", "NO_CODE_PLANNING_ONLY") passes
-    # the plausible-new-file rule at repo root, but it is the model saying "no
-    # code change here". Requiring ALL-CAPS keeps real extension-less files
-    # (Makefile, Dockerfile) out of this bucket.
+
+    # Everything below needs the live filesystem, so a root that no longer exists
+    # makes all of it meaningless — the path was very likely resolvable when the
+    # suggestion was recorded. With the tree gone we genuinely cannot tell an
+    # edit to an existing README from an invented one, and saying so is more
+    # honest than guessing advisory.
+    # NOTE the check is one-sided: a root that exists today may be a re-clone or
+    # a reused temp path, so this detects definite invalidity and never certifies
+    # validity.
+    if not root or not Path(root).is_dir():
+        return "root_unavailable"
+
+    suffix = Path(file_path).suffix.lower()
+    # Sentinel: an all-caps, extension-less name that resolves to nothing
+    # ("NO_MODIFY", "NO_CODE_PLANNING_ONLY") passes the plausible-new-file rule
+    # at repo root, but it is the model saying "no code change here". Requiring
+    # ALL-CAPS keeps real extension-less files (Makefile, Dockerfile) out.
     stem = Path(file_path).name
-    if (not Path(file_path).suffix and stem
-            and stem.replace("_", "").isupper()
+    if (not suffix and stem and stem.replace("_", "").isupper()
             and not (Path(root) / normalize_suggestion_path(file_path, root)).is_file()):
         return "advisory"
-    if suggestion_is_verifiable(file_path, has_change_text, root):
-        return "verifiable"
+    # Prose suffix that names no existing file. This runs BEFORE the verifiable
+    # test on purpose: a bare-slash doc at repo root ("/ARCHITECTURAL_REVIEW.md")
+    # normalizes to a name whose parent IS the root, so the plausible-new-file
+    # rule inside `suggestion_is_verifiable` grants it "verifiable". Measured: 11
+    # of 21 supposedly verifiable suggestions were review prose that does not
+    # exist on disk, which made the headline number — and every threshold below
+    # it — wrong. Editing a real README.md still counts; inventing one does not.
+    if suffix in _ADVISORY_SUFFIXES and not _resolves_to_file(file_path, root):
+        return "advisory"
     normalized = normalize_suggestion_path(file_path, root)
     if normalized.startswith("docs/") or "/docs/" in normalized:
         return "advisory"
-    suffix = Path(file_path).suffix.lower()
-    if suffix in _ADVISORY_SUFFIXES:
-        # A doc-shaped or extension-less path that resolves to nothing is the
-        # model saying "no code change here" (/REVIEW_ONLY/..., NO_MODIFY,
-        # /planning/critique.md), not an edit we failed to find.
+
+    if suggestion_is_verifiable(file_path, has_change_text, root):
+        return "verifiable"
+    # Unresolved and not code-shaped: an advisory answer's invented path
+    # ("/review/wave2_residual_bugs.json", "/dev/null"), not an edit we failed to
+    # find. Code-shaped paths fall through to "unattributable" so genuine
+    # defects stay visible there.
+    if suffix not in _SOURCE_SUFFIXES:
         return "advisory"
     return "unattributable"
+
+
+def _resolves_to_file(file_path: str, root: str) -> bool:
+    """Does this suggestion path name a file that exists right now?"""
+    from neo.memory.outcomes import normalize_suggestion_path
+
+    try:
+        normalized = normalize_suggestion_path(file_path, root)
+        path = Path(normalized)
+        if not path.is_absolute():
+            if not root:
+                return False
+            path = Path(root) / normalized
+        return path.is_file()
+    except (OSError, ValueError):
+        return False
 
 
 def _suggestion_verifiability() -> dict[str, int]:
     """Bucket recorded session suggestions by whether learning could ever attach.
 
-    Three outcomes, because collapsing them makes the number unactionable: a
-    prompt that legitimately had no edit target is a usage property, while a real
-    code suggestion we failed to attribute is a bug worth chasing.
+    Four outcomes, because collapsing them makes the number unactionable: a
+    prompt that legitimately had no edit target is a usage property, a real code
+    suggestion we failed to attribute is a bug worth chasing, and a suggestion
+    whose recorded root is gone is neither — it is simply unmeasurable.
+
+    Known limit: `session_<project_id>.json` is OVERWRITTEN on each save, so this
+    reads the most recent session per project, not full history.
     """
     sessions_dir = Path.home() / ".neo" / "sessions"
-    counts = {"verifiable": 0, "advisory": 0, "unattributable": 0}
+    counts = {
+        "verifiable": 0, "advisory": 0, "unattributable": 0, "root_unavailable": 0,
+    }
     try:
         session_files = sorted(sessions_dir.glob("session_*.json"))
     except OSError:

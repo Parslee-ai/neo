@@ -1001,7 +1001,8 @@ class TestOutcomeLinkage:
             MemoryCandidateEvidence,
         )
 
-        episode = LearningEpisode(episode_id="ep-one", project_id=store.project_id)
+        episode = LearningEpisode(episode_id="ep-one", project_id=store.project_id,
+                                  repository_revision="rev-ep-one")
         episode.memory_candidates.append(MemoryCandidateEvidence(
             candidate_id="candidate-one",
             suggestion_id="suggestion-one",
@@ -1042,7 +1043,8 @@ class TestOutcomeLinkage:
             episode_id = f"ep-{suffix}"
             candidate_id = f"candidate-{suffix}"
             suggestion_id = f"suggestion-{suffix}"
-            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{episode_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=candidate_id,
                 suggestion_id=suggestion_id,
@@ -1075,15 +1077,25 @@ class TestOutcomeLinkage:
         assert "durable" in promoted[0].tags
         assert "probation" not in promoted[0].tags
 
-    def _accept_episode(self, store, ep_id, subject, body, kind="pattern"):
+    def _accept_episode(self, store, ep_id, subject, body, kind="pattern",
+                        revision=None):
         """Record one ACCEPTED outcome for a fresh episode (drives the real
-        detect_implicit_feedback promotion path)."""
+        detect_implicit_feedback promotion path).
+
+        `revision` defaults to a value unique per episode — the ordinary shape,
+        where each acceptance is observed at its own HEAD. Tests exercising the
+        promotion independence gate pass it explicitly (a shared value, or ""
+        for the blank a repo-less or failed `rev-parse` produces).
+        """
+        if revision is None:
+            revision = f"rev-{ep_id}"
         from neo.memory.episodes import (
             LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
         )
         episode_store = LearningEpisodeStore(store.project_id)
         cand_id = f"{ep_id}-cand"
-        episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+        episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                                  repository_revision=revision)
         episode.memory_candidates.append(MemoryCandidateEvidence(
             candidate_id=cand_id, suggestion_id=f"{ep_id}-sug",
             subject=subject, body=body, kind=kind,
@@ -1119,6 +1131,81 @@ class TestOutcomeLinkage:
         # fingerprint survives in the frozen correlation signature.
         assert "[fp:" not in promoted[0].subject
         assert promoted[0].canonical_signature.endswith("deadbeef1234")
+
+    def test_same_revision_acceptances_do_not_promote(self, store):
+        """The drill regression. Two acceptances at the SAME HEAD are one
+        operator applying one patch twice, not a lesson that recurred — distinct
+        episode ids alone let that mint a durable PATTERN whose content was
+        wrong. Promotion claims recurrence, so it must span two revisions."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "same-rev-0", subject, "Reasoning: catch OSError.",
+                             revision="d83659cea51676124f2488f6629e0957302e1c1f")
+        self._accept_episode(store, "same-rev-1", subject, "Reasoning: catch OSError.",
+                             revision="d83659cea51676124f2488f6629e0957302e1c1f")
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+        from neo.memory.episodes import LearningEpisodeStore
+        es = LearningEpisodeStore(store.project_id)
+        # Not rejected — still supported_once, so a later acceptance at a NEW
+        # revision promotes it. Under-promotion delays; it does not discard.
+        assert es.load("same-rev-1").memory_candidates[0].status == "supported_once"
+
+    def test_distinct_revision_acceptances_promote(self, store):
+        """The same lesson accepted at two different points in the repo's history
+        IS recurrence — that must still promote, or the gate has killed learning
+        rather than tightened it."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "diff-rev-0", subject, "Reasoning: catch OSError.",
+                             revision="1111111111111111111111111111111111111111")
+        self._accept_episode(store, "diff-rev-1", subject, "Reasoning: catch OSError.",
+                             revision="2222222222222222222222222222222222222222")
+
+        promoted = [f for f in store.entries if "episode-derived" in f.tags]
+        assert len(promoted) == 1
+        assert "durable" in promoted[0].tags
+
+    def test_missing_revisions_fail_closed(self, store):
+        """No revision recorded is no independence evidence. There is
+        deliberately no session-id fallback: `session_id` is a per-episode uuid4
+        that nothing assigns from a real session, so falling back to "distinct
+        sessions" would have restored the exact gate being replaced. The
+        reachable cause of a blank revision is a transient `rev-parse` failure,
+        and promoting on that made a flaky subprocess decide whether a durable
+        fact got minted."""
+        subject = "bugfix: guard the parse [parser.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "norev-0", subject, "Reasoning: guard it.",
+                             revision="")
+        self._accept_episode(store, "norev-1", subject, "Reasoning: guard it.",
+                             revision="")
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_mixed_revision_evidence_fails_closed(self, store):
+        """One episode with a revision and one without is not two revisions.
+        Fail closed: a delayed durable fact is recoverable, a wrong one is not."""
+        subject = "bugfix: guard the parse [parser.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "mixed-0", subject, "Reasoning: guard it.",
+                             revision="1111111111111111111111111111111111111111")
+        self._accept_episode(store, "mixed-1", subject, "Reasoning: guard it.",
+                             revision="")
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_promotion_is_not_decided_by_a_flaky_rev_parse(self, store):
+        """Regression for the inverted incentive the session fallback created:
+        two blank revisions must not be MORE permissive than one blank and one
+        present. Both shapes block; neither promotes."""
+        base = "bugfix: guard the parse [parser.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "flaky-0", base, "R.", revision="")
+        self._accept_episode(store, "flaky-1", base, "R.", revision="")
+        both_blank = [f for f in store.entries if "episode-derived" in f.tags]
+
+        other = "bugfix: widen the guard [parser.py] [fp:cafebabe5678]"
+        self._accept_episode(store, "flaky-2", other, "R.", revision="")
+        self._accept_episode(store, "flaky-3", other, "R.", revision="aaa111")
+        one_blank = [f for f in store.entries if "episode-derived" in f.tags]
+
+        assert both_blank == [] and one_blank == []
 
     def test_divergent_fingerprint_blocks_false_promotion(self, store):
         """Two accepted episodes sharing a task/prompt prefix but proposing
@@ -1157,7 +1244,8 @@ class TestOutcomeLinkage:
             episode_id = f"rollback-{index}"
             candidate_id = f"rollback-candidate-{index}"
             suggestion_id = f"rollback-suggestion-{index}"
-            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{episode_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=candidate_id,
                 suggestion_id=suggestion_id,
@@ -1234,7 +1322,8 @@ class TestOutcomeLinkage:
         for index in range(2):
             ep_id = f"{prefix}-{index}"
             cand_id = f"{prefix}-cand-{index}"
-            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{ep_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=cand_id, suggestion_id=f"{prefix}-sug-{index}",
                 subject=subject, body=body, kind="pattern",
@@ -1294,7 +1383,8 @@ class TestOutcomeLinkage:
         for index in range(2):
             ep_id = f"correct-{index}"
             cand_id = f"correct-cand-{index}"
-            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{ep_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=cand_id, suggestion_id=f"correct-sug-{index}",
                 subject=subject, body=body, kind="pattern",
@@ -1335,7 +1425,8 @@ class TestOutcomeLinkage:
         episode_store = LearningEpisodeStore(store.project_id)
         for index in range(2):
             ep_id = f"kill-{index}"
-            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{ep_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=f"kill-cand-{index}", suggestion_id=f"kill-sug-{index}",
                 subject=subject, body=body, kind="pattern",
@@ -1373,7 +1464,8 @@ class TestOutcomeLinkage:
         episode_store = LearningEpisodeStore(store.project_id)
         for index in range(2):
             ep_id = f"kill-{index}"
-            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{ep_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=f"kill-cand-{index}", suggestion_id=f"kill-sug-{index}",
                 subject=subject, body=body, kind="pattern",
@@ -1501,7 +1593,8 @@ class TestOutcomeLinkage:
             LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
         )
         episode_store = LearningEpisodeStore(store.project_id)
-        ep = LearningEpisode(episode_id="solo", project_id=store.project_id)
+        ep = LearningEpisode(episode_id="solo", project_id=store.project_id,
+                             repository_revision="rev-solo")
         ep.memory_candidates.append(MemoryCandidateEvidence(
             candidate_id="solo-cand", suggestion_id="solo-sug",
             subject="pattern: cache results [src/a.py]", body="memoize the call",
@@ -1533,7 +1626,8 @@ class TestOutcomeLinkage:
 
         def _accept(idx):
             ep_id, cand_id, sug_id = f"g{idx}", f"g{idx}c", f"g{idx}s"
-            ep = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+            ep = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{ep_id}")
             ep.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=cand_id, suggestion_id=sug_id,
                 subject=subject, body=body, kind="pattern"))
@@ -1572,7 +1666,8 @@ class TestOutcomeLinkage:
             episode_id = f"regression-{index}"
             suggestion_id = f"regression-suggestion-{index}"
             candidate_id = f"regression-candidate-{index}"
-            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{episode_id}")
             episode.suggestions.append(SuggestionEvidence(
                 suggestion_id=suggestion_id,
                 description="validate input before processing",
@@ -1645,7 +1740,8 @@ class TestOutcomeLinkage:
         for index in range(2):
             episode_id = f"failed-{index}"
             candidate_id = f"failed-candidate-{index}"
-            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{episode_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=candidate_id,
                 suggestion_id=f"failed-suggestion-{index}",
@@ -1695,7 +1791,8 @@ class TestOutcomeLinkage:
         for index in range(3):
             episode_id = f"arch-{index}"
             candidate_id = f"arch-candidate-{index}"
-            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id)
+            episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id,
+                                      repository_revision=f"rev-{episode_id}")
             episode.memory_candidates.append(MemoryCandidateEvidence(
                 candidate_id=candidate_id,
                 suggestion_id=f"arch-suggestion-{index}",
@@ -1741,7 +1838,8 @@ class TestOutcomeLinkage:
             es = LearningEpisodeStore(st.project_id, base_dir=episodes_dir)
             for i in range(n_accepts):
                 ep_id, cid, sid = f"{name}-{i}", f"{name}-c-{i}", f"{name}-s-{i}"
-                ep = LearningEpisode(episode_id=ep_id, project_id=st.project_id)
+                ep = LearningEpisode(episode_id=ep_id, project_id=st.project_id,
+                                    repository_revision=f"rev-{ep_id}")
                 ep.memory_candidates.append(MemoryCandidateEvidence(
                     candidate_id=cid, suggestion_id=sid,
                     subject=subject, body=body, kind="pattern"))
@@ -1809,7 +1907,8 @@ class TestOutcomeLinkage:
         def _feed(st, prefix, n, otype):
             es = LearningEpisodeStore(st.project_id, base_dir=episodes_dir)
             for i in range(n):
-                ep = LearningEpisode(episode_id=f"{prefix}-{i}", project_id=st.project_id)
+                ep = LearningEpisode(episode_id=f"{prefix}-{i}", project_id=st.project_id,
+                                    repository_revision=f"rev-{prefix}-{i}")
                 ep.memory_candidates.append(MemoryCandidateEvidence(
                     candidate_id=f"{prefix}c{i}", suggestion_id=f"{prefix}s{i}",
                     subject=subject, body=body, kind="pattern"))
@@ -1861,7 +1960,8 @@ class TestOutcomeLinkage:
         def _feed(st, prefix, n, otype):
             es = LearningEpisodeStore(st.project_id, base_dir=episodes_dir)
             for i in range(n):
-                ep = LearningEpisode(episode_id=f"{prefix}-{i}", project_id=st.project_id)
+                ep = LearningEpisode(episode_id=f"{prefix}-{i}", project_id=st.project_id,
+                                    repository_revision=f"rev-{prefix}-{i}")
                 ep.memory_candidates.append(MemoryCandidateEvidence(
                     candidate_id=f"{prefix}c{i}", suggestion_id=f"{prefix}s{i}",
                     subject=subject, body=body, kind="pattern"))
@@ -1927,6 +2027,7 @@ class TestOutcomeLinkage:
                 episode = LearningEpisode(
                     episode_id=episode_id,
                     project_id=project_store.project_id,
+                    repository_revision=f"rev-{episode_id}",
                 )
                 episode.memory_candidates.append(MemoryCandidateEvidence(
                     candidate_id=candidate_id,
@@ -2018,7 +2119,8 @@ class TestOutcomeLinkage:
             for index in range(2):
                 ep_id = f"{project}-{index}"
                 cand_id = f"cand-{project}-{index}"
-                episode = LearningEpisode(episode_id=ep_id, project_id=project_store.project_id)
+                episode = LearningEpisode(episode_id=ep_id, project_id=project_store.project_id,
+                                          repository_revision=f"rev-{ep_id}")
                 episode.memory_candidates.append(MemoryCandidateEvidence(
                     candidate_id=cand_id, suggestion_id=f"sug-{project}-{index}",
                     subject=subject, body=body, kind="pattern",
