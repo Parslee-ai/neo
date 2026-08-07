@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.43.0] - 2026-08-06
+
+The interactive learning loop had never once reached `accepted` in 30 days of real traffic. This release is the end of that investigation: four separate defects, each of which independently prevented a suggestion from ever being verified, and each measured against a live install rather than argued from the code.
+
+### Fixed
+
+- **Neo never read the file you asked it about.** `score_candidate` had no handling for a path spelled out in the prompt, so an explicitly named file competed on generic filename-token overlap — capped at three hits — against every other candidate. Asked to fix a function in `src/neo/subcommands.py`, Neo ranked that file **163rd of 296 candidates**, below its own test file, because an 86KB file takes a heavy size penalty. The file never entered the context, so the model correctly declined to patch code it had not seen and returned no diff. A suggestion carrying no diff text can never be git-verified, so it can never be learned from — which is a large part of why only ~32% of recorded suggestions were verifiable at all.
+
+  Named paths are now pinned (`EXPLICIT_PATH_BOOST`, set to exceed every organic signal combined). Matching tests containment in *both* directions, because absolute paths — what tracebacks, IDE "copy path" and Neo's own suggestion output emit — otherwise went unmatched, and anchors on `/` so a bare `subcommands.py` hits `src/neo/subcommands.py` but not `tests/test_subcommands.py`. A named path that matches nothing now warns instead of staying silent, which was indistinguishable from mentioning no path at all. (`context_gatherer.py`)
+
+- **Every large file contributed its import block, twice, for any prompt.** `select_chunks` took the first five matching lines *in file order*. Matching is a substring test and `extract_prompt_tokens` emits every 3+ character word, so `"in"` matched `int`, `using` and `point` — virtually every line qualified, and "first five matches" meant lines 1-5 of any large file against any prompt. With a 40-line window that is the module docstring and imports, emitted as two overlapping near-duplicate windows that consumed both slots of `MAX_CHUNKS_PER_FILE`.
+
+  Windows are now ranked by **per-file document frequency** and **matched-token length**. A length cutoff for "discriminative" was tried and is inverted on real prompts — English stopwords are long and identifiers are short, so `len >= 4` keeps "does" and "here" while discarding `db`, `fs`, `os` and `api`. Length weighting matters separately: match *count* let a keyword-bearing module docstring tie with the function body and win on the file-order tie-break. Merging is bounded, because unbounded chain-merging measured **8.3× over `max_chunk_bytes`** — and since the caller admits a chunk all-or-nothing, an oversized chunk that no longer fits the global budget is dropped and the named file contributes nothing, reintroducing the original bug through a different door. (`context_gatherer.py`)
+
+- **Promotion accepted evidence that was not independent, and minted a fact that was wrong.** A candidate promoted on two supporting episodes with distinct `episode_id`s — but every invocation mints a fresh one, so one operator applying the same patch twice, minutes apart, at the same HEAD satisfied it. This was reproduced live, and the durable PATTERN it produced encoded an incorrect lesson. Supporting episodes must now span at least two distinct repository revisions.
+
+  A session-id fallback for non-git projects was written and then removed rather than shipped: `LearningEpisode.session_id` is a per-episode `uuid4()` that nothing ever assigns from a real session (121 episodes on a live ledger, 121 distinct ids), so "two distinct sessions" was the very gate being replaced under a different name. Because acceptance detection is entirely git-based, a genuinely non-git project can never record an ACCEPTED outcome and could not reach the fallback anyway; its only reachable trigger was a transient `rev-parse` failure, which made *both* failing promote while *one* failing blocked. Two costs are accepted and documented on the predicate: the revision is captured when the episode begins, not when the fix lands, and one lesson applied across several files before a commit records a single revision and will not promote. (`memory/store.py`)
+
+- **`neo memory learning-stats` misread its own data in three ways.** Suggestions whose recorded `codebase_root` no longer exists — mostly deleted Claude Code agent worktrees — are unmeasurable, not unattributable, and they dominated the bucket that exists specifically as a bug signal; they now have their own name, and every filesystem-dependent test runs after the root check so the count is honest. Invented review prose at repo root (`/ARCHITECTURAL_REVIEW.md`) counted as *verifiable*, because the plausible-new-file rule admits any path whose parent is the root — 11 of 21 supposedly verifiable suggestions were documents that do not exist. And verdicts compared the unmeasurable count against a content bucket, so a single dead root suppressed STARVED entirely and claimed "most recorded suggestions" off a count of one; they are now computed over the measurable subset, with an integrity note qualifying every branch including ACTIVE.
+
+  On the live corpus this moves `{verifiable 21, advisory 34, unattributable 10}` to `{verifiable 10, advisory 40, unattributable 1, root_unavailable 14}` — and the single remaining unattributable is a genuine defect. `suggestion_is_verifiable` is deliberately untouched: its bias toward admitting a doubtful path is correct, because `kind` is frozen at mint and under-admitting there permanently kills a real lesson, whereas over-admitting in a report costs only an inaccurate number. (`subcommands.py`)
+
+- **A peer process's saved session could be erased without trace.** `_rewrite_session_log` now takes the scope lock, re-reads the log under it, and preserves every record appended since its own read. Locking the write alone was not enough, and the loss was reproduced: a second Neo process saving between one process's read and its `os.replace` vanished. Merge-on-write rather than a wider lock, deliberately — holding the lock across the git and LM work in `collect_outcomes` would let a slow reasoning run block another process's save. (`memory/outcomes.py`, #170)
+
+- **Pending suggestions were destroyed before the user could act on them.** `collect_outcomes` cleared the entire session log whenever any session existed, so *any* Neo invocation between "Neo suggests X" and "user applies X" discarded the pending suggestion and the later acceptance had nothing to attribute to. Pendingness is now tracked per suggested path rather than per repository — the first fix retained sessions only when no file anywhere in the repo had changed, which held solely in a pristine tree — with a `scanned_through` watermark so the window does not re-scan, and a 14-day TTL. `replay_linked_feedback`, the documented repair command for a broken memory loop, no longer nukes the log it exists to repair. (`memory/outcomes.py`, #166, #168)
+
+- **Tests wrote into live developer state.** `Path.home()` was patched, but roughly 20 constants capture their path at import time and pytest imports every module during collection, before any fixture runs. `conftest.HOME_PATH_CONSTANTS` now re-points each one, and `test_home_isolation.py` AST-scans `src/` to assert the table stays complete — the durable half, since the table alone would rot. (`tests/conftest.py`, #168)
+
+### Changed
+
+- The Codex install instructions in the README were missing their second step. (#167)
+- `.coverage` is untracked and coverage artifacts are gitignored. (#165)
+- Dependency and CI action updates: `tree-sitter`, `ruff`, `actions/checkout` 6→7, `actions/setup-python` 6→7. (#153, #154, #155, #160)
+
 ## [0.42.0] - 2026-08-05
 
 ### Added
