@@ -23,10 +23,8 @@ Updates version numbers, CHANGELOG.md, and builds distributions for a new releas
 1. **Validates** the new version is higher than current and follows semver format
 2. **Reviews** commits since last release tag
 3. **Updates** CHANGELOG.md with new version section and categorized changes
-4. **Updates** version in:
-   - `pyproject.toml` (line 7)
-   - `src/neo/__init__.py` (line 5)
-   - `.claude-plugin/plugin.json` (line 3)
+4. **Updates** the version in `pyproject.toml` — the single source of truth — and
+   runs `make sync-version` to propagate it to the three derived files
 5. **Builds** wheel and sdist distributions
 6. **Reports** what was done and next steps
 
@@ -68,10 +66,23 @@ Add new section at top of `CHANGELOG.md`:
 
 ### Step 4: Update Versions
 
-Update version string in all three files:
-- `pyproject.toml`: Change `version = "X.Y.Z"`
-- `src/neo/__init__.py`: Change `__version__ = "X.Y.Z"`
-- `.claude-plugin/plugin.json`: Change `"version": "X.Y.Z"`
+**Edit ONE file, then propagate.** `pyproject.toml` is the source of truth:
+
+```bash
+# 1. Change `version = "X.Y.Z"` in pyproject.toml (the only hand edit)
+make sync-version        # propagates to the three derived files
+python tools/sync_version.py --check   # confirms all four in sync
+```
+
+`make sync-version` rewrites `src/neo/__init__.py`, `.claude-plugin/plugin.json`
+and `plugins/neo/.codex-plugin/plugin.json`. **Never hand-edit those three** —
+they are derived, and `tests/test_host_adapter_parity.py` fails if they drift
+from `pyproject.toml`.
+
+This step used to list the files for manual editing and named only three of the
+four, omitting the Codex manifest. That is precisely how the package and the two
+plugin manifests reached 0.41.0 / 0.37.0 / 0.19.0 — a documented step with no
+enforcement gets skipped. Do not reintroduce a hand-edit list here.
 
 ### Step 5: Build Distributions
 
@@ -87,12 +98,16 @@ Verify both files were created in `dist/` directory.
 
 Show what was updated and provide next steps:
 ```bash
-# Next steps:
-git add CHANGELOG.md pyproject.toml src/neo/__init__.py .claude-plugin/plugin.json
+git add CHANGELOG.md pyproject.toml src/neo/__init__.py \
+        .claude-plugin/plugin.json plugins/neo/.codex-plugin/plugin.json
 git commit -m "chore: bump version to {new_version}"
-git tag v{new_version}
-git push origin main --tags
 ```
+
+**Do not tag or push to main from here.** `main` is protected and requires a
+pull request plus one approving review, so `git push origin main --tags` — what
+this step used to say — fails outright. Tagging before the release PR merges
+also points the tag at a commit that may never reach `main`. Use
+`/ship-release` for the branch → PR → merge → tag → GitHub Release sequence.
 
 ## Error Handling
 
