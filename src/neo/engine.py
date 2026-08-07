@@ -16,6 +16,7 @@ import re
 import textwrap
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -62,6 +63,46 @@ if TYPE_CHECKING:
 
 # Initialize logger
 logger = logging.getLogger(__name__)
+
+# Caps on the failure evidence stored in an episode's outcome_details.
+#
+# NOT for eviction: `LearningEpisodeStore._enforce_limit` prunes by FILE COUNT
+# (500 per project, oldest mtime first) and never looks at bytes, so an
+# oversized record evicts nothing. The real reasons are that
+# `LearningEpisodeStore.list()` JSON-parses every episode file in every project
+# on each `neo memory learning-stats` run, that `memory.explain` dumps
+# `outcome_details` verbatim into its output, and that a smaller record is a
+# smaller privacy blast radius. Disk is not a concern — the live ledger measures
+# 2.6 MB with the busiest project at 46 files against the 500 cap.
+_ERROR_MESSAGE_CHARS = 500
+_ERROR_TRACEBACK_CHARS = 4000
+# Share of the traceback budget kept from the FRONT on overflow. Both ends are
+# kept: `raise X from Y` renders the original cause first and the outer
+# exception last, and the outer one is already stored twice over in
+# `error_type` and `error_message` — so keeping only the tail spends the whole
+# budget restating what we have and discards the sole new fact.
+_ERROR_TRACEBACK_HEAD_CHARS = 1600
+
+
+def _elide_middle(text: str, budget: int) -> str:
+    """Trim `text` to `budget` by removing the MIDDLE, marking what was cut.
+
+    Keeping only the tail loses the wrong end. With `raise X from Y` the render
+    puts the original cause first and the outer exception last, and that outer
+    exception is already recorded twice in `error_type` and `error_message` — so
+    a tail-only cut spends the entire budget restating what we already have and
+    throws away `ValueError: database is locked`, the one new fact in the record.
+
+    The marker is not decoration: a silently truncated traceback presented as a
+    whole one is the same class of defect this evidence exists to fix.
+    """
+    if len(text) <= budget:
+        return text
+    marker = "\n... [{} characters elided] ...\n"
+    head = min(_ERROR_TRACEBACK_HEAD_CHARS, budget)
+    tail = max(budget - head - len(marker.format(len(text))), 0)
+    elided = len(text) - head - tail
+    return text[:head] + marker.format(elided) + (text[-tail:] if tail else "")
 
 
 class EngineBusyError(RuntimeError):
@@ -427,7 +468,10 @@ class NeoEngine:
             if episode is not None:
                 episode.completed_at = time.time()
                 episode.final_outcome = "engine_error"
-                episode.outcome_details = {"error_type": type(exc).__name__}
+                episode.outcome_details = {
+                    "error_type": type(exc).__name__,
+                    **self._error_evidence(exc),
+                }
                 try:
                     self.episode_store.save(episode)
                 except Exception as save_exc:
@@ -436,6 +480,59 @@ class NeoEngine:
         finally:
             overseer.stop()
             self._log_action("process.end", "")
+
+    @staticmethod
+    def _error_evidence(exc: Exception) -> dict[str, str]:
+        """Message and traceback for a failed run, redacted and bounded.
+
+        `error_type` alone is not diagnosable after the fact. Two genuine
+        failures sat in a live ledger for eleven days as a bare `ValueError`
+        with nothing to say what raised them, which is the whole reason this
+        exists.
+
+        Redacted because this is persisted state that `memory.explain` also
+        exports — the same reason `redact_sensitive_text` guards facts. Redact
+        happens BEFORE truncation deliberately: the other order can split a
+        secret across the cut and leave the tail half unscrubbed. Two limits of
+        that scrubbing are worth knowing when reading the result. It renders
+        code, and its `key=value` pattern rewrites source lines that were never
+        secrets — measured at 22 of 35,870 lines across this repo, none of them
+        credentials, turning `if secret == None:` into `if secret=[REDACTED]
+        None:`. So a `[REDACTED]` in a traceback may mean "there was an `==`
+        here", not "a credential was removed". Conversely it MISSES a secret
+        inside a rendered mapping (`KeyError: {'api_key': 'sk-live-...'}`),
+        where only the vendor-prefix pattern saves you. Damage is bounded to one
+        token on one line, never the structure. Note stdlib `format_exception`
+        does not render frame locals, so what is captured is paths and source
+        lines, not argument values.
+
+        The two fields are captured INDEPENDENTLY. A hostile `__str__` must not
+        cost the traceback: `format_exception` is already hardened against one
+        and renders `<exception str() failed>`, so sharing a try block would
+        discard recoverable evidence.
+
+        Never raises. This runs on the failure path, where an exception would
+        replace a diagnosable error with an undiagnosable one.
+        """
+        from neo.memory.episodes import redact_sensitive_text
+
+        detail: dict[str, str] = {}
+        try:
+            message = redact_sensitive_text(str(exc)).strip()
+            if message:
+                detail["error_message"] = message[:_ERROR_MESSAGE_CHARS]
+        except Exception as detail_exc:
+            logger.debug("error-message capture failed: %s", detail_exc)
+        try:
+            rendered = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            text = redact_sensitive_text(rendered).rstrip()
+            if text:
+                detail["traceback"] = _elide_middle(text, _ERROR_TRACEBACK_CHARS)
+        except Exception as detail_exc:
+            logger.debug("error-traceback capture failed: %s", detail_exc)
+        return detail
 
     def _begin_learning_episode(self, neo_input: NeoInput):
         """Create the in-memory evidence record for one request."""

@@ -1092,10 +1092,19 @@ def main():
         except ImportError:
             pass
 
-        # Generic error handler
+        # Generic error handler. The message is scrubbed on the way out: this
+        # goes to a HOST, which may log or forward it, and an exception string
+        # is a common place for a credential to surface (a failed auth call
+        # renders the key). Redacting the copy we write to a local episode while
+        # shipping the same string raw to a peer would be the wrong way round.
+        from neo.memory.episodes import redact_sensitive_text
+
         error_output = {
             "error": "ProcessingError",
-            "message": f"Unexpected error during processing: {str(e)}",
+            "message": (
+                "Unexpected error during processing: "
+                f"{redact_sensitive_text(str(e))}"
+            ),
             "error_type": type(e).__name__,
             "suggestions": [
                 "Check Neo's logs for detailed stack trace",
