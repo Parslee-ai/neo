@@ -3244,3 +3244,42 @@ class TestTombstoneTextStrip:
         store._facts.append(old)
         assert store.strip_tombstone_embeddings(save=False) == 1
         assert old.body == ""
+
+
+class TestCrashEvidenceSupersession:
+    def test_a_superseding_outcome_clears_the_crash_evidence(self, store):
+        """"engine_error" is not an OutcomeType, so it ranks 0 and any later
+        outcome supersedes it. Without clearing, `.update()` leaves a traceback
+        beside `final_outcome: "accepted"` — the self-contradicting half-record
+        the rank guard exists to prevent."""
+        from neo.memory.episodes import LearningEpisode, LearningEpisodeStore
+
+        episode_store = LearningEpisodeStore(store.project_id)
+        episode = LearningEpisode(episode_id="crashed", project_id=store.project_id,
+                                  final_outcome="engine_error")
+        episode.outcome_details = {
+            "error_type": "ValueError",
+            "error_message": "boom",
+            "traceback": "Traceback (most recent call last): ...",
+        }
+        episode_store.save(episode)
+
+        # A candidate_id is required to reach the attribution path: an ACCEPTED
+        # outcome with neither a linked fact nor a candidate falls past both
+        # branches and never touches the episode.
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED, file_path="src/a.py",
+            suggestion_id="s1", learning_episode_id="crashed",
+            candidate_id="c1", candidate_subject="bugfix: guard [a.py]",
+            candidate_body="Suggestion: guard it", candidate_kind="pattern",
+        )
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=([outcome], {})):
+            store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        saved = episode_store.load("crashed")
+        assert saved.final_outcome == "accepted"
+        assert saved.outcome_details["file_path"] == "src/a.py"
+        for stale in ("error_type", "error_message", "traceback"):
+            assert stale not in saved.outcome_details, (
+                f"{stale} outlived the crash it described")

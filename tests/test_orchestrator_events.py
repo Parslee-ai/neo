@@ -678,3 +678,101 @@ def test_every_surfaceable_beat_declares_its_wording():
     for beat in engine.beat_deck["beats"]:
         if beat.get("surface") == "orchestrator":
             assert beat.get("orchestrator_line"), beat["beat_id"]
+
+
+def test_a_failed_run_records_why_not_just_the_type():
+    """`error_type` alone is not diagnosable after the fact. Two genuine failures
+    sat in a live ledger for eleven days as a bare `ValueError` with nothing to
+    say what raised them."""
+    class Exploding:
+        model = "fake"
+        provider = "fake"
+
+        def generate(self, messages, **kwargs):
+            raise RuntimeError("model exploded on token 7")
+
+        def name(self):
+            return "fake-lm"
+
+    engine = NeoEngine(lm_adapter=Exploding(), enable_persistent_memory=False)
+    with pytest.raises(RuntimeError, match="model exploded"):
+        engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
+
+    episode = engine.current_learning_episode
+    assert episode is not None and episode.final_outcome == "engine_error"
+    details = episode.outcome_details
+    assert details["error_type"] == "RuntimeError"
+    assert "model exploded on token 7" in details["error_message"]
+    # The tail is what matters: it names the frame that actually raised.
+    assert "raise RuntimeError" in details["traceback"]
+
+
+def test_failure_evidence_is_redacted_and_bounded():
+    """A traceback renders frame content and is persisted state, so it gets the
+    same credential scrubbing facts do; the ledger is a fixed-size ring buffer,
+    so it is capped rather than allowed to evict real learning history."""
+    from neo.engine import _ERROR_MESSAGE_CHARS, _ERROR_TRACEBACK_CHARS, NeoEngine
+
+    secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    try:
+        raise ValueError(f"auth failed: api_key={secret} " + "x" * 4000)
+    except ValueError as exc:
+        detail = NeoEngine._error_evidence(exc)
+
+    assert secret not in detail["error_message"]
+    assert secret not in detail["traceback"]
+    assert len(detail["error_message"]) <= _ERROR_MESSAGE_CHARS
+    assert len(detail["traceback"]) <= _ERROR_TRACEBACK_CHARS
+
+
+def test_a_hostile_str_costs_the_message_but_not_the_traceback():
+    """The two fields are captured independently. `format_exception` is already
+    hardened against a bad `__str__` and renders `<exception str() failed>`, so
+    a shared try block would throw away perfectly good evidence to avoid an
+    error it had already survived."""
+    from neo.engine import NeoEngine
+
+    class Hostile(Exception):
+        def __str__(self):
+            raise RuntimeError("__str__ exploded")
+
+    try:
+        raise Hostile()
+    except Hostile as exc:
+        detail = NeoEngine._error_evidence(exc)
+
+    assert "error_message" not in detail       # unreachable, correctly dropped
+    assert "raise Hostile()" in detail["traceback"]   # still recovered
+
+
+def test_chained_traceback_keeps_both_the_cause_and_the_failure():
+    """Overflow must not discard the original cause. `raise X from Y` renders Y
+    first and X last, and X is already stored in `error_type` and
+    `error_message` — so a tail-only cut spends the whole budget restating what
+    we have and drops the one new fact."""
+    from neo.engine import _ERROR_TRACEBACK_CHARS, NeoEngine
+
+    # Padded rather than deeply recursive: Python collapses repeated frames
+    # ("[Previous line repeated N times]"), so recursion does not overflow.
+    try:
+        try:
+            raise ValueError("database is locked: /var/db/neo.sqlite " + "x" * 5000)
+        except ValueError as cause:
+            raise RuntimeError("reasoning panel failed") from cause
+    except RuntimeError as exc:
+        detail = NeoEngine._error_evidence(exc)
+
+    tb = detail["traceback"]
+    assert len(tb) <= _ERROR_TRACEBACK_CHARS
+    assert "database is locked" in tb, "the original cause was truncated away"
+    assert "reasoning panel failed" in tb, "the outer failure was truncated away"
+    assert "characters elided" in tb, "truncation must announce itself"
+
+
+def test_untruncated_traceback_carries_no_elision_marker():
+    from neo.engine import NeoEngine
+
+    try:
+        raise ValueError("small")
+    except ValueError as exc:
+        assert "elided" not in NeoEngine._error_evidence(exc)["traceback"]

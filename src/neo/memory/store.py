@@ -1154,6 +1154,15 @@ class FactStore:
             # comparison. Half the record describing a different event than the
             # other half is worse than either half alone.
             if supersedes:
+                # Drop the crash evidence first. "engine_error" is not an
+                # OutcomeType, so it ranks lowest and ANY later outcome
+                # supersedes it — and `.update()` alone would leave a traceback
+                # sitting beside `final_outcome: "accepted"`. That is the same
+                # self-contradicting half-record this rank guard exists to
+                # prevent; the keys describe the run that failed, not the
+                # outcome now replacing it.
+                for stale in ("error_type", "error_message", "traceback"):
+                    episode.outcome_details.pop(stale, None)
                 episode.outcome_details.update({
                     "suggestion_id": outcome.suggestion_id,
                     "file_path": outcome.file_path,
