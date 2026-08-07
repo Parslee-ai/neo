@@ -37,7 +37,9 @@ Runs the complete release workflow for projects with protected main branches:
 
 Run `/prepare-release {version}` which:
 - Updates CHANGELOG.md
-- Updates version in pyproject.toml, src/neo/__init__.py, .claude-plugin/plugin.json
+- Updates the version in `pyproject.toml` (the only hand edit) and runs
+  `make sync-version` to propagate it to `src/neo/__init__.py` and both plugin
+  manifests
 - Builds distributions
 
 ### Phase 2: Create Release Branch
@@ -51,9 +53,14 @@ If branch already exists, check it out instead.
 ### Phase 3: Commit Changes
 
 ```bash
-git add CHANGELOG.md pyproject.toml src/neo/__init__.py .claude-plugin/plugin.json
+git add CHANGELOG.md pyproject.toml src/neo/__init__.py \
+        .claude-plugin/plugin.json plugins/neo/.codex-plugin/plugin.json
 git commit -m "chore: bump version to {version}"
 ```
+
+Four version files, not three — the Codex plugin manifest is the one that gets
+forgotten. `python tools/sync_version.py --check` should report all four in sync
+before committing.
 
 ### Phase 4: Push and Create PR
 
@@ -116,7 +123,12 @@ Report status and provide link to new release.
 
 ## Notes
 
-- Main branch must be protected (requires PR for merges)
+- Main branch is protected: it requires a PR **and one approving review**.
+  GitHub does not let an account approve its own PR, so a solo release needs
+  either a second reviewer or `gh pr merge --admin` (works because
+  `enforce_admins` is false). Plain `gh pr merge` fails with "the base branch
+  policy prohibits the merge" — that is the protection working, not a bug.
+- Fill the PR body from `.github/PULL_REQUEST_TEMPLATE.md`
 - Requires `gh` CLI authenticated with GitHub
 - Requires PyPI configured with Trusted Publishers in GitHub Actions
 - Safe to re-run - checks existing state at each phase
