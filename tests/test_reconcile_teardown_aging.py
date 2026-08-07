@@ -38,7 +38,11 @@ def _feed(store, episodes_dir, prefix, n, otype):
     es = LearningEpisodeStore(store.project_id, base_dir=episodes_dir)
     for i in range(n):
         ep_id, cid, sid = f"{prefix}-{i}", f"{prefix}c{i}", f"{prefix}s{i}"
-        ep = LearningEpisode(episode_id=ep_id, project_id=store.project_id)
+        # Distinct revision per episode: the ordinary shape, where each
+        # acceptance is observed at its own HEAD. Promotion requires the
+        # supporting episodes to span two snapshots.
+        ep = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                             repository_revision=f"rev-{ep_id}")
         ep.memory_candidates.append(MemoryCandidateEvidence(
             candidate_id=cid, suggestion_id=sid,
             subject=SUBJECT, body=BODY, kind="pattern"))

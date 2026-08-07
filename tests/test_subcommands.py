@@ -177,10 +177,10 @@ def test_learning_stats_idle_when_no_promotions(capsys):
     assert out["interactive_loop_active"] is False
 
 
-def test_learning_stats_buckets_suggestions_three_ways(tmp_path, monkeypatch):
+def test_learning_stats_buckets_suggestions_four_ways(tmp_path, monkeypatch):
     """Collapsing these makes the number unactionable: a prompt that legitimately
     had no edit target is a usage property, a real code suggestion we failed to
-    attribute is a bug."""
+    attribute is a bug, and a vanished root is neither."""
     import json as _json
 
     from neo import subcommands
@@ -204,7 +204,7 @@ def test_learning_stats_buckets_suggestions_three_ways(tmp_path, monkeypatch):
     }))
     monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
     assert subcommands._suggestion_verifiability() == {
-        "verifiable": 1, "advisory": 4, "unattributable": 1,
+        "verifiable": 1, "advisory": 4, "unattributable": 1, "root_unavailable": 0,
     }
 
 
@@ -222,8 +222,163 @@ def test_learning_stats_verifiability_handles_missing_sessions(tmp_path, monkeyp
     from neo import subcommands
     monkeypatch.setattr(subcommands.Path, "home", staticmethod(lambda: tmp_path))
     assert subcommands._suggestion_verifiability() == {
-        "verifiable": 0, "advisory": 0, "unattributable": 0,
+        "verifiable": 0, "advisory": 0, "unattributable": 0, "root_unavailable": 0,
     }
+
+
+def test_vanished_root_is_unmeasurable_not_unattributable(tmp_path):
+    """Once a test needs the LIVE filesystem, a root that no longer exists makes
+    it meaningless. Measured: 8 of 10 "unattributable" suggestions were this — 7
+    from deleted Claude Code agent worktrees — burying the signal the bucket
+    exists to carry."""
+    from neo import subcommands
+    gone = str(tmp_path / "deleted-worktree")
+    assert subcommands._classify_suggestion(
+        "api/Svc.cs", True, gone) == "root_unavailable"
+    assert subcommands._classify_suggestion(
+        "/api/Svc.cs", True, gone) == "root_unavailable"
+    # No root recorded at all is equally unmeasurable, not advisory.
+    assert subcommands._classify_suggestion(
+        "api/Svc.cs", True, "") == "root_unavailable"
+    # A root that DOES exist still classifies normally.
+    assert subcommands._classify_suggestion(
+        "api/Svc.cs", True, str(tmp_path)) == "unattributable"
+
+
+def test_a_dead_root_makes_every_filesystem_answer_unavailable(tmp_path):
+    """Only the empty-input test is decidable without the disk. The prose-suffix,
+    sentinel and docs/ branches all stat, and under a dead root each degrades to
+    "does not exist" and would silently return advisory — under-counting the
+    integrity signal (measured 8 reported against 14 real) and inflating
+    `measurable` by the difference."""
+    from neo import subcommands
+    gone = str(tmp_path / "deleted-worktree")
+    # Decidable from the arguments alone: still advisory.
+    assert subcommands._classify_suggestion("", False, gone) == "advisory"
+    # Everything else is unknowable once the tree is gone. We cannot tell an
+    # edit to an existing README from an invented one.
+    assert subcommands._classify_suggestion("plan.md", True, gone) == "root_unavailable"
+    assert subcommands._classify_suggestion("NO_MODIFY", True, gone) == "root_unavailable"
+    assert subcommands._classify_suggestion("docs/x.py", True, gone) == "root_unavailable"
+    assert subcommands._classify_suggestion("README.md", True, gone) == "root_unavailable"
+
+
+def test_invented_non_code_path_is_advisory(tmp_path):
+    """An unresolved path that could not be code is an advisory answer's invented
+    target, not an edit we failed to find."""
+    from neo import subcommands
+    assert subcommands._classify_suggestion(
+        "/review/wave2_residual_bugs.json", True, str(tmp_path)) == "advisory"
+    # Same meaning without the leading slash -> same bucket. An earlier version
+    # keyed on the slash and split these on nothing but LM formatting.
+    assert subcommands._classify_suggestion(
+        "review/wave2_residual_bugs.json", True, str(tmp_path)) == "advisory"
+
+
+def test_unresolved_code_paths_stay_a_bug_signal(tmp_path):
+    """The cases a leading-slash rule wrongly buried. Both are code, both are
+    invisible to suggestion_is_verifiable, and both are exactly what the
+    unattributable bucket exists to surface."""
+    from neo import subcommands
+    # Model emitted an unexpanded placeholder segment.
+    assert subcommands._classify_suggestion(
+        "/dotnet/src/<entitlements>/Store.cs", True, str(tmp_path)) == "unattributable"
+    # Genuine new module in a directory that does not exist yet.
+    assert subcommands._classify_suggestion(
+        "/src/newpkg/handler.py", True, str(tmp_path)) == "unattributable"
+    assert subcommands._classify_suggestion(
+        "src/newpkg/handler.py", True, str(tmp_path)) == "unattributable"
+
+
+def test_invented_review_prose_is_not_counted_verifiable(tmp_path):
+    """A bare-slash doc at repo root normalizes to a name whose parent IS the
+    root, so `suggestion_is_verifiable`'s plausible-new-file rule granted it
+    "verifiable". Measured: 11 of 21 supposedly verifiable suggestions were
+    review prose that does not exist, making the headline number wrong."""
+    from neo import subcommands
+    assert subcommands._classify_suggestion(
+        "/ARCHITECTURAL_REVIEW.md", True, str(tmp_path)) == "advisory"
+    assert subcommands._classify_suggestion(
+        "REVIEW_TASK_1.md", True, str(tmp_path)) == "advisory"
+    # But EDITING a doc that really exists is still a real edit target.
+    (tmp_path / "README.md").write_text("hi")
+    assert subcommands._classify_suggestion(
+        "README.md", True, str(tmp_path)) == "verifiable"
+
+
+def test_real_new_file_in_existing_dir_stays_verifiable(tmp_path):
+    """Proposing a new file inside a directory that exists is a real suggestion
+    and shows up in git log once committed."""
+    from neo import subcommands
+    (tmp_path / "config").mkdir()
+    assert subcommands._classify_suggestion(
+        "config/settings.json", True, str(tmp_path)) == "verifiable"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1")
+    assert subcommands._classify_suggestion(
+        "/src/app.py", True, str(tmp_path)) == "verifiable"
+
+
+def _write_session(name: str, root: str, paths: list[str]) -> None:
+    import json as _json
+    from pathlib import Path as _Path
+    sessions = _Path.home() / ".neo" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / f"session_{name}.json").write_text(_json.dumps({
+        "codebase_root": root,
+        "suggestions": [{"file_path": p, "suggested_code": "x"} for p in paths],
+    }))
+
+
+def _record_idle_episode() -> None:
+    """The bucket report is only reached once at least one episode exists."""
+    from neo.memory.episodes import LearningEpisode, LearningEpisodeStore
+    LearningEpisodeStore("proj").save(LearningEpisode(
+        episode_id="e1", started_at=1000.0,
+        final_outcome="suggested_pending_downstream_outcome"))
+
+
+def test_one_dead_root_does_not_suppress_the_starved_verdict(capsys):
+    """The regression both reviewers caught. Comparing the unmeasurable count
+    against a content bucket made `root_unavailable > verifiable` true at 1 > 0,
+    so a single stale worktree hid STARVED and claimed "most recorded
+    suggestions" off a count of one."""
+    from pathlib import Path as _Path
+    from types import SimpleNamespace
+
+    from neo.subcommands import _handle_learning_stats
+
+    _record_idle_episode()
+    live = _Path.home() / "repo"
+    live.mkdir(parents=True, exist_ok=True)
+    _write_session("live", str(live), ["plan.md", "notes.md", "summary.md"])
+    _write_session("dead", str(_Path.home() / "gone-worktree"), ["api/Svc.cs"])
+
+    _handle_learning_stats(SimpleNamespace(json=False, since=None))
+    out = capsys.readouterr().out
+    assert "STARVED" in out
+    assert "UNMEASURABLE" not in out
+    # And the integrity note still qualifies the reading.
+    assert "1 of 4 recorded suggestion(s) could not be classified" in out
+
+
+def test_unmeasurable_requires_every_suggestion_to_be_unclassifiable(capsys):
+    from pathlib import Path as _Path
+    from types import SimpleNamespace
+
+    from neo.subcommands import _handle_learning_stats
+
+    _record_idle_episode()
+    # Includes a doc path on purpose: it previously slipped past the root check
+    # into `advisory`, leaving measurable == 1 and silently defeating this
+    # verdict on a corpus that was 100% dead-root.
+    _write_session("dead", str(_Path.home() / "gone-worktree"),
+                   ["api/Svc.cs", "b.py", "plan.md"])
+
+    _handle_learning_stats(SimpleNamespace(json=False, since=None))
+    out = capsys.readouterr().out
+    assert "UNMEASURABLE" in out
+    assert "STARVED" not in out
 
 
 def test_real_extensionless_files_are_not_called_advisory(tmp_path):

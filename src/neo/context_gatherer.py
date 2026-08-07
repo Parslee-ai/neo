@@ -25,6 +25,9 @@ from neo import progress
 # Constants
 MIN_SCORE_THRESHOLD = 0.2  # Filter files with very low relevance (was 0.3, reduced for broad prompts)
 MAX_CHUNKS_PER_FILE = 2    # Cap chunks per file so one large file doesn't dominate the budget
+MAX_CHUNK_CENTERS = 20     # Best-scoring lines considered as window centers before merging
+MAX_MERGED_WINDOW_LINES = 200   # Ceiling on a merged window so one file can't eat the budget
+DISCRIMINATIVE_MAX_LINE_FRACTION = 0.25  # A token on >25% of a file's lines is noise in it
 
 
 @dataclass
@@ -213,6 +216,70 @@ def extract_prompt_tokens(prompt: str) -> set[str]:
     return tokens
 
 
+# Enough to clear any organic score (filename overlap caps at +1.8, the two
+# re-rank boosts at +1.0 and +1.2). Naming a path is the least ambiguous signal
+# a prompt can carry, so it outranks every heuristic rather than competing with
+# them.
+EXPLICIT_PATH_BOOST = 10.0
+
+# Loose: real filtering is "does this match a file we actually found", which no
+# amount of prose punctuation can fake.
+_PATH_LIKE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z][A-Za-z0-9]{0,5}')
+
+
+def extract_explicit_paths(prompt: str) -> set[str]:
+    """Path-like tokens in the prompt, normalized to forward slashes.
+
+    These are candidates only — `matches_explicit_path` decides whether one
+    names a file that exists, so "e.g." and "0.42.0" cost nothing.
+
+    Leading "./" is stripped as a PREFIX, never with `str.strip("./")`: that
+    strips a character *set* from both ends, so an absolute
+    "/Users/me/repo/src/app.py" lost its leading slash and silently stopped
+    being recognizable as absolute.
+    """
+    found = set()
+    for raw in _PATH_LIKE.findall(prompt):
+        token = raw.replace("\\", "/")
+        while token.startswith("./"):
+            token = token[2:]
+        if token:
+            found.add(token.lower())
+    return found
+
+
+def matches_explicit_path(rel_path: str, explicit: set[str]) -> bool:
+    """Does `rel_path` name one of the paths the prompt spelled out?
+
+    Containment is tested in BOTH directions on a path boundary:
+
+    * the prompt gives a repo-relative or bare name ("subcommands.py") and the
+      candidate is longer ("src/neo/subcommands.py"), and
+    * the prompt gives an ABSOLUTE path ("/Users/me/repo/src/neo/subcommands.py")
+      and the candidate is the shorter repo-relative form.
+
+    The second direction was missing, which killed the highest-value input:
+    tracebacks, IDE "copy path", and neo's own suggestion output all emit
+    absolute paths.
+
+    Matching is anchored on "/" so a bare "subcommands.py" hits
+    "src/neo/subcommands.py" but NOT "tests/test_subcommands.py" — matching the
+    neighbour would re-bury the named file under its own test, which is the
+    failure this exists to fix.
+    """
+    if not rel_path or not explicit:
+        return False
+    candidate = rel_path.replace("\\", "/").lower()
+    for token in explicit:
+        if not token:
+            continue
+        if (candidate == token
+                or candidate.endswith("/" + token)
+                or token.endswith("/" + candidate)):
+            return True
+    return False
+
+
 def calculate_adaptive_limit(prompt: str, default_max: int = 30) -> int:
     """
     Calculate adaptive file limit based on prompt specificity.
@@ -342,32 +409,122 @@ def select_chunks(content: str, prompt_tokens: set[str], max_chunk_bytes: int = 
     if len(content) <= max_chunk_bytes:
         return [(content, 1, len(lines))]
 
-    # Find lines with keyword matches
-    matching_idxs = [
-        i for i, line in enumerate(lines)
-        if any(token in line.lower() for token in prompt_tokens)
-    ]
+    # Rank lines by the total length of the DISCRIMINATIVE tokens they carry.
+    #
+    # This used to take the first five matching lines in FILE ORDER. Matching is
+    # a substring test, and `extract_prompt_tokens` emits every 3+ character word
+    # — "the", "in", "is", "py", "src" — so "in" matches `int`, `using`, `point`
+    # and virtually every line qualified. "First five matches" therefore meant
+    # "lines 1-5" for any prompt against any large file, and with a 40-line
+    # window that is the module docstring and imports. Asked to fix a named
+    # function in an 86KB file, neo received that file's import block twice and
+    # answered that the function body was not provided — so it emitted no patch,
+    # and a suggestion with no diff text can never be verified or learned from.
+    #
+    # Two properties matter, and BOTH are load-bearing — the merge below does
+    # not rescue a bad ranking, it only hides it on the cases that happen to
+    # tie:
+    #
+    # 1. "Discriminative" is measured PER FILE, by document frequency. A length
+    #    cutoff was tried and is inverted on real prompts: English stopwords are
+    #    long and identifiers are short, so `len >= 4` keeps "does" and "here"
+    #    while discarding "db", "fs", "os" and "api" — frequently the entire
+    #    subject of the prompt. A token matching most lines of THIS file is
+    #    noise regardless of its length.
+    # 2. Lines are weighted by matched token LENGTH, not match count. Counting
+    #    made a specific prompt degenerate: `_classify_suggestion` and
+    #    `subcommands` both scored 1, so the module docstring tied with the
+    #    function body and won on the file-order tie-break — still returning
+    #    lines 1-43 as the first chunk. Length weighting prefers the line
+    #    carrying the longer, more specific token.
+    lowered_lines = [line.lower() for line in lines]
+    line_count = len(lines) or 1
+    frequency = {
+        token: sum(1 for line in lowered_lines if token in line)
+        for token in prompt_tokens
+    }
+    present = {token for token, hits in frequency.items() if hits}
+    discriminative = {
+        token for token in present
+        if frequency[token] <= DISCRIMINATIVE_MAX_LINE_FRACTION * line_count
+    } or present
 
-    if not matching_idxs:
+    scored_lines = []
+    for i, line in enumerate(lowered_lines):
+        weight = sum(len(token) for token in discriminative if token in line)
+        if weight:
+            scored_lines.append((weight, i))
+
+    if not scored_lines:
         # No matches, return header + first N lines
         header_size = min(200, len(lines))
         chunk = '\n'.join(lines[:header_size])
         return [(chunk, 1, header_size)]
 
-    # Build windows around matches
-    chunks = []
+    scored_lines.sort(key=lambda pair: (-pair[0], pair[1]))
     window_size = 40
+    best_by_index = {index: weight for weight, index in scored_lines[:MAX_CHUNK_CENTERS]}
 
-    for idx in matching_idxs[:5]:  # Limit to 5 windows
-        start = max(0, idx - window_size)
-        end = min(len(lines), idx + window_size)
-        chunk = '\n'.join(lines[start:end])
-        chunks.append((chunk, start + 1, end))
+    # Merge overlapping windows instead of emitting near-duplicates. Two centers
+    # a couple of lines apart previously produced two chunks differing by two
+    # lines, each consuming a slot of the per-file cap.
+    #
+    # Merging is bounded. Unbounded, ~20 centers spaced just under 2*window_size
+    # chain into one window measured at 8.3x `max_chunk_bytes` — and because the
+    # caller admits a chunk all-or-nothing, an oversized one that no longer fits
+    # the global budget is DROPPED, so the explicitly-named file contributes
+    # nothing. That is the original bug returning through a different door.
+    merged: list[list[int]] = []
+    for index in sorted(best_by_index):
+        start = max(0, index - window_size)
+        end = min(len(lines), index + window_size)
+        if (merged and start <= merged[-1][1]
+                and end - merged[-1][0] <= MAX_MERGED_WINDOW_LINES):
+            merged[-1][1] = max(merged[-1][1], end)
+            if best_by_index[index] > merged[-1][2]:
+                merged[-1][2] = best_by_index[index]
+                merged[-1][3] = index
+        else:
+            # Refusing a merge must not emit an overlapping range: clamp the new
+            # window to start where the previous one ended.
+            start = max(start, merged[-1][1]) if merged else start
+            if start < end:
+                merged.append([start, end, best_by_index[index], index])
 
+    # Strongest window first, so the per-file cap keeps the most relevant region
+    # rather than whichever happens to appear earliest in the file.
+    merged.sort(key=lambda window: window[2], reverse=True)
+
+    chunks = []
+    for start, end, _weight, center in merged[:MAX_CHUNKS_PER_FILE]:
+        start, end = _fit_to_budget(lines, start, end, center, max_chunk_bytes)
+        chunks.append(('\n'.join(lines[start:end]), start + 1, end))
         if sum(len(c[0]) for c in chunks) >= max_chunk_bytes:
             break
 
     return chunks
+
+
+def _fit_to_budget(
+    lines: list[str], start: int, end: int, center: int, max_bytes: int
+) -> tuple[int, int]:
+    """Shrink [start, end) to fit `max_bytes`, growing outward from `center`.
+
+    Truncating from the front would be simpler and wrong: the center is the line
+    that earned the window, so it is the one line that must survive.
+    """
+    if len('\n'.join(lines[start:end])) <= max_bytes:
+        return start, end
+    low = high = min(max(center, start), end - 1)
+    size = len(lines[low])
+    while size < max_bytes and (low > start or high < end - 1):
+        if low > start:
+            low -= 1
+            size += len(lines[low]) + 1
+        if high < end - 1 and size < max_bytes:
+            high += 1
+            size += len(lines[high]) + 1
+    return low, high + 1
 
 
 def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
@@ -559,12 +716,37 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # Entry point filenames to boost
     entry_points = {'main', 'app', 'server', 'index', 'login', 'auth', '__init__'}
 
+    # A path the prompt named outright must be in the bundle. Without this it
+    # competed on generic filename overlap and lost: asked to fix a function in
+    # `src/neo/subcommands.py`, neo ranked that file 163rd of 296 — below its own
+    # test file — because filename hits cap at 3 and an 86KB file takes a large
+    # size penalty. It never reached the context, so the model correctly refused
+    # to write a patch for code it had not seen, and the suggestion was recorded
+    # with no diff text and could never be verified or learned from.
+    explicit_paths = extract_explicit_paths(config.prompt)
+
     # Score all candidates
     scored = []
+    explicit_hits = 0
     for abs_path, rel_path, size in candidates:
         score = score_candidate(rel_path, size, prompt_tokens, git_recent, entry_points)
+        if matches_explicit_path(rel_path, explicit_paths):
+            score += EXPLICIT_PATH_BOOST
+            explicit_hits += 1
         if score > 0:
             scored.append((abs_path, rel_path, size, score))
+    if explicit_hits:
+        progress.note(
+            f"Prompt names {explicit_hits} file(s) explicitly - pinned to context")
+    elif explicit_paths:
+        # A named path that matched nothing is the single highest-value
+        # diagnostic here, and staying silent makes it indistinguishable from
+        # "no path mentioned". Causes: a typo, a path outside the scan root, or
+        # one filtered out by --exclude/--exts.
+        progress.note(
+            "Warning: prompt names a path but no scanned file matched "
+            f"({', '.join(sorted(explicit_paths)[:3])}) - check spelling, "
+            "--exclude and --exts")
 
     # Sort by score descending
     scored.sort(key=lambda x: x[3], reverse=True)

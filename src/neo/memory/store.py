@@ -1522,6 +1522,46 @@ class FactStore:
             logger.warning("Failed to record later regression: %s", exc)
             return None
 
+    @staticmethod
+    def _supporting_episodes_span_distinct_revisions(revisions: list[str]) -> bool:
+        """Do these supporting episodes come from at least two repo snapshots?
+
+        Distinct episode ids alone is too weak a test: every neo invocation mints
+        a fresh one, so ONE operator applying the SAME patch twice minutes apart
+        at the same HEAD already satisfied it. A live drill promoted a durable
+        PATTERN exactly that way, and the lesson it encoded was wrong — a
+        measured gap, not a hypothetical.
+
+        Fails closed when no revision is recorded. A session-id fallback was
+        tried and removed: `LearningEpisode.session_id` is a per-episode uuid4
+        that nothing ever assigns from a real session (121 episodes on a live
+        ledger, 121 distinct ids), so `>=2 distinct sessions` was the very gate
+        being replaced, wearing a different name. Worse, acceptance detection is
+        entirely git-based, so a genuinely non-git project can never record an
+        ACCEPTED outcome and could not reach the fallback anyway — the only way
+        in was a transient `rev-parse` failure, which made BOTH failing promote
+        while ONE failing blocked. Load-dependent non-determinism in the durable
+        memory path is worse than the permissiveness it came with.
+
+        Two honest limits, chosen deliberately rather than papered over:
+
+        * This tests "not the same repository snapshot", which is narrower than
+          independence. The revision is captured when the episode BEGINS — HEAD
+          when the advice was asked for, not the commit the fix landed in — so
+          committing between two attempts satisfies it even though committing
+          only shows that time passed. Keying on the acceptance-carrying sha
+          (already walked by `_get_changed_files_since`) would be strictly
+          better and is the obvious next move.
+        * It blocks a real flow: applying the same lesson across several files
+          in one sitting and committing once records ONE revision and promotes
+          nothing. 40% of revision-bearing episodes on a live ledger share a HEAD
+          with another, so this is the common shape, not an edge case. Accepted
+          because a delayed durable fact is recoverable and a wrong one needs a
+          contradiction to retract — the same fail-safe direction as the kind
+          gate.
+        """
+        return len({revision for revision in revisions if revision}) >= 2
+
     def _promote_repeatedly_supported_candidate(self, outcome) -> Optional[Fact]:
         """Promote only repeated, independently accepted ordinary patterns."""
         if outcome.candidate_kind != FactKind.PATTERN.value or not outcome.candidate_id:
@@ -1533,7 +1573,9 @@ class FactStore:
                 self.project_id or "unscoped", base_dir=self._episodes_dir
             )
             target_signature = self._episode_signature(outcome.candidate_subject)
-            supporting_ids: list[str] = []
+            # episode_id -> repository_revision. Keyed by episode so the
+            # independence evidence stays aligned with the deduped id list.
+            supporting: dict[str, str] = {}
             for episode in episode_store.list():
                 for candidate in episode.memory_candidates:
                     if candidate.kind != FactKind.PATTERN.value:
@@ -1542,11 +1584,17 @@ class FactStore:
                         continue
                     signature = self._episode_signature(candidate.subject)
                     if signature == target_signature:
-                        supporting_ids.append(episode.episode_id)
+                        supporting.setdefault(
+                            episode.episode_id, episode.repository_revision
+                        )
                         break
 
-            supporting_ids = list(dict.fromkeys(supporting_ids))
+            supporting_ids = list(supporting)
             if len(supporting_ids) < 2:
+                return None
+            if not self._supporting_episodes_span_distinct_revisions(
+                list(supporting.values())
+            ):
                 return None
 
             # Respect a prior rollback: if this signature was already rolled back
