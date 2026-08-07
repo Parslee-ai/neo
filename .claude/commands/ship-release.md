@@ -80,9 +80,17 @@ Then run: `/ship-release {version} --continue`
 
 ### Phase 5: Create Tag (after PR merge)
 
+**Verify the release PR actually merged before tagging.** This phase only pulls
+`main` and tags it, so running `--continue` early tags a tree with no version
+bump — and Phase 6 then publishes anyway, leaving PyPI carrying `{version}` while
+the tag points at a commit that still says the previous one. Nothing downstream
+catches that.
+
 ```bash
+gh pr view {pr-number} --json state -q .state   # must print MERGED
 git checkout main
 git pull origin main
+grep '^version' pyproject.toml                  # must print {version}
 git tag v{version}
 git push origin v{version}
 ```
@@ -96,7 +104,19 @@ gh release create v{version} \
   dist/neo_reasoner-{version}*
 ```
 
-This triggers the GitHub Actions workflow (.github/workflows/publish.yml) which publishes to PyPI.
+This triggers `.github/workflows/publish.yml`, which publishes to PyPI.
+
+**The attached files are not what gets published.** The workflow's `build` job
+checks out the tag, runs `python -m build` itself, and `publish-pypi` uploads
+*that* artifact via Trusted Publishers. The Phase 1 `dist/` build is a local
+verification step and the attachments are convenience copies for the release
+page. Two consequences worth knowing: a stale `dist/` cannot corrupt what lands
+on PyPI, but a missing one makes `gh release create` fail on the glob — likely
+when `--continue` runs in a fresh clone or after `make clean`. Re-run
+`python -m build` in that case.
+
+The distinction is easy to miss because both builds normally produce
+byte-identical artifacts, so a mismatch would not be visible on the release page.
 
 ### Phase 7: Verify Publication
 
@@ -108,8 +128,27 @@ Report status and provide link to new release.
 
 ## Options
 
-- `--continue`: Resume after PR is merged (skips phases 1-4)
-- `--dry-run`: Show what would happen without making changes
+- `--continue`: Resume after the release PR is merged, skipping phases 1-4.
+  Confirm the merge landed before tagging — see Phase 5.
+- `--dry-run`: Report each phase and the commands it would run, changing nothing:
+  no version edit, no CHANGELOG entry, no branch, no PR, no tag, no release.
+
+## Dry-running the publish workflow
+
+`publish-testpypi` exists for this and is gated to manual dispatch:
+
+```bash
+gh workflow run publish.yml
+```
+
+**Its publish step fails today.** No Trusted Publisher is configured for this
+repo on TestPyPI, so the OIDC exchange returns `invalid-publisher` (last
+attempted 2026-07-26). `ci-check`, `build` and the artifact round-trip still run,
+which is most of what a workflow change needs smoke-tested — so a dispatch is
+still worth doing, you just cannot read the upload as a signal. Configure at
+<https://test.pypi.org/manage/account/publishing/> (owner `Parslee-ai`, repo
+`neo`, workflow `publish.yml`) to make the publish half work. See also the NOTE
+above `publish-testpypi` in the workflow, and CONTRIBUTING.md.
 
 ## Error Handling
 
