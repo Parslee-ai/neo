@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "benchmark_id": "neo-evidence-learning-v1",
   "description": "Deterministic repeated repository-task families for Neo's evidence learning loop.",
   "task_families": [
@@ -44,7 +44,9 @@
     "harmful_memory_rate_max": 0.0,
     "unsupported_promotion_rate_max": 0.0,
     "repeat_error_rate_max": 0.0,
-    "project_leakage_rate_max": 0.0,
+    "project_leakage_rate_max": 0.0
+  },
+  "performance_budget": {
     "latency_ms_max": 500.0
   },
   "primary_quality_metrics": [

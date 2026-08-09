@@ -784,6 +784,12 @@ def _handle_evaluate_learning(args) -> None:
             print(f"    [{marker}] {scenario.id}")
         for failure in report.acceptance_failures:
             print(f"  failure: {failure}")
+        # Advisory, and worded so it cannot be misread as a failed gate. The
+        # exit code below ignores it: latency is a property of the machine,
+        # and a slow runner is not a reason to disbelieve a correctness
+        # verdict that every scenario passed (#183).
+        for note in report.performance_notes:
+            print(f"  slower than budget (advisory, does not affect {status}): {note}")
     if not report.accepted:
         raise SystemExit(1)
 
