@@ -1,8 +1,9 @@
 """Every path that cuts text into an LM prompt must mark the cut.
 
-This file covers the class rather than one instance. Seven prompt-building
-sites across six modules each sliced their inputs bare, so a reader — the
-model — could not distinguish text that ended from text that was severed.
+This file covers the class rather than one instance. Seventeen cuts across
+eight prompt builders in six modules each sliced their input bare, so a
+reader — the model — could not distinguish text that ended from text that
+was severed.
 `neo.agent_context` and `ContextAssembler` already did it correctly.
 
 The tests drive the real prompt builders and assert on the text that would
@@ -195,6 +196,56 @@ class TestDeliberationContext:
 
         content = sum(sent.count(c) for c in "ABC")
         assert content <= _DELIBERATION_TOTAL_CHARS
+
+
+class TestMisconfiguredBudget:
+    """What the two new ValueErrors do to their callers.
+
+    Both are programmer errors — every call site passes a module constant, so
+    neither can fire without someone editing a constant. The question the rule
+    asks is what happens when one does.
+    """
+
+    def test_unseatable_budget_degrades_to_the_fast_path(self):
+        """`_deliberate` already treats any panel failure as "fall back".
+
+        Letting the ValueError propagate to that handler is deliberate: a
+        misconfigured constant should be loud in the log and non-fatal to the
+        user's run, not a traceback out of a reasoning call. Asserted rather
+        than assumed, because "it degrades" and "it crashes" look identical
+        until someone checks.
+        """
+        from neo.engine import NeoEngine
+
+        engine = NeoEngine.__new__(NeoEngine)
+        with patch.object(NeoEngine, "_build_car_role_factory", lambda *a, **kw: None), \
+             patch("neo.engine._DELIBERATION_TOTAL_CHARS", 2):
+            result = engine._deliberate({
+                'prompt': 'p',
+                'execution_envelope_text': 'A' * 100,
+                'past_learnings': 'B' * 100,
+                'verifiable_constraints': 'C' * 100,
+            }, route_fn=None)
+
+        assert result == (None, None, None, None)
+
+    def test_the_failure_is_logged_not_swallowed(self, caplog):
+        import logging
+
+        from neo.engine import NeoEngine
+
+        engine = NeoEngine.__new__(NeoEngine)
+        with caplog.at_level(logging.WARNING, logger='neo.engine'), \
+             patch.object(NeoEngine, "_build_car_role_factory", lambda *a, **kw: None), \
+             patch("neo.engine._DELIBERATION_TOTAL_CHARS", 2):
+            engine._deliberate({
+                'prompt': 'p',
+                'execution_envelope_text': 'A' * 100,
+                'past_learnings': 'B' * 100,
+                'verifiable_constraints': 'C' * 100,
+            }, route_fn=None)
+
+        assert any("cannot seat" in r.getMessage() for r in caplog.records)
 
 
 class TestPatternExtractionPrompt:

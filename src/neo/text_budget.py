@@ -21,6 +21,17 @@ Three shapes, because the right cut depends on where the information is:
 Reach for the one that matches the input. Picking `truncate_marked` for a
 traceback compiles, passes tests, and throws away the answer.
 
+## On the ValueErrors
+
+`truncate_marked` and `apportion` both reject a budget that cannot do the job.
+No caller catches them, deliberately: every call site passes a module constant
+against a bounded input count, so neither can fire without someone editing a
+constant, and at that point a loud failure beats a silent one. The single path
+where one is reachable at runtime — the deliberation panel — already treats
+any failure as "fall back to the fast path", so a misconfigured constant is
+logged and non-fatal rather than a traceback out of a reasoning call. That is
+asserted in `TestMisconfiguredBudget`, not assumed.
+
 ## Marker dialects
 
 This module does NOT own every truncation marker in the tree, and claiming

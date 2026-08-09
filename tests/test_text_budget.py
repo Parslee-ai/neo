@@ -1,7 +1,7 @@
 """Tests for the shared prompt-budget helpers.
 
-These exist because seven prompt-building sites each cut text with a bare
-slice. A bare slice is indistinguishable from text that ended, so the model
+These exist because seventeen cuts across eight prompt builders each took a
+bare slice. A bare slice is indistinguishable from text that ended, so the model
 reasons about absence from a fragment.
 
 Three shapes, and picking the wrong one is a real defect rather than a style
