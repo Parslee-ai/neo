@@ -55,6 +55,50 @@ STALENESS_THRESHOLD = 0.1  # 10% of files changed triggers full reindex warning
 REFRESH_BUDGET_MS = 5000  # Max 5s for opportunistic refresh
 REFRESH_MAX_CHUNKS = 100  # Max chunks to update during opportunistic refresh
 
+# Directory names that never contain source worth indexing. Matched against
+# every path component, so `a/node_modules/b/c.js` is excluded by the second
+# component alone.
+#
+# `.worktrees` and `.claude` are here for the same reason as `node_modules`,
+# and they are the ones that actually bit: a git worktree checked out inside
+# the repo is a *second copy of the repository*, so without this its files
+# compete for index slots against the originals they duplicate. One .NET repo
+# indexed 83 files, all of them Python, all of them from a worktree.
+EXCLUDED_DIR_NAMES = frozenset({
+    # VCS internals and nested checkouts
+    '.git', '.hg', '.svn', '.worktrees', 'worktrees',
+    # Agent tooling scratch space (worktrees, review corpora, caches)
+    '.claude', '.neo', '.codex', '.car',
+    # Dependency trees
+    'node_modules', 'bower_components', 'site-packages', 'Pods', 'Carthage',
+    # Build output whose names are not plausible source directories
+    'obj', '__pycache__',
+    '.next', '.nuxt', '.svelte-kit', '.output',
+    # Virtualenvs and tool caches
+    '.venv', 'venv', '.tox', '.nox', '.eggs',
+    '.mypy_cache', '.pytest_cache', '.ruff_cache',
+    # Editor / IDE
+    '.idea', '.vscode', '.vs',
+})
+
+# Matching is exact and case-sensitive, so `Bin/` and `Build/` (VS-era .NET
+# layouts) are not matched by name. That is deliberate rather than an
+# oversight: a case-insensitive rule would also swallow a `Build/` package
+# that is real source, and the gitignore filter below catches the generated
+# ones under whatever casing the repo actually uses.
+#
+# Deliberately NOT in the set above: `bin`, `build`, `out`, `target`, `dist`,
+# `vendor`. Every one of them is real source somewhere — `bin/` holds
+# checked-in helper scripts and Rust binary crates (`src/bin/main.rs`),
+# `target` and `out` are ordinary package names outside Cargo, `vendor` is
+# source the user may well be asking about. A sweep of three repos on the
+# machine this was written on found 254 git-tracked source files under `bin/`
+# or `vendor/`. Repos that generate into those directories gitignore them, and
+# the gitignore filter below already catches that case. The asymmetry decides
+# it: excluding a real source directory hides code permanently and invisibly,
+# while indexing some generated code only spends slots, and the build report
+# now shows that.
+
 
 @dataclass
 class CodeChunk:
@@ -164,6 +208,9 @@ class ProjectIndex:
         self.faiss_index: Optional[Any] = None
         self.embedding_model: Optional[TextEmbedding] = None
         self.parser: Optional[TreeSitterParser] = None  # Lazy-initialized
+        # Populated by build_index; describes what the cap left out. Not
+        # persisted — it describes one build, not the index on disk.
+        self.selection_report: Optional[Dict[str, Any]] = None
 
         # Load existing index if available
         if self.snapshot_path.exists():
@@ -291,6 +338,306 @@ class ProjectIndex:
             os.unlink(tmp_name)
             raise
 
+    def _build_exclusion_filter(self):
+        """Return a predicate deciding whether a path is unfit to index.
+
+        Two independent filters, because neither alone is enough:
+
+        - `EXCLUDED_DIR_NAMES`, which catches what a repo forgot to ignore.
+          `.claude/` tooling corpora and in-repo worktrees are routinely
+          untracked-but-not-gitignored, and a worktree is a second copy of
+          the repository competing with the originals for index slots.
+        - The repo's own `.gitignore`, read with the same helper
+          `context_gatherer` already uses, so prompt assembly and the index
+          agree on what counts as source rather than each having a private
+          opinion.
+
+        `should_ignore` only ever tests the path it is handed, so a file
+        under a gitignored directory does not match on its own — the walk in
+        `context_gatherer.iter_paths` prunes those directories separately.
+        This reproduces that by testing each ancestor directory, memoized so
+        a directory is judged once no matter how many files sit under it.
+
+        Inherits one limitation from the shared helper: negation patterns
+        (`!keep.py`) are ignored, so a re-included file stays excluded.
+        """
+        from neo.context_gatherer import load_gitignore_patterns, should_ignore
+
+        patterns = load_gitignore_patterns(str(self.repo_root))
+        verdicts: Dict[tuple, bool] = {}
+
+        def dir_excluded(parts: tuple) -> bool:
+            if parts in verdicts:
+                return verdicts[parts]
+            verdicts[parts] = (
+                (len(parts) > 1 and dir_excluded(parts[:-1]))
+                or parts[-1] in EXCLUDED_DIR_NAMES
+                or should_ignore("/".join(parts), patterns, is_dir=True)
+            )
+            return verdicts[parts]
+
+        def excluded(path: Path) -> bool:
+            try:
+                rel = path.relative_to(self.repo_root)
+            except ValueError:
+                return True
+            if rel.parts[:-1] and dir_excluded(rel.parts[:-1]):
+                return True
+            return should_ignore(rel.as_posix(), patterns)
+
+        return excluded
+
+    @staticmethod
+    def _allocate_slots(counts: Dict[str, int], budget: int) -> Dict[str, int]:
+        """Divide `budget` index slots across languages by repo composition.
+
+        Proportional, with a floor of one slot per language present. Both
+        halves matter, and each fixes a different way of producing an index
+        that cannot answer a question about the repository:
+
+        - Proportional, because glob order is not a ranking. Concatenating
+          `**/*.py` before `**/*.cs` and slicing gave a .NET backend of 4,272
+          C# files an index of 83 Python files and zero C#.
+        - Floor of one, because proportion alone rounds small languages to
+          nothing. The same repo's 18 Python files deserve a slot; they just
+          do not deserve all 100 of them.
+
+        A language allocated more slots than it has files hands the surplus
+        back, largest language first, so no budget is left on the table.
+        """
+        langs = [lang for lang, n in counts.items() if n > 0]
+        if not langs or budget <= 0:
+            return {}
+
+        # Not enough budget to seat every language: the biggest ones take it.
+        if budget <= len(langs):
+            ordered = sorted(langs, key=lambda lang: (-counts[lang], lang))
+            return {lang: 1 for lang in ordered[:budget]}
+
+        total = sum(counts[lang] for lang in langs)
+        shared = budget - len(langs)  # one slot per language already reserved
+        alloc = {
+            lang: 1 + int(counts[lang] / total * shared) for lang in langs
+        }
+
+        # Nobody gets more slots than they have files; redistribute the rest.
+        # This loop also absorbs the slack left by rounding every share down,
+        # so no separate largest-remainder pass is needed — which language
+        # receives a ±1 rounding slot is not observable against a within-
+        # language ranking that is itself only a path heuristic.
+        alloc = {lang: min(alloc[lang], counts[lang]) for lang in langs}
+        free = budget - sum(alloc.values())
+        while free > 0:
+            hungry = sorted(
+                (lang for lang in langs if alloc[lang] < counts[lang]),
+                key=lambda lang: (-counts[lang], lang),
+            )
+            if not hungry:
+                break
+            for lang in hungry:
+                if free == 0:
+                    break
+                alloc[lang] += 1
+                free -= 1
+
+        return alloc
+
+    @staticmethod
+    def _cap_chunks(chunks: List[CodeChunk], cap: int) -> List[CodeChunk]:
+        """Trim to `cap` by round-robin across files, never by slicing.
+
+        Slicing a language-ordered list is the same defect the file budget
+        was just fixed for, one function later and with the fix's own work
+        as its victim. Chunks arrive grouped by file, and files arrive
+        grouped by language, so `chunks[:1000]` on a 300-file C# repo kept
+        1000 C# chunks and dropped every TypeScript and Python chunk the
+        allocator had just fought to include — 63 of 100 selected files
+        contributed nothing at all.
+
+        Round-robin needs no language awareness: taking every file's first
+        chunk before any file's second means the apportionment already done
+        at file-selection time carries through, and every selected file is
+        represented as long as there are at least as many slots as files
+        (100 files against a 1000-chunk cap by default).
+        """
+        if len(chunks) <= cap:
+            return chunks
+
+        by_file: Dict[str, List[CodeChunk]] = {}
+        for chunk in chunks:
+            by_file.setdefault(chunk.file_path, []).append(chunk)
+
+        kept: List[CodeChunk] = []
+        depth = 0
+        while len(kept) < cap:
+            # `added` rather than a precomputed max depth: the early return
+            # above guarantees more chunks than slots, so the cap is always
+            # what stops this — but a loop whose termination depends on an
+            # invariant established elsewhere should still be able to stop
+            # on its own.
+            added = False
+            for group in by_file.values():
+                if depth < len(group):
+                    kept.append(group[depth])
+                    added = True
+                    if len(kept) >= cap:
+                        break
+            if not added:
+                break
+            depth += 1
+        return kept
+
+    def _select_files(
+        self, file_patterns: List[str], max_files: int
+    ) -> Tuple[List[Tuple[Path, str]], Dict[str, Any]]:
+        """Pick which files to index, and report on what was left out.
+
+        Returns (selected, report) where `selected` is a list of
+        (path, content_hash) pairs — the hash is computed here to reject
+        duplicate content, and returned so the caller need not recompute it.
+
+        The report is what makes truncation visible. `--index` previously
+        printed "Built index" and exited 0 whether it had indexed the
+        repository or 83 files of a stale worktree copy.
+        """
+        from neo.languages import language_for_path
+
+        # Deduplicate at the path level first: overlapping patterns would
+        # otherwise present the same file twice — and would double-count it
+        # in the exclusion tally the operator reads.
+        is_excluded = self._build_exclusion_filter()
+        candidates: Dict[Path, None] = {}
+        excluded_paths: set = set()
+        for pattern in file_patterns:
+            for path in self.repo_root.glob(pattern):
+                if is_excluded(path):
+                    excluded_paths.add(path)
+                    continue
+                candidates.setdefault(path, None)
+        excluded = len(excluded_paths)
+
+        # Security checks live here so a rejected file backfills from the
+        # same language's remaining candidates rather than costing a slot.
+        repo_root_resolved = self.repo_root.resolve()
+        by_language: Dict[str, List[Path]] = {}
+        for path in candidates:
+            # Symlink check comes first and uses lstat: both is_file() and
+            # resolve() follow the link, and the point of rejecting symlinks
+            # is to not touch what they point at.
+            if path.is_symlink():
+                logger.warning(f"Skipping symlink: {path}")
+                continue
+            # Also covers the file-vanished-since-glob race; a missing path is
+            # not a file, and the slot it would have taken backfills below.
+            if not path.is_file():
+                logger.debug(f"Skipping non-file path: {path}")
+                continue
+            try:
+                path.resolve().relative_to(repo_root_resolved)
+            except ValueError:
+                logger.warning(f"Skipping file outside repo: {path}")
+                continue
+            language = language_for_path(path) or path.suffix.lstrip('.')
+            by_language.setdefault(language, []).append(path)
+
+        # Rank within a language: shallower paths first, then alphabetical.
+        # This is a weak heuristic, not centrality — but it is deterministic,
+        # and it beats whatever order the filesystem happened to yield.
+        for paths in by_language.values():
+            paths.sort(key=lambda p: (len(p.relative_to(self.repo_root).parts), str(p)))
+
+        counts = {lang: len(paths) for lang, paths in by_language.items()}
+        eligible = sum(counts.values())
+        allocation = self._allocate_slots(counts, max_files)
+
+        selected: List[Tuple[Path, str]] = []
+        seen_hashes: Dict[str, Path] = {}
+        duplicates = 0
+        examined = 0
+        per_language: Dict[str, Dict[str, int]] = {}
+
+        # One iterator per language, consumed by `take` and then resumed by
+        # the refill pass — so a file examined in the quota pass is never
+        # examined again.
+        pending = {
+            lang: iter(by_language[lang])
+            for lang in sorted(by_language, key=lambda lang: (-counts[lang], lang))
+        }
+
+        def take(language: str, quota: int) -> int:
+            """Consume up to `quota` usable files from `language`."""
+            nonlocal duplicates, examined
+            taken = 0
+            while taken < quota:
+                path = next(pending[language], None)
+                if path is None:
+                    break
+                examined += 1
+                file_hash = self._compute_file_hash(path)
+                if not file_hash:
+                    # Unreadable, or vanished since the glob. Not counted
+                    # against the quota, so the next candidate takes its slot.
+                    continue
+                # Content-identical files must not each consume a slot: they
+                # produce identical chunks and identical embeddings, so the
+                # second copy buys nothing and costs a file the index could
+                # have held instead.
+                #
+                # Two accepted costs. A skipped duplicate never enters
+                # `snapshot.file_hashes`, so `check_staleness` will not
+                # notice if the copies later diverge — it is not indexed, so
+                # there is nothing stale to refresh, and the next full build
+                # re-decides. And genuinely distinct files that happen to be
+                # byte-identical (barrel `index.ts`, empty `__init__.py`,
+                # generated boilerplate) lose their path from the index; the
+                # content is still there under the first path that had it.
+                if file_hash in seen_hashes:
+                    duplicates += 1
+                    logger.debug(f"Skipping duplicate content: {path}")
+                    continue
+                seen_hashes[file_hash] = path
+                selected.append((path, file_hash))
+                taken += 1
+            return taken
+
+        for language in pending:
+            per_language[language] = {
+                'selected': take(language, allocation.get(language, 0)),
+                'eligible': counts[language],
+            }
+
+        # Refill across languages. `take` backfills within a language, but a
+        # language whose remaining candidates are all duplicates (or that ran
+        # out entirely) leaves its quota unspent — and dedup must not quietly
+        # shrink the index below what the operator allowed. Largest language
+        # first, matching how `_allocate_slots` redistributes.
+        for language in pending:
+            if len(selected) >= max_files:
+                break
+            per_language[language]['selected'] += take(
+                language, max_files - len(selected)
+            )
+
+        report = {
+            'eligible': eligible,
+            'selected': len(selected),
+            'excluded': excluded,
+            'duplicates': duplicates,
+            'max_files': max_files,
+            # Truncated means THE CAP BOUND US, and the test that cannot be
+            # fooled is whether any candidate went unexamined: the loops stop
+            # pulling from a language's iterator precisely when the budget is
+            # spent. Counting instead on `selected < eligible` blamed dedup on
+            # the cap — 7 files with 5 duplicates under a cap of 1000 reported
+            # "2 of 7 eligible files (capped at --max-files=1000)", naming a
+            # knob that was never reached and that raising cannot help. So did
+            # `selected >= max_files`, whenever max_files landed exactly on the
+            # unique-file count. Duplicates and exclusions get their own lines.
+            'truncated': examined < eligible,
+            'per_language': per_language,
+        }
+        return selected, report
+
     def build_index(self, file_patterns: List[str] = None, languages: List[str] = None, max_files: int = 100):
         """
         Build initial index for repository.
@@ -334,41 +681,16 @@ class ProjectIndex:
         self.snapshot = IndexSnapshot()
         self.snapshot.commit_hash = self._get_git_commit()
 
-        # Find files to index
-        files_to_index = []
-        for pattern in file_patterns:
-            files_to_index.extend(self.repo_root.glob(pattern))
-
-        # Limit total files
-        files_to_index = files_to_index[:max_files]
+        # Find files to index: excluded paths dropped, ranked across
+        # languages by repo composition, then cut to `max_files`.
+        files_to_index, selection = self._select_files(file_patterns, max_files)
+        self.selection_report = selection
         self.snapshot.total_files = len(files_to_index)
 
         # Extract chunks and edges from each file
         all_chunks = []
         all_edges = []
-        for file_path in files_to_index:
-            # Security: Reject symlinks and paths outside repo
-
-            # Defensive: Check existence first (handles race conditions)
-            if not file_path.exists():
-                logger.warning(f"Skipping non-existent path: {file_path}")
-                continue
-
-            # Check symlinks before resolving (prevents info disclosure)
-            if file_path.is_symlink():
-                logger.warning(f"Skipping symlink: {file_path}")
-                continue
-
-            # Validate path containment using pathlib
-            resolved_path = file_path.resolve()
-            repo_root_resolved = self.repo_root.resolve()
-
-            try:
-                resolved_path.relative_to(repo_root_resolved)
-            except ValueError:
-                logger.warning(f"Skipping file outside repo: {file_path} (resolves to {resolved_path})")
-                continue
-
+        for file_path, file_hash in files_to_index:
             rel_path = file_path.relative_to(self.repo_root)
             chunks = self._extract_chunks_from_file(file_path, str(rel_path))
             all_chunks.extend(chunks)
@@ -377,14 +699,32 @@ class ProjectIndex:
             edges = self._extract_edges_from_file(file_path, str(rel_path))
             all_edges.extend(edges)
 
-            # Track file hash
-            file_hash = self._compute_file_hash(file_path)
+            # Hash was computed during selection (it is what rejects
+            # duplicate content), so reuse it rather than re-reading.
             self.snapshot.file_hashes[str(rel_path)] = file_hash
 
-        # Limit total chunks (take top N by some scoring)
-        if len(all_chunks) > MAX_CHUNKS_PER_REPO:
-            logger.warning(f"Too many chunks ({len(all_chunks)}), limiting to {MAX_CHUNKS_PER_REPO}")
-            all_chunks = all_chunks[:MAX_CHUNKS_PER_REPO]
+        # Limit total chunks. Round-robin across files rather than slicing,
+        # for exactly the reason the file budget is apportioned rather than
+        # sliced — see _cap_chunks.
+        total_chunks = len(all_chunks)
+        all_chunks = self._cap_chunks(all_chunks, MAX_CHUNKS_PER_REPO)
+        selection['chunks_extracted'] = total_chunks
+        selection['chunks_kept'] = len(all_chunks)
+        selection['chunks_capped'] = len(all_chunks) < total_chunks
+        selection['max_chunks'] = MAX_CHUNKS_PER_REPO
+        # Round-robin represents every file only while there are at least as
+        # many chunk slots as files. `MAX_CHUNKS_PER_REPO` is fixed at 1000 and
+        # `--max-files` is operator-settable, so above that the guarantee stops
+        # holding — and `truncated` is False in exactly that case, because the
+        # file cap was never the binding constraint. Report the shortfall
+        # directly: an operator who raises --max-files to 3000 and is told
+        # nothing was truncated should not have to discover that two thirds of
+        # their files carry no chunks at all.
+        selection['files_with_chunks'] = len({c.file_path for c in all_chunks})
+        if selection['chunks_capped']:
+            logger.warning(
+                f"Too many chunks ({total_chunks}), limiting to {MAX_CHUNKS_PER_REPO}"
+            )
 
         self.chunks = all_chunks
         self.edges = all_edges
