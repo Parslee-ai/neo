@@ -551,10 +551,11 @@ class TestChunkCap:
         report = index.selection_report
         assert report['truncated'] is False       # the file cap never bound
         assert report['selected'] == 6
-        assert report['files_with_chunks'] == 2
+        assert report['files_producing_chunks'] == 6   # every file had chunks
+        assert report['files_with_chunks'] == 2        # the cap took four
 
         printed = "\n".join(_format_selection_report(report))
-        assert "4 selected files contributed no chunks" in printed
+        assert "4 indexed files lost every chunk to the 2-chunk cap" in printed
 
     def test_no_shortfall_line_when_every_file_is_represented(self, tmp_path):
         for i in range(3):
@@ -564,7 +565,77 @@ class TestChunkCap:
         index.build_index(file_patterns=["**/*.py"], max_files=100)
 
         printed = "\n".join(_format_selection_report(index.selection_report))
-        assert "contributed no chunks" not in printed
+        assert "lost every chunk" not in printed
+        assert "yielded no chunks" not in printed
+
+    def test_constructless_file_is_not_blamed_on_the_chunk_cap(self, tmp_path):
+        """A file with nothing to extract is not a cap event.
+
+        `_extract_chunks_from_file` returns [] for any file holding no
+        function, class, interface or struct — an empty `__init__.py`, an
+        enum-only `.cs`, a type-alias-only `.ts`. That is independent of every
+        cap, and no cap setting changes it.
+
+        The first version of this report subtracted post-cap
+        `files_with_chunks` from `selected` and attributed the whole
+        difference to `MAX_CHUNKS_PER_REPO`. Reproduced against the neo repo
+        itself: 25 files selected, 559 of 559 chunks kept, `chunks_capped`
+        False on the same report, and the console still printed "the
+        1000-chunk cap is below the 25 files selected; lower --max-files".
+        The culprit was an empty `tests/__init__.py`, and lowering
+        --max-files would only have indexed less.
+        """
+        _write(tmp_path, "real.py", "def f(): return 1\n")
+        _write(tmp_path, "__init__.py", "")
+        _write(tmp_path, "constants.py", "TIMEOUT = 30\nRETRIES = 3\n")
+
+        index = ProjectIndex(str(tmp_path))
+        index.build_index(file_patterns=["**/*.py"], max_files=100)
+
+        report = index.selection_report
+        assert report['chunks_capped'] is False
+        assert report['selected'] == 3
+        assert report['files_producing_chunks'] == 1
+        assert report['files_with_chunks'] == 1
+
+        printed = "\n".join(_format_selection_report(report))
+        assert "2 selected files yielded no chunks" in printed
+        # The cap did not fire, so it must not be named and no remedy offered.
+        assert "cap" not in printed
+        assert "--max-files" not in printed
+
+    def test_cap_starvation_and_barren_files_are_reported_separately(self, tmp_path):
+        """Both causes at once must not be conflated into either one."""
+        for i in range(4):
+            _write(tmp_path, f"m{i}.py", f"def f{i}(): return {i}\n")
+        _write(tmp_path, "empty.py", "")
+
+        index = ProjectIndex(str(tmp_path))
+        with patch("neo.index.project_index.MAX_CHUNKS_PER_REPO", 2):
+            index.build_index(file_patterns=["**/*.py"], max_files=100)
+
+        report = index.selection_report
+        assert report['selected'] == 5
+        assert report['files_producing_chunks'] == 4
+        assert report['files_with_chunks'] == 2
+
+        printed = "\n".join(_format_selection_report(report))
+        assert "2 indexed files lost every chunk to the 2-chunk cap" in printed
+        assert "1 selected file yielded no chunks" in printed
+
+    def test_report_without_chunk_phase_makes_no_cap_accusation(self):
+        """A selection-only report predates `files_producing_chunks`.
+
+        Falling back to the post-cap count makes `starved` zero rather than
+        equal to `selected`, so a missing key produces silence instead of a
+        fabricated cap event.
+        """
+        printed = "\n".join(_format_selection_report({
+            'eligible': 5, 'selected': 5, 'excluded': 0, 'duplicates': 0,
+            'max_files': 100, 'truncated': False, 'per_language': {},
+            'files_with_chunks': 5, 'max_chunks': 1000,
+        }))
+        assert printed == ""
 
     def test_no_chunk_cap_flag_when_everything_fits(self, tmp_path):
         _write(tmp_path, "a.py", "def a(): return 1\n")

@@ -2101,6 +2101,13 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             # header, because the question it answers is "how much of my
             # source did the model see".
             sent_chars += len(content)
+            # `replace` rewrites ONLY `content`, which is correct exactly while
+            # the incoming type carries no field derived from content length.
+            # The live path satisfies that: `cli` converts the gatherer's
+            # `ContextFile` — which does carry a `bytes` — into
+            # `models.ContextFile` (path / content / line_range) before the
+            # engine sees it. Route a size-carrying type here and that field
+            # silently disagrees with the content sitting beside it.
             visible.append(replace(f, content=content) if len(original) > limit else f)
 
             if len(original) > limit:

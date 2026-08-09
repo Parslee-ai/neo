@@ -203,6 +203,44 @@ class TestCSharpEdges:
         ]
         assert expected in pairs
 
+    @pytest.mark.parametrize(
+        "source,expected",
+        [
+            ("class A : System.Exception { }\n", ("A", "Exception")),
+            ("class B : My.Ns.Repo<Order> { }\n", ("B", "Repo")),
+            ("class C : global::Foo.Bar { }\n", ("C", "Bar")),
+        ],
+    )
+    def test_qualified_base_is_not_dropped(self, parser, source, expected):
+        """A fully-qualified base parses as `qualified_name`.
+
+        `: System.Exception` and `: Microsoft.AspNetCore.Mvc.ControllerBase`
+        are everyday .NET, and neither `identifier` nor `generic_name` matches
+        them — so an alternation covering only those two compiles fine and
+        drops the edge, exactly as the identifier-only pattern did for
+        generics.
+
+        The captured name is the rightmost segment (`Exception`, not
+        `System`), via the `name:` field, so qualified and unqualified bases
+        land in the graph under one naming convention rather than two.
+        """
+        edges = parser.extract_edges(Path("q.cs"), source, "c_sharp")
+        pairs = [
+            (e.source_symbol, e.target_symbol)
+            for e in edges
+            if e.edge_type == "inherits"
+        ]
+        assert expected in pairs
+
+    def test_declaration_without_bases_yields_no_edge(self, parser):
+        """The four-way alternation must not match a bare declaration.
+
+        Generated patterns are easy to widen past what was intended; this
+        pins the other side of the contract.
+        """
+        edges = parser.extract_edges(Path("p.cs"), "class Plain { }\n", "c_sharp")
+        assert [e for e in edges if e.edge_type == "inherits"] == []
+
 
 class TestJavaScriptEdges:
     def test_import_edges(self, parser):

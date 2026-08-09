@@ -559,6 +559,22 @@
      files; `MAX_CHUNKS_PER_REPO` is fixed at 1000 while `--max-files` is not,
      so `files_with_chunks` reports the shortfall — `truncated` is False there,
      because the FILE cap genuinely was not the constraint.
+     **And the corollary the first version of this report broke: never blame a
+     cap for an absence it did not cause.** A selected file is missing from the
+     index for one of TWO unrelated reasons, and the console must not guess
+     between them. Either it produced no chunks at all — no function, class,
+     interface or struct for the grammar to match, as in an empty
+     `__init__.py`, an enum-only `.cs`, a type-alias-only `.ts` — which no cap
+     setting changes and which therefore gets a bare statement with NO remedy
+     attached; or the cap took every chunk it produced, which gets the cap
+     named and `lower --max-files`. `files_producing_chunks` is measured
+     BEFORE `_cap_chunks` precisely so the two stay separable; subtracting the
+     post-cap `files_with_chunks` from `selected` conflates them and is what
+     printed "the 1000-chunk cap is below the 25 files selected" for a build
+     that kept 559 of 559 chunks, with `chunks_capped` False on the same
+     report. It fired on this repo, on any repo with an `__init__.py`. A report
+     that invents a cause is worse than the silence it replaced, because
+     silence at least does not send the operator to the wrong knob.
   **Query footgun** (`language_parser.py`; incident detail in the tree-sitter
   doc's "Why queries break silently"): a query that fails to compile is
   indistinguishable from one that matches nothing — `_get_query` returns None
@@ -566,10 +582,15 @@
   once, so TS interfaces and ALL C# inheritance edges were absent from every
   index since they shipped. Three rules follow. Compile results are cached
   INCLUDING failures (the uncached retry warned per query *per file* — 9,699
-  lines in one run). C# bases need `[(identifier) (generic_name (identifier))]`
-  across class/interface/record/struct, since an identifier-only, class-only
-  pattern compiles fine and silently drops `: Repository<Order>` and
-  `interface IX : IY`. And `test_every_chunk_query_compiles` /
+  lines in one run). C# bases need all four of `identifier`, `generic_name`,
+  and `qualified_name` with either as its `name:` field — across
+  class/interface/record/struct — since a narrower pattern compiles fine and
+  silently drops `: Repository<Order>`, `: System.Exception` and
+  `interface IX : IY`. That query is GENERATED from `_CS_BASE_TYPES` over the
+  four declaration kinds rather than written out four times: the hand-copied
+  version is what left `interface_declaration` uncovered, and each widening
+  since has had to be applied everywhere at once or not at all. And
+  `test_every_chunk_query_compiles` /
   `test_every_edge_query_compiles` prove compilation ONLY, so a new query still
   needs its own behavioural assertion.
 - Context selection (`context_gatherer`): **a path named in the prompt is pinned**

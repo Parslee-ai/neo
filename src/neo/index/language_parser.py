@@ -264,6 +264,44 @@ QUERIES = {
 # TSX uses same queries as TypeScript
 QUERIES['tsx'] = QUERIES['typescript']
 
+# Every shape a C# base type can take, capturing the simple name in each.
+#
+# The alternation is not decoration — each arm was found missing by probing
+# the grammar with real .NET source, and each absent arm drops edges silently:
+#
+#   : IFoo                      -> identifier
+#   : Repository<Order>         -> generic_name        (everyday .NET)
+#   : System.Exception          -> qualified_name      (everyday .NET)
+#   : My.Ns.Repo<Order>         -> qualified_name whose `name:` is generic_name
+#   : global::Foo.Bar           -> qualified_name over alias_qualified_name
+#
+# `qualified_name` exposes the rightmost segment as its `name:` field, so the
+# last two arms capture `Exception` and `Repo` rather than the namespace —
+# matching what the identifier and generic_name arms yield, so consumers see
+# one naming convention rather than two.
+_CS_BASE_TYPES = """[(identifier) @base
+                     (generic_name (identifier) @base)
+                     (qualified_name name: (identifier) @base)
+                     (qualified_name name: (generic_name (identifier) @base))]"""
+
+# `base_list` hangs off four declaration kinds, and every one of them needs the
+# identical alternation above. Generated rather than copied four times because
+# the copy is what failed before: the original pattern covered
+# `class_declaration` alone, so `interface IX : IY` produced nothing, and a
+# hand-maintained fourfold duplicate invites the next widening to be applied to
+# three of the four. `test_every_edge_query_compiles` covers the generation.
+_CS_INHERITANCE = "[\n" + "\n".join(
+    f"""  ({declaration}
+      name: (identifier) @class_name
+      (base_list {_CS_BASE_TYPES}))"""
+    for declaration in (
+        'class_declaration',
+        'interface_declaration',
+        'record_declaration',
+        'struct_declaration',
+    )
+) + "\n] @class_def"
+
 # Edge queries for relationship extraction (imports, inheritance)
 EDGE_QUERIES = {
     'python': {
@@ -292,36 +330,10 @@ EDGE_QUERIES = {
         # `bases:` field name did not exist in the grammar, so this never
         # compiled and every C# inheritance edge was silently dropped.
         #
-        # The alternations are not decoration. A base written `Base<T>` parses
-        # as `generic_name`, not `identifier`, so an identifier-only pattern
-        # drops `: Repository<Order>` and `: IEnumerable<T>` — everyday .NET.
-        # Interfaces, records and structs carry their own `base_list` under
-        # their own node types, and matching only `class_declaration` meant
-        # `interface IX : IY` produced nothing.
-        'inheritance': """
-            [
-              (class_declaration
-                  name: (identifier) @class_name
-                  (base_list
-                      [(identifier) @base
-                       (generic_name (identifier) @base)]))
-              (interface_declaration
-                  name: (identifier) @class_name
-                  (base_list
-                      [(identifier) @base
-                       (generic_name (identifier) @base)]))
-              (record_declaration
-                  name: (identifier) @class_name
-                  (base_list
-                      [(identifier) @base
-                       (generic_name (identifier) @base)]))
-              (struct_declaration
-                  name: (identifier) @class_name
-                  (base_list
-                      [(identifier) @base
-                       (generic_name (identifier) @base)]))
-            ] @class_def
-        """,
+        # Built from _CS_INHERITANCE rather than written out: see the note
+        # there for why the four declaration kinds are generated instead of
+        # copied.
+        'inheritance': _CS_INHERITANCE,
     },
     'typescript': {
         'imports': """

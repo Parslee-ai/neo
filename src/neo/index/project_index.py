@@ -707,11 +707,30 @@ class ProjectIndex:
         # for exactly the reason the file budget is apportioned rather than
         # sliced — see _cap_chunks.
         total_chunks = len(all_chunks)
+        # Measured BEFORE the cap, and that ordering is the whole point. A
+        # selected file can end up absent from the index for two unrelated
+        # reasons, and only one of them is a cap:
+        #
+        #   - it yielded no chunks at all, because it holds no function,
+        #     class, interface or struct for the grammar to match. An empty
+        #     `__init__.py`, an enum-only `.cs`, a type-alias-only `.ts`. No
+        #     cap is involved and no cap setting changes it.
+        #   - it yielded chunks and the cap took every one of them.
+        #
+        # Without this line the two are indistinguishable downstream, and the
+        # report blamed the chunk cap for both. It printed "the 1000-chunk cap
+        # is below the 25 files selected; lower --max-files" for a build that
+        # kept 559 of 559 chunks — naming a cap that had not fired, on
+        # evidence `chunks_capped` contradicted one key over, and prescribing
+        # a remedy that indexes strictly less. Keep the causes separate here
+        # so the console never has to guess between them.
+        files_producing_chunks = len({c.file_path for c in all_chunks})
         all_chunks = self._cap_chunks(all_chunks, MAX_CHUNKS_PER_REPO)
         selection['chunks_extracted'] = total_chunks
         selection['chunks_kept'] = len(all_chunks)
         selection['chunks_capped'] = len(all_chunks) < total_chunks
         selection['max_chunks'] = MAX_CHUNKS_PER_REPO
+        selection['files_producing_chunks'] = files_producing_chunks
         # Round-robin represents every file only while there are at least as
         # many chunk slots as files. `MAX_CHUNKS_PER_REPO` is fixed at 1000 and
         # `--max-files` is operator-settable, so above that the guarantee stops
