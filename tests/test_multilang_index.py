@@ -209,7 +209,7 @@ def test_chunk_content_quality(temp_repo):
         assert len(chunk.content) > 0
 
         # Should have proper metadata
-        assert chunk.chunk_type in ['function', 'class', 'module_doc']
+        assert chunk.chunk_type in ['function', 'class']
         assert chunk.start_line > 0
         assert chunk.end_line >= chunk.start_line
 

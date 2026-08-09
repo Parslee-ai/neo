@@ -87,12 +87,25 @@ Per-subsystem coverage isn't uniform. For example, `code_smells` empty-catch det
 2. Confirm `tree-sitter-language-pack` ships the grammar: `python -c "from tree_sitter_language_pack import get_parser; get_parser('YOUR_LANG')"`.
 3. Add chunk-extraction queries to `language_parser.py` (functions, classes, methods) and register them in `QUERIES` — `architecture_metrics.py` walks files only when `lang in QUERIES`.
 4. If the language has try/catch-style error handling, register a detector in `code_smells._ERROR_SWALLOW_DETECTORS`; otherwise empty-catch detection is silently no-op for it.
+5. Add a behavioural assertion, not just a compile check. `test_every_chunk_query_compiles` and `test_every_edge_query_compiles` will catch a query that does not compile, but a query that compiles and matches nothing looks identical to a file with nothing in it. Assert that a fixture containing the construct produces the chunk or edge you expect.
+
+### Why queries break silently
+
+A query that fails to compile is not an error anywhere the operator can see it. `_get_query` returns `None` and `parse_file` moves to the next query; `_extract_edges` logs at DEBUG. The construct is simply absent from the index.
+
+Four queries were in this state at once: `typescript`/`tsx` `interfaces` (grammar renamed the interface body from `object_type` to `interface_body`), `c_sharp` `inheritance` (`bases:` was never a field name), and a `python` `module_doc` that also had no consumer. TypeScript interfaces and C# inheritance edges had been missing from every index since the queries shipped, with no signal but a warning line — one per query *per parsed file*, which is how a single run produced 9,699 of them. Compile results, failures included, are now cached per parser instance, so a broken query warns once.
+
+Grammars move. `test_every_chunk_query_compiles` / `test_every_edge_query_compiles` are parametrized over every entry in `QUERIES` and `EDGE_QUERIES` so the next rename fails a test instead of quietly shrinking the index.
 
 ## Operational Notes
 
 - Use `neo --update` instead of `--index` after the first build — it re-embeds only changed files.
 - The index build caps at **100 files** per run by default. Override it with `neo --index --max-files N`; the same flag caps *context gathering* at 30 by default when used without `--index`, so each subsystem keeps its own floor.
-- Neo honors `.gitignore` by default; double-check large generated dirs aren't tracked.
+- **The cut is apportioned, not sliced.** `ProjectIndex._select_files` groups eligible files by language and gives each a share of `--max-files` proportional to how much of the repo it is, with a floor of one slot per language present (`_allocate_slots`). Before this, patterns were globbed in list order and concatenated, so whichever language globbed first ate the budget — a .NET repo of 4,272 C# files produced an index of 83 Python files and zero C#, and exited 0. Within a language, files are ordered shallowest-path-first; that is a weak heuristic, not centrality ranking.
+- **`MAX_CHUNKS_PER_REPO` (1000) is applied the same way.** `_cap_chunks` round-robins across files, so every indexed file keeps a chunk before any file keeps a second. A plain slice re-created the bug one layer down, since chunks arrive grouped by file and files grouped by language.
+- **Exclusions are two layers.** `EXCLUDED_DIR_NAMES` in `project_index.py` names directories that are never source (`.git`, `.worktrees`, `node_modules`, `.claude`, `obj`, `__pycache__`, virtualenvs, IDE dirs); matching is exact and case-sensitive against directory components only, so a *file* named `build.py` is kept. On top of that the repo's own `.gitignore` is honored via `context_gatherer.load_gitignore_patterns`, walking ancestor directories so files under an ignored directory are excluded too. Ambiguous names — `bin`, `build`, `out`, `target`, `dist`, `vendor` — are deliberately **not** hardcoded, because each is real source in some repo (`src/bin/main.rs`, vendored trees); repos that generate into them gitignore them.
+- Byte-identical files are indexed once. A duplicate does not consume a slot, and the freed slot is refilled — across languages if the original language has nothing unique left.
+- **Anything left out is reported.** Each line is conditional — a build that indexed everything prints none of them, so their presence is the signal. `neo --index` adds: how many of the eligible files were indexed with a per-language breakdown (only when the file cap actually bound), a capped chunk total, how many selected files ended up with no chunks at all, and counts for skipped duplicates and excluded paths. "Built index" on its own no longer means the index represents the repository.
 - `MAX_CHUNK_LENGTH` is set to **2000 characters** (defined in both `language_parser.py` and `project_index.py` — keep them in sync if you change one).
 - Malformed code returns empty chunks by design (better than half-parsed garbage propagating into embeddings).
 
