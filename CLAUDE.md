@@ -402,6 +402,28 @@
   Changes to layer ordering, the 2/3 constraint cap, or the inline `(changed from: X)`
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
+- Learning-loop benchmark (`memory/evaluation.py`, `benchmarks/learning_loop_v1.json`,
+  `neo memory evaluate-learning`). **`accepted` is a correctness verdict and nothing
+  else — never gate it on wall-clock time.** Everything it enforces is reproducible on
+  any machine: twelve scenarios, four safety rates that evaluate to exactly `0.0`, the
+  primary-metric comparison against the memory-disabled baseline, and a zero
+  model-call assertion. Latency is a property of the hardware, so it lives in a
+  separate `performance_budget` block and surfaces as `performance_within_budget` /
+  `performance_notes`, advisory, with no effect on the exit code. It used to sit in
+  `safety_thresholds`: a GitHub runner recorded **592.44ms against the 500ms limit with
+  every scenario passing and every rate at zero**, while the same commit ran at ~53ms
+  locally — an 11× spread with no code difference, so no threshold can be both
+  sensitive enough to catch a regression and loose enough to survive a shared runner.
+  Retuning the number only moves the coin-flip. Worse, `accepted` is the benchmark's
+  *published* verdict, so a timing wobble invalidated a correctness claim, and the
+  failure presented as `assert report.accepted is True` with a 9,000-character repr —
+  it reads as "my change broke the learning benchmark" and costs a real detour to rule
+  out. Corpus schema 2 moved the key; schema 1 still loads and its budget is read
+  through the fallback in `_check_performance_budget`, because `--corpus` lets a caller
+  supply their own file. **Footgun**: keeping the two verdicts apart is the whole fix,
+  and the way to undo it is one `failures.extend(performance_notes)` —
+  `test_no_latency_text_leaks_into_acceptance_failures` exists for exactly that edit,
+  since the two obvious tests either side of it stay green when it happens (#183).
 - A2UI memory inspector (`neo.a2ui`): a per-project A2UI v0.9 surface
   (`neo-<project_id8>`) registered with the running `car-server` daemon so any
   conformant renderer (CarHost.app, future webviews) can inspect neo's state

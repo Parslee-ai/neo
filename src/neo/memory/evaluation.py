@@ -36,7 +36,18 @@ from neo.memory.store import FactStore
 DEFAULT_CORPUS_PATH = (
     Path(__file__).resolve().parents[3] / "benchmarks" / "learning_loop_v1.json"
 )
-REPORT_SCHEMA_VERSION = 1
+# 2 adds `performance_within_budget` / `performance_notes` and removes latency
+# from the `accepted` decision. A consumer reading only `accepted` gets a
+# STRICTER-to-looser change on one axis, so the bump is what tells it the
+# verdict's meaning narrowed rather than its implementation improving.
+REPORT_SCHEMA_VERSION = 2
+
+# Corpus schema versions this harness understands. 2 moves `latency_ms_max`
+# out of `safety_thresholds` into `performance_budget`; 1 is still accepted
+# and read through the fallback in `_check_performance_budget`, because
+# `--corpus` lets a caller supply their own file and breaking it would be a
+# gratuitous cost for a key that merely moved.
+SUPPORTED_CORPUS_SCHEMAS = (1, 2)
 
 
 class EvaluationMode(str, Enum):
@@ -108,13 +119,24 @@ class ModeReport:
 
 @dataclass
 class LearningEvaluationReport:
-    """Machine-readable benchmark report and acceptance decision."""
+    """Machine-readable benchmark report and acceptance decision.
+
+    Two verdicts, deliberately separate. `accepted` answers "did the learning
+    loop behave correctly and safely", which is reproducible on any machine.
+    `performance_within_budget` answers "was it fast enough here", which is a
+    property of the hardware it ran on. Folding the second into the first made
+    a slow CI runner indistinguishable from a memory-safety violation (#183).
+    """
 
     benchmark_id: str
     corpus_schema_version: int
     modes: list[ModeReport]
     accepted: bool
     acceptance_failures: list[str]
+    # Advisory. A False here is a signal to look at the machine or the budget,
+    # never a reason to disbelieve `accepted`.
+    performance_within_budget: bool = True
+    performance_notes: list[str] = field(default_factory=list)
     schema_version: int = REPORT_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -125,8 +147,12 @@ def load_corpus(path: Optional[Path] = None) -> dict[str, Any]:
     """Load and minimally validate the versioned benchmark corpus."""
     target = path or DEFAULT_CORPUS_PATH
     data = json.loads(target.read_text())
-    if int(data.get("schema_version", 0)) != 1:
-        raise ValueError("unsupported learning benchmark corpus schema")
+    if int(data.get("schema_version", 0)) not in SUPPORTED_CORPUS_SCHEMAS:
+        raise ValueError(
+            "unsupported learning benchmark corpus schema "
+            f"{data.get('schema_version')!r}; supported: "
+            f"{', '.join(str(v) for v in SUPPORTED_CORPUS_SCHEMAS)}"
+        )
     if not data.get("task_families"):
         raise ValueError("learning benchmark corpus has no task families")
     return data
@@ -620,11 +646,7 @@ class LearningLoopEvaluator:
                     f"{metric_name}={value:.4f} exceeds {threshold_name}="
                     f"{float(thresholds[threshold_name]):.4f}"
                 )
-        if evidence.metrics.latency_ms > float(thresholds["latency_ms_max"]):
-            failures.append(
-                f"latency_ms={evidence.metrics.latency_ms:.4f} exceeds "
-                f"latency_ms_max={float(thresholds['latency_ms_max']):.4f}"
-            )
+        performance_notes = self._check_performance_budget(evidence.metrics)
 
         primary = self.corpus["primary_quality_metrics"]
         improved = any(
@@ -645,7 +667,46 @@ class LearningLoopEvaluator:
             modes=modes,
             accepted=not failures,
             acceptance_failures=failures,
+            performance_within_budget=not performance_notes,
+            performance_notes=performance_notes,
         )
+
+    def _check_performance_budget(self, metrics: "ModeMetrics") -> list[str]:
+        """Report budget overruns WITHOUT contributing to `accepted`.
+
+        Latency is a property of the hardware; every other threshold in this
+        benchmark is a property of the algorithm and evaluates to an exact
+        deterministic rate on any machine. Grouping them meant a slow CI runner
+        was reported in the same register as a memory-safety violation, and
+        because `accepted` is the benchmark's published verdict, a timing
+        wobble invalidated a correctness claim.
+
+        Measured: a GitHub runner recorded 592.44ms against the 500ms budget
+        with all twelve scenarios passing and every safety rate at zero, while
+        the same commit runs at ~53ms locally. That is an 11x spread with no
+        code difference, so no threshold with useful sensitivity can also be
+        immune to it. Separating the verdicts is the only fix that does not
+        trade one of those away (#183).
+
+        Reads `performance_budget` and falls back to `safety_thresholds` for a
+        schema-1 corpus, which is where the budget used to live.
+        """
+        budget = self.corpus.get("performance_budget")
+        if budget is None:
+            budget = {
+                key: value
+                for key, value in self.corpus.get("safety_thresholds", {}).items()
+                if key == "latency_ms_max"
+            }
+        limit = budget.get("latency_ms_max")
+        if limit is None:
+            return []
+        if metrics.latency_ms > float(limit):
+            return [
+                f"latency_ms={metrics.latency_ms:.4f} exceeds "
+                f"latency_ms_max={float(limit):.4f}"
+            ]
+        return []
 
 
 def run_learning_evaluation(
