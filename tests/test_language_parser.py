@@ -1,10 +1,11 @@
 """Tests for tree-sitter multi-language parser."""
 
+import logging
 from pathlib import Path
 
 import pytest
 
-from neo.index.language_parser import TreeSitterParser
+from neo.index.language_parser import EDGE_QUERIES, QUERIES, TreeSitterParser
 
 
 # Sample code for each language
@@ -105,10 +106,87 @@ pub struct Calculator {
 '''
 
 
+SAMPLE_TSX = '''
+export interface ButtonProps {
+    label: string;
+}
+
+export class Button {
+    render(): string {
+        return "<button/>";
+    }
+}
+'''
+
+
 @pytest.fixture
 def parser():
     """Create parser instance."""
     return TreeSitterParser()
+
+
+def _query_ids(group):
+    """Flatten a QUERIES-shaped dict into (language, query_name) pairs."""
+    return [(lang, name) for lang, queries in group.items() for name in queries]
+
+
+@pytest.mark.parametrize("language,query_name", _query_ids(QUERIES))
+def test_every_chunk_query_compiles(parser, language, query_name):
+    """Every query in QUERIES must compile against the installed grammar.
+
+    A query that fails to compile is indistinguishable from one that matches
+    nothing: `_get_query` returns None and `parse_file` moves on. That is how
+    `typescript:interfaces` sat broken from the day it shipped, dropping every
+    interface in every TypeScript repo out of the index without an error.
+    Grammars move; this is the assertion that notices when they do.
+    """
+    assert parser._get_query(language, query_name) is not None, (
+        f"QUERIES[{language!r}][{query_name!r}] does not compile against the "
+        f"installed grammar — every construct it matches is silently missing "
+        f"from the index."
+    )
+
+
+@pytest.mark.parametrize("language,query_name", _query_ids(EDGE_QUERIES))
+def test_every_edge_query_compiles(language, query_name):
+    """Same guarantee for the edge queries, which fail even more quietly.
+
+    `_extract_edges` logs compile failures at DEBUG, so a broken edge query
+    produces no console output at all — `c_sharp:inheritance` dropped every
+    inheritance edge in every C# repo with nothing but a debug line to show.
+
+    Compiled against the grammar directly rather than through the parser's
+    private cache key: keying on `f"{language}:edge:{name}"` here would keep
+    passing if `_extract_edges` changed its convention, which is exactly the
+    breakage this test exists to notice.
+    """
+    from tree_sitter import Query
+    from tree_sitter_language_pack import get_language
+    from neo.index.language_parser import _resolve_parser_name
+
+    grammar = get_language(_resolve_parser_name(language))
+    try:
+        Query(grammar, EDGE_QUERIES[language][query_name])
+    except Exception as exc:  # pragma: no cover - the assert carries the message
+        pytest.fail(
+            f"EDGE_QUERIES[{language!r}][{query_name!r}] does not compile "
+            f"against the installed grammar ({exc}) — every edge it matches "
+            f"is silently missing."
+        )
+
+
+def test_edge_queries_are_reached_through_the_parser(parser):
+    """Guards the cache-key convention the compile test deliberately avoids.
+
+    If `_extract_edges` and `_compile_cached` ever disagree on the key, the
+    per-query compile test above still passes; this one does not.
+    """
+    edges = parser.extract_edges(
+        Path("sample.py"), "import os\n\n\nclass A(B):\n    pass\n", "python"
+    )
+
+    kinds = {e.edge_type for e in edges}
+    assert 'imports' in kinds and 'inherits' in kinds
 
 
 def test_parser_initialization(parser):
@@ -192,6 +270,32 @@ def test_parse_typescript(parser):
     # Should find class, interface, and function
     types = {c.chunk_type for c in chunks}
     assert 'class' in types or 'function' in types
+
+
+def test_typescript_interface_is_extracted(parser):
+    """A TypeScript interface must produce an `interface:` chunk.
+
+    The pre-existing TypeScript tests only asserted on classes and functions,
+    so a never-compiling `interfaces` query looked exactly like one that found
+    nothing. This is the assertion that distinguishes them.
+    """
+    chunks = parser.parse_file(Path('test.ts'), SAMPLE_TYPESCRIPT, 'typescript')
+
+    assert 'interface:User' in {c.chunk_id for c in chunks}
+
+
+def test_tsx_interface_is_extracted(parser):
+    """TSX aliases the TypeScript queries, so it needs its own assertion.
+
+    `QUERIES['tsx'] = QUERIES['typescript']` binds the same dict object, which
+    means one broken definition breaks two languages and one fix repairs both
+    — but only a separate test proves the alias is still wired up.
+    """
+    chunks = parser.parse_file(Path('Button.tsx'), SAMPLE_TSX, 'tsx')
+
+    chunk_ids = {c.chunk_id for c in chunks}
+    assert 'interface:ButtonProps' in chunk_ids
+    assert 'class:Button' in chunk_ids
 
 
 def test_parse_javascript(parser):
@@ -295,6 +399,50 @@ def test_lazy_loading(parser):
 
     # Other parsers not loaded yet
     assert 'c_sharp' not in parser.parsers
+
+
+def test_broken_chunk_query_warns_once_not_once_per_file(monkeypatch, caplog):
+    """A query that cannot compile must warn once, not once per parsed file.
+
+    Before failures were cached, `_get_query` recompiled on every call, so a
+    single broken query emitted one warning per file: a run over 175
+    TypeScript files produced 9,699 identical lines and buried the answer.
+    """
+    monkeypatch.setitem(
+        QUERIES['python'], 'functions', '(this_node_type_does_not_exist) @x'
+    )
+    parser = TreeSitterParser()
+
+    with caplog.at_level(logging.WARNING, logger='neo.index.language_parser'):
+        for i in range(5):
+            parser.parse_file(Path(f'f{i}.py'), SAMPLE_PYTHON, 'python')
+
+    failures = [
+        r for r in caplog.records
+        if 'Failed to compile query python:functions' in r.getMessage()
+    ]
+    assert len(failures) == 1, (
+        f"expected exactly 1 compile warning across 5 files, got {len(failures)}"
+    )
+
+
+def test_broken_edge_query_warns_once_not_once_per_file(monkeypatch, caplog):
+    """The edge path recompiled per file with no cache of any kind."""
+    monkeypatch.setitem(
+        EDGE_QUERIES['python'], 'imports', '(this_node_type_does_not_exist) @x'
+    )
+    parser = TreeSitterParser()
+
+    with caplog.at_level(logging.WARNING, logger='neo.index.language_parser'):
+        for i in range(5):
+            parser.extract_edges(Path(f'f{i}.py'), SAMPLE_PYTHON, 'python')
+
+    failures = [
+        r for r in caplog.records
+        if 'Failed to compile query' in r.getMessage()
+        and 'imports' in r.getMessage()
+    ]
+    assert len(failures) == 1
 
 
 def test_syntax_error_handling(parser):

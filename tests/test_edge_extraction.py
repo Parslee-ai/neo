@@ -59,6 +59,12 @@ public class Circle : Shape
 {
     public override double Area() { return 3.14; }
 }
+
+public class Square : Shape, IComparable
+{
+    public override double Area() { return 1.0; }
+    public int CompareTo(object o) { return 0; }
+}
 '''
 
 SAMPLE_JAVASCRIPT = '''
@@ -130,6 +136,110 @@ class TestCSharpEdges:
         import_edges = [e for e in edges if e.edge_type == "imports"]
         targets = [e.target_symbol for e in import_edges]
         assert any("System" in t for t in targets)
+
+    def test_inheritance_edges(self, parser):
+        """C# had no inheritance assertion, and its query had been broken.
+
+        The grammar exposes `base_list` as an unnamed child of
+        `class_declaration`, not under a `bases:` field, so the query failed to
+        compile and every C# inheritance edge was dropped. Edge-query compile
+        failures log at DEBUG, so nothing surfaced.
+        """
+        edges = parser.extract_edges(Path("test.cs"), SAMPLE_CSHARP, "c_sharp")
+        pairs = [
+            (e.source_symbol, e.target_symbol)
+            for e in edges
+            if e.edge_type == "inherits"
+        ]
+        assert ("Circle", "Shape") in pairs
+
+    def test_inheritance_edges_include_every_base(self, parser):
+        """Each entry of a plain (non-generic) base list yields its own edge."""
+        edges = parser.extract_edges(Path("test.cs"), SAMPLE_CSHARP, "c_sharp")
+        pairs = [
+            (e.source_symbol, e.target_symbol)
+            for e in edges
+            if e.edge_type == "inherits"
+        ]
+        assert ("Square", "Shape") in pairs
+        assert ("Square", "IComparable") in pairs
+
+    def test_generic_base_is_not_dropped(self, parser):
+        """`: Repository<Order>` parses as `generic_name`, not `identifier`.
+
+        An identifier-only pattern compiles fine and silently omits every
+        generic base — which in .NET is most of them.
+        """
+        edges = parser.extract_edges(
+            Path("g.cs"), "class Repo : Base<Order>, IFoo { }\n", "c_sharp"
+        )
+        pairs = [
+            (e.source_symbol, e.target_symbol)
+            for e in edges
+            if e.edge_type == "inherits"
+        ]
+        assert ("Repo", "Base") in pairs
+        assert ("Repo", "IFoo") in pairs
+
+    @pytest.mark.parametrize(
+        "source,expected",
+        [
+            ("interface IX : IY { }\n", ("IX", "IY")),
+            ("record Rec : BaseRec { }\n", ("Rec", "BaseRec")),
+            ("struct St : IEquatable<St> { }\n", ("St", "IEquatable")),
+        ],
+    )
+    def test_non_class_declarations_also_yield_edges(self, parser, source, expected):
+        """Interfaces, records and structs carry their own `base_list`.
+
+        Matching only `class_declaration` meant interface-to-interface
+        inheritance produced nothing at all.
+        """
+        edges = parser.extract_edges(Path("x.cs"), source, "c_sharp")
+        pairs = [
+            (e.source_symbol, e.target_symbol)
+            for e in edges
+            if e.edge_type == "inherits"
+        ]
+        assert expected in pairs
+
+    @pytest.mark.parametrize(
+        "source,expected",
+        [
+            ("class A : System.Exception { }\n", ("A", "Exception")),
+            ("class B : My.Ns.Repo<Order> { }\n", ("B", "Repo")),
+            ("class C : global::Foo.Bar { }\n", ("C", "Bar")),
+        ],
+    )
+    def test_qualified_base_is_not_dropped(self, parser, source, expected):
+        """A fully-qualified base parses as `qualified_name`.
+
+        `: System.Exception` and `: Microsoft.AspNetCore.Mvc.ControllerBase`
+        are everyday .NET, and neither `identifier` nor `generic_name` matches
+        them — so an alternation covering only those two compiles fine and
+        drops the edge, exactly as the identifier-only pattern did for
+        generics.
+
+        The captured name is the rightmost segment (`Exception`, not
+        `System`), via the `name:` field, so qualified and unqualified bases
+        land in the graph under one naming convention rather than two.
+        """
+        edges = parser.extract_edges(Path("q.cs"), source, "c_sharp")
+        pairs = [
+            (e.source_symbol, e.target_symbol)
+            for e in edges
+            if e.edge_type == "inherits"
+        ]
+        assert expected in pairs
+
+    def test_declaration_without_bases_yields_no_edge(self, parser):
+        """The four-way alternation must not match a bare declaration.
+
+        Generated patterns are easy to widen past what was intended; this
+        pins the other side of the contract.
+        """
+        edges = parser.extract_edges(Path("p.cs"), "class Plain { }\n", "c_sharp")
+        assert [e for e in edges if e.edge_type == "inherits"] == []
 
 
 class TestJavaScriptEdges:
