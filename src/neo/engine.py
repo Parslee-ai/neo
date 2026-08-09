@@ -83,6 +83,25 @@ _ERROR_TRACEBACK_CHARS = 4000
 # budget restating what we have and discards the sole new fact.
 _ERROR_TRACEBACK_HEAD_CHARS = 1600
 
+# Caps on the REPOSITORY CONTEXT block in the reasoning prompt.
+#
+# These are token-overflow guards, not relevance judgements — the gatherer has
+# already decided which files matter by the time they get here. 3000 characters
+# is roughly 40-75 lines of C#, so for a compiled-language repo the model
+# routinely sees the usings, the fields and the first method or two of a file
+# and nothing below that.
+#
+# Whatever the numbers are, the cut must be MARKED (see
+# `_render_context_files`). An unmarked cut is the dangerous case: the model
+# cannot distinguish "the file ends here" from "the file was clipped", so it
+# answers questions about absence from a fragment.
+_MAX_CONTEXT_FILES = 20
+_CONTEXT_FILE_CHARS = 3000
+_IMPORTANT_FILE_CHARS = 8000
+# Substrings that earn the larger cap. Matched against the whole lowercased
+# path, so a source file under a directory named `architecture` also qualifies.
+_IMPORTANT_FILE_PATTERNS = ('readme.md', 'claude.md', 'architecture')
+
 
 def _elide_middle(text: str, budget: int) -> str:
     """Trim `text` to `budget` by removing the MIDDLE, marking what was cut.
@@ -2006,6 +2025,87 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             return None, None, None, None
         return result.plan, result.simulation_traces, result.code_suggestions, result
 
+    @staticmethod
+    def _render_context_files(files: list) -> tuple[list[str], str, list]:
+        """Render the REPOSITORY CONTEXT block, marking every cut it makes.
+
+        Returns ``(sections, banner, visible)``. The banner is deliberately
+        built from what was actually included rather than from what was
+        offered, and `visible` carries each shown file cut down to the text
+        the model received, so downstream passes cannot describe source the
+        model was never given.
+
+        Two failures this fixes, both of which let a reader believe they had
+        more than they did:
+
+        1. The model was handed a bare slice. `--- path ---` followed by text
+           that simply stops is indistinguishable from a file that ends there,
+           so the model reasons about absence — "X is not called here", "there
+           is no null check" — from a fragment. The dangerous case is not the
+           obvious clip; it is a cut landing just past a method signature,
+           where there is enough context to look answerable and not enough to
+           be right. Marking the cut converts that into a refusal, which is
+           behaviour neo already handles well.
+        2. The operator was handed a pre-truncation byte count. A banner
+           reading "12 files, 340000 bytes" described bytes that were never
+           sent: with these caps the model saw at most a fifth of that, and
+           nothing in the output said so.
+
+        Mirrors `neo.agent_context._read_doc`, which marks its truncation;
+        this path was the one that did not.
+        """
+        from dataclasses import replace
+
+        shown = files[:_MAX_CONTEXT_FILES]
+        sections: list[str] = []
+        visible: list = []
+        sent_chars = 0
+        truncated_count = 0
+
+        for f in shown:
+            original = f.content or ''
+            lowered = f.path.lower()
+            limit = (
+                _IMPORTANT_FILE_CHARS
+                if any(pat in lowered for pat in _IMPORTANT_FILE_PATTERNS)
+                else _CONTEXT_FILE_CHARS
+            )
+            content = original[:limit]
+            # Counts the file's own text, not our marker or the `--- path ---`
+            # header, because the question it answers is "how much of my
+            # source did the model see".
+            sent_chars += len(content)
+            visible.append(replace(f, content=content) if len(original) > limit else f)
+
+            if len(original) > limit:
+                truncated_count += 1
+                content += (
+                    f"\n... [truncated: {len(original) - limit} of "
+                    f"{len(original)} characters not shown]"
+                )
+            sections.append(f"\n--- {f.path} ---\n{content}")
+
+        total_chars = sum(len(f.content or '') for f in files)
+        file_part = (
+            f"{len(shown)} of {len(files)} files"
+            if len(shown) < len(files)
+            else f"{len(files)} file{'' if len(files) == 1 else 's'}"
+        )
+        # "chars", not "bytes": `len()` on a str counts code points, and the
+        # old banner said bytes while summing exactly this.
+        size_part = (
+            f"{sent_chars} of {total_chars} chars"
+            if sent_chars < total_chars
+            else f"{sent_chars} chars"
+        )
+        note = ""
+        if truncated_count:
+            noun = "file" if truncated_count == 1 else "files"
+            note = f"; {truncated_count} {noun} truncated, marked inline"
+        banner = f"\nREPOSITORY CONTEXT ({file_part}, {size_part}{note}):"
+
+        return sections, banner, visible
+
     def _format_combined_prompt(self, context: dict[str, Any]) -> tuple[str, "MemorySignal"]:
         """Format the combined prompt and return it alongside the memory signal.
 
@@ -2077,24 +2177,25 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
 
         # Add context files if provided
         files = context.get('files', [])
+        visible_files: list = []
         if files:
-            parts.append(f"\nREPOSITORY CONTEXT ({len(files)} files, {sum(len(f.content or '') for f in files)} bytes):")
-            for f in files[:20]:  # Limit to 20 files to avoid token overflow
-                # Allow more content for important files (README, docs)
-                is_important = any(pat in f.path.lower() for pat in ['readme.md', 'claude.md', 'architecture'])
-                char_limit = 8000 if is_important else 3000
-                content_preview = (f.content or '')[:char_limit]
-                parts.append(f"\n--- {f.path} ---\n{content_preview}")
+            rendered, banner, visible_files = self._render_context_files(files)
+            parts.append(banner)
+            parts.extend(rendered)
 
         if exemplars:
             parts.append("\nSimilar Past Tasks:")
             parts.extend(f"- {ex}" for ex in exemplars[:3])
 
         # Surface code smells in the gatherer-picked files so the model sees
-        # known issues alongside the source. Scoped to `files[:20]` to match
-        # what we actually showed the model above.
+        # known issues alongside the source. Scanned against the TRUNCATED
+        # content, not the originals: scanning the full text emitted
+        # citations like `src/Service.cs:401 [todo/warn] HACK: ...` for a
+        # file the model was shown to line ~215. An unmarked cut invites a
+        # wrong inference about unseen code; a line-numbered finding about
+        # unseen code asserts one, which is worse.
         from neo.code_smells import format_for_prompt, scan_files
-        smells_section = format_for_prompt(scan_files(files[:20]))
+        smells_section = format_for_prompt(scan_files(visible_files))
         if smells_section:
             parts.append(smells_section)
 
