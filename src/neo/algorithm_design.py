@@ -9,6 +9,18 @@ from typing import Optional, List
 from enum import Enum
 
 from neo.languages import KNOWN_FENCE_TAGS, display_name_for
+from neo.text_budget import shown_of, truncate_marked
+
+# Caps on the problem text sent to the design and codegen prompts. Both are
+# marked: a design derived from half a problem statement is confidently wrong
+# about the half it never saw, and the design then steers code generation.
+_DESIGN_PROBLEM_CHARS = 800
+_CODEGEN_PROBLEM_CHARS = 500
+# How many design details are echoed into the codegen prompt. Shown counts are
+# stated when the list is longer, because "Edge cases to handle:" followed by
+# three bullets reads as an exhaustive list of three edge cases.
+_ECHOED_DESIGN_ITEMS = 3
+_ECHOED_DESIGN_STEPS = 5
 
 
 class AlgorithmClass(Enum):
@@ -54,7 +66,7 @@ def design_algorithm(problem_description: str, adapter) -> AlgorithmDesign:
 
     design_prompt = f"""Design an algorithm for this problem (DON'T write code yet):
 
-{problem_description[:800]}
+{truncate_marked(problem_description, _DESIGN_PROBLEM_CHARS)}
 
 Think step-by-step. Answer in this EXACT format:
 
@@ -218,19 +230,25 @@ def generate_code_from_design(
     lang_key = language.lower()
     display_name = display_name_for(language)
 
-    # Build guidance from design
+    # Build guidance from design. The counts are stated whenever a list is
+    # longer than what is echoed: the prompt tells the model to "follow this
+    # exactly", so an elided list reads as the complete set of steps or edge
+    # cases and the model implements against a specification it believes is
+    # whole. Naming the omission is the difference between a short list and
+    # a wrong one.
     design_guidance = f"""
 ALGORITHM DESIGN (follow this exactly):
 Class: {design.algorithm_class.value}
 Key insight: {design.key_insight}
 
-Steps to implement:
-{chr(10).join([f"{i+1}. {step}" for i, step in enumerate(design.steps[:5])])}
+Steps to implement:{shown_of(design.steps, _ECHOED_DESIGN_STEPS)}
+{chr(10).join([f"{i+1}. {step}" for i, step in enumerate(design.steps[:_ECHOED_DESIGN_STEPS])])}
 
-Edge cases to handle:
-{chr(10).join([f"- {case}" for case in design.edge_cases[:3]])}
+Edge cases to handle:{shown_of(design.edge_cases, _ECHOED_DESIGN_ITEMS)}
+{chr(10).join([f"- {case}" for case in design.edge_cases[:_ECHOED_DESIGN_ITEMS]])}
 
-Data structures: {', '.join(design.data_structures[:3])}
+Data structures:{shown_of(design.data_structures, _ECHOED_DESIGN_ITEMS)}
+{', '.join(design.data_structures[:_ECHOED_DESIGN_ITEMS])}
 
 Expected complexity: {design.complexity}
 """
@@ -238,7 +256,7 @@ Expected complexity: {design.complexity}
     code_prompt = f"""Implement the following algorithm design in {display_name}:
 
 PROBLEM:
-{problem_description[:500]}
+{truncate_marked(problem_description, _CODEGEN_PROBLEM_CHARS)}
 
 {design_guidance}
 

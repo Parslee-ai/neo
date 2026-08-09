@@ -650,9 +650,51 @@
   fed it rather than the originals. Scanning full content emitted findings like
   `src/Service.cs:401 [todo/warn] HACK: ...` for a file the model saw to line
   ~215: an unmarked cut invites a wrong inference about unseen code, but a
-  line-numbered finding about unseen code asserts one. `neo.agent_context`
-  marks its truncation (`PER_FILE_CAP_BYTES` + `... [truncated]`) — copy that
-  shape for any new path that cuts text. Use `neo --dry-run` to see the block.
+  line-numbered finding about unseen code asserts one.
+  Use `neo --dry-run` to see the block.
+- **Prompt-bound text is cut through `neo.text_budget`, never by a slice.**
+  Three shapes, and the choice is a correctness question, not a style one:
+  `truncate_marked` keeps the HEAD (source, problem statements, memory);
+  `elide_middle` keeps BOTH ENDS (tracebacks); `shown_of` annotates an elided
+  LIST. Picking wrong compiles, passes, and throws away the answer — a
+  head-cut of a 40-frame traceback keeps forty `File "..."` headers and drops
+  `ValueError: database is locked`, and a plain traceback puts the exception
+  line last while a chained one puts the original cause first, so only a
+  middle-elide serves both. A list is truncated as silently as a string: under
+  a prompt saying "follow this exactly", three bullets read as three edge
+  cases. Before the extraction the defect sat in NINETEEN individual cuts
+  across nine prompt builders in six modules. Seventeen were found by the
+  first sweep; two more (`_community_fallback_learnings`, one body cut and one
+  list elision) came out of review, and the reason they were missed is worth
+  keeping: that body cut is a `[:200]` on a `.get()` result rather than on a
+  named variable, so it does not pattern-match the other seventeen. A sweep
+  that looks for slices on identifiers will miss the same shape again.
+  **Never nest cuts.** `_deliberate` used to cut each section to 2,000 and the
+  concatenation to 6,000, which delivered `verifiable_constraints` as 1,890 of
+  31,000 characters with its own marker sliced off, beneath an outer marker
+  reporting 163 dropped — 29,110 characters gone behind a note asserting they
+  were not, and always that section, because the order and caps were both
+  fixed. A marker computed over a concatenated buffer is structurally
+  incapable of describing source loss. Sections now share the budget via
+  `apportion` (max-min fair) and are cut ONCE. Nesting also wasted the budget
+  it was cutting: on a live store a 30-char envelope plus 33,144 chars of
+  memory against 6,000 sent **2,030 under the old flat cap**, where
+  apportionment sends the full 6,000. **Check whether a value arrives already
+  cut** — `outcomes` caps `diff_summary` before `store` hands it to
+  `pattern_extraction`, whose own cut drops that inner marker, leaving one
+  that understates the real loss. The community fallback was a second instance
+  of exactly this, inside `engine` itself: its unmarked body cut fed
+  `past_learnings`, which `_deliberation_context` then apportioned and cut
+  again, so the new marker would have reported the pre-cut length as the
+  fact's real one. Marking the inner cut is what makes the outer one true —
+  an apportioned section is only as honest as its least honest input. **Footguns**: `truncate_marked` and
+  `apportion` raise on a budget that cannot do the job and no call site
+  catches them narrowly — every caller passes a module constant, so it is a
+  programmer error, and the one runtime-reachable path (the panel) degrades to
+  the fast path through its existing broad handler. And the two helpers differ
+  on the budget: `elide_middle` reserves its marker and lands **inside** the
+  budget, while `truncate_marked` appends on top, so it bounds the CONTENT and
+  its rendered section runs ~50 chars over.
 - Host communication (`neo.events` + `models.OrchestratorMessage`): the engine
   reports lifecycle facts so a host (Claude Code, MCP, an IDE) doesn't have to
   reverse-engineer presentation from raw plans. **Governing rule: Neo reports
