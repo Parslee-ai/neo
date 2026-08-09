@@ -121,6 +121,66 @@ def isolate_neo_home(tmp_path, monkeypatch):
     return fake_home
 
 
+# Variables through which an ambient git process redirects every `git`
+# invocation a child makes. `GIT_DIR` and `GIT_WORK_TREE` are the dangerous
+# pair: they override the repository discovery that `cwd=` is supposed to
+# drive, so `subprocess.run(["git", "init"], cwd=tmp_path)` silently operates
+# on the INHERITED repository instead of the temporary one.
+#
+# Sourced from `git(1)`'s environment section; the object/alternate ones are
+# included because they redirect writes even when GIT_DIR is correct.
+_GIT_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_INTERNAL_SUPER_PREFIX",
+)
+
+
+@pytest.fixture(autouse=True)
+def scrub_ambient_git_env(monkeypatch):
+    """Detach the suite from any git process that spawned it.
+
+    Tests and production code both shell out to `git` with `cwd=` pointing at a
+    temporary repository. `cwd` does NOT override `GIT_DIR`: when it is set,
+    git ignores repository discovery entirely and operates on the directory it
+    names. So an inherited `GIT_DIR` silently redirects every one of those
+    calls at the real repository.
+
+    Which is not hypothetical, and the damage is not subtle. Committing from a
+    LINKED WORKTREE exports `GIT_DIR=<repo>/.git/worktrees/<name>` and an
+    absolute `GIT_INDEX_FILE` to hooks — a commit from the main worktree
+    exports neither, which is why this hid for so long. `.githooks/pre-commit`
+    runs the full suite, so a single `git commit` inside a worktree ran
+    `tests/test_pending_session_retention.py`'s `git init -q .` against the
+    real gitdir. That set `core.bare = true` in `.git/config`, which worktrees
+    SHARE with the main repository, and the fixture's subsequent
+    `git add -A` / `git commit` wrote its two-file temp tree onto the
+    worktree's checked-out branch as a new commit. Reproduced from first
+    principles, then again end to end: the main checkout stopped being a work
+    tree and the worktree's history was replaced.
+
+    Scrubbed for the whole suite rather than fixed in the one fixture that
+    tripped it, because the exposure is every `subprocess` git call in `src/`
+    as much as in `tests/` — `_get_changed_files_since`,
+    `_get_working_tree_changes`, `_get_git_remote_url` and the acceptance
+    detector all shell out, and under an inherited `GIT_DIR` they would answer
+    about the wrong repository while looking perfectly healthy.
+
+    `GIT_AUTHOR_*` / `GIT_COMMITTER_*` are deliberately left alone: they only
+    supply identity, which a temp repo needs anyway, and removing them would
+    break commits on machines with no `user.email` configured.
+    """
+    for name in _GIT_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def clear_remote_url_cache():
     """Reset the memoized git-remote lookups between tests.
