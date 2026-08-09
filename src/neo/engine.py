@@ -32,7 +32,7 @@ from neo.events import (
     NullSink,
     safe_emit,
 )
-from neo.text_budget import apportion, elide_middle, truncate_marked
+from neo.text_budget import apportion, elide_middle, shown_of, truncate_marked
 from neo.models import (
     AppliedAction,
     CodeSuggestion,
@@ -103,6 +103,12 @@ _DELIBERATION_TOTAL_CHARS = 6000
 
 # Per-exemplar solution text in the "Similar Past Tasks" prompt section.
 _EXEMPLAR_SOLUTION_CHARS = 100
+
+# Community-cache fallback, used only when FactStore retrieval finds nothing
+# similar enough. That is precisely when the model has the least other
+# context and leans hardest on what it is handed, so both cuts are marked.
+_COMMUNITY_FALLBACK_FACTS = 2
+_COMMUNITY_BODY_CHARS = 200
 # Substrings that earn the larger cap. Matched against the whole lowercased
 # path, so a source file under a directory named `architecture` also qualifies.
 _IMPORTANT_FILE_PATTERNS = ('readme.md', 'claude.md', 'architecture')
@@ -2324,6 +2330,15 @@ RULES:
         Reads ~/.neo/community_facts_cache.json directly and picks facts whose
         subject contains any token from the prompt. Falls back to the first 2
         facts if no token match.
+
+        Both cuts here are marked, and the list one is not optional politeness.
+        These are curated global rules presented under a heading that reads as
+        the complete set, so a silent 5-into-2 elision tells the model three
+        rules do not exist. And the body cut feeds `past_learnings`, which
+        `_deliberation_context` apportions and cuts AGAIN — an unmarked cut
+        upstream of a marked one makes the surviving marker report the wrong
+        denominator, which is the nested-cut defect this module exists to
+        remove rather than relocate.
         """
         cache = Path.home() / ".neo" / "community_facts_cache.json"
         if not cache.exists():
@@ -2346,14 +2361,20 @@ RULES:
             scored.append((hits, f))
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        picked = [f for h, f in scored if h > 0][:2] or [f for _, f in scored[:2]]
+        matching = [f for h, f in scored if h > 0]
+        # `candidates` is what the section is selecting FROM, so the annotation
+        # describes the real omission: on a token match that is the matching
+        # set, and on the no-match fallback it is the whole cache.
+        candidates = matching or [f for _, f in scored]
+        picked = candidates[:_COMMUNITY_FALLBACK_FACTS]
         if not picked:
             return ""
 
-        lines = ["## Community Patterns (fallback)"]
+        header = "## Community Patterns (fallback)"
+        lines = [header + shown_of(candidates, len(picked))]
         for f in picked:
             subject = f.get("subject", "")
-            body = (f.get("body", "") or "")[:200]
+            body = truncate_marked(f.get("body", ""), _COMMUNITY_BODY_CHARS)
             lines.append(f"- **{subject}**: {body}")
         return "\n".join(lines)
 

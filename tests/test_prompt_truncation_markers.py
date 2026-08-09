@@ -580,8 +580,87 @@ class TestExemplarFormatting:
         assert f"{4000 - _EXEMPLAR_SOLUTION_CHARS} of 4000" in rendered
 
 
+class TestCommunityFallbackSection:
+    """`engine._community_fallback_learnings` — both of its cuts.
+
+    Missed by the first pass of this audit, and worth recording why: the body
+    cut is a `[:200]` applied to a `.get()` result rather than to a named
+    variable, so it does not look like the other sixteen.
+
+    It matters more than its size suggests. The branch fires only when
+    `FactStore` retrieval found nothing similar enough — precisely when the
+    model has the least other context and leans hardest on what it is handed.
+    And its output becomes `past_learnings`, one of the three sections
+    `_deliberation_context` apportions, so an unmarked cut here sits upstream
+    of a marked one: the surviving marker would describe the already-cut
+    value and report a denominator that is not the fact's real length. That
+    is the nested-cut defect this change set exists to remove, not relocate.
+    """
+
+    def _run(self, tmp_path, monkeypatch, facts, prompt="pattern rules caching"):
+        import json
+
+        monkeypatch.setattr("pathlib.Path.home", staticmethod(lambda: tmp_path))
+        neo_dir = tmp_path / ".neo"
+        neo_dir.mkdir(parents=True, exist_ok=True)
+        (neo_dir / "community_facts_cache.json").write_text(
+            json.dumps({"data": {"facts": facts}})
+        )
+        from neo.engine import NeoEngine
+
+        return NeoEngine._community_fallback_learnings(object(), prompt)
+
+    def _facts(self, count, body_len):
+        return [
+            {"subject": f"Pattern {i}", "body": "pattern " + "x" * body_len}
+            for i in range(count)
+        ]
+
+    def test_long_body_is_marked(self, tmp_path, monkeypatch):
+        rendered = self._run(tmp_path, monkeypatch, self._facts(2, 900))
+        assert was_truncated(rendered)
+
+    def test_marker_reports_the_facts_real_length(self, tmp_path, monkeypatch):
+        """Not the length of some already-cut intermediate."""
+        from neo.engine import _COMMUNITY_BODY_CHARS
+
+        total = len("pattern ") + 900
+        rendered = self._run(tmp_path, monkeypatch, self._facts(2, 900))
+        assert f"{total - _COMMUNITY_BODY_CHARS} of {total}" in rendered
+
+    def test_short_body_is_not_marked(self, tmp_path, monkeypatch):
+        """A marker that fires when nothing was cut is noise, not honesty."""
+        rendered = self._run(tmp_path, monkeypatch, self._facts(2, 5))
+        assert not was_truncated(rendered)
+
+    def test_elided_fact_list_is_annotated(self, tmp_path, monkeypatch):
+        """Five curated rules shown as two must not read as two rules total."""
+        from neo.engine import _COMMUNITY_FALLBACK_FACTS
+
+        rendered = self._run(tmp_path, monkeypatch, self._facts(5, 5))
+        assert f"[showing {_COMMUNITY_FALLBACK_FACTS} of 5]" in rendered
+
+    def test_complete_fact_list_is_not_annotated(self, tmp_path, monkeypatch):
+        rendered = self._run(tmp_path, monkeypatch, self._facts(2, 5))
+        assert "showing" not in rendered
+
+    def test_annotation_counts_the_set_actually_selected_from(
+        self, tmp_path, monkeypatch
+    ):
+        """On the no-token-match path the candidate set is the whole cache.
+
+        The two paths select from different populations, and the annotation
+        has to describe the one in force or it reports a loss that did not
+        happen in the size it claims.
+        """
+        rendered = self._run(
+            tmp_path, monkeypatch, self._facts(4, 5), prompt="zzzz nomatch"
+        )
+        assert "[showing 2 of 4]" in rendered
+
+
 @pytest.mark.parametrize("module_name,helpers", [
-    ("neo.engine", {"truncate_marked", "apportion"}),
+    ("neo.engine", {"truncate_marked", "apportion", "shown_of"}),
     ("neo.pattern_extraction", {"truncate_marked"}),
     ("neo.constraint_verification", {"truncate_marked"}),
     ("neo.repair_loop", {"truncate_marked"}),

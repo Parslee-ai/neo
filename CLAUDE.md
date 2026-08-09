@@ -662,8 +662,13 @@
   line last while a chained one puts the original cause first, so only a
   middle-elide serves both. A list is truncated as silently as a string: under
   a prompt saying "follow this exactly", three bullets read as three edge
-  cases. Before the extraction the defect sat in SEVENTEEN individual cuts
-  across eight prompt builders in six modules.
+  cases. Before the extraction the defect sat in NINETEEN individual cuts
+  across nine prompt builders in six modules. Seventeen were found by the
+  first sweep; two more (`_community_fallback_learnings`, one body cut and one
+  list elision) came out of review, and the reason they were missed is worth
+  keeping: that body cut is a `[:200]` on a `.get()` result rather than on a
+  named variable, so it does not pattern-match the other seventeen. A sweep
+  that looks for slices on identifiers will miss the same shape again.
   **Never nest cuts.** `_deliberate` used to cut each section to 2,000 and the
   concatenation to 6,000, which delivered `verifiable_constraints` as 1,890 of
   31,000 characters with its own marker sliced off, beneath an outer marker
@@ -677,7 +682,12 @@
   apportionment sends the full 6,000. **Check whether a value arrives already
   cut** — `outcomes` caps `diff_summary` before `store` hands it to
   `pattern_extraction`, whose own cut drops that inner marker, leaving one
-  that understates the real loss. **Footguns**: `truncate_marked` and
+  that understates the real loss. The community fallback was a second instance
+  of exactly this, inside `engine` itself: its unmarked body cut fed
+  `past_learnings`, which `_deliberation_context` then apportioned and cut
+  again, so the new marker would have reported the pre-cut length as the
+  fact's real one. Marking the inner cut is what makes the outer one true —
+  an apportioned section is only as honest as its least honest input. **Footguns**: `truncate_marked` and
   `apportion` raise on a budget that cannot do the job and no call site
   catches them narrowly — every caller passes a module constant, so it is a
   programmer error, and the one runtime-reachable path (the panel) degrades to
