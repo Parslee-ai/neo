@@ -18,7 +18,15 @@ from neo.memory.models import Fact, FactKind, FactMetadata, FactScope
 
 logger = logging.getLogger(__name__)
 
-# Files to scan for constraints, in priority order
+# Files to scan for constraints, in priority order.
+#
+# Several entries deliberately name the same document under different
+# spellings, because different tools write different ones. On a
+# case-insensitive filesystem — macOS by default — `AGENTS.md` and `agents.md`
+# are then not two candidates but ONE FILE listed twice, and a symlinked
+# `CLAUDE.md -> AGENTS.md` is a third spelling of it. `_group_by_file_identity`
+# collapses those before ingestion; the order here decides which spelling wins
+# and becomes the `source_file` recorded on the facts.
 CONSTRAINT_FILES = [
     ("~/.claude/CLAUDE.md", FactScope.GLOBAL),
     ("{project}/CLAUDE.md", FactScope.PROJECT),
@@ -63,10 +71,21 @@ class ConstraintIngester:
         new_facts: list[Fact] = []
         superseded_facts: list[Fact] = []
 
-        for file_template, scope in CONSTRAINT_FILES:
-            file_path = self._resolve_path(file_template)
-            if not file_path or not file_path.exists():
-                continue
+        for file_path, aliases, scope in self._group_by_file_identity():
+            # Retire facts recorded under a non-canonical spelling of this same
+            # file, and do it BEFORE the unchanged-checksum short-circuit.
+            #
+            # This is the migration path, and the ordering is the whole of it.
+            # Stores written before aliases were collapsed hold a full second
+            # (and third) copy of every section under the other spellings —
+            # valid, confidence 1.0, CONSTRAINT and therefore exempt from
+            # recall decay, so nothing ages them out. Their file has not
+            # changed, so the checksum matches, so a cleanup placed below the
+            # short-circuit would never run and the duplicates would outlive
+            # the fix indefinitely.
+            self._retire_alias_facts(
+                file_path, aliases, existing_facts, superseded_facts
+            )
 
             current_checksum = self._file_checksum(file_path)
             stored_checksum = self._checksums.get(str(file_path), "")
@@ -111,6 +130,97 @@ class ConstraintIngester:
 
         self._save_checksums()
         return new_facts, superseded_facts
+
+    def _group_by_file_identity(
+        self,
+    ) -> list[tuple[Path, list[Path], FactScope]]:
+        """Collapse `CONSTRAINT_FILES` entries that name the same file.
+
+        Returns one `(canonical_path, alias_paths, scope)` per distinct file,
+        in `CONSTRAINT_FILES` order. `alias_paths` are the other spellings that
+        reached it, and is empty for the ordinary case.
+
+        The table lists `AGENTS.md` and `agents.md` separately because
+        different tools write different ones. On a case-insensitive filesystem
+        — macOS by default, which is where this was found — those are the same
+        file, so the ingest loop visited it twice. Both the checksum cache and
+        the supersession pass key on the literal path string, and
+        `"…/AGENTS.md" != "…/agents.md"`, so neither pass saw the other's work:
+        the second visit found no stored checksum, superseded nothing, and
+        minted a complete second copy of every section. Measured on one machine
+        before this fix: 51 duplicated subjects in a single project, and the
+        same pattern in every project that had an `AGENTS.md` — with the
+        control holding, since projects without one showed zero.
+
+        Identity is `(st_dev, st_ino)`, not a normalized string. `realpath`
+        resolves symlinks but preserves the case it was given, so on macOS it
+        does not equate the two spellings at all, and `os.path.normcase` is a
+        no-op outside Windows. Only the filesystem knows, so ask it — which
+        catches the symlinked `CLAUDE.md -> AGENTS.md` layout for free.
+
+        Falls back to the resolved path string when `stat` fails, which keeps a
+        race between `exists()` and `stat()` from dropping a file entirely: the
+        cost is a missed alias collapse, not a missed rule file.
+        """
+        groups: list[tuple[Path, list[Path], FactScope]] = []
+        by_identity: dict[object, int] = {}
+
+        for file_template, scope in CONSTRAINT_FILES:
+            file_path = self._resolve_path(file_template)
+            if not file_path or not file_path.exists():
+                continue
+
+            try:
+                stat = file_path.stat()
+                identity: object = (stat.st_dev, stat.st_ino)
+            except OSError:
+                identity = str(file_path.resolve())
+
+            if identity in by_identity:
+                # A later spelling of a file already claimed. The first entry
+                # wins, so CONSTRAINT_FILES order is what decides the canonical
+                # path — deliberately, since it is the documented priority
+                # order and is stable across runs.
+                canonical, aliases, _ = groups[by_identity[identity]]
+                if file_path != canonical:
+                    aliases.append(file_path)
+                continue
+
+            by_identity[identity] = len(groups)
+            groups.append((file_path, [], scope))
+
+        return groups
+
+    def _retire_alias_facts(
+        self,
+        canonical: Path,
+        aliases: list[Path],
+        existing_facts: list[Fact],
+        superseded_facts: list[Fact],
+    ) -> None:
+        """Invalidate constraints recorded under a non-canonical spelling.
+
+        Also drops the aliases' checksum entries, so a stale cache row cannot
+        keep a retired spelling alive in `checksums.json` forever.
+        """
+        alias_keys = {str(path) for path in aliases} - {str(canonical)}
+        if not alias_keys:
+            return
+
+        for fact in existing_facts:
+            if (fact.kind == FactKind.CONSTRAINT
+                    and fact.is_valid
+                    and fact.metadata.source_file in alias_keys):
+                fact.is_valid = False
+                superseded_facts.append(fact)
+
+        for key in alias_keys:
+            self._checksums.pop(key, None)
+
+        logger.info(
+            f"Collapsed {len(alias_keys)} alias spelling(s) of {canonical} "
+            f"({', '.join(sorted(alias_keys))})"
+        )
 
     def _resolve_path(self, template: str) -> Optional[Path]:
         """Resolve a file path template."""
