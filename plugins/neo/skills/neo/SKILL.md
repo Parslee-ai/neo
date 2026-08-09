@@ -1,6 +1,6 @@
 ---
 name: neo
-description: Ask Neo for semantic reasoning and code suggestions over the current codebase. Use for general questions, code suggestions, or architectural guidance backed by Neo's persistent memory.
+description: Ask Neo for semantic reasoning and code suggestions over explicitly selected context. Use for general questions, code suggestions, or architectural guidance; persistent memory is opt-in for external-provider calls.
 ---
 
 # Neo — Semantic Reasoning Helper
@@ -11,19 +11,38 @@ When the user invokes this skill (`$neo <question or task>`), do the following:
 
 2. **Say what you are delegating.** One sentence, before the call: the user should know what question is in flight before a 5–30 second pause.
 
-3. **Gather context.** Use your file-reading tools to collect the most relevant files for the user's question (typically 1–5 files). Include the user's full question text.
+3. **Gather context deliberately.** Use your file-reading tools to collect the
+   most relevant files for the user's question (typically 1–5 files). Include
+   only the task text and excerpts Neo actually needs. Do not forward unrelated
+   conversation history, secrets, credentials, tokens, cookies, or session
+   material.
 
-4. **Invoke Neo with `--json`.** Allow up to 5 minutes — Neo runs multi-agent reasoning across LLM calls.
+4. **Respect the provider boundary.** `neo --version` reports the configured
+   provider. Before an external-provider call, tell the user which Neo provider
+   will receive which files or data categories. Production, private, or customer
+   material requires explicit authorization for that provider and that scope;
+   invoking `$neo` is not blanket consent to send unrelated sensitive context.
+
+5. **Invoke Neo with `--json --no-scan --no-memory`.** Allow up to 5 minutes — Neo runs
+   multi-agent reasoning across LLM calls. Use Codex's approval flow when the
+   command needs network access. The approval description must name the Neo
+   provider and summarize the data being sent.
 
    ```bash
-   neo --json --mode advise <<'QUERY'
+   neo --json --no-scan --no-memory --mode advise <<'QUERY'
    <restate the user's question here, plus any short context excerpts>
    QUERY
    ```
 
    `--json` controls output only; a plain-text heredoc is still read as text.
+   `--no-scan` is mandatory because Codex already curated the context. It
+   prevents Neo from adding directory files or project instruction files.
+   `--no-memory` is the privacy-safe default because retrieved Neo facts are
+   also provider context. Omit it only when the user explicitly asks to use
+   shared Neo memory and authorizes relevant stored facts to be sent to the
+   named provider; disclose that additional category before approval.
 
-5. **Read both streams.** Never parse Neo's human-readable text output — it is formatted for a terminal reader and omits the fields below.
+6. **Read both streams.** Never parse Neo's human-readable text output — it is formatted for a terminal reader and omits the fields below.
 
 ## Output contract
 

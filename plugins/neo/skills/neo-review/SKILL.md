@@ -11,19 +11,33 @@ When the user invokes this skill (`$neo-review <file or module>`), do the follow
 
 2. **Read the relevant code.** Up to 5 files at a time keeps Neo's context budget healthy. Prefer the files where the actual logic lives over generated/test files.
 
-3. **Invoke Neo with a review-framed prompt.** Allow up to 5 minutes.
+3. **Apply the provider boundary.** Redact secrets, credentials, tokens,
+   cookies, and session material. Before an external-provider call, tell the
+   user which Neo provider will receive which files or data categories.
+   Production, private, or customer code requires explicit authorization for
+   that provider and scope; invoking the skill is not blanket consent.
+
+4. **Invoke Neo with a review-framed prompt.** Allow up to 5 minutes. Use
+   Codex's approval flow for required network access, naming the provider and
+   summarized data in the approval description.
 
    ```bash
-   neo --json --mode advise <<'QUERY'
+   neo --json --no-scan --no-memory --mode advise <<'QUERY'
    Review the following code for: security vulnerabilities, edge cases, error handling, performance issues. Provide concrete suggestions with confidence scores.
 
    <paste relevant code or summarize what you read>
    QUERY
    ```
 
-4. **Filter Neo's output to review-relevant findings.** Group by severity. Flag any finding with confidence ≥ 0.8 as actionable; treat lower-confidence findings as worth-checking-but-verify.
+5. **Filter Neo's output to review-relevant findings.** Group by severity. Flag any finding with confidence ≥ 0.8 as actionable; treat lower-confidence findings as worth-checking-but-verify.
 
-5. **Cross-reference with Neo's KNOWN ISSUES IN NEARBY CODE section if present.** Neo's context-assembly already surfaces TODOs, stubs, swallowed exceptions, hardcoded credentials — those overlap with review concerns and add weight to related findings.
+6. **Cross-reference with Neo's KNOWN ISSUES IN NEARBY CODE section if present.** Neo's context-assembly already surfaces TODOs, stubs, swallowed exceptions, hardcoded credentials — those overlap with review concerns and add weight to related findings.
+
+`--no-scan` is mandatory: Codex already selected the review files, so Neo must
+not silently add working-directory files to the provider request.
+`--no-memory` is the default so unrelated stored facts cannot enter the provider
+prompt. Omit it only when the user explicitly authorizes relevant Neo memory;
+include stored facts as a disclosed data category.
 
 ## Reading Neo's output
 

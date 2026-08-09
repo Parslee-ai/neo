@@ -23,9 +23,13 @@
   "interface": {
     "displayName": "Neo",
     "shortDescription": "Semantic reasoning with persistent memory",
-    "longDescription": "Neo is a mode-explicit reasoning helper. Codex skills use read-only `advise` by default and `learn` only for deliberate pattern evidence. `agent` requires explicit workspace authority plus a host executor; Neo never executes generated shell commands. Requires the neo CLI installed locally (`pip install neo-reasoner[openai]`).",
+    "longDescription": "Neo is a mode-explicit reasoning helper. Codex advise skills send only explicitly curated task context: implicit directory and project-instruction discovery plus persistent fact retrieval are disabled by default. External-provider calls use Codex approval with provider and data scope disclosed. Shared memory is opt-in for advise and used by deliberate `learn` workflows with its provider and persistence effects disclosed. `agent` requires explicit workspace authority plus a host executor; Neo never executes generated shell commands. Requires the neo CLI installed locally (`pip install neo-reasoner[openai]`).",
     "developerName": "Parslee AI",
     "category": "Productivity",
-    "capabilities": ["Read"]
+    "capabilities": ["Read", "Interactive"],
+    "defaultPrompt": [
+      "Ask Neo to reason over a small, explicitly approved code context",
+      "Have Neo review selected code without scanning the rest of the workspace"
+    ]
   }
 }

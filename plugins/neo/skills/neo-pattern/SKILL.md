@@ -15,10 +15,20 @@ When the user invokes this skill (`$neo-pattern <code reference or description>`
 
 3. **For pattern-finding:** translate the user's description into search terms. Use Grep/Glob to gather candidate files; pass them to Neo for semantic matching against the description.
 
-4. **Invoke Neo with a pattern-framed prompt.** Allow up to 5 minutes.
+4. **Apply the provider and learning boundary.** Redact secrets, credentials,
+   tokens, cookies, and session material. Before an external-provider call,
+   tell the user which Neo provider will receive which files or data categories.
+   Production, private, or customer code requires explicit authorization for
+   that provider and scope. Because this learning workflow uses shared Neo
+   memory, also disclose that relevant stored facts may be selected for the
+   provider prompt and that `learn` records an episode candidate.
+
+5. **Invoke Neo with a pattern-framed prompt.** Allow up to 5 minutes. Use
+   Codex's approval flow for required network access, naming the provider,
+   summarized data, and candidate-learning effect in the approval description.
 
    ```bash
-   neo --json --mode learn <<'QUERY'
+   neo --json --no-scan --mode learn <<'QUERY'
    <Extract a reusable pattern from> | <Find code matching this pattern>:
 
    <code or description here>
@@ -27,7 +37,10 @@ When the user invokes this skill (`$neo-pattern <code reference or description>`
    QUERY
    ```
 
-5. **Present the pattern with concrete examples.** A named pattern with two example sites is more useful than an abstract description of one.
+6. **Present the pattern with concrete examples.** A named pattern with two example sites is more useful than an abstract description of one.
+
+`--no-scan` is mandatory: Codex already selected the pattern evidence, so Neo
+must not silently add working-directory files to the provider request.
 
 ## Reading Neo's output
 

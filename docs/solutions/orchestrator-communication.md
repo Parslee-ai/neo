@@ -273,6 +273,21 @@ reasoning ends and Codex's begins, so the Codex skills carry stronger
 attribution wording ("Neo found …") and an explicit instruction that Neo's
 result is an input, not the deliverable.
 
+**Context authority differs too.** Codex has already read and selected the
+relevant workspace excerpts before it invokes Neo. Every Codex skill therefore
+passes `--no-scan`: without it the CLI would perform a second, implicit scan of
+the working directory and separately discover project instruction documents.
+Advise skills also pass `--no-memory` by default so unrelated persistent facts
+cannot enter the provider prompt. Shared memory remains available only when the
+user explicitly asks for it and authorizes stored facts as a provider data
+category; deliberate pattern learning discloses both retrieval and persistence
+effects. The Codex adapter also
+requires the approval description to name the configured Neo provider and the
+files or data categories being sent. Sensitive production, private, or
+customer context requires provider-and-scope-specific authorization. These are
+Codex host-boundary rules; the Claude plugin's agent and commands remain a
+separate adapter and continue to use their established context contract.
+
 ## Sink failures are findable
 
 `safe_emit` logs the **first** failure at WARNING and the rest at DEBUG. Logging

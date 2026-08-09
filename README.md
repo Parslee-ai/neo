@@ -393,6 +393,12 @@ Once installed:
 
 - **Skills**: `$neo`, `$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`
 - **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Claude Code plugin
+- **Explicit context boundary**: Codex selects the relevant excerpts and every
+  skill invokes `neo --no-scan`, so Neo cannot silently add files or project
+  instruction documents from the current directory
+- **Privacy-safe advice**: advise skills also use `--no-memory` by default, so
+  stored Neo facts cannot silently enter an external-provider prompt; memory is
+  opt-in with its data category disclosed
 
 Examples:
 
@@ -403,7 +409,20 @@ $neo-architect Should I use microservices or monolith?
 $neo-debug Race condition in task processor
 ```
 
-The plugin wraps the local `neo` CLI, so the binary must be installed first (`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set, or your provider of choice). Anything you teach Neo from Codex is immediately available in the Claude Code plugin and the CAR endpoint, and vice versa — there is one fact store per host.
+The plugin wraps the local `neo` CLI, so the binary must be installed first
+(`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set, or your provider
+of choice). The plugin is intentionally a skills integration, not a Claude
+agent or an MCP server: Codex invokes Neo inside its coding loop and then keeps
+working. If Neo uses an external provider, Codex discloses the provider and the
+files or data categories being sent in its approval request. Invoking a Neo
+skill does not authorize unrelated production, private, or customer material.
+
+Anything you deliberately teach Neo from Codex is immediately available in the
+Claude Code plugin and the CAR endpoint, and vice versa — there is one fact
+store per host. Codex's `--no-scan` and `--no-memory` boundaries change only
+what is read and sent on that invocation; they do not alter or fork the shared
+memory store. Deliberate pattern learning retains memory access and discloses
+both retrieved-fact and persistence effects before provider approval.
 
 Plugin sources live under [`plugins/neo/`](plugins/neo/) — see the manifest and skill definitions.
 

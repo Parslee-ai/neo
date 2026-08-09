@@ -18,6 +18,7 @@ versions.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,45 @@ def test_dunder_version_matches_the_package_version():
 @pytest.mark.parametrize("name", CAPABILITIES)
 def test_codex_skills_invoke_neo_with_json(name):
     assert "neo --json" in _codex_skill(name), name
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_codex_skills_disable_implicit_directory_scan(name):
+    """Codex curates explicit context; a second CLI scan can leak unrelated files."""
+    body = _codex_skill(name)
+    assert "neo --json --no-scan" in body, name
+    assert "`--no-scan` is mandatory" in body, name
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_codex_skills_disclose_external_provider_data_scope(name):
+    """Network approval must identify both the recipient and the payload class."""
+    body = _codex_skill(name)
+    for phrase in ("external-provider", "which Neo provider", "data categories",
+                   "approval flow"):
+        assert phrase in body, f"{name}: missing {phrase}"
+    assert re.search(r"explicit\s+authorization", body), name
+
+
+def test_codex_entry_skill_rejects_blanket_sensitive_context_consent():
+    body = _codex_skill("neo")
+    assert "not blanket consent" in body
+    for secret_class in ("secrets", "credentials", "tokens", "cookies",
+                         "session"):
+        assert secret_class in body
+
+
+@pytest.mark.parametrize("name", [name for name in CAPABILITIES if name != "neo-pattern"])
+def test_codex_advise_skills_disable_implicit_memory(name):
+    body = _codex_skill(name)
+    assert "neo --json --no-scan --no-memory --mode advise" in body, name
+    assert "stored facts" in body, name
+
+
+def test_codex_learning_skill_discloses_memory_retrieval_and_persistence():
+    body = _codex_skill("neo-pattern")
+    assert "relevant stored facts" in body
+    assert "episode candidate" in body
 
 
 @pytest.mark.parametrize("name", CAPABILITIES)

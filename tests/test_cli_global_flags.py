@@ -15,6 +15,7 @@ import subprocess
 import sys
 import pytest
 
+from neo import cli
 from neo.adapters import _adapter_kwargs_for_config
 
 
@@ -189,6 +190,18 @@ class TestCLIGlobalFlags:
         output = result.stdout + result.stderr
         assert "DRY RUN" in output
         assert "OpenAI API key required" not in output
+
+    def test_curated_context_flags_are_parsed(self, monkeypatch):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["neo", "--no-scan", "--no-memory", "test prompt"],
+        )
+
+        args = cli.parse_args()
+
+        assert args.no_scan is True
+        assert args.no_memory is True
 
     def test_memory_prune_dry_run_works(self):
         result = subprocess.run(

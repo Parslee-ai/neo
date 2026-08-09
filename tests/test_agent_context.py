@@ -9,6 +9,9 @@ from neo.agent_context import (
     discover,
     format_for_prompt,
 )
+from neo.engine import NeoEngine
+from neo.execution_context import resolve_execution_context
+from neo.models import NeoInput, TaskType
 
 
 def _write(root: Path, rel: str, content: str = "stub guidance") -> Path:
@@ -178,3 +181,43 @@ def test_end_to_end_mixed_project(tmp_path: Path):
     assert "Always run pytest" in rendered
     assert "Use Black formatting" in rendered
     assert "OAuth 2" in rendered
+
+
+class _FakeLM:
+    model = "fake"
+    provider = "fake"
+
+    def generate(self, messages, **kwargs):
+        return ""
+
+    def name(self):
+        return "fake-lm"
+
+
+def test_curated_input_excludes_implicit_agent_docs(tmp_path: Path):
+    """A host's no-scan boundary must cover the engine's second discovery path."""
+    marker = "PRIVATE_PROJECT_INSTRUCTION_MARKER"
+    _write(tmp_path, "AGENTS.md", marker)
+    neo_input = NeoInput(
+        prompt="answer from explicit context only",
+        task_type=TaskType.FEATURE,
+        working_directory=str(tmp_path),
+        allow_implicit_context=False,
+    )
+    engine = NeoEngine(
+        lm_adapter=_FakeLM(),
+        enable_persistent_memory=False,
+        codebase_root=str(tmp_path),
+    )
+    engine.context = neo_input
+    engine.resolved_execution_context = resolve_execution_context(neo_input)
+
+    prompt, _ = engine._format_combined_prompt({
+        "prompt": neo_input.prompt,
+        "task_type": neo_input.task_type,
+        "files": [],
+    })
+    episode = engine._begin_learning_episode(neo_input)
+
+    assert marker not in prompt
+    assert not any(item.kind == "project_instruction" for item in episode.context_selection)

@@ -11,10 +11,18 @@ When the user invokes this skill (`$neo-debug <bug description>`), do the follow
 
 2. **Gather observable evidence.** Recent error logs, stack traces, test failures. Read the file(s) implicated by the stack trace. If the user mentioned a specific function, locate it.
 
-3. **Invoke Neo with a debug-framed prompt.** Allow up to 5 minutes.
+3. **Apply the provider boundary.** Redact secrets, credentials, tokens,
+   cookies, session material, and unrelated log records. Before an
+   external-provider call, tell the user which Neo provider will receive which
+   files or data categories. Production, private, or customer diagnostics
+   require explicit authorization for that provider and scope.
+
+4. **Invoke Neo with a debug-framed prompt.** Allow up to 5 minutes. Use
+   Codex's approval flow for required network access, naming the provider and
+   summarized data in the approval description.
 
    ```bash
-   neo --json --mode advise <<'QUERY'
+   neo --json --no-scan --no-memory --mode advise <<'QUERY'
    Debug this issue: <user's description>
 
    Symptoms: <what happens>
@@ -29,9 +37,15 @@ When the user invokes this skill (`$neo-debug <bug description>`), do the follow
    QUERY
    ```
 
-4. **Present Neo's hypotheses ranked by confidence.** Lead with the verification step the user can take next — debugging is an iterative loop, not a one-shot answer.
+5. **Present Neo's hypotheses ranked by confidence.** Lead with the verification step the user can take next — debugging is an iterative loop, not a one-shot answer.
 
-5. **If Neo returns multiple competing hypotheses, surface them all.** Don't collapse to "the most likely one" — concurrent-systems bugs often have multiple contributing causes.
+6. **If Neo returns multiple competing hypotheses, surface them all.** Don't collapse to "the most likely one" — concurrent-systems bugs often have multiple contributing causes.
+
+`--no-scan` is mandatory: Codex already selected the evidence, so Neo must not
+silently add working-directory files to the provider request.
+`--no-memory` is the default so unrelated stored facts cannot enter the provider
+prompt. Omit it only when the user explicitly authorizes relevant Neo memory;
+include stored facts as a disclosed data category.
 
 ## Reading Neo's output
 

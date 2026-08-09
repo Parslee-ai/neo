@@ -188,6 +188,10 @@ class NeoInput:
     current_state: dict[str, Any] = field(default_factory=dict)
     role: CallerRole = CallerRole.PLANNER
     requested_output: str = "next_action"
+    # Curated hosts can disable implicit repository context (AGENTS.md,
+    # CLAUDE.md, and tool-specific rule files) for a single request. The
+    # default preserves standalone and existing host behavior.
+    allow_implicit_context: bool = True
 
 
 @dataclass

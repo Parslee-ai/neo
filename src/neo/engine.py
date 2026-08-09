@@ -560,12 +560,13 @@ class NeoEngine:
             )
             for f in neo_input.context_files
         ]
-        for doc in discover_agent_docs(self.codebase_root):
-            context_selection.append(ContextSelection(
-                path=doc.path,
-                content_sha256=content_hash(doc.content),
-                kind="project_instruction",
-            ))
+        if neo_input.allow_implicit_context:
+            for doc in discover_agent_docs(self.codebase_root):
+                context_selection.append(ContextSelection(
+                    path=doc.path,
+                    content_sha256=content_hash(doc.content),
+                    kind="project_instruction",
+                ))
 
         provider = str(getattr(self.lm, "provider", "") or "")
         model = str(getattr(self.lm, "model", "") or "")
@@ -2068,7 +2069,9 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             discover as discover_agent_docs,
             format_for_prompt as format_agent_docs,
         )
-        agent_docs_section = format_agent_docs(discover_agent_docs(self.codebase_root))
+        agent_docs_section = ""
+        if self.context is None or self.context.allow_implicit_context:
+            agent_docs_section = format_agent_docs(discover_agent_docs(self.codebase_root))
         if agent_docs_section:
             parts.append(agent_docs_section)
 

@@ -443,7 +443,16 @@ def parse_args():
     p.add_argument("--exts", metavar="CSV", help="Restrict to file extensions (comma-separated)")
     p.add_argument("--diff-since", metavar="REV", help="Prioritize files changed since git rev or duration")
     p.add_argument("--no-git", action="store_true", help="Skip git-aware heuristics")
-    p.add_argument("--no-scan", action="store_true", help="Skip directory scan; use only JSON-provided context")
+    p.add_argument(
+        "--no-scan",
+        action="store_true",
+        help="Disable implicit directory and project-instruction discovery",
+    )
+    p.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Disable persistent fact retrieval and learning for this request",
+    )
     p.add_argument("--semantic", action="store_true", help="Use semantic search (requires .neo/index.json)")
     p.add_argument("--stdin-json", action="store_true", help="Force JSON input mode")
     p.add_argument("--stdin-text", action="store_true", help="Force text input mode")
@@ -880,6 +889,7 @@ def main():
                     for change in input_data.get("proposed_changes", [])
                     if isinstance(change, dict)
                 ],
+                allow_implicit_context=not args.no_scan,
                 **execution_fields_from_dict(input_data),
             )
             if not args.json:
@@ -912,6 +922,7 @@ def main():
                 if args.allow_write_path or args.allow_command
                 else None
             ),
+            allow_implicit_context=not args.no_scan,
         )
         if not args.dry_run:
             _print_neo_greeting(prompt, working_dir)
@@ -1024,6 +1035,7 @@ def main():
         from neo.events import JsonlSink
         engine = NeoEngine(
             lm_adapter=adapter,
+            enable_persistent_memory=not args.no_memory,
             codebase_root=neo_input.working_directory,
             config=config,
             event_sink=JsonlSink(sys.stderr) if args.json else None,

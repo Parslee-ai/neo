@@ -11,19 +11,34 @@ When the user invokes this skill (`$neo-optimize <target>`), do the following:
 
 2. **Capture the current implementation plus its callers** if you can do so cheaply. Neo can suggest better algorithms, but only if it sees how the code is used.
 
-3. **Invoke Neo with an optimization-framed prompt.** Allow up to 5 minutes.
+3. **Apply the provider boundary.** Redact secrets, credentials, tokens,
+   cookies, and session material. Before an external-provider call, tell the
+   user which Neo provider will receive which files or data categories.
+   Production, private, or customer code requires explicit authorization for
+   that provider and scope.
+
+4. **Invoke Neo with an optimization-framed prompt.** Allow up to 5 minutes.
+   Use Codex's approval flow for required network access, naming the provider
+   and summarized data in the approval description.
 
    ```bash
-   neo --json --mode advise <<'QUERY'
+   neo --json --no-scan --no-memory --mode advise <<'QUERY'
    Suggest optimizations for the following code. Focus on: algorithmic improvements (lower asymptotic complexity), redundant computation, allocation in hot loops, IO batching opportunities. Skip micro-style changes.
 
    <paste current implementation + relevant callers>
    QUERY
    ```
 
-4. **Present Neo's suggestions ranked by expected impact.** Each CodeSuggestion includes `estimated_risk` and `blast_radius` — surface those alongside the recommendation.
+5. **Present Neo's suggestions ranked by expected impact.** Each CodeSuggestion includes `estimated_risk` and `blast_radius` — surface those alongside the recommendation.
 
-5. **For high-risk changes, recommend benchmarking before applying.** Neo's confidence reflects pattern-match strength, not measured speedup.
+6. **For high-risk changes, recommend benchmarking before applying.** Neo's confidence reflects pattern-match strength, not measured speedup.
+
+`--no-scan` is mandatory: Codex already selected the implementation and
+callers, so Neo must not silently add working-directory files to the provider
+request.
+`--no-memory` is the default so unrelated stored facts cannot enter the provider
+prompt. Omit it only when the user explicitly authorizes relevant Neo memory;
+include stored facts as a disclosed data category.
 
 ## Reading Neo's output
 
