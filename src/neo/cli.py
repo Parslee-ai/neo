@@ -587,18 +587,40 @@ def _format_selection_report(report: Optional[dict]) -> list[str]:
             f"chunks (cap {report['max_chunks']}); each indexed file keeps its "
             f"first chunks before any file keeps a second"
         )
-    # Only possible when the file count exceeds the chunk cap, which the
-    # `truncated` line above cannot describe — it reports the FILE budget.
+    # A selected file can be absent from the index for two unrelated reasons,
+    # and they get separate lines because they have separate remedies — one of
+    # them has none at all. Reporting both as the chunk cap was the original
+    # form of this block, and it named a cap that had not fired: 25 files, 559
+    # of 559 chunks kept, and still "the 1000-chunk cap is below the 25 files
+    # selected; lower --max-files". The culprit was an empty `__init__.py`, and
+    # lowering --max-files would only have indexed less.
+    #
     # Keyed on presence, not on a 0 default: a selection-only report has no
     # chunk phase, and treating "absent" as "zero files represented" would
     # claim every file was dropped.
     if 'files_with_chunks' in report:
-        missing = report['selected'] - report['files_with_chunks']
-        if missing > 0:
+        # `files_producing_chunks` is measured before the cap, so this
+        # subtraction isolates the files the cap alone emptied. Falling back to
+        # the post-cap count makes `starved` zero for a report predating the
+        # key, which is the safe direction: silence, not a false accusation.
+        produced = report.get('files_producing_chunks', report['files_with_chunks'])
+        starved = produced - report['files_with_chunks']
+        if starved > 0:
             lines.append(
-                f"[Neo] {missing} selected files contributed no chunks — the "
-                f"{report['max_chunks']}-chunk cap is below the "
+                f"[Neo] {starved} indexed files lost every chunk to the "
+                f"{report['max_chunks']}-chunk cap, which is below the "
                 f"{report['selected']} files selected; lower --max-files"
+            )
+        # Stated as a fact about the source, with no remedy attached, because
+        # there is no setting that makes a constructs-free file produce a
+        # chunk. It is reported at all so that "Indexed 100 of 4,000" is not
+        # read as "100 files' worth of chunks are in the index".
+        barren = report['selected'] - produced
+        if barren > 0:
+            noun = "file" if barren == 1 else "files"
+            lines.append(
+                f"[Neo] {barren} selected {noun} yielded no chunks (no "
+                f"functions, classes or interfaces for the parser to extract)"
             )
     if report.get('duplicates'):
         lines.append(

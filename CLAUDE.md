@@ -559,6 +559,22 @@
      files; `MAX_CHUNKS_PER_REPO` is fixed at 1000 while `--max-files` is not,
      so `files_with_chunks` reports the shortfall — `truncated` is False there,
      because the FILE cap genuinely was not the constraint.
+     **And the corollary the first version of this report broke: never blame a
+     cap for an absence it did not cause.** A selected file is missing from the
+     index for one of TWO unrelated reasons, and the console must not guess
+     between them. Either it produced no chunks at all — no function, class,
+     interface or struct for the grammar to match, as in an empty
+     `__init__.py`, an enum-only `.cs`, a type-alias-only `.ts` — which no cap
+     setting changes and which therefore gets a bare statement with NO remedy
+     attached; or the cap took every chunk it produced, which gets the cap
+     named and `lower --max-files`. `files_producing_chunks` is measured
+     BEFORE `_cap_chunks` precisely so the two stay separable; subtracting the
+     post-cap `files_with_chunks` from `selected` conflates them and is what
+     printed "the 1000-chunk cap is below the 25 files selected" for a build
+     that kept 559 of 559 chunks, with `chunks_capped` False on the same
+     report. It fired on this repo, on any repo with an `__init__.py`. A report
+     that invents a cause is worse than the silence it replaced, because
+     silence at least does not send the operator to the wrong knob.
   **Query footgun** (`language_parser.py`; incident detail in the tree-sitter
   doc's "Why queries break silently"): a query that fails to compile is
   indistinguishable from one that matches nothing — `_get_query` returns None
