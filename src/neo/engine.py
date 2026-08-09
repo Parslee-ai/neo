@@ -107,6 +107,25 @@ _EXEMPLAR_SOLUTION_CHARS = 100
 # path, so a source file under a directory named `architecture` also qualifies.
 _IMPORTANT_FILE_PATTERNS = ('readme.md', 'claude.md', 'architecture')
 
+# Caps on the REPOSITORY CONTEXT block in the reasoning prompt.
+#
+# These are token-overflow guards, not relevance judgements — the gatherer has
+# already decided which files matter by the time they get here. 3000 characters
+# is roughly 40-75 lines of C#, so for a compiled-language repo the model
+# routinely sees the usings, the fields and the first method or two of a file
+# and nothing below that.
+#
+# Whatever the numbers are, the cut must be MARKED (see
+# `_render_context_files`). An unmarked cut is the dangerous case: the model
+# cannot distinguish "the file ends here" from "the file was clipped", so it
+# answers questions about absence from a fragment.
+_MAX_CONTEXT_FILES = 20
+_CONTEXT_FILE_CHARS = 3000
+_IMPORTANT_FILE_CHARS = 8000
+# Substrings that earn the larger cap. Matched against the whole lowercased
+# path, so a source file under a directory named `architecture` also qualifies.
+_IMPORTANT_FILE_PATTERNS = ('readme.md', 'claude.md', 'architecture')
+
 
 def _format_exemplar(exemplar) -> str:
     """Render one retrieved exemplar for the "Similar Past Tasks" section.
