@@ -218,6 +218,51 @@ class TestCLIGlobalFlags:
         assert "traceback" not in output.lower()
 
 
+class TestConstructTopKBounds:
+    """`construct search --top-k` must reject values it cannot honour.
+
+    Rejected at parse time rather than clamped downstream, because both
+    out-of-range directions fail silently and plausibly (issue #28). A
+    negative value reaches a list slice as `results[:-3]`, which drops the
+    LAST three results and returns the rest; zero returns nothing, which
+    reads as "no patterns match".
+    """
+
+    @pytest.mark.parametrize("value", ["-1", "0", "101", "abc", "3.5"])
+    def test_out_of_range_values_are_rejected(self, value):
+        import argparse
+
+        with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+            cli._top_k(value)
+        assert "--top-k" in str(excinfo.value)
+
+    @pytest.mark.parametrize("value", ["-1", "0", "101", "abc"])
+    def test_rejection_exits_rather_than_running_the_search(
+        self, value, monkeypatch
+    ):
+        """argparse must turn the rejection into exit 2, not a traceback."""
+        monkeypatch.setattr(
+            sys, "argv",
+            ["neo", "construct", "search", "q", "--top-k", value],
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            cli.parse_args()
+        assert excinfo.value.code == 2
+
+    @pytest.mark.parametrize("value", ["1", "5", "100"])
+    def test_in_range_values_are_accepted(self, value, monkeypatch):
+        """Parsing must succeed; the search itself may still find nothing."""
+        monkeypatch.setattr(
+            sys, "argv",
+            ["neo", "construct", "search", "q", "--top-k", value],
+        )
+        assert cli.parse_args().top_k == int(value)
+
+    def test_default_is_unchanged(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["neo", "construct", "search", "q"])
+        assert cli.parse_args().top_k == 5
+
+
 def test_adapter_kwargs_passes_base_url_to_ollama():
     class Config:
         provider = "ollama"
