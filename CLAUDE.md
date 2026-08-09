@@ -582,10 +582,15 @@
   once, so TS interfaces and ALL C# inheritance edges were absent from every
   index since they shipped. Three rules follow. Compile results are cached
   INCLUDING failures (the uncached retry warned per query *per file* — 9,699
-  lines in one run). C# bases need `[(identifier) (generic_name (identifier))]`
-  across class/interface/record/struct, since an identifier-only, class-only
-  pattern compiles fine and silently drops `: Repository<Order>` and
-  `interface IX : IY`. And `test_every_chunk_query_compiles` /
+  lines in one run). C# bases need all four of `identifier`, `generic_name`,
+  and `qualified_name` with either as its `name:` field — across
+  class/interface/record/struct — since a narrower pattern compiles fine and
+  silently drops `: Repository<Order>`, `: System.Exception` and
+  `interface IX : IY`. That query is GENERATED from `_CS_BASE_TYPES` over the
+  four declaration kinds rather than written out four times: the hand-copied
+  version is what left `interface_declaration` uncovered, and each widening
+  since has had to be applied everywhere at once or not at all. And
+  `test_every_chunk_query_compiles` /
   `test_every_edge_query_compiles` prove compilation ONLY, so a new query still
   needs its own behavioural assertion.
 - Context selection (`context_gatherer`): **a path named in the prompt is pinned**
