@@ -27,6 +27,7 @@ import numpy as np
 from datasketch import MinHash, MinHashLSH
 from collections import OrderedDict
 from neo.math_utils import cosine_similarity
+from neo.text_budget import elide_middle, truncate_marked
 from neo.storage import FileStorage
 from neo.storage_interface import StorageBackend
 
@@ -58,6 +59,42 @@ except ImportError:
     # fastembed not installed - will fall back to OpenAI or MinHash
 
 logger = logging.getLogger(__name__)
+
+# Caps on the failure-analysis prompt. Marked, because the extracted root
+# cause is stored as a learned pitfall and replayed on later prompts.
+_FAILURE_TRACE_CHARS = 500
+_FAILURE_SUGGESTION_CHARS = 200
+
+
+def build_failure_analysis_prompt(error_trace: str, suggestion: str) -> str:
+    """Build the root-cause extraction prompt.
+
+    Extracted from its caller so it can be tested without an OpenAI client.
+
+    The trace is elided in the MIDDLE, not cut at the tail. A traceback's
+    most specific frame is at one end and its original cause at the other,
+    and `ValueError: database is locked` is the LAST line — a head-cut of a
+    40-frame traceback keeps forty `File "..."` headers and discards the only
+    line naming the failure. The model then confidently names a different
+    root cause, which is stored as a durable pitfall and replayed later.
+
+    The suggestion is head-cut, which is right for it: a proposal leads with
+    what it proposes.
+    """
+    return f"""Analyze this failure and extract 1-3 root causes as bullet points.
+
+ERROR TRACE:
+{elide_middle(error_trace or "", _FAILURE_TRACE_CHARS)}
+
+SUGGESTION THAT FAILED:
+{truncate_marked(suggestion, _FAILURE_SUGGESTION_CHARS)}
+
+Output format (1-3 lines only):
+- Root cause 1
+- Root cause 2
+- Root cause 3
+
+Focus on: edge cases, algorithm choice, complexity, logic errors."""
 
 # Constants for embeddings (Phase 1)
 EMBEDDING_DIM = 1536  # OpenAI text-embedding-3-small dimension
@@ -1949,21 +1986,7 @@ class PersistentReasoningMemory:
             # Fallback: extract simple patterns from error trace
             return self._extract_failure_heuristics(error_trace)
 
-        # Quick prompt to LLM (use OpenAI client)
-        prompt = f"""Analyze this failure and extract 1-3 root causes as bullet points.
-
-ERROR TRACE:
-{error_trace[:500]}
-
-SUGGESTION THAT FAILED:
-{suggestion[:200]}
-
-Output format (1-3 lines only):
-- Root cause 1
-- Root cause 2
-- Root cause 3
-
-Focus on: edge cases, algorithm choice, complexity, logic errors."""
+        prompt = build_failure_analysis_prompt(error_trace, suggestion)
 
         try:
             response = self.openai_client.chat.completions.create(

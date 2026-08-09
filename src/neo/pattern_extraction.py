@@ -10,8 +10,14 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from neo.languages import fence_tag_for
+from neo.text_budget import truncate_marked
 
 logger = logging.getLogger(__name__)
+
+# Caps on what reaches the extraction prompt. Every cut is marked — see
+# `extract_pattern_from_correction` for why a fenced cut is the worst kind.
+_PROBLEM_DESCRIPTION_CHARS = 300
+_CODE_SAMPLE_CHARS = 500
 
 
 @dataclass
@@ -117,22 +123,29 @@ def extract_pattern_from_correction(
     `language` (when provided) is used as the markdown fence tag so the
     LM gets a consistent syntax cue. Passing None drops the tag — better
     than hardcoding ```python and lying when the code is JS/Go/Java.
+
+    All three inputs are cut with a marker. A fence is the worst place to
+    hide a cut: ``` closing after a mid-function slice renders as a complete
+    function, and the rule extracted here is durable — it outlives the run
+    and is replayed as prevention guidance on later prompts. A rule derived
+    from half a fix is worse than no rule, because it carries the same
+    authority.
     """
     fence = fence_tag_for(language)
 
     extraction_prompt = f"""Analyze this coding mistake and extract a PREVENTION RULE:
 
 PROBLEM TYPE:
-{problem_description[:300]}
+{truncate_marked(problem_description, _PROBLEM_DESCRIPTION_CHARS)}
 
 FAILED CODE:
 ```{fence}
-{failed_code[:500]}
+{truncate_marked(failed_code, _CODE_SAMPLE_CHARS)}
 ```
 
 CORRECTED CODE:
 ```{fence}
-{corrected_code[:500]}
+{truncate_marked(corrected_code, _CODE_SAMPLE_CHARS)}
 ```
 
 BUG CATEGORY: {bug_category}
@@ -145,7 +158,10 @@ Extract a reusable prevention pattern in this format:
 3. Prevention rule (one sentence, how to avoid it):
 4. Generalization (does this apply to similar problems?):
 
-Make the prevention rule ACTIONABLE and SPECIFIC."""
+Make the prevention rule ACTIONABLE and SPECIFIC.
+Text matching "... [truncated: N of M characters not shown]" is our note about
+what was omitted, NOT part of the code. Do not quote it in the pattern, and do
+not assume the omitted part is absent — say so if the rule depends on it."""
 
     response = adapter.generate(
         [{"role": "user", "content": extraction_prompt}],

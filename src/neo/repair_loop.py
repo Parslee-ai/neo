@@ -9,8 +9,14 @@ from typing import Optional
 from dataclasses import dataclass
 
 from neo.structured_parser import ParseResult, ParseErrorCode
+from neo.text_budget import truncate_marked
 
 logger = logging.getLogger(__name__)
+
+# Caps on the repair prompt. Marked, because a malformed document is often
+# malformed at the end — see `build_repair_prompt`.
+_ORIGINAL_PROMPT_CHARS = 200
+_BAD_RESPONSE_CHARS = 1000
 
 
 @dataclass
@@ -41,10 +47,19 @@ def create_repair_prompt(
 
     Returns:
         Prompt for formatter model
+
+    Both inputs are cut with a marker. `bad_response` is the acute case: it is
+    malformed JSON, and malformed JSON is very often malformed at the END —
+    an unterminated string, a missing closing brace, a trailing comma before
+    EOF. Cutting the tail silently can therefore remove the very defect the
+    formatter is being asked to repair, and hand it a fragment that looks
+    like a different, cleaner problem. A marked cut tells the formatter the
+    document continued, so it does not "fix" a truncation into valid JSON
+    that drops half the content.
     """
     return f"""You are a JSON formatter. Your ONLY job is to fix malformed JSON responses.
 
-**Original Task:** {original_prompt[:200]}...
+**Original Task:** {truncate_marked(original_prompt, _ORIGINAL_PROMPT_CHARS)}
 
 **Expected Format:**
 <<<NEO:SCHEMA=v3:KIND={kind}>>>
@@ -54,7 +69,7 @@ def create_repair_prompt(
 **Error Detected:** [{error_code}] {error_message}
 
 **Malformed Response:**
-{bad_response[:1000]}
+{truncate_marked(bad_response, _BAD_RESPONSE_CHARS)}
 
 **Your Task:**
 1. Extract the semantic content from the malformed response
@@ -62,6 +77,9 @@ def create_repair_prompt(
 3. Ensure valid JSON (no trailing commas, proper quotes, escaped characters)
 4. Include ONLY the JSON array between sentinels - NO explanations or text
 5. Preserve all semantic meaning from the original
+6. Text matching "... [truncated: N of M characters not shown]" is our note
+   about what was omitted, NOT content. Do not reproduce it in any field, and
+   do not invent content to replace what it says was dropped.
 
 **Rules:**
 - Start with <<<NEO:SCHEMA=v3:KIND={kind}>>>

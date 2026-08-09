@@ -9,6 +9,12 @@ from typing import List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 
+from neo.text_budget import truncate_marked
+
+# Cap on the problem text sent for constraint extraction. Marked, because the
+# caller treats the result as the complete constraint set.
+_PROBLEM_DESCRIPTION_CHARS = 500
+
 
 class ConstraintType(Enum):
     """Types of verifiable constraints."""
@@ -166,10 +172,18 @@ class ConstraintVerifier:
         return constraints
 
     def _llm_extract_constraints(self, problem_description: str, adapter) -> List[Constraint]:
-        """Use LLM to extract constraints when patterns don't match."""
+        """Use LLM to extract constraints when patterns don't match.
+
+        The description is cut with a marker. The caller treats what comes
+        back as *the* constraint set and verifies solutions against it, so a
+        constraint stated in a dropped tail does not merely go unextracted —
+        it becomes a constraint the verifier reports as satisfied because it
+        never knew to check. Marking the cut lets the model say it saw only
+        part of the problem instead of answering as though it saw all of it.
+        """
         prompt = f"""Extract verifiable constraints from this problem:
 
-{problem_description[:500]}
+{truncate_marked(problem_description, _PROBLEM_DESCRIPTION_CHARS)}
 
 List ONLY constraints that can be checked programmatically:
 - sorted/increasing/decreasing order

@@ -32,6 +32,7 @@ from neo.events import (
     NullSink,
     safe_emit,
 )
+from neo.text_budget import apportion, elide_middle, truncate_marked
 from neo.models import (
     AppliedAction,
     CodeSuggestion,
@@ -76,13 +77,6 @@ logger = logging.getLogger(__name__)
 # 2.6 MB with the busiest project at 46 files against the 500 cap.
 _ERROR_MESSAGE_CHARS = 500
 _ERROR_TRACEBACK_CHARS = 4000
-# Share of the traceback budget kept from the FRONT on overflow. Both ends are
-# kept: `raise X from Y` renders the original cause first and the outer
-# exception last, and the outer one is already stored twice over in
-# `error_type` and `error_message` — so keeping only the tail spends the whole
-# budget restating what we have and discards the sole new fact.
-_ERROR_TRACEBACK_HEAD_CHARS = 1600
-
 # Caps on the REPOSITORY CONTEXT block in the reasoning prompt.
 #
 # These are token-overflow guards, not relevance judgements — the gatherer has
@@ -98,30 +92,31 @@ _ERROR_TRACEBACK_HEAD_CHARS = 1600
 _MAX_CONTEXT_FILES = 20
 _CONTEXT_FILE_CHARS = 3000
 _IMPORTANT_FILE_CHARS = 8000
+
+# Budget for the CONTENT handed to the multi-agent panel (`_deliberate`). ONE
+# number: the sections share it by fair apportionment, so there is no
+# per-section cap to keep in sync and no second cut that can slice a section's
+# marker off. The rendered string runs over it by the markers and separators
+# (~150 characters at three cut sections) — `truncate_marked` bounds content,
+# not output.
+_DELIBERATION_TOTAL_CHARS = 6000
+
+# Per-exemplar solution text in the "Similar Past Tasks" prompt section.
+_EXEMPLAR_SOLUTION_CHARS = 100
 # Substrings that earn the larger cap. Matched against the whole lowercased
 # path, so a source file under a directory named `architecture` also qualifies.
 _IMPORTANT_FILE_PATTERNS = ('readme.md', 'claude.md', 'architecture')
 
 
-def _elide_middle(text: str, budget: int) -> str:
-    """Trim `text` to `budget` by removing the MIDDLE, marking what was cut.
+def _format_exemplar(exemplar) -> str:
+    """Render one retrieved exemplar for the "Similar Past Tasks" section.
 
-    Keeping only the tail loses the wrong end. With `raise X from Y` the render
-    puts the original cause first and the outer exception last, and that outer
-    exception is already recorded twice in `error_type` and `error_message` — so
-    a tail-only cut spends the entire budget restating what we already have and
-    throws away `ValueError: database is locked`, the one new fact in the record.
-
-    The marker is not decoration: a silently truncated traceback presented as a
-    whole one is the same class of defect this evidence exists to fix.
+    The old form was `f"{ex.prompt} -> {ex.solution[:100]}..."`, which appended
+    a literal ellipsis whether or not anything was cut — a marker that lies in
+    both directions. A 40-character solution was presented as continuing, and
+    a 4,000-character one was presented as continuing by exactly as much.
     """
-    if len(text) <= budget:
-        return text
-    marker = "\n... [{} characters elided] ...\n"
-    head = min(_ERROR_TRACEBACK_HEAD_CHARS, budget)
-    tail = max(budget - head - len(marker.format(len(text))), 0)
-    elided = len(text) - head - tail
-    return text[:head] + marker.format(elided) + (text[-tail:] if tail else "")
+    return f"{exemplar.prompt} -> {truncate_marked(exemplar.solution, _EXEMPLAR_SOLUTION_CHARS)}"
 
 
 class EngineBusyError(RuntimeError):
@@ -548,7 +543,7 @@ class NeoEngine:
             )
             text = redact_sensitive_text(rendered).rstrip()
             if text:
-                detail["traceback"] = _elide_middle(text, _ERROR_TRACEBACK_CHARS)
+                detail["traceback"] = elide_middle(text, _ERROR_TRACEBACK_CHARS)
         except Exception as detail_exc:
             logger.debug("error-traceback capture failed: %s", detail_exc)
         return detail
@@ -1695,7 +1690,7 @@ class NeoEngine:
                 k=3,
                 task_type=context.get("task_type"),
             )
-            exemplars = [f"{ex.prompt} -> {ex.solution[:100]}..." for ex in similar]
+            exemplars = [_format_exemplar(ex) for ex in similar]
 
         # Retrieve past learnings from persistent memory
         past_learnings = []
@@ -2004,21 +1999,49 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         from neo.adapters import create_adapter
         return build_role_factory(role_models, lambda m: create_adapter("car", model=m), fallback)
 
+    _DELIBERATION_KEYS = (
+        "execution_envelope_text", "past_learnings", "verifiable_constraints",
+    )
+
+    def _deliberation_context(self, context: dict[str, Any]) -> str:
+        """Assemble the panel's context, cutting each section exactly once.
+
+        The budget is apportioned across the sections actually present rather
+        than capped per-section and then capped again. A nested cut is not
+        merely wasteful, it is dishonest: cutting each section to 2,000 and
+        the concatenation to 6,000 delivered `verifiable_constraints` as
+        1,890 of 31,000 characters with its own marker sliced off, under an
+        outer marker reporting 163 characters dropped. 29,110 characters
+        disappeared behind a note asserting they had not. Because the section
+        order and caps are both fixed, it was always that same section.
+
+        Cutting once per section means one marker per section, each stating
+        that section's real loss, and no marker can be cut by a later pass.
+        """
+        present = {
+            key: str(context[key])
+            for key in self._DELIBERATION_KEYS
+            if context.get(key)
+        }
+        if not present:
+            return ""
+        budget = _DELIBERATION_TOTAL_CHARS - 2 * max(len(present) - 1, 0)  # separators
+        allocation = apportion(
+            {key: len(value) for key, value in present.items()}, budget
+        )
+        return "\n\n".join(
+            truncate_marked(value, allocation[key])
+            for key, value in present.items()
+        ).strip()
+
     def _deliberate(self, context: dict[str, Any], route_fn):
         """Run the multi-agent panel. Returns (plan, sims, code, DeliberationResult|None)."""
         from neo.multi_agent import MultiAgentReasoner
         prompt = context.get("prompt", "")
-        ctx_str = ""
-        for key in (
-            "execution_envelope_text", "past_learnings", "verifiable_constraints",
-        ):
-            v = context.get(key)
-            if v:
-                ctx_str += (str(v)[:2000] + "\n\n")
         role_factory = self._build_car_role_factory(route_fn, prompt)
         try:
             result = MultiAgentReasoner(role_factory, k_plans=3, max_repair_rounds=1).deliberate(
-                prompt, context=ctx_str.strip()[:6000]
+                prompt, context=self._deliberation_context(context)
             )
         except Exception as e:
             logger.warning("deliberation failed: %s", e)
@@ -2070,8 +2093,11 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
                 if any(pat in lowered for pat in _IMPORTANT_FILE_PATTERNS)
                 else _CONTEXT_FILE_CHARS
             )
+            # `visible` carries the cut content WITHOUT the marker: it feeds
+            # code_smells, which reports line numbers, and the marker is our
+            # prose rather than the file's.
             content = original[:limit]
-            # Counts the file's own text, not our marker or the `--- path ---`
+            # Counts the file's own text, not the marker or the `--- path ---`
             # header, because the question it answers is "how much of my
             # source did the model see".
             sent_chars += len(content)
@@ -2079,11 +2105,9 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
 
             if len(original) > limit:
                 truncated_count += 1
-                content += (
-                    f"\n... [truncated: {len(original) - limit} of "
-                    f"{len(original)} characters not shown]"
-                )
-            sections.append(f"\n--- {f.path} ---\n{content}")
+            sections.append(
+                f"\n--- {f.path} ---\n{truncate_marked(original, limit)}"
+            )
 
         total_chars = sum(len(f.content or '') for f in files)
         file_part = (
@@ -2123,7 +2147,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         exemplars = []
         if self.exemplar_index:
             similar = self.exemplar_index.search(context["prompt"], k=3)
-            exemplars = [f"{ex.prompt} -> {ex.solution[:100]}..." for ex in similar]
+            exemplars = [_format_exemplar(ex) for ex in similar]
 
         past_learnings = []
         memory_signal = MemorySignal()
