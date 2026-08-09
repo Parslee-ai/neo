@@ -520,6 +520,58 @@
   and retrieval changes than waiting for an inference round trip. **Use it before
   believing any claim about what Neo "saw"** — the two defects below were both
   invisible from the outside and presented as the model being unhelpful.
+- Project index (`index/project_index.py`, `index/language_parser.py`; full
+  notes in `docs/tree-sitter-setup.md`). Three invariants, each of which was
+  violated and each of which produced an index that could not answer a question
+  about its own repository:
+  1. **Budgets are apportioned, never sliced.** `_select_files` groups eligible
+     files by language and hands each a share of `--max-files` proportional to
+     repo composition, floor of one slot per language (`_allocate_slots`); then
+     `_cap_chunks` round-robins `MAX_CHUNKS_PER_REPO` across FILES so each keeps
+     a chunk before any keeps a second. Both exist because a list slice is not a
+     ranking: globbing `**/*.py` before `**/*.cs` and slicing gave a .NET repo of
+     4,272 C# files an index of 83 Python files (95 from an in-repo worktree) and
+     zero C#, exit 0. Fixing only the file cut left `chunks[:1000]` re-creating it
+     one function later — chunks arrive grouped by file and files by language, so
+     the slice kept 1000 C# chunks and dropped every other language, with 37 of
+     the 100 selected files contributing nothing.
+  2. **Exclusion is two layers and `bin`/`build`/`out`/`target`/`dist`/`vendor`
+     belong to neither by name.** `EXCLUDED_DIR_NAMES` covers what repos forget to
+     ignore (`.worktrees`, `.claude`, `node_modules`, `obj`, virtualenvs);
+     `_build_exclusion_filter` layers the repo's own `.gitignore` on top via
+     `context_gatherer.load_gitignore_patterns`. **Footgun**: `should_ignore` only
+     tests the path handed to it, so ancestor directories must be walked
+     separately — `iter_paths` gets this via `os.walk` pruning, which the index
+     has no equivalent of. Matching is exact and case-sensitive, against
+     directory components only. The ambiguous names stay out because each is real
+     source somewhere (`src/bin/main.rs`, vendored trees; 254 tracked files under
+     `bin/`+`vendor/` across three local repos) and the asymmetry is one-sided:
+     over-excluding hides code permanently, over-including only spends slots.
+  3. **A cap that fired must be reported.** `selection_report` carries eligible /
+     selected / excluded / duplicates / chunk counts and the CLI prints them.
+     `truncated` means THE CAP BOUND US and is `examined < eligible` — whether
+     any candidate went unlooked-at, which the per-language iterators already
+     know. Both cheaper predicates name the wrong knob: `selected < eligible`
+     made dedup print "2 of 7 eligible files (capped at --max-files=1000)", and
+     `selected >= max_files` did the same whenever `--max-files` landed exactly
+     on the unique-file count. Raising a cap that never bound fixes nothing.
+     Separately, round-robin only represents every file while chunk slots ≥
+     files; `MAX_CHUNKS_PER_REPO` is fixed at 1000 while `--max-files` is not,
+     so `files_with_chunks` reports the shortfall — `truncated` is False there,
+     because the FILE cap genuinely was not the constraint.
+  **Query footgun** (`language_parser.py`; incident detail in the tree-sitter
+  doc's "Why queries break silently"): a query that fails to compile is
+  indistinguishable from one that matches nothing — `_get_query` returns None
+  and `parse_file` moves on; edge failures log at DEBUG. Four were broken at
+  once, so TS interfaces and ALL C# inheritance edges were absent from every
+  index since they shipped. Three rules follow. Compile results are cached
+  INCLUDING failures (the uncached retry warned per query *per file* — 9,699
+  lines in one run). C# bases need `[(identifier) (generic_name (identifier))]`
+  across class/interface/record/struct, since an identifier-only, class-only
+  pattern compiles fine and silently drops `: Repository<Order>` and
+  `interface IX : IY`. And `test_every_chunk_query_compiles` /
+  `test_every_edge_query_compiles` prove compilation ONLY, so a new query still
+  needs its own behavioural assertion.
 - Context selection (`context_gatherer`): **a path named in the prompt is pinned**
   (`EXPLICIT_PATH_BOOST=10.0`, chosen to exceed every organic signal combined —
   filename overlap caps at +1.8, the re-rank boosts at +1.0 and +1.2). Without it a
@@ -553,6 +605,33 @@
   global budget is DROPPED — the original bug returning through a different door.
   `_fit_to_budget` shrinks outward from the window's best line so truncation can never
   discard the line that earned the window.
+- Prompt-side file rendering (`engine._render_context_files`): the REPOSITORY
+  CONTEXT block caps each file at `_CONTEXT_FILE_CHARS` (3000), or
+  `_IMPORTANT_FILE_CHARS` (8000) when the path contains one of
+  `_IMPORTANT_FILE_PATTERNS`, and shows at most `_MAX_CONTEXT_FILES` (20).
+  **Every cut MUST be marked and the banner MUST count post-truncation
+  characters** — that is the whole contract, and both halves were broken.
+  `content_preview = content[:char_limit]` appended nothing, so `--- path ---`
+  followed by text that just stops was indistinguishable from a file that ends
+  there, and the model answered questions about absence ("X is never called",
+  "there is no null check") from a fragment. The dangerous case is not an
+  obvious clip but a cut landing just past a method signature: enough to look
+  answerable, not enough to be right — measured live, a claim confirmed at 0.90
+  that moved to 0.99 *and reversed* once the body was supplied. Marked
+  truncation converts that into a refusal, which neo already does well.
+  Meanwhile the banner summed `len(f.content)` BEFORE the cut and called the
+  result bytes, so "12 files, 340000 bytes" described a payload the model never
+  received. It now reads `sent of total chars` — **chars, not bytes**: `len()`
+  on a `str` counts code points and the caps are character counts, so claiming
+  bytes was a second lie on any non-ASCII source. **Footgun**: the function
+  returns THREE values — `(sections, banner, visible)`. `visible` is each shown
+  file cut to what the model actually got, and `code_smells.scan_files` MUST be
+  fed it rather than the originals. Scanning full content emitted findings like
+  `src/Service.cs:401 [todo/warn] HACK: ...` for a file the model saw to line
+  ~215: an unmarked cut invites a wrong inference about unseen code, but a
+  line-numbered finding about unseen code asserts one. `neo.agent_context`
+  marks its truncation (`PER_FILE_CAP_BYTES` + `... [truncated]`) — copy that
+  shape for any new path that cuts text. Use `neo --dry-run` to see the block.
 - Host communication (`neo.events` + `models.OrchestratorMessage`): the engine
   reports lifecycle facts so a host (Claude Code, MCP, an IDE) doesn't have to
   reverse-engineer presentation from raw plans. **Governing rule: Neo reports

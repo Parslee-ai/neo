@@ -659,7 +659,7 @@ Neo is one binary with a plain-text prompt plus a handful of subcommands. Run
 | `--index` / `--update` / `--languages CSV` | Build, incrementally refresh, and scope the per-project semantic index |
 | `--semantic` | Use the semantic index for file selection (requires `.neo/index.json`) |
 | `--max-bytes N` | Hard cap on total context bytes (default 300000) |
-| `--max-files N` | Cap on files: context gathering (default 30), or the index build when passed with `--index` (default 100) |
+| `--max-files N` | Cap on files: context gathering (default 30), or the index build when passed with `--index` (default 100). The index build apportions this budget across languages by repo composition and reports what the cap left out |
 | `--include GLOB` / `--exclude GLOB` | Allow/block file patterns; both repeatable |
 | `--exts CSV` | Restrict context to these file extensions |
 | `--diff-since REV` | Prioritize files changed since a git rev or duration |
@@ -1130,6 +1130,8 @@ The context gatherer picks files using three signals:
 - **EPISODE-history feedback loop**: each Neo run stashes touched file paths as `file:<rel>` tags on EPISODE facts. On the next run, the gatherer queries for similar past prompts and gives those files up to +0.5 boost — past file selections measurably influence future ones.
 
 A per-file chunk cap of 2 prevents large files from eating the budget; a one-time first-run hint fires if the index is missing.
+
+The index build itself apportions its budget rather than truncating whatever globbed first: files are grouped by language and given a share of `--max-files` proportional to how much of the repo they are, with a floor of one slot per language, and the `MAX_CHUNKS_PER_REPO` cut round-robins across files so every indexed file keeps a chunk. Non-source paths (`.worktrees`, `node_modules`, `.claude`, virtualenvs, plus anything the repo's own `.gitignore` names) are excluded, and byte-identical duplicates are indexed once. When a cap bites, `neo --index` says so — a capped build no longer looks the same as a complete one. See [tree-sitter setup](docs/tree-sitter-setup.md#operational-notes).
 
 
 ### Learning Feedback Loop
