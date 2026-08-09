@@ -583,10 +583,38 @@ class ConstructIndex:
 
         Returns:
             PatternSchema or None if not found
+
+        `pattern_id` is interpolated into a filesystem path, so it is confined
+        to `construct_root` before anything is read. The check that holds is
+        resolved-path containment, not a scan for `..`: a symlink planted
+        inside the library escapes without the string ever containing `..`,
+        and a substring test would reject a legitimate id like `retry..backoff`
+        while missing that case entirely. `resolve()` collapses both traversal
+        segments and symlinks, so one comparison covers both.
+
+        Read-only, and the caller already has filesystem access — so this is
+        hygiene rather than a privilege boundary. It matters because
+        `pattern_id` reaches here straight from argv and from MCP callers,
+        where "already has filesystem access" stops being obviously true.
         """
-        # Construct file path from pattern_id
-        # pattern_id format: "domain/filename"
-        pattern_path = self.construct_root / f"{pattern_id}.md"
+        # `Path` treats an absolute right-hand operand as a replacement rather
+        # than a suffix, so `construct_root / "/etc/passwd"` IS "/etc/passwd" —
+        # containment below catches it, but reject it here where the intent is
+        # legible. An empty id would address `construct_root/.md`.
+        if not pattern_id or Path(pattern_id).is_absolute():
+            logger.warning(f"Invalid pattern_id: {pattern_id!r}")
+            return None
+
+        root = self.construct_root.resolve()
+        pattern_path = (self.construct_root / f"{pattern_id}.md").resolve()
+
+        try:
+            pattern_path.relative_to(root)
+        except ValueError:
+            logger.warning(
+                f"Rejected pattern_id escaping the pattern library: {pattern_id!r}"
+            )
+            return None
 
         if not pattern_path.exists():
             logger.warning(f"Pattern not found: {pattern_id}")

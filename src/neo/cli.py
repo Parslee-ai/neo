@@ -62,6 +62,33 @@ from neo.subcommands import (  # noqa: E402, F401
 # Re-export constants that were at module level
 from neo.subcommands import MIN_EMBEDDING_SUCCESS_RATE, VALID_EMBEDDING_DIMENSIONS  # noqa: E402, F401
 
+# Upper bound on `construct search --top-k`. The pattern library is curated and
+# small — a request for more than this is a typo or a misunderstanding of what
+# the command returns, not a real query.
+MAX_TOP_K = 100
+
+
+def _top_k(value: str) -> int:
+    """argparse type for `--top-k`: an integer in [1, MAX_TOP_K].
+
+    Rejecting at parse time rather than clamping downstream, because the two
+    failures it prevents are silent in opposite directions. A negative value
+    reaches a list slice as `results[:-3]`, which drops the LAST three results
+    and returns the rest — plausible output for a nonsense request. A value of
+    zero returns nothing, which reads as "no patterns match".
+    """
+    import argparse
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--top-k must be an integer, got {value!r}")
+    if not 1 <= parsed <= MAX_TOP_K:
+        raise argparse.ArgumentTypeError(
+            f"--top-k must be between 1 and {MAX_TOP_K}, got {parsed}"
+        )
+    return parsed
+
 
 def parse_args():
     """Parse command-line arguments."""
@@ -191,7 +218,8 @@ def parse_args():
         # construct search
         search_p = subparsers.add_parser('search', help='Search patterns')
         search_p.add_argument('query', help='Search query')
-        search_p.add_argument('--top-k', type=int, default=5, help='Number of results')
+        search_p.add_argument('--top-k', type=_top_k, default=5,
+                              help=f'Number of results (1-{MAX_TOP_K}, default 5)')
 
         # construct index
         index_p = subparsers.add_parser('index', help='Build search index')

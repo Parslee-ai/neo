@@ -4,6 +4,7 @@ Tests for The Construct pattern library.
 Tests cover pattern parsing, validation, indexing, and CLI integration.
 """
 
+import os
 import pytest
 import tempfile
 import time
@@ -71,6 +72,31 @@ This pattern is missing required sections.
 ## Forces
 Some forces
 """
+
+
+def _axis_embedder():
+    """A stub embedder putting each fixture pattern on its own unit axis.
+
+    Two properties are load-bearing, and each corresponds to a way the earlier
+    version of the ordering test could not have worked:
+
+    - The vectors must be near-ORTHOGONAL, not just unequal. FAISS normalizes
+      to unit length for cosine similarity, so `[0.9]*768` and `[0.1]*768`
+      normalize to the same vector and rank identically.
+    - The discriminating token must be unique to one fixture. `"cache"` is
+      not: the rate-limiting pattern inherits the caching pattern's tradeoff
+      list, "Cache invalidation complexity" included, so keying on it puts
+      both patterns on the same axis. `"token bucket"` appears only in the
+      rate-limiting fixture.
+    """
+    def embed(texts):
+        vector = [0.0] * 768
+        vector[1 if "token bucket" in texts[0].lower() else 0] = 1.0
+        return [vector]
+
+    embedder = MagicMock()
+    embedder.embed = MagicMock(side_effect=embed)
+    return embedder
 
 
 @pytest.fixture
@@ -287,6 +313,74 @@ class TestConstructIndex:
         pattern = index.show_pattern('nonexistent/pattern')
         assert pattern is None
 
+    @pytest.mark.parametrize("template", [
+        "../{stem}",
+        "caching/../../{stem}",
+        "{absolute}",
+    ])
+    def test_show_pattern_rejects_paths_outside_the_library(
+        self, temp_construct_dir, template
+    ):
+        """`pattern_id` is interpolated into a path, so it must be confined.
+
+        The escape target is a real, loadable pattern file placed outside the
+        library — otherwise the test proves nothing. A traversal to a path
+        that does not exist is rejected by the pre-existing `exists()` check
+        for the wrong reason, so every such case passes with or without
+        containment. Confirmed by running these against the unfixed source.
+
+        The absolute case is included because `Path.__truediv__` treats an
+        absolute right-hand operand as a REPLACEMENT, not a suffix:
+        `construct_root / "/tmp/x"` is `/tmp/x`, library root discarded
+        entirely (issue #25).
+        """
+        outside = temp_construct_dir.parent / "outside.md"
+        outside.write_text(VALID_PATTERN_CONTENT)
+        # Sanity: the escape target really is loadable, so a None result below
+        # is containment refusing it rather than the file being unreadable.
+        assert PatternReader.load(outside) is not None
+
+        pattern_id = template.format(
+            stem="outside", absolute=str(outside.with_suffix("")),
+        )
+        index = ConstructIndex(construct_root=temp_construct_dir)
+        assert index.show_pattern(pattern_id) is None
+
+    @pytest.mark.parametrize("pattern_id", ["", ".."])
+    def test_show_pattern_rejects_degenerate_ids(
+        self, temp_construct_dir, pattern_id
+    ):
+        """An empty id addresses `construct_root/.md`; `..` the parent dir."""
+        index = ConstructIndex(construct_root=temp_construct_dir)
+        assert index.show_pattern(pattern_id) is None
+
+    def test_show_pattern_rejects_symlink_escape(self, temp_construct_dir):
+        """A symlink escapes without the id ever containing `..`.
+
+        This is why the check is resolved-path containment rather than a scan
+        for traversal sequences: the string test passes this case cleanly.
+        """
+        outside = temp_construct_dir.parent / "outside.md"
+        outside.write_text(VALID_PATTERN_CONTENT)
+        os.symlink(outside, temp_construct_dir / "caching" / "escape.md")
+
+        index = ConstructIndex(construct_root=temp_construct_dir)
+        assert index.show_pattern("caching/escape") is None
+
+    def test_show_pattern_still_loads_legitimate_ids(self, temp_construct_dir):
+        """The other side of the contract: containment must not over-reject.
+
+        A dotted id is legal — `..` as a substring is not traversal — and the
+        ordinary nested id must keep working.
+        """
+        index = ConstructIndex(construct_root=temp_construct_dir)
+        assert index.show_pattern("caching/cache-aside") is not None
+
+        (temp_construct_dir / "caching" / "retry..backoff.md").write_text(
+            VALID_PATTERN_CONTENT
+        )
+        assert index.show_pattern("caching/retry..backoff") is not None
+
     def test_construct_show_malformed_yaml(self):
         """Test handling of malformed pattern files."""
         tmpdir = tempfile.mkdtemp()
@@ -319,29 +413,54 @@ class TestConstructIndex:
     @patch('neo.construct.FASTEMBED_AVAILABLE', True)
     @patch('neo.construct.FAISS_AVAILABLE', True)
     def test_construct_search_relevance_ordering(self, temp_construct_dir):
-        """Test that search results are ordered by relevance."""
-        # Mock the embedder
+        """Search results come back ordered by similarity to the query.
+
+        This test previously built the differentiated embeddings below and
+        then asserted only `index.embedder is not None`, never calling
+        `search()` — scaffolding for an assertion it did not make, which reads
+        to a skimmer as though ordering were covered (issue #27).
+
+        The embeddings must be near-ORTHOGONAL, not merely different in
+        magnitude. FAISS normalizes to unit length for cosine similarity, so
+        the old `[0.9]*768` and `[0.1]*768` both normalize to the identical
+        vector and rank equally — the ordering would have been arbitrary even
+        if the assertion had existed.
+        """
         with patch('neo.memory.store.build_resilient_embedder') as mock_embedder_class:
-            mock_embedder = MagicMock()
-            # Return different embeddings for different queries
-            def embed_side_effect(texts):
-                # Simulate embeddings: first pattern matches "cache", second matches "rate"
-                if "cache" in texts[0].lower():
-                    return [[0.9] * 768]  # High similarity to caching pattern
-                elif "rate" in texts[0].lower():
-                    return [[0.1] * 768]  # Low similarity to caching pattern
-                else:
-                    return [[0.5] * 768]
-            mock_embedder.embed = MagicMock(side_effect=embed_side_effect)
-            mock_embedder_class.return_value = mock_embedder
+            mock_embedder_class.return_value = _axis_embedder()
 
             index = ConstructIndex(construct_root=temp_construct_dir)
-            # Force index build
             index.build_index(force_rebuild=True)
 
-            # Search should work with mocked embedder
-            # This is a basic test - in reality, semantic search ordering depends on embeddings
-            assert index.embedder is not None
+            results = index.search("cache-aside read-through", top_k=2)
+
+            assert len(results) == 2
+            ordered = [pattern.pattern_id for pattern, _ in results]
+            assert ordered[0] == "caching/cache-aside"
+            assert ordered[1] == "rate-limiting/token-bucket"
+
+            scores = [score for _, score in results]
+            assert scores[0] > scores[1]
+            assert scores == sorted(scores, reverse=True)
+
+    @patch('neo.construct.FASTEMBED_AVAILABLE', True)
+    @patch('neo.construct.FAISS_AVAILABLE', True)
+    def test_construct_search_ordering_follows_the_query(self, temp_construct_dir):
+        """The ranking must track the query, not a fixed pattern order.
+
+        Without this, a `search()` that ignored its argument and returned
+        patterns in directory order would satisfy the test above.
+        """
+        with patch('neo.memory.store.build_resilient_embedder') as mock_embedder_class:
+            mock_embedder_class.return_value = _axis_embedder()
+
+            index = ConstructIndex(construct_root=temp_construct_dir)
+            index.build_index(force_rebuild=True)
+
+            results = index.search("token bucket limiter", top_k=2)
+
+            ordered = [pattern.pattern_id for pattern, _ in results]
+            assert ordered[0] == "rate-limiting/token-bucket"
 
     @patch('neo.construct.FASTEMBED_AVAILABLE', True)
     @patch('neo.construct.FAISS_AVAILABLE', True)
