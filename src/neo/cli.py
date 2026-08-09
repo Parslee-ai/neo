@@ -17,6 +17,7 @@ import os
 import select
 import sys
 from dataclasses import asdict
+from typing import Optional
 
 # Disable tokenizer parallelism warning (fastembed uses HuggingFace tokenizers)
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
@@ -576,6 +577,92 @@ def read_prompt_from_argv_or_stdin(args):
     sys.exit(2)
 
 
+def _format_selection_report(report: Optional[dict]) -> list[str]:
+    """Render what the index cap left out, as `[Neo] ` console lines.
+
+    Silent truncation is what made a broken index look like a successful one:
+    `--index` printed "Built index" and exited 0 whether it had indexed the
+    repository or 83 Python files from a stale worktree copy. An operator who
+    is told 100 of 4,344 files were indexed can raise --max-files; an operator
+    told only "Built index" has no reason to think anything is wrong.
+    """
+    if not report:
+        return []
+
+    lines: list[str] = []
+    if report.get('truncated'):
+        lines.append(
+            f"[Neo] Indexed {report['selected']} of {report['eligible']} "
+            f"eligible files (capped at --max-files={report['max_files']})"
+        )
+        per_language = report.get('per_language') or {}
+        # Biggest languages first — that is the order an operator scans for
+        # "is my primary language actually in here?"
+        ranked = sorted(
+            per_language.items(),
+            key=lambda item: (-item[1]['eligible'], item[0]),
+        )
+        breakdown = ", ".join(
+            f"{lang} {counts['selected']}/{counts['eligible']}"
+            for lang, counts in ranked
+        )
+        if breakdown:
+            lines.append(f"[Neo]   {breakdown}")
+
+    if report.get('chunks_capped'):
+        lines.append(
+            f"[Neo] Kept {report['chunks_kept']} of {report['chunks_extracted']} "
+            f"chunks (cap {report['max_chunks']}); each indexed file keeps its "
+            f"first chunks before any file keeps a second"
+        )
+    # A selected file can be absent from the index for two unrelated reasons,
+    # and they get separate lines because they have separate remedies — one of
+    # them has none at all. Reporting both as the chunk cap was the original
+    # form of this block, and it named a cap that had not fired: 25 files, 559
+    # of 559 chunks kept, and still "the 1000-chunk cap is below the 25 files
+    # selected; lower --max-files". The culprit was an empty `__init__.py`, and
+    # lowering --max-files would only have indexed less.
+    #
+    # Keyed on presence, not on a 0 default: a selection-only report has no
+    # chunk phase, and treating "absent" as "zero files represented" would
+    # claim every file was dropped.
+    if 'files_with_chunks' in report:
+        # `files_producing_chunks` is measured before the cap, so this
+        # subtraction isolates the files the cap alone emptied. Falling back to
+        # the post-cap count makes `starved` zero for a report predating the
+        # key, which is the safe direction: silence, not a false accusation.
+        produced = report.get('files_producing_chunks', report['files_with_chunks'])
+        starved = produced - report['files_with_chunks']
+        if starved > 0:
+            lines.append(
+                f"[Neo] {starved} indexed files lost every chunk to the "
+                f"{report['max_chunks']}-chunk cap, which is below the "
+                f"{report['selected']} files selected; lower --max-files"
+            )
+        # Stated as a fact about the source, with no remedy attached, because
+        # there is no setting that makes a constructs-free file produce a
+        # chunk. It is reported at all so that "Indexed 100 of 4,000" is not
+        # read as "100 files' worth of chunks are in the index".
+        barren = report['selected'] - produced
+        if barren > 0:
+            noun = "file" if barren == 1 else "files"
+            lines.append(
+                f"[Neo] {barren} selected {noun} yielded no chunks (no "
+                f"functions, classes or interfaces for the parser to extract)"
+            )
+    if report.get('duplicates'):
+        lines.append(
+            f"[Neo] Skipped {report['duplicates']} files with content "
+            f"identical to an already-indexed file"
+        )
+    if report.get('excluded'):
+        lines.append(
+            f"[Neo] Skipped {report['excluded']} paths under excluded "
+            f"directories (worktrees, node_modules, build output, ...)"
+        )
+    return lines
+
+
 def _configure_logging(args) -> None:
     """Configure logging based on CLI flags, env var, or config.
 
@@ -734,6 +821,8 @@ def main():
             index.build_index(languages=languages, max_files=max_files)
             status = index.status()
             print(f"[Neo] Built index: {status['total_chunks']} chunks, {status.get('total_edges', 0)} edges from {status['total_files']} files")
+            for line in _format_selection_report(index.selection_report):
+                print(line)
             print(f"[Neo] Index stored in {codebase_root}/.neo/")
             print("[Neo] Supported languages: Python, C#, TypeScript, JavaScript, Java, Go, Rust, C/C++")
             print("[Neo] Use '--semantic' flag to enable semantic search")

@@ -86,11 +86,15 @@ QUERIES = {
                 name: (identifier) @name
                 body: (block) @body) @class
         """,
-        'module_doc': """
-            (module
-                . (expression_statement
-                    (string) @doc))
-        """
+        # No `module_doc` query. One existed, matching a module docstring
+        # wrapped in an `expression_statement` — a shape the grammar does not
+        # produce, so it failed to compile and warned once per Python file
+        # parsed. Correcting it to the real shape (a bare `string` directly
+        # under `module`) only exposed that nothing consumed it either:
+        # `_process_captures` builds chunks from construct captures
+        # (function/class/method/interface/struct) and drops a lone `@doc`.
+        # It has never produced a chunk in any released version, so it is
+        # gone rather than fixed into something still inert.
     },
     'c_sharp': {
         'functions': """
@@ -125,7 +129,7 @@ QUERIES = {
         'interfaces': """
             (interface_declaration
                 name: (type_identifier) @name
-                body: (object_type) @body) @interface
+                body: (interface_body) @body) @interface
         """
     },
     'javascript': {
@@ -260,6 +264,44 @@ QUERIES = {
 # TSX uses same queries as TypeScript
 QUERIES['tsx'] = QUERIES['typescript']
 
+# Every shape a C# base type can take, capturing the simple name in each.
+#
+# The alternation is not decoration — each arm was found missing by probing
+# the grammar with real .NET source, and each absent arm drops edges silently:
+#
+#   : IFoo                      -> identifier
+#   : Repository<Order>         -> generic_name        (everyday .NET)
+#   : System.Exception          -> qualified_name      (everyday .NET)
+#   : My.Ns.Repo<Order>         -> qualified_name whose `name:` is generic_name
+#   : global::Foo.Bar           -> qualified_name over alias_qualified_name
+#
+# `qualified_name` exposes the rightmost segment as its `name:` field, so the
+# last two arms capture `Exception` and `Repo` rather than the namespace —
+# matching what the identifier and generic_name arms yield, so consumers see
+# one naming convention rather than two.
+_CS_BASE_TYPES = """[(identifier) @base
+                     (generic_name (identifier) @base)
+                     (qualified_name name: (identifier) @base)
+                     (qualified_name name: (generic_name (identifier) @base))]"""
+
+# `base_list` hangs off four declaration kinds, and every one of them needs the
+# identical alternation above. Generated rather than copied four times because
+# the copy is what failed before: the original pattern covered
+# `class_declaration` alone, so `interface IX : IY` produced nothing, and a
+# hand-maintained fourfold duplicate invites the next widening to be applied to
+# three of the four. `test_every_edge_query_compiles` covers the generation.
+_CS_INHERITANCE = "[\n" + "\n".join(
+    f"""  ({declaration}
+      name: (identifier) @class_name
+      (base_list {_CS_BASE_TYPES}))"""
+    for declaration in (
+        'class_declaration',
+        'interface_declaration',
+        'record_declaration',
+        'struct_declaration',
+    )
+) + "\n] @class_def"
+
 # Edge queries for relationship extraction (imports, inheritance)
 EDGE_QUERIES = {
     'python': {
@@ -284,12 +326,14 @@ EDGE_QUERIES = {
             (using_directive
                 (qualified_name) @module) @import
         """,
-        'inheritance': """
-            (class_declaration
-                name: (identifier) @class_name
-                bases: (base_list
-                    (identifier) @base)) @class_def
-        """,
+        # `base_list` is an unnamed child of the declaration — the older
+        # `bases:` field name did not exist in the grammar, so this never
+        # compiled and every C# inheritance edge was silently dropped.
+        #
+        # Built from _CS_INHERITANCE rather than written out: see the note
+        # there for why the four declaration kinds are generated instead of
+        # copied.
+        'inheritance': _CS_INHERITANCE,
     },
     'typescript': {
         'imports': """
@@ -408,7 +452,10 @@ class TreeSitterParser:
         """Initialize parser with lazy loading."""
         self.parsers: Dict[str, Any] = {}  # Lazy-loaded parsers per language
         self.languages: Dict[str, Any] = {}  # Language objects
-        self.compiled_queries: Dict[str, Dict[str, Any]] = {}  # Compiled queries
+        # "<language>:<query_name>" -> compiled Query, or None when the query
+        # does not compile against the installed grammar. The None entries are
+        # load-bearing: see _compile_cached.
+        self.compiled_queries: Dict[str, Optional[Any]] = {}
 
     def supports_extension(self, ext: str) -> bool:
         """Check if file extension is supported."""
@@ -424,39 +471,60 @@ class TreeSitterParser:
         if language not in self.parsers:
             try:
                 parser_name = _resolve_parser_name(language)
-                self.parsers[language] = get_parser(parser_name)
-                self.languages[language] = get_language(parser_name)
+                # Both locals first, then publish together. Assigning
+                # `self.parsers` before `get_language` returns would leave the
+                # two dicts disagreeing if the second call raised: the retry
+                # returns early on `language not in self.parsers` and every
+                # reader of `self.languages[language]` then hits a KeyError
+                # that has nothing to do with the real failure.
+                loaded_parser = get_parser(parser_name)
+                loaded_language = get_language(parser_name)
+                self.parsers[language] = loaded_parser
+                self.languages[language] = loaded_language
                 logger.debug(f"Loaded tree-sitter parser for {language}")
             except Exception as e:
                 logger.error(f"Failed to load parser for {language}: {e}")
                 raise
         return self.parsers[language]
 
+    def _compile_cached(self, cache_key: str, language: str, query_text: str):
+        """Compile `query_text` once per parser instance, caching the outcome.
+
+        Failures are cached as None, not just logged. A query that fails to
+        compile against the installed grammar fails identically for every
+        subsequent file, so recompiling per file re-pays the cost and re-emits
+        the warning: one run over 175 TypeScript files buried its answer under
+        9,699 identical lines. Caching the failure makes it one line per
+        (language, query) per process, which is what the operator needs to see.
+        """
+        if cache_key in self.compiled_queries:
+            return self.compiled_queries[cache_key]
+
+        lang_obj = self.languages.get(language)
+        if not lang_obj:
+            # Ensure language is loaded
+            self._get_parser(language)
+            lang_obj = self.languages[language]
+
+        try:
+            # tree-sitter 0.23+: Query(language, text). Older
+            # Language.query(text) is deprecated and removed in
+            # newer versions.
+            self.compiled_queries[cache_key] = Query(lang_obj, query_text)
+            logger.debug(f"Compiled query {cache_key}")
+        except Exception as e:
+            self.compiled_queries[cache_key] = None
+            logger.warning(f"Failed to compile query {cache_key}: {e}")
+
+        return self.compiled_queries[cache_key]
+
     def _get_query(self, language: str, query_name: str):
         """Get or compile query for language."""
-        cache_key = f"{language}:{query_name}"
-        if cache_key not in self.compiled_queries:
-            if language not in QUERIES or query_name not in QUERIES[language]:
-                return None
-
-            query_text = QUERIES[language][query_name]
-            lang_obj = self.languages.get(language)
-            if not lang_obj:
-                # Ensure language is loaded
-                self._get_parser(language)
-                lang_obj = self.languages[language]
-
-            try:
-                # tree-sitter 0.23+: Query(language, text). Older
-                # Language.query(text) is deprecated and removed in
-                # newer versions.
-                self.compiled_queries[cache_key] = Query(lang_obj, query_text)
-                logger.debug(f"Compiled query {cache_key}")
-            except Exception as e:
-                logger.warning(f"Failed to compile query {cache_key}: {e}")
-                return None
-
-        return self.compiled_queries.get(cache_key)
+        if language not in QUERIES or query_name not in QUERIES[language]:
+            return None
+        return self._compile_cached(
+            f"{language}:{query_name}", language, QUERIES[language][query_name]
+        )
 
     @staticmethod
     def _run_query(query, root_node) -> List[Tuple[Any, str]]:
@@ -588,13 +656,15 @@ class TreeSitterParser:
         content_bytes = content.encode('utf8')
 
         for query_name, query_text in EDGE_QUERIES[language].items():
-            try:
-                lang_obj = self.languages.get(language)
-                if not lang_obj:
-                    self._get_parser(language)
-                    lang_obj = self.languages[language]
+            # Cache-keyed separately from QUERIES: a language can define both
+            # a chunk query and an edge query under the same name.
+            query = self._compile_cached(
+                f"{language}:edge:{query_name}", language, query_text
+            )
+            if query is None:
+                continue
 
-                query = Query(lang_obj, query_text)
+            try:
                 captures = self._run_query(query, tree.root_node)
             except Exception as e:
                 logger.debug(f"Edge query {query_name} failed for {language}: {e}")
