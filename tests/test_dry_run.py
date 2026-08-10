@@ -147,8 +147,10 @@ class TestEndToEnd:
         `detect_implicit_feedback` skip works -- that call is a no-op without
         a prior session, so on a fresh HOME it writes nothing either way.
         Measured: deleting the `not self.dry_run` guard leaves this test
-        GREEN. `test_dry_run_skips_the_one_call_that_saves` is the real guard;
-        this one is a net, not a hook.
+        GREEN. `FactStore(read_only=True)` is the real guard -- it stops the
+        writer this test cannot see, `initialize()`'s prune/demote/purge,
+        which needs an AGED store to fire and so never fires on the cold
+        empty one two fresh runs produce. This is a net, not a hook.
         """
         home = tmp_path / "home"
         home.mkdir(exist_ok=True)
@@ -288,6 +290,7 @@ class TestPanelIsSuppressed:
         from neo.models import NeoInput
 
         built = []
+        reached_the_stop = False
         with patch("neo.adapters.create_adapter",
                    side_effect=lambda *a, **k: (built.append(a), MagicMock())[1]):
             engine = NeoEngine(lm_adapter=RecordingLM(),
@@ -300,11 +303,15 @@ class TestPanelIsSuppressed:
                         prompt="design a novel distributed consensus scheme",
                         context_files=[], working_directory=str(tmp_path)))
                 except DryRunComplete:
-                    pass
+                    reached_the_stop = True
                 except Exception:  # noqa: BLE001
                     pass
 
         assert built == [], f"dry run built real adapters: {built}"
+        # Without this, `assert built == []` also passes when `process()` dies
+        # on its first line -- one unrelated regression from being green for
+        # entirely the wrong reason.
+        assert reached_the_stop, "the run never reached the dry-run stop"
 
     def test_mode_is_forced_fast(self, tmp_path):
         from unittest.mock import patch
@@ -320,6 +327,40 @@ class TestPanelIsSuppressed:
 
         assert decision.mode is ReasoningMode.FAST
         assert route_fn is None
+
+    def test_the_operator_is_told_the_panel_is_never_previewed(self, tmp_path, capsys):
+        """Say it, but do not overclaim it.
+
+        Silence would reproduce one level up the defect this flag exists to
+        expose: fast-path output on a machine that would have deliberated is
+        a report about a run Neo would not have made.
+
+        The obvious version gated the note on `car_available` and announced a
+        "suppressed panel" on any car-server machine -- including for the
+        familiar, low-effort prompts that take the fast path regardless. That
+        is the failure `shown_of` already forbids: a marker that fires when
+        nothing was dropped trains the reader to ignore it. Knowing the real
+        answer needs `capable_model_count` and the effort tier, i.e. a CAR
+        daemon round-trip taken only to decide whether to print a string,
+        under a flag that promises no calls. So the note is unconditional and
+        states only what is unconditionally true.
+        """
+        from unittest.mock import patch
+
+        from neo.engine import NeoEngine
+
+        engine = NeoEngine(lm_adapter=RecordingLM(),
+                           codebase_root=str(tmp_path), dry_run=True)
+
+        for capability in ((True, 5, lambda *a, **k: {}), (False, 0, None)):
+            with patch.object(NeoEngine, "_car_route_capability",
+                              return_value=capability) as probe:
+                engine._decide_reasoning_mode({"prompt": "x"}, "hard", None)
+            note = capsys.readouterr().err
+            assert "always takes the fast path" in note
+            # ...and never asserts that a panel WOULD have run here.
+            assert "suppressed" not in note
+            probe.assert_not_called()
 
 
 class TestJsonDryRunKeepsItsContract:

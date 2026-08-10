@@ -121,16 +121,33 @@ def parser():
 def _captures(parser, language, table, query_name):
     """Capture count for ONE query against its language's fixture.
 
-    Goes through `_compile_cached` + `_run_query` rather than `parse_file`,
-    because the whole point is to attribute a zero to the specific query that
-    produced it instead of letting a sibling mask it.
+    Resolves the query through the SAME accessor production uses, which is
+    the whole point and was got wrong first time round. The original went
+    through `_compile_cached("yieldtest:{lang}:{name}", ...)` -- a private
+    namespace no production path touches -- so it verified the query TEXT
+    while leaving the lookup untested. Two mutations that break real
+    extraction left all 29 tests green: making `_get_query` return None for
+    `java.classes` (production drops every `class:` chunk), and collapsing
+    its cache key to `f"{language}"` so the first query per language wins and
+    its siblings silently receive the wrong compiled object.
+
+    That second one is one query yielding the wrong structure while its
+    neighbours look fine -- the #158 shape this file exists for.
+
+    The two tables resolve differently in production and must be followed
+    separately: chunk queries go through `_get_query` (key `"{lang}:{name}"`),
+    edge queries are compiled inline by `_extract_edges` under a third
+    namespace (`"{lang}:edge:{name}"`) and never touch `_get_query` at all.
     """
     source = FIXTURES[language]
-    compiled = parser._compile_cached(
-        f"yieldtest:{language}:{query_name}", language, table[language][query_name]
-    )
+    if table is QUERIES:
+        compiled = parser._get_query(language, query_name)
+    else:
+        compiled = parser._compile_cached(
+            f"{language}:edge:{query_name}", language, table[language][query_name]
+        )
     if compiled is None:
-        return None  # failed to compile -- reported distinctly below
+        return None  # failed to compile / not found -- reported distinctly below
     tree = parser._get_parser(language).parse(source.encode())
     return len(parser._run_query(compiled, tree.root_node))
 
@@ -163,10 +180,47 @@ class TestEveryEdgeQueryMatches:
         )
 
 
+# What `parse_file` must produce per language, as chunk_type counts. This is
+# the check a capture COUNT cannot make: collapsing `_get_query`'s cache key
+# to `f"{language}"` still returns a compiled query for every name, so every
+# capture count stays non-zero while the wrong query answers -- java yields
+# duplicated methods and zero classes. Only the shape of the output shows it.
+EXPECTED_KINDS = {
+    "c": {"function", "struct"},
+    "go": {"function", "struct"},
+    "java": {"class", "method"},
+    "php": {"class", "function", "method"},
+    "ruby": {"class", "method"},
+}
+
+
 class TestEndToEndYield:
     """The per-query tests above can all pass while the wiring that turns
     captures into `CodeChunk`/`CodeEdge` objects drops them, so assert the
     public surface too."""
+
+    @pytest.mark.parametrize("language", sorted(EXPECTED_KINDS))
+    def test_parse_file_produces_every_declared_kind(self, parser, language):
+        """The kind-level guard, and the reason it exists.
+
+        `_captures` proves each query name resolves to something that
+        matches. It cannot prove the name resolved to the RIGHT query:
+        mutating `_get_query`'s cache key to `f"{language}"` makes the first
+        query per language win and hands its compiled object to every
+        sibling. Every capture count stays positive; java then yields six
+        duplicated `method` chunks and zero `class` chunks. Measured: that
+        mutation left all 29 other tests in this file green.
+        """
+        source = FIXTURES[language]
+        path = pathlib.Path(tempfile.mkdtemp()) / f"a{_EXT[language]}"
+        path.write_text(source)
+
+        kinds = {c.chunk_type for c in (parser.parse_file(path, source) or [])}
+        assert kinds == EXPECTED_KINDS[language], (
+            f"{language} produced {sorted(kinds)}, expected "
+            f"{sorted(EXPECTED_KINDS[language])} -- a query resolved to the "
+            f"wrong compiled object, or a declared kind stopped being emitted"
+        )
 
     @pytest.mark.parametrize("language", sorted(FIXTURES))
     def test_parse_file_produces_chunks(self, parser, language):

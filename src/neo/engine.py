@@ -1611,9 +1611,19 @@ class NeoEngine:
         self, *, code_suggestions, static_checks, reasoning_fact,
         simulation_facts, metadata,
     ) -> None:
-        """Finalize and persist the task evidence without promoting knowledge."""
+        """Finalize and persist the task evidence without promoting knowledge.
+
+        Skipped entirely under `dry_run`, and that path is reachable: VERIFY
+        mode reasons without an LM call, so `process()` returns NORMALLY and
+        never raises `DryRunComplete` -- and this method then writes an
+        episode file AND a `citation_survival` metric. Those are exactly the
+        two surfaces `learning-stats` and `citation-stats` read, so a dry run
+        was polluting both "is it learning?" dashboards. Measured on a clean
+        HOME: `--stdin-json --json --dry-run` in VERIFY mode produced 1
+        episode and 1 `citation_survival` line.
+        """
         episode = self.current_learning_episode
-        if episode is None:
+        if episode is None or self.dry_run:
             return
         from neo.memory.episodes import (
             aggregate_verification_status,
@@ -2200,6 +2210,29 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
 
         if self.dry_run:
             from neo.reasoning_mode import ModeDecision, ReasoningMode
+
+            # Say so, unconditionally and without asking anything. Silence
+            # would reproduce one level up the defect this flag exists to
+            # expose -- fast-path output on a machine that would have
+            # deliberated is a report about a run Neo would not have made.
+            #
+            # But the note must not overclaim either, and the obvious version
+            # did: gating on `car_available` announces a suppressed panel on
+            # any car-server machine, including for the familiar, low-effort
+            # prompts that would have taken the fast path anyway. That is the
+            # failure `shown_of` already forbids -- a marker that fires when
+            # nothing was dropped trains the reader to ignore it.
+            # Reconstructing the real answer needs `capable_model_count` and
+            # the effort tier, i.e. a CAR daemon round-trip taken purely to
+            # decide whether to print a string, under a flag that promises no
+            # calls. So the note states what is unconditionally true instead.
+            from neo import progress
+
+            progress.note(
+                "dry-run: always takes the fast path; the multi-agent panel "
+                "is never previewed (it builds real CAR adapters and would "
+                "bill you)"
+            )
             return ModeDecision(
                 mode=ReasoningMode.FAST,
                 reason="dry-run: the panel routes around self.lm to real CAR adapters",
