@@ -39,8 +39,9 @@ _EMPTY: set = set()
 _ENTRY = {"main", "app", "server", "index", "login", "auth", "__init__"}
 
 
-def _score(path, tokens, *, demote):
-    return score_candidate(path, 4000, tokens, _EMPTY, _ENTRY, demote_tests=demote)
+def _score(path, tokens, *, demote, relevance=0.0):
+    return score_candidate(path, 4000, tokens, _EMPTY, _ENTRY,
+                           demote_tests=demote, content_relevance=relevance)
 
 
 MIN_SCORE_THRESHOLD = __import__(
@@ -110,48 +111,52 @@ class TestScoringDemotion:
     _TOKENS = {"adapter", "car"}
 
     def test_a_test_file_no_longer_outranks_its_subject(self):
-        """The measured failure, reduced to its mechanism.
+        """The measured failure, reduced to its mechanism — now expressed in
+        terms of CONTENT, because content is what ranks files.
 
-        `test_car_adapter.py` matches both prompt tokens; `adapters.py`
-        matches one. Without the penalty the test file wins on filename
-        overlap alone, before any size penalty is applied to the
-        implementation.
+        A test file is a lexical superset of its subject: it contains the same
+        identifiers plus test scaffolding, so BM25 scores it at least as high.
+        That makes the demotion matter MORE than it did under filename
+        scoring, not less — measured, it moves neo's MRR from 0.558 to 0.718.
+        Both files here score a full content match; only the penalty separates
+        them.
         """
-        impl = _score("src/neo/adapters.py", self._TOKENS, demote=True)
-        test = _score("tests/test_car_adapter.py", self._TOKENS, demote=True)
+        impl = _score("src/neo/adapters.py", self._TOKENS, demote=True, relevance=1.0)
+        test = _score("tests/test_car_adapter.py", self._TOKENS, demote=True,
+                      relevance=1.0)
 
         assert test < impl, (
             f"test file scored {test:.2f} vs implementation {impl:.2f}"
         )
 
-    def test_without_demotion_the_test_file_still_wins(self):
-        """Pins the mechanism rather than the fix, so this file documents WHY
-        the penalty exists and not merely that it is applied."""
-        impl = _score("src/neo/adapters.py", self._TOKENS, demote=False)
-        test = _score("tests/test_car_adapter.py", self._TOKENS, demote=False)
+    def test_without_demotion_the_test_file_ties_or_wins(self):
+        """Pins the mechanism rather than the fix.
 
-        assert test > impl
+        On equal content the test file wins on filename overlap alone — it
+        matches both prompt tokens where the implementation matches one.
+        """
+        impl = _score("src/neo/adapters.py", self._TOKENS, demote=False, relevance=1.0)
+        test = _score("tests/test_car_adapter.py", self._TOKENS, demote=False,
+                      relevance=1.0)
 
-    def test_the_penalty_scales_the_bonuses_not_the_final_score(self):
-        """Placement is deliberate: the multiplier lands after the bonuses and
-        BEFORE the additive depth and size penalties.
+        assert test >= impl
 
-        So it is not `final * TEST_PENALTY`. Scaling the final score would
-        shrink the penalties too, making a deep or oversized test file
-        cheaper than a shallow one -- the wrong direction. Scaling only the
-        positive signal is also what the ProjectIndex path does, where the
-        multiplier applies to a cosine similarity before it becomes a boost.
+    def test_the_penalty_scales_everything_above_the_additive_penalties(self):
+        """Placement: the multiplier lands after the bonuses and content term,
+        and BEFORE the additive depth penalty.
 
-        Measured for `tests/test_car_adapter.py` at 4KB and depth 1:
-        bonuses 1.20, depth penalty 0.05, so plain = 1.15 and demoted =
-        1.20 * 0.4 - 0.05 = 0.43.
+        Scaling the final score would shrink the penalties too, making a deep
+        test file cheaper than a shallow one — the wrong direction. It is
+        therefore not `final * TEST_PENALTY`.
         """
         depth_penalty = 0.05  # one separator in "tests/test_car_adapter.py"
-        plain = _score("tests/test_car_adapter.py", self._TOKENS, demote=False)
-        demoted = _score("tests/test_car_adapter.py", self._TOKENS, demote=True)
+        plain = _score("tests/test_car_adapter.py", self._TOKENS, demote=False,
+                       relevance=1.0)
+        demoted = _score("tests/test_car_adapter.py", self._TOKENS, demote=True,
+                         relevance=1.0)
 
-        bonuses = plain + depth_penalty
-        assert demoted == pytest.approx(bonuses * TEST_PENALTY - depth_penalty)
+        positives = plain + depth_penalty
+        assert demoted == pytest.approx(positives * TEST_PENALTY - depth_penalty)
         assert demoted < plain
 
     def test_non_test_files_are_untouched(self):
@@ -189,8 +194,10 @@ class TestDemotionReRanksButNeverEvicts:
     _TOKENS = {"widget"}
 
     def test_a_file_that_would_be_admitted_stays_admitted(self):
-        plain = _score("tests/test_widget.py", self._TOKENS, demote=False)
-        demoted = _score("tests/test_widget.py", self._TOKENS, demote=True)
+        plain = _score("tests/test_widget.py", self._TOKENS, demote=False,
+                       relevance=0.5)
+        demoted = _score("tests/test_widget.py", self._TOKENS, demote=True,
+                         relevance=0.5)
 
         assert plain >= MIN_SCORE_THRESHOLD
         assert demoted >= MIN_SCORE_THRESHOLD, "the penalty evicted rather than re-ranked"

@@ -94,56 +94,44 @@ class TestSizeDoesNotAffectScore:
 
     `score -= 0.01 * size_kb` once over 10 KB, uncapped, against a realistic
     positive signal of +0.6 to +2.1 — so a file with one keyword hit became
-    unrankable above 60 KB. Measured on this repo, `src/neo/memory/store.py`
-    scored 0.000 and ranked 200th of 284 for "fix the fact store supersession
-    threshold", because it is 162 KB. Ground-truth files ran 31-177 KB against
-    a corpus median of 10 KB: central files are large *because* they are
-    central.
+    unrankable above 60 KB. Measured, `src/neo/memory/store.py` scored 0.000
+    and ranked 200th of 284 for "fix the fact store supersession threshold",
+    because it is 162 KB. Ground truth ran 31-177 KB against a corpus median
+    of 10 KB: central files are large *because* they are central.
 
     BugLocator's rVSM (Zhou et al., ICSE 2012) ranks LARGER files HIGHER for
-    exactly this task, on the empirical finding that larger files are more
-    likely to contain the defect. So the sign was wrong, not the magnitude —
-    and BM25's `b` handles the real concern with bounded, corpus-derived
-    length normalization instead.
+    exactly this task. So the sign was wrong, not the magnitude, and BM25's
+    `b` handles the real concern with bounded, corpus-derived normalization.
 
     The tests replaced here asserted the penalty (`assert big < small`). They
-    pinned the defect, which is why it survived a rewrite of everything around
-    it.
+    pinned the defect, which is part of why it survived a rewrite of
+    everything around it.
     """
 
     _TOKENS = {"widget"}
 
-    def test_large_non_main_file_penalized_heavily(self):
-        big = score_candidate(
-            "widget.py", 50 * 1024, self._TOKENS, _EMPTY, _ENTRY,
-            demote_tests=False)
-        small = score_candidate(
-            "widget.py", 1000, self._TOKENS, _EMPTY, _ENTRY,
-            demote_tests=False)
-        assert big < small
+    @pytest.mark.parametrize("path", ["widget.py", "main.py", "src/deep/widget.py"])
+    def test_score_is_independent_of_size(self, path):
+        tiny = score_candidate(path, 1_000, self._TOKENS, _EMPTY, _ENTRY,
+                               demote_tests=False)
+        huge = score_candidate(path, 500 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+                               demote_tests=False)
+        assert tiny == huge, "size is back in the scoring function"
 
-    def test_large_main_file_penalized_lightly(self):
-        big = score_candidate(
-            "main.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY,
-            demote_tests=False)
-        small = score_candidate(
-            "main.py", 1000, self._TOKENS, _EMPTY, _ENTRY,
-            demote_tests=False)
-        assert big < small
-        # And it should beat a same-size non-main file (lighter penalty
-        # leaves it higher).
-        non_main_big = score_candidate(
-            "widget.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY,
-            demote_tests=False,
+    def test_a_large_relevant_file_outranks_a_small_irrelevant_one(self):
+        """The property the old scorer made impossible."""
+        big_relevant = score_candidate(
+            "src/store.py", 162 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False, content_relevance=1.0,
         )
         small_irrelevant = score_candidate(
             "src/tiny.py", 1_000, self._TOKENS, _EMPTY, _ENTRY,
-            content_relevance=0.0,
+            demote_tests=False, content_relevance=0.0,
         )
         assert big_relevant > small_irrelevant
 
     def test_content_relevance_outweighs_every_tie_breaker_combined(self):
-        """Content must decide the ranking, not the bonuses around it.
+        """Content decides the ranking, not the bonuses around it.
 
         docs 0.8 + git recency 0.3 + entry point 0.2 + filename 0.45 = 1.75,
         against 3.0 for a full content match. A file the prompt is *about*
@@ -151,11 +139,11 @@ class TestSizeDoesNotAffectScore:
         """
         content_only = score_candidate(
             "src/obscurely_named.py", 5_000, set(), _EMPTY, _ENTRY,
-            content_relevance=1.0,
+            demote_tests=False, content_relevance=1.0,
         )
         every_bonus = score_candidate(
             "docs/main.py", 5_000, {"docs", "main"}, {"docs/main.py"}, _ENTRY,
-            content_relevance=0.0,
+            demote_tests=False, content_relevance=0.0,
         )
         assert content_only > every_bonus
 

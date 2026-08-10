@@ -609,55 +609,43 @@ def infer_language(path: str) -> Optional[str]:
 
 def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
                     git_recent: set[str], entry_points: set[str],
-                    *, demote_tests: bool) -> float:
-    """Score a candidate file for relevance.
+                    *, demote_tests: bool, content_relevance: float = 0.0) -> float:
+    """
+    Two signals, in order of weight.
 
-    `demote_tests` applies the same `TEST_PENALTY` the ProjectIndex boost has
-    always applied to its cosine, and it is a consistency fix rather than a
-    new policy: the two scoring paths disagreed about test files, and only
-    one of them was ever corrected. A test file is a strict SUPERSET of its
-    subject's filename tokens -- `test_car_adapter.py` matches {adapter, car}
-    where `adapters.py` matches {adapter} -- so on the keyword path it can
-    only ever outrank the code it tests, and then the implementation takes a
-    size penalty on top.
+    `content_relevance` is a normalized BM25 score over the file's CONTENT
+    (see `neo.file_retrieval`) and is the dominant term. Selection used to
+    score a path string and a byte count and never open the file; the
+    dominant term was then `score -= 0.01 * size_kb`, uncapped, which made a
+    file with one keyword hit unrankable above 60 KB. Measured, the 162 KB
+    `src/neo/memory/store.py` scored 0.000 and ranked 200th of 284 for a
+    prompt about the fact store. That penalty is gone: BugLocator's rVSM
+    (ICSE 2012) ranks larger files HIGHER for this task, and BM25's `b`
+    handles the real concern with bounded, corpus-derived normalization.
+    `size` stays in the signature but is no longer scored.
 
-Measured with `tools/rank_eval.py` -- recall@k against hand-labelled
-    relevant files, over 12 prompts on this repo:
+    `demote_tests` applies the same `TEST_PENALTY` the ProjectIndex boost
+    always applied to its cosine — a consistency fix, since the two scoring
+    paths disagreed about test files and only one was ever corrected. It
+    matters MORE under content BM25 than it did before, because a test file
+    contains its subject's identifiers plus test scaffolding and so is often
+    the better lexical match. Measured over cases mined from git history:
 
-        k        main     with the penalty
-        3        0.250    0.333
-        5        0.542    0.667
-        10       0.667    0.667
-        20       0.667    0.667
+        repo    R@10 without   with     MRR without   with
+        neo        0.705       0.783      0.558      0.718
+        car        0.969       0.969      0.680      0.682
+        quip       0.786       0.820      0.583      0.651
 
-    The win is in ORDERING, not retrieval: the same files are reachable
-    either way, they arrive earlier. That matters because per-file character
-    caps mean a file at rank 3 contributes far more content than the same
-    file at rank 9.
+    Keyword-only and REQUIRED. It was briefly optional-defaulting-to-False so
+    existing pure-scoring tests would not need editing — a production default
+    shaped around test convenience, where the default was the buggy
+    behaviour and the call site reads `not prompt_targets_tests(...)`, so a
+    forgotten argument failed OPEN toward the defect being fixed.
 
-    Two earlier metrics -- mean rank of the first source file, and count of
-    tests and docs in the top 10 -- reported a much larger win (4.50 -> 2.00,
-    5.58 -> 4.25) and should not be trusted. Both reward ANY `src/` file
-    landing early regardless of relevance, both penalise a test file that is
-    the correct answer, and both IMPROVE when a file is evicted below
-    `MIN_SCORE_THRESHOLD` rather than merely demoted. They were the reason
-    two other candidate fixes were rejected, and at least one of those
-    rejections was made on a reading those metrics could not support.
-
-        Keyword-only and REQUIRED. It was briefly optional-defaulting-to-False so
-    that existing pure-scoring tests would not need editing -- which is a
-    production default shaped around test convenience, and the default was the
-    buggy behaviour. The call site reads `not prompt_targets_tests(...)`, so a
-    forgotten argument would have failed open toward exactly the defect this
-    fixes. One production caller; no reason for a default at all.
-
-    The penalty RE-RANKS and must not EVICT. Scaling bonuses can push a file
-    under `MIN_SCORE_THRESHOLD`, which drops it from context entirely: a test
-    file with one token hit at depth 1 goes 0.55 -> 0.19 against a 0.2 floor.
-    Both metrics used to justify this change -- rank of the first source file,
-    count of tests and docs in the top 10 -- improve monotonically when a file
-    DISAPPEARS, so neither could have detected that cost. A file that would
-    have been admitted stays admitted, ranked below everything else.
+    The penalty RE-RANKS and must not EVICT. Scaling can push a file under
+    `MIN_SCORE_THRESHOLD`, dropping it from context entirely, and rank-based
+    metrics improve when that happens — so a file that would have been
+    admitted stays admitted, ranked below everything else.
     """
     score = 0.0
     name_lower = rel_path.lower()
@@ -696,6 +684,12 @@ Measured with `tools/rank_eval.py` -- recall@k against hand-labelled
     # file. Normalized to [0, 3] so it outweighs every tie-breaker combined
     # (0.8 docs + 0.3 git + 0.2 entry = 1.3) while staying far below
     # EXPLICIT_PATH_BOOST, which encodes an explicit user instruction.
+    score += 3.0 * content_relevance
+
+    # Content relevance: the dominant term, and the only one that has read
+    # the file. Normalized to [0, 3] so it outweighs every tie-breaker
+    # combined (0.8 docs + 0.3 git + 0.2 entry + 0.45 filename = 1.75) while
+    # staying far below EXPLICIT_PATH_BOOST, which encodes a user instruction.
     score += 3.0 * content_relevance
 
     # Filename overlap, kept as a weak tie-breaker rather than a primary
@@ -1069,6 +1063,16 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # rot starting.
     demote_tests = not prompt_targets_tests(config.prompt)
 
+    # Read the files. This is the change: selection used to happen on the path
+    # string and the byte count alone, with content first opened afterwards to
+    # chunk whatever had already been chosen.
+    from neo.file_retrieval import build_index, normalize
+
+    file_index = build_index(candidates)
+    relevance = normalize(file_index.scores(config.prompt)) if file_index else {}
+    if relevance:
+        progress.note(f"Content relevance: {len(relevance)} files match the prompt")
+
     # Score all candidates
     scored = []
     explicit_hits = 0
@@ -1076,6 +1080,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         score = score_candidate(
             rel_path, size, prompt_tokens, git_recent, entry_points,
             demote_tests=demote_tests,
+            content_relevance=relevance.get(rel_path, 0.0),
         )
         if matches_explicit_path(rel_path, explicit_paths):
             score += EXPLICIT_PATH_BOOST
