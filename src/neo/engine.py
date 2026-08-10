@@ -245,6 +245,10 @@ class NeoEngine:
                         codebase_root=codebase_root,
                         config=config,
                         lm_adapter=lm_adapter,
+                        # `initialize()` prunes, demotes and purges, then
+                        # saves -- all before inference. A dry run must not
+                        # age the store it is inspecting.
+                        read_only=dry_run,
                     )
                     # Set persistent_memory for backward compat in methods that check it
                     self.persistent_memory = self.fact_store
@@ -2174,8 +2178,32 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             return False, 0, None
 
     def _decide_reasoning_mode(self, context: dict[str, Any], difficulty: str, neo_input):
-        """Gate: fast vs multi-agent. Returns (ModeDecision, route_fn|None)."""
+        """Gate: fast vs multi-agent. Returns (ModeDecision, route_fn|None).
+
+        `dry_run` forces FAST, and that is a correctness requirement rather
+        than a shortcut. The panel does NOT reason through `self.lm`:
+        `_build_car_role_factory` calls `create_adapter("car", model=m)` per
+        role and uses `self.lm` only as the fallback for unassigned roles. So
+        a `RecordingLM` does not intercept the panel — on a machine with
+        `car-server` reachable, which is this project's documented normal
+        setup because the observer autostarts off it, `--dry-run` on a novel
+        prompt would run the full multi-agent panel against real models,
+        spend real money, never raise `DryRunComplete`, and print ordinary
+        output. The flag would become a no-op that bills you.
+
+        Forcing FAST is also the honest choice for what the flag reports: the
+        panel's later prompts are built from earlier model responses, so they
+        cannot be shown without making the calls that `--dry-run` exists to
+        avoid.
+        """
         from neo.reasoning_mode import decide_mode
+
+        if self.dry_run:
+            from neo.reasoning_mode import ModeDecision, ReasoningMode
+            return ModeDecision(
+                mode=ReasoningMode.FAST,
+                reason="dry-run: the panel routes around self.lm to real CAR adapters",
+            ), None
         signal = self._compute_memory_signal(context)
         explicit = (getattr(self.config, "reasoning_mode", "auto") if self.config else "auto") or "auto"
         explicit = None if explicit.lower() == "auto" else explicit.lower()

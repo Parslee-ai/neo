@@ -390,7 +390,7 @@ class ResolvedExecutionContext:
             # all the reader needs to know something is missing.
             lines.append(
                 f"Recent attempts"
-                f"{shown_of(self.trajectory.attempts, _MAX_RECENT_ATTEMPTS)}: "
+                f"{shown_of(self.trajectory.attempts, _MAX_RECENT_ATTEMPTS, tail=True)}: "
                 + _bounded_json(
                     self.trajectory.attempts[-_MAX_RECENT_ATTEMPTS:], 1500
                 )

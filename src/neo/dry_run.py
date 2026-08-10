@@ -16,13 +16,30 @@ about what Neo saw*. An instrument that under-reports sends the operator
 looking in the wrong place, which is the same failure as a cap that blames the
 wrong knob.
 
+**One call, and only the first.** `RecordingLM` stops at the first
+`generate()`. The multi-agent panel is separately suppressed under `dry_run`
+(see `NeoEngine._decide_reasoning_mode`) for two reasons: it routes around
+`self.lm` to real CAR adapters and would bill you under a flag that promises
+no calls, and its later prompts are built from earlier model responses, so
+they cannot be shown without making the calls this flag exists to avoid.
+
 **The prompt is recorded, never reconstructed.** `RecordingLM` is a real
 `LMAdapter` installed in the engine's own `self.lm` slot, so what gets printed
-is the exact `messages` list the provider adapter would have received. A
-renderer that walked the context dict and re-assembled the prompt would be a
-second implementation of the prompt builders, free to drift from the seven
-real ones the moment any of them changed -- the same duplicated-rule shape
-that put `EXCLUDED_DIR_NAMES` in two places and cost a release.
+is the exact `messages` list Neo hands the adapter. A renderer that walked the
+context dict and re-assembled the prompt would be a second implementation of
+the prompt builders, free to drift from the seven real ones the moment any of
+them changed -- the same duplicated-rule shape that put `EXCLUDED_DIR_NAMES`
+in two places and cost a release.
+
+That is the adapter's INPUT, not the wire payload, and the distinction is
+worth keeping straight because half the adapters restructure it: Anthropic
+hoists the system message into a separate `system=` kwarg, Google remaps
+`system`->`user` and `content`->`parts`, Ollama flattens everything into one
+delimited string, and CAR sends a flattened `prompt` and an `intent_json`
+alongside. Rendering the true wire payload would mean resolving a provider,
+which needs credentials -- and requiring an API key to find out what Neo would
+have sent is a barrier with nothing behind it. So the scope is named in the
+output rather than quietly overclaimed.
 
 `DryRunComplete` derives from `BaseException`, not `Exception`, and that is
 load-bearing: `NeoEngine._process_guarded` wraps the run in `except Exception`
@@ -60,8 +77,12 @@ class RecordingLM(LMAdapter):
     context, so the first prompt is the one that answers "what did Neo see".
     """
 
-    #: Advertised so `_decide_reasoning_mode` and any capability probe see a
-    #: plausible model rather than an empty string.
+    #: Set because `NeoOutput` and the metrics layer read `.model`/`.provider`
+    #: off the adapter and would otherwise report an empty string. NOT read by
+    #: `_decide_reasoning_mode`, which never consults `self.lm` -- the panel is
+    #: suppressed under `dry_run` in the engine instead, because
+    #: `_build_car_role_factory` builds real CAR adapters and would route
+    #: around this class entirely.
     model = "dry-run"
     provider = "dry-run"
 
@@ -108,12 +129,27 @@ def render(calls: list[dict[str, Any]], gathered: Any = None) -> str:
 
     call = calls[0]
     total = sum(len(m.get("content") or "") for m in call["messages"])
-    out.append("=== DRY RUN: the exact prompt that would be sent ===")
+    out.append("=== DRY RUN: the messages Neo hands the adapter ===")
     out.append("")
     out.append(
-        f"model params: max_tokens={call['max_tokens']} "
+        "This is Neo's request, not the wire payload. The provider adapter "
+        "restructures it: Anthropic hoists the system message into a separate "
+        "`system=` argument, Google remaps roles and content keys, Ollama "
+        "flattens everything into one string, and CAR adds an intent hint. "
+        "Which adapter would run is not resolved here, because --dry-run "
+        "deliberately requires no credentials."
+    )
+    out.append("")
+    out.append(
+        f"engine requested: max_tokens={call['max_tokens']} "
         f"temperature={call['temperature']} "
-        f"reasoning_effort={call['reasoning_effort']}"
+        f"reasoning_effort={call['reasoning_effort']} "
+        f"stop={call['stop']!r}"
+    )
+    out.append(
+        "  (providers drop what they do not accept -- Anthropic ignores "
+        "temperature on Opus 4.7+/Sonnet 5, CAR lets backend defaults win, "
+        "and reasoning_effort reaches only the OpenAI-family adapters.)"
     )
     out.append(f"{len(call['messages'])} message(s), {total:,} chars total")
     out.append("")

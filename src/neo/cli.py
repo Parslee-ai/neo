@@ -709,6 +709,22 @@ def _configure_logging(args) -> None:
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
 
+def _emit_dry_run_terminal_event() -> None:
+    """Close the JSONL stream a dry run opened.
+
+    `--json` promises every run ends with `completed` or `FAILED`, because a
+    host cannot tell STARTED-then-silence from a crash or a hang. A dry run
+    raises past the engine's own COMPLETED emit, so the CLI closes the stream
+    itself rather than leaving `reasoning` running forever.
+    """
+    from neo.events import JsonlSink, NeoEvent, NeoEventType
+
+    JsonlSink(sys.stderr).emit(NeoEvent(
+        type=NeoEventType.COMPLETED,
+        message="dry run: context assembled, no inference performed",
+    ))
+
+
 def _print_selected_files(gathered) -> None:
     """Report the gatherer's choice: which files, which lines, what score.
 
@@ -1138,9 +1154,9 @@ def main():
             if args.dry_run:
                 _print_selected_files(gathered)
 
-        if args.dry_run and not gathered:
-            # No gatherer ran (explicit --file / stdin), so report what the
-            # caller supplied instead of printing nothing above the prompt.
+        if args.dry_run and args.no_scan:
+            # Keyed on --no-scan, not on `not gathered`: a scan that legitimately
+            # finds zero files would otherwise print BOTH reports, each empty.
             _print_supplied_files(neo_input.context_files)
 
     if neo_input.operating_mode is OperatingMode.AGENT:
@@ -1213,11 +1229,42 @@ def main():
         )
         try:
             output = engine.process(neo_input)
+            if args.dry_run:
+                # `process()` returning normally under --dry-run means no LM
+                # call was ever assembled: VERIFY mode reasons without one,
+                # and the budget-skip branch closes reasoning as `skipped`.
+                # Without this the command exits 0 having printed ordinary
+                # output, and the operator reads it as the dry-run report.
+                print(render([]), file=sys.stderr)
+                sys.exit(0)
         except DryRunComplete as complete:
             # Not an error path. `DryRunComplete` is a BaseException so the
             # engine's own `except Exception` cannot mistake assembly-finished
             # for a crash; see `neo.dry_run`.
-            print(render(complete.calls), file=sys.stderr)
+            #
+            # Under --json the report goes to STDOUT as the single JSON
+            # document that contract promises, not to stderr. Writing prose
+            # to stderr there broke two documented invariants at once: stdout
+            # carried zero documents, and every source line beginning with
+            # `{` became a counterfeit event for a host parsing the JSONL
+            # stream by that prefix. The synthetic terminal event exists
+            # because the engine raised past its own COMPLETED emit, and
+            # STARTED-then-silence is precisely what a host cannot
+            # distinguish from a crash or a hang.
+            if args.json:
+                print(json.dumps({
+                    "dry_run": True,
+                    "calls": complete.calls,
+                    "note": (
+                        "messages as Neo hands them to the adapter; the "
+                        "provider adapter restructures them (Anthropic "
+                        "hoists system, Google remaps roles, Ollama "
+                        "flattens, CAR adds intent_json)"
+                    ),
+                }, indent=2))
+                _emit_dry_run_terminal_event()
+            else:
+                print(render(complete.calls), file=sys.stderr)
             sys.exit(0)
     except TimeoutError as e:
         error_output = {

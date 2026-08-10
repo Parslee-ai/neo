@@ -104,7 +104,11 @@ class TestRecentAttempts:
             trajectory=TrajectoryContext(iteration=7, attempts=attempts)
         ).prompt_section()
 
-        assert f"[showing {_MAX_RECENT_ATTEMPTS} of {len(attempts)}]" in section
+        # "last", not just a count. `[showing 3 of 7]` reads as a sample of
+        # seven; `[showing last 3 of 7]` says the loop has run seven times and
+        # you are seeing where it is now -- which is the signal a caller needs
+        # to decide whether Neo is going in circles.
+        assert f"[showing last {_MAX_RECENT_ATTEMPTS} of {len(attempts)}]" in section
         # Tail semantics: the most RECENT survive, not the first.
         assert f"a{len(attempts) - 1}" in section
         assert '"a0"' not in section
@@ -145,3 +149,21 @@ class TestNoBareSlicesRemain:
         section = _context(**{attr: items}).prompt_section()
 
         assert shown_of(items, cap) in section
+
+
+class TestTailMarkerIsDistinctFromHead:
+    def test_head_and_tail_markers_do_not_read_the_same(self):
+        """The default must stay the head form: six of the seven `shown_of`
+        call sites are head cuts, so a `last` that leaked into them would be
+        actively false."""
+        from neo.text_budget import shown_of
+
+        items = list(range(20))
+        assert shown_of(items, 3) == " [showing 3 of 20]"
+        assert shown_of(items, 3, tail=True) == " [showing last 3 of 20]"
+
+    def test_neither_form_fires_when_nothing_is_dropped(self):
+        from neo.text_budget import shown_of
+
+        assert shown_of([1, 2], 5) == ""
+        assert shown_of([1, 2], 5, tail=True) == ""

@@ -103,7 +103,7 @@ class TestEndToEnd:
         # operator needs when the right file is missing.
         assert "files selected, in rank order" in result.stderr
         # ...and the four things the docs promised and did not deliver.
-        assert "exact prompt that would be sent" in result.stderr
+        assert "messages Neo hands the adapter" in result.stderr
         assert "Execution Envelope" in result.stderr
         assert "message 1/" in result.stderr
 
@@ -137,7 +137,7 @@ class TestEndToEnd:
             input=payload, capture_output=True, text=True, timeout=300,
         )
         assert result.returncode == 0
-        assert "exact prompt that would be sent" in result.stderr
+        assert "messages Neo hands the adapter" in result.stderr
 
     def test_dry_run_leaves_the_fact_files_byte_identical(self, tmp_path):
         """A coarse backstop, and labelled as one.
@@ -262,4 +262,94 @@ class TestNoCredentialsRequired:
         )
         assert result.returncode == 0, result.stderr[-2000:]
         assert "API key required" not in result.stdout + result.stderr
-        assert "exact prompt that would be sent" in result.stderr
+        assert "messages Neo hands the adapter" in result.stderr
+
+
+class TestPanelIsSuppressed:
+    """`--dry-run` must not reach `create_adapter("car", ...)`.
+
+    The panel does not reason through `self.lm`: `_build_car_role_factory`
+    builds a real CAR adapter per role and uses `self.lm` only as the fallback
+    for unassigned roles. So `RecordingLM` does not intercept it. On a machine
+    with `car-server` reachable -- this project's documented normal setup,
+    since the observer autostarts off it -- a novel prompt under `--dry-run`
+    would have run the full panel against real models, spent real money, never
+    raised `DryRunComplete`, and printed ordinary output. The flag would have
+    been a no-op that bills you.
+
+    Measured before the fix: 4 `create_adapter("car", ...)` calls (planner,
+    coder, critic, judge).
+    """
+
+    def test_no_car_adapter_is_built(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+
+        from neo.engine import NeoEngine
+        from neo.models import NeoInput
+
+        built = []
+        with patch("neo.adapters.create_adapter",
+                   side_effect=lambda *a, **k: (built.append(a), MagicMock())[1]):
+            engine = NeoEngine(lm_adapter=RecordingLM(),
+                               codebase_root=str(tmp_path), dry_run=True)
+            # Force the panel to look fully available.
+            with patch.object(NeoEngine, "_car_route_capability",
+                              return_value=(True, 5, lambda *a, **k: {})):
+                try:
+                    engine.process(NeoInput(
+                        prompt="design a novel distributed consensus scheme",
+                        context_files=[], working_directory=str(tmp_path)))
+                except DryRunComplete:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+
+        assert built == [], f"dry run built real adapters: {built}"
+
+    def test_mode_is_forced_fast(self, tmp_path):
+        from unittest.mock import patch
+
+        from neo.engine import NeoEngine
+        from neo.reasoning_mode import ReasoningMode
+
+        engine = NeoEngine(lm_adapter=RecordingLM(),
+                           codebase_root=str(tmp_path), dry_run=True)
+        with patch.object(NeoEngine, "_car_route_capability",
+                          return_value=(True, 5, lambda *a, **k: {})):
+            decision, route_fn = engine._decide_reasoning_mode({}, "hard", None)
+
+        assert decision.mode is ReasoningMode.FAST
+        assert route_fn is None
+
+
+class TestJsonDryRunKeepsItsContract:
+    """`--json` promises stdout is exactly ONE JSON document and every run
+    ends with `completed` or `FAILED`. Writing the report to stderr broke both
+    at once: zero documents on stdout, no terminal event, and every source
+    line beginning with `{` became a counterfeit event for a host parsing the
+    JSONL stream by that prefix."""
+
+    def test_stdout_is_one_json_document_and_the_stream_terminates(self, tmp_path):
+        (tmp_path / "app.py").write_text("def handler():\n    return 1\n")
+        result = _run(["--dry-run", "--json", "fix the handler",
+                       "--cwd", str(tmp_path)])
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)          # raises if not exactly one
+        assert payload["dry_run"] is True
+        assert payload["calls"]
+
+        events = [json.loads(line) for line in result.stderr.splitlines()
+                  if line.startswith("{")]
+        assert any(e.get("type") == "completed" for e in events), (
+            "STARTED-then-silence is what a host cannot tell from a crash"
+        )
+
+    def test_no_prompt_content_leaks_into_the_event_stream(self, tmp_path):
+        (tmp_path / "app.py").write_text('def handler():\n    return {"a": 1}\n')
+        result = _run(["--dry-run", "--json", "fix the handler",
+                       "--cwd", str(tmp_path)])
+
+        for line in result.stderr.splitlines():
+            if line.startswith("{"):
+                json.loads(line)  # every `{`-prefixed line is a real event
