@@ -15,29 +15,33 @@ def _score(path: str, size: int = 1000) -> float:
     return score_candidate(path, size, _EMPTY, _EMPTY, _ENTRY)
 
 
-class TestMainImplBoost:
-    def test_main_py_boosted(self):
-        # main.py beats foo.py — entry point + main_impl bonuses both fire.
-        assert _score("main.py") > _score("foo.py")
+class TestEntryPointBoost:
+    """`entry_points` is the surviving name-based bonus; `main_impl_stems` is not.
 
-    def test_main_go_boosted(self):
-        # The basename is lowercased, so the main_impl substring check
-        # ('main') and the entry_point startswith both apply across
-        # languages.
-        assert _score("main.go") > _score("foo.go")
+    These files still outrank a plain one, but now for ONE reason (+0.2 for an
+    entry-point basename) rather than two. The `main_impl_stems` whitelist that
+    also gave them +0.4 is deleted: it existed to exempt seven hardcoded stems
+    from a size penalty that was killing large central files, and with that
+    penalty gone it has nothing to patch.
+    """
 
-    def test_main_java_capitalcase_boosted(self):
-        # Main.java → main.java after lowercasing — both boosts apply.
-        assert _score("Main.java") > _score("Foo.java")
+    @pytest.mark.parametrize("special,plain", [
+        ("main.py", "foo.py"),
+        ("main.go", "foo.go"),
+        ("Main.java", "Foo.java"),   # basename is lowercased first
+        ("index.js", "widget.js"),
+        ("app.ts", "widget.ts"),
+        ("server.rs", "widget.rs"),
+    ])
+    def test_entry_point_basename_still_boosted(self, special, plain):
+        assert _score(special) > _score(plain)
 
-    def test_index_js_boosted(self):
-        assert _score("index.js") > _score("widget.js")
-
-    def test_app_ts_boosted(self):
-        assert _score("app.ts") > _score("widget.ts")
-
-    def test_server_rs_boosted(self):
-        assert _score("server.rs") > _score("widget.rs")
+    @pytest.mark.parametrize("path", ["main.py", "index.js", "app.ts"])
+    def test_the_gap_is_the_entry_point_bonus_alone(self, path):
+        """Pins the SIZE of the gap, not just its direction — otherwise
+        re-adding a second name-based bonus would pass unnoticed."""
+        plain = "widget" + path[path.rindex("."):]
+        assert _score(path) - _score(plain) == pytest.approx(0.2, abs=0.01)
 
 
 class TestNoNeoBias:
@@ -48,10 +52,13 @@ class TestNoNeoBias:
         assert _score("persistent.py") == _score("widget.py")
         assert _score("structured_parser.py") == _score("widget.py")
 
-    def test_generic_core_boosted(self):
-        # `core` is in the new generic list — boost stays for legitimate
-        # main-implementation names.
-        assert _score("core.py") > _score("widget.py")
+    def test_core_is_no_longer_special_either(self):
+        """`core` was in the `main_impl_stems` whitelist and nowhere else — no
+        entry-point prefix, no other mechanism. With the whitelist gone it
+        scores like any other file, which is the intended change: a central
+        file should be identified by its content, not by whether someone
+        thought of its name."""
+        assert _score("core.py") == _score("widget.py")
 
 
 class TestStemEqualityNotSubstring:
@@ -67,41 +74,82 @@ class TestStemEqualityNotSubstring:
     def test_reindex_not_boosted(self):
         assert _score("reindex.py") == _score("widget.py")
 
-    def test_application_loses_main_impl_boost(self):
-        # Application.java used to get +0.4 from substring `'app' in
-        # 'application'`. Stem-equality drops that. The entry_points
-        # startswith check (separate mechanism) still fires for `app*`,
-        # giving +0.2 — so it still beats Widget.java by less than it
-        # used to.
-        app_score = _score("Application.java")
-        widget_score = _score("Widget.java")
-        assert app_score > widget_score
-        # And the gap is the entry_point bonus (0.2), not main_impl (0.4)
-        # plus entry_point (0.2). Approximate because of depth penalty etc.
-        assert (app_score - widget_score) == pytest.approx(0.2, abs=0.01)
+    def test_application_gets_only_the_entry_point_bonus(self):
+        """`main_impl_stems` is gone; `entry_points` is not.
 
+        The whitelist gave +0.4 to seven hardcoded stems AND exempted them
+        from the size penalty. It existed only because that penalty was
+        killing large central files — it rescued `engine.py` at -0.13 and left
+        `store.py` at -1.62, a 12x disparity between two files of near-identical
+        size decided by whether someone had thought of the name. With the
+        penalty gone it has nothing to patch, and content BM25 identifies a
+        central file by what is in it.
+        """
+        gap = _score("Application.java") - _score("Widget.java")
+        assert gap == pytest.approx(0.2, abs=0.01)  # entry_point only
 
-class TestLargeFilePenalty:
-    # Without some baseline score the max(0.0, …) clamp hides the penalty,
-    # so each test gives the candidate a prompt-token match to lift it
-    # above zero before the size hit lands.
+class TestSizeDoesNotAffectScore:
+    """Size is not scored. It used to be the DOMINANT term, and backwards.
+
+    `score -= 0.01 * size_kb` once over 10 KB, uncapped, against a realistic
+    positive signal of +0.6 to +2.1 — so a file with one keyword hit became
+    unrankable above 60 KB. Measured on this repo, `src/neo/memory/store.py`
+    scored 0.000 and ranked 200th of 284 for "fix the fact store supersession
+    threshold", because it is 162 KB. Ground-truth files ran 31-177 KB against
+    a corpus median of 10 KB: central files are large *because* they are
+    central.
+
+    BugLocator's rVSM (Zhou et al., ICSE 2012) ranks LARGER files HIGHER for
+    exactly this task, on the empirical finding that larger files are more
+    likely to contain the defect. So the sign was wrong, not the magnitude —
+    and BM25's `b` handles the real concern with bounded, corpus-derived
+    length normalization instead.
+
+    The tests replaced here asserted the penalty (`assert big < small`). They
+    pinned the defect, which is why it survived a rewrite of everything around
+    it.
+    """
+
     _TOKENS = {"widget"}
 
-    def test_large_non_main_file_penalized_heavily(self):
-        big = score_candidate("widget.py", 50 * 1024, self._TOKENS, _EMPTY, _ENTRY)
-        small = score_candidate("widget.py", 1000, self._TOKENS, _EMPTY, _ENTRY)
-        assert big < small
+    @pytest.mark.parametrize("path", ["widget.py", "main.py", "src/deep/widget.py"])
+    def test_score_is_independent_of_size(self, path):
+        tiny = score_candidate(path, 1_000, self._TOKENS, _EMPTY, _ENTRY)
+        huge = score_candidate(path, 500 * 1024, self._TOKENS, _EMPTY, _ENTRY)
+        assert tiny == huge, "size is back in the scoring function"
 
-    def test_large_main_file_penalized_lightly(self):
-        big = score_candidate("main.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY)
-        small = score_candidate("main.py", 1000, self._TOKENS, _EMPTY, _ENTRY)
-        assert big < small
-        # And it should beat a same-size non-main file (lighter penalty
-        # leaves it higher).
-        non_main_big = score_candidate(
-            "widget.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY
+    def test_a_large_file_can_outrank_a_small_one_on_content(self):
+        """The property the old scorer made impossible.
+
+        A 162 KB file whose content matches beats a 1 KB file whose content
+        does not, which is the whole point: relevance decides, size does not.
+        """
+        big_relevant = score_candidate(
+            "src/store.py", 162 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            content_relevance=1.0,
         )
-        assert big > non_main_big
+        small_irrelevant = score_candidate(
+            "src/tiny.py", 1_000, self._TOKENS, _EMPTY, _ENTRY,
+            content_relevance=0.0,
+        )
+        assert big_relevant > small_irrelevant
+
+    def test_content_relevance_outweighs_every_tie_breaker_combined(self):
+        """Content must decide the ranking, not the bonuses around it.
+
+        docs 0.8 + git recency 0.3 + entry point 0.2 + filename 0.45 = 1.75,
+        against 3.0 for a full content match. A file the prompt is *about*
+        must beat a file that merely looks promising.
+        """
+        content_only = score_candidate(
+            "src/obscurely_named.py", 5_000, set(), _EMPTY, _ENTRY,
+            content_relevance=1.0,
+        )
+        every_bonus = score_candidate(
+            "docs/main.py", 5_000, {"docs", "main"}, {"docs/main.py"}, _ENTRY,
+            content_relevance=0.0,
+        )
+        assert content_only > every_bonus
 
 
 class TestExplicitPathPinning:

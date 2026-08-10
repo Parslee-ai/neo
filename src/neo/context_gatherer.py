@@ -544,8 +544,23 @@ def infer_language(path: str) -> Optional[str]:
 
 
 def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
-                    git_recent: set[str], entry_points: set[str]) -> float:
-    """Score a candidate file for relevance."""
+                    git_recent: set[str], entry_points: set[str],
+                    content_relevance: float = 0.0) -> float:
+    """Score a candidate file for relevance.
+
+    `content_relevance` is a normalized BM25 score over the file's CONTENT
+    (see `neo.file_retrieval`) and is the dominant term. Everything else here
+    is a tie-breaker, and is scaled to stay one.
+
+    `size` is retained in the signature but is no longer scored. It used to
+    carry `score -= 0.01 * size_kb`, uncapped, which made a file with one
+    keyword hit unrankable above 60 KB — measured, `src/neo/memory/store.py`
+    scored 0.000 and ranked 200th of 284 for a prompt about the fact store,
+    because it is 162 KB. Central files are large *because* they are central,
+    and BM25's length normalization handles the real concern in a bounded,
+    corpus-derived way. The parameter stays so callers and tests are
+    unaffected; drop it only with a deprecation pass.
+    """
     score = 0.0
     name_lower = rel_path.lower()
     basename = os.path.basename(rel_path).lower()
@@ -570,15 +585,29 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     # like an entry point" (entry_points adds +0.2). Files that merely
     # *start* with "main" (e.g. main_v2.py) only get the entry_points
     # bonus — the stacking distinguishes "canonical" from "adjacent."
-    main_impl_stems = {"core", "engine", "main", "index", "app", "server", "lib"}
-    stem = os.path.splitext(basename)[0]
-    is_main_impl = stem in main_impl_stems
-    if is_main_impl:
-        score += 0.4
+    # The `main_impl_stems` whitelist that used to live here is gone. It gave
+    # +0.4 to seven hardcoded stems AND exempted them from the size penalty,
+    # and it existed only because that penalty was killing large central
+    # files: it rescued `engine.py` (-0.13) and left `store.py` (-1.62), a 12x
+    # disparity between two files of near-identical size decided by whether
+    # someone had thought of the name. With the penalty gone the whitelist has
+    # nothing to patch, and content BM25 identifies a central file by what is
+    # in it rather than by a list of names someone maintained.
 
-    # Keyword overlap in filename
+    # Content relevance: the dominant term, and the only one that has read the
+    # file. Normalized to [0, 3] so it outweighs every tie-breaker combined
+    # (0.8 docs + 0.3 git + 0.2 entry = 1.3) while staying far below
+    # EXPLICIT_PATH_BOOST, which encodes an explicit user instruction.
+    score += 3.0 * content_relevance
+
+    # Filename overlap, kept as a weak tie-breaker rather than a primary
+    # signal. It is a substring test against the whole path, so short prompt
+    # tokens match by coincidence -- `a` is inside 49 of 85 basenames here.
+    # That noise was survivable at 0.6 per hit only because nothing better
+    # existed; at 0.15 it can separate two files whose content ranks equally
+    # and little else.
     hits = sum(1 for token in prompt_tokens if token in name_lower)
-    score += 0.6 * min(hits, 3)
+    score += 0.15 * min(hits, 3)
 
     # Git recency bonus
     if rel_path in git_recent:
@@ -592,20 +621,10 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     depth = rel_path.count(os.sep)
     score -= 0.05 * depth
 
-    # Penalize by size (god objects are code smell). main_impl files
-    # (engine.py, server.py, app.py, etc.) get a much gentler penalty
-    # — they're large *because* they're central, and the old 0.002
-    # multiplier was pushing THE relevant file (93KB engine.py) below
-    # threshold on prompts about it. New main_impl penalty is 0.001
-    # per KB-over-50, so 93KB loses 0.043 instead of 0.086.
-    size_kb = size / 1024
-    if size_kb > 10 and not is_main_impl:
-        # Penalty for large files: 10KB = -0.1, 50KB = -0.5, 100KB = -1.0
-        score -= 0.01 * size_kb
-    elif size_kb > 50 and is_main_impl:
-        # Lighter penalty for main implementation files: 50KB = 0,
-        # 100KB = -0.05, 500KB = -0.45.
-        score -= 0.001 * (size_kb - 50)
+    # No size penalty. See the docstring: it was the dominant term and it was
+    # anti-correlated with relevance. BugLocator's rVSM (ICSE 2012) ranks
+    # larger files HIGHER for this exact task; BM25's `b` handles the real
+    # concern with bounded, corpus-derived length normalization.
 
     return max(0.0, score)
 
@@ -933,11 +952,22 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # with no diff text and could never be verified or learned from.
     explicit_paths = extract_explicit_paths(config.prompt)
 
+    # Read the files. This is the change: selection used to happen on the path
+    # string and the byte count alone, with content first opened afterwards to
+    # chunk whatever had already been chosen.
+    from neo.file_retrieval import build_index, normalize
+
+    file_index = build_index(candidates)
+    relevance = normalize(file_index.scores(config.prompt)) if file_index else {}
+    if relevance:
+        progress.note(f"Content relevance: {len(relevance)} files match the prompt")
+
     # Score all candidates
     scored = []
     explicit_hits = 0
     for abs_path, rel_path, size in candidates:
-        score = score_candidate(rel_path, size, prompt_tokens, git_recent, entry_points)
+        score = score_candidate(rel_path, size, prompt_tokens, git_recent, entry_points,
+                                content_relevance=relevance.get(rel_path, 0.0))
         if matches_explicit_path(rel_path, explicit_paths):
             score += EXPLICIT_PATH_BOOST
             explicit_hits += 1
