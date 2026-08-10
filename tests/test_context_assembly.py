@@ -261,3 +261,86 @@ class TestTokenBudgetEnforcement:
         assert len(result.valid_facts) == 1  # at_least_one kicks in
         assert len(result.working_set) == 0  # no budget cascade
         assert len(result.known_unknowns) == 0  # no budget cascade
+
+
+class TestRankingPolicyStaysSingleSourced:
+    """`models.py` says the ranking formula "MUST stay in one place -- if the
+    two paths diverge, outcome learning ranks inconsistently."
+
+    That invariant was held by a comment and nothing else. A comment is what
+    held `EXCLUDED_DIR_NAMES` in two places while the gatherer's copy was
+    corrected and the index's copy kept hiding the same files. Checked at the
+    time of writing: both paths do call `rank_score` and nothing recomputes
+    the formula inline. These tests are here so that stays true.
+    """
+
+    def _facts(self, n=60):
+        import random
+
+        import numpy as np
+
+        from neo.memory.models import Fact, FactKind
+
+        random.seed(0)
+        np.random.seed(0)
+        out = []
+        for i in range(n):
+            fact = Fact(subject=f"s{i}", body="b",
+                        kind=random.choice(list(FactKind)))
+            fact.metadata.confidence = random.random()
+            fact.metadata.success_count = random.randint(0, 9)
+            fact.metadata.access_count = random.randint(0, 9)
+            fact.embedding = list(np.random.rand(16))
+            out.append(fact)
+        return out
+
+    def test_both_retrieval_paths_produce_the_same_ordering(self):
+        import time
+
+        import numpy as np
+
+        from neo.math_utils import batched_cosine
+        from neo.memory.context import ContextAssembler
+        from neo.memory.models import rank_score
+
+        np.random.seed(1)
+        facts = self._facts()
+        query = np.random.rand(16)
+        now = time.time()
+
+        assembled = ContextAssembler()._score_facts(facts, query)
+        sims = batched_cosine([f.embedding for f in facts], query)
+        direct = sorted(
+            [(f, rank_score(f, s, now)) for f, s in zip(facts, sims)],
+            key=lambda pair: pair[1], reverse=True,
+        )
+
+        assert [f.id for f, _ in assembled] == [f.id for f, _ in direct]
+        # Scores agree to floating-point noise; they differ only by the
+        # microseconds between the two `now` captures feeding recall decay.
+        assert max(abs(a - b) for (_, a), (_, b) in zip(assembled, direct)) < 1e-6
+
+    def test_no_module_recomputes_the_formula_inline(self):
+        """The structural half. The differential above only compares the two
+        paths that exist today; this catches a THIRD path being written with
+        the formula pasted in, which is exactly how the duplication starts.
+        """
+        import pathlib
+
+        src = pathlib.Path(__file__).resolve().parents[1] / "src" / "neo"
+        offenders = []
+        for path in src.rglob("*.py"):
+            if path.name == "models.py":
+                continue  # the one legitimate definition site
+            text = path.read_text()
+            for lineno, line in enumerate(text.splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("#") or stripped.startswith(('"', "'")):
+                    continue
+                if "success_bonus(" in line or "provenance_bonus(" in line:
+                    offenders.append(f"{path.relative_to(src)}:{lineno}")
+
+        assert not offenders, (
+            "the ranking formula is being recomputed outside models.py: "
+            f"{offenders} -- call rank_score() instead"
+        )
