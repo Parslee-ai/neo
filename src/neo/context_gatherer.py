@@ -621,17 +621,30 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     only ever outrank the code it tests, and then the implementation takes a
     size penalty on top.
 
-    Measured over 12 self-chosen code prompts on THIS repo: the first source
-    file ranked 4.50 on average and 5.58 of the top 10 slots went to tests and
-    docs; with the penalty, 1.75 and 4.41. Six doc-seeking prompts went
-    2.16 -> 3.00 docs in the top 10, because demoting tests leaves room rather
-    than competing with documentation. Treat those numbers as DIRECTIONAL: the
-    prompts are self-chosen and unlabelled, the corpus is a single Python
-    repo, and a mean over an unbounded rank is dominated by its worst case.
-    The harness is not in the tree, so nobody -- including the author -- can
-    re-run them as written.
+Measured with `tools/rank_eval.py` -- recall@k against hand-labelled
+    relevant files, over 12 prompts on this repo:
 
-    Keyword-only and REQUIRED. It was briefly optional-defaulting-to-False so
+        k        main     with the penalty
+        3        0.250    0.333
+        5        0.542    0.667
+        10       0.667    0.667
+        20       0.667    0.667
+
+    The win is in ORDERING, not retrieval: the same files are reachable
+    either way, they arrive earlier. That matters because per-file character
+    caps mean a file at rank 3 contributes far more content than the same
+    file at rank 9.
+
+    Two earlier metrics -- mean rank of the first source file, and count of
+    tests and docs in the top 10 -- reported a much larger win (4.50 -> 2.00,
+    5.58 -> 4.25) and should not be trusted. Both reward ANY `src/` file
+    landing early regardless of relevance, both penalise a test file that is
+    the correct answer, and both IMPROVE when a file is evicted below
+    `MIN_SCORE_THRESHOLD` rather than merely demoted. They were the reason
+    two other candidate fixes were rejected, and at least one of those
+    rejections was made on a reading those metrics could not support.
+
+        Keyword-only and REQUIRED. It was briefly optional-defaulting-to-False so
     that existing pure-scoring tests would not need editing -- which is a
     production default shaped around test convenience, and the default was the
     buggy behaviour. The call site reads `not prompt_targets_tests(...)`, so a
