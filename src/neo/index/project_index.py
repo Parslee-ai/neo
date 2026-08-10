@@ -55,49 +55,9 @@ STALENESS_THRESHOLD = 0.1  # 10% of files changed triggers full reindex warning
 REFRESH_BUDGET_MS = 5000  # Max 5s for opportunistic refresh
 REFRESH_MAX_CHUNKS = 100  # Max chunks to update during opportunistic refresh
 
-# Directory names that never contain source worth indexing. Matched against
-# every path component, so `a/node_modules/b/c.js` is excluded by the second
-# component alone.
-#
-# `.worktrees` and `.claude` are here for the same reason as `node_modules`,
-# and they are the ones that actually bit: a git worktree checked out inside
-# the repo is a *second copy of the repository*, so without this its files
-# compete for index slots against the originals they duplicate. One .NET repo
-# indexed 83 files, all of them Python, all of them from a worktree.
-EXCLUDED_DIR_NAMES = frozenset({
-    # VCS internals and nested checkouts
-    '.git', '.hg', '.svn', '.worktrees', 'worktrees',
-    # Agent tooling scratch space (worktrees, review corpora, caches)
-    '.claude', '.neo', '.codex', '.car',
-    # Dependency trees
-    'node_modules', 'bower_components', 'site-packages', 'Pods', 'Carthage',
-    # Build output whose names are not plausible source directories
-    'obj', '__pycache__',
-    '.next', '.nuxt', '.svelte-kit', '.output',
-    # Virtualenvs and tool caches
-    '.venv', 'venv', '.tox', '.nox', '.eggs',
-    '.mypy_cache', '.pytest_cache', '.ruff_cache',
-    # Editor / IDE
-    '.idea', '.vscode', '.vs',
-})
-
-# Matching is exact and case-sensitive, so `Bin/` and `Build/` (VS-era .NET
-# layouts) are not matched by name. That is deliberate rather than an
-# oversight: a case-insensitive rule would also swallow a `Build/` package
-# that is real source, and the gitignore filter below catches the generated
-# ones under whatever casing the repo actually uses.
-#
-# Deliberately NOT in the set above: `bin`, `build`, `out`, `target`, `dist`,
-# `vendor`. Every one of them is real source somewhere — `bin/` holds
-# checked-in helper scripts and Rust binary crates (`src/bin/main.rs`),
-# `target` and `out` are ordinary package names outside Cargo, `vendor` is
-# source the user may well be asking about. A sweep of three repos on the
-# machine this was written on found 254 git-tracked source files under `bin/`
-# or `vendor/`. Repos that generate into those directories gitignore them, and
-# the gitignore filter below already catches that case. The asymmetry decides
-# it: excluding a real source directory hides code permanently and invisibly,
-# while indexing some generated code only spends slots, and the build report
-# now shows that.
+# Path exclusions live in ONE place: `context_gatherer.load_gitignore_patterns`,
+# which both this module and prompt assembly read. A second list used to sit
+# here; see `_build_exclusion_filter` for what the duplication cost.
 
 
 @dataclass
@@ -341,25 +301,27 @@ class ProjectIndex:
     def _build_exclusion_filter(self):
         """Return a predicate deciding whether a path is unfit to index.
 
-        Two independent filters, because neither alone is enough:
-
-        - `EXCLUDED_DIR_NAMES`, which catches what a repo forgot to ignore.
-          `.claude/` tooling corpora and in-repo worktrees are routinely
-          untracked-but-not-gitignored, and a worktree is a second copy of
-          the repository competing with the originals for index slots.
-        - The repo's own `.gitignore`, read with the same helper
-          `context_gatherer` already uses, so prompt assembly and the index
-          agree on what counts as source rather than each having a private
-          opinion.
+        ONE source of truth: `context_gatherer.load_gitignore_patterns`,
+        which carries both the repo's own `.gitignore` and the defaults that
+        apply when it says nothing. There used to be a second list here, and
+        the duplication cost exactly what duplication costs — when the
+        gatherer's copy was corrected to stop hiding 60 git-tracked skill
+        implementations, this copy kept hiding them, and the two subsystems
+        disagreed about `.claude` until someone diffed them. 27 of that
+        list's 31 names were already in the shared defaults; the other four
+        were the ones that had to go anyway.
 
         `should_ignore` only ever tests the path it is handed, so a file
-        under a gitignored directory does not match on its own — the walk in
+        under an ignored directory does not match on its own — the walk in
         `context_gatherer.iter_paths` prunes those directories separately.
         This reproduces that by testing each ancestor directory, memoized so
         a directory is judged once no matter how many files sit under it.
 
-        Inherits one limitation from the shared helper: negation patterns
-        (`!keep.py`) are ignored, so a re-included file stays excluded.
+        `should_ignore` honors negation for a path evaluated directly. This
+        caller still cannot re-include a file beneath an excluded ancestor,
+        because `dir_excluded` short-circuits first — which is also git's
+        rule, so the short-circuit is the correct behaviour rather than a
+        limitation.
         """
         from neo.context_gatherer import load_gitignore_patterns, should_ignore
 
@@ -371,7 +333,6 @@ class ProjectIndex:
                 return verdicts[parts]
             verdicts[parts] = (
                 (len(parts) > 1 and dir_excluded(parts[:-1]))
-                or parts[-1] in EXCLUDED_DIR_NAMES
                 or should_ignore("/".join(parts), patterns, is_dir=True)
             )
             return verdicts[parts]

@@ -558,7 +558,7 @@
      the slice kept 1000 C# chunks and dropped every other language, with 37 of
      the 100 selected files contributing nothing.
   2. **Exclusion is two layers and `bin`/`build`/`out`/`target`/`dist`/`vendor`
-     belong to neither by name.** `EXCLUDED_DIR_NAMES` covers what repos forget to
+     belong to neither by name.** The shared default list covers what repos forget to
      ignore (`.worktrees`, `.claude`, `node_modules`, `obj`, virtualenvs);
      `_build_exclusion_filter` layers the repo's own `.gitignore` on top via
      `context_gatherer.load_gitignore_patterns`. **Footgun**: `should_ignore` only
