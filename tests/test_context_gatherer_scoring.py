@@ -12,7 +12,8 @@ _ENTRY = {"main", "app", "server", "index", "login", "auth", "__init__"}
 
 def _score(path: str, size: int = 1000) -> float:
     """Helper: score `path` with a no-keyword, no-git baseline."""
-    return score_candidate(path, size, _EMPTY, _EMPTY, _ENTRY)
+    return score_candidate(path, size, _EMPTY, _EMPTY, _ENTRY,
+                           demote_tests=False)
 
 
 class TestMainImplBoost:
@@ -88,18 +89,27 @@ class TestLargeFilePenalty:
     _TOKENS = {"widget"}
 
     def test_large_non_main_file_penalized_heavily(self):
-        big = score_candidate("widget.py", 50 * 1024, self._TOKENS, _EMPTY, _ENTRY)
-        small = score_candidate("widget.py", 1000, self._TOKENS, _EMPTY, _ENTRY)
+        big = score_candidate(
+            "widget.py", 50 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
+        small = score_candidate(
+            "widget.py", 1000, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
         assert big < small
 
     def test_large_main_file_penalized_lightly(self):
-        big = score_candidate("main.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY)
-        small = score_candidate("main.py", 1000, self._TOKENS, _EMPTY, _ENTRY)
+        big = score_candidate(
+            "main.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
+        small = score_candidate(
+            "main.py", 1000, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
         assert big < small
         # And it should beat a same-size non-main file (lighter penalty
         # leaves it higher).
         non_main_big = score_candidate(
-            "widget.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY
+            "widget.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False,
         )
         assert big > non_main_big
 

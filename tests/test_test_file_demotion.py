@@ -43,6 +43,10 @@ def _score(path, tokens, *, demote):
     return score_candidate(path, 4000, tokens, _EMPTY, _ENTRY, demote_tests=demote)
 
 
+MIN_SCORE_THRESHOLD = __import__(
+    "neo.context_gatherer", fromlist=["x"]).MIN_SCORE_THRESHOLD
+
+
 class TestIsTestPath:
     @pytest.mark.parametrize("path", [
         "tests/test_engine.py",
@@ -155,11 +159,54 @@ class TestScoringDemotion:
             assert (_score(path, self._TOKENS, demote=True)
                     == _score(path, self._TOKENS, demote=False))
 
-    def test_demotion_is_off_by_default(self):
-        """The existing pure-scoring tests call `score_candidate` positionally
-        and must keep their meaning."""
-        assert (score_candidate("tests/test_x.py", 4000, self._TOKENS, _EMPTY, _ENTRY)
-                == _score("tests/test_x.py", self._TOKENS, demote=False))
+    def test_demote_tests_is_required_and_keyword_only(self):
+        """It was briefly optional-defaulting-to-False, so that the existing
+        pure-scoring tests would not need editing.
+
+        That is a production default shaped around test convenience, and the
+        default was the buggy behaviour: the call site reads
+        `not prompt_targets_tests(...)`, so a forgotten argument fails OPEN
+        toward the defect being fixed. One production caller; no reason for a
+        default at all.
+        """
+        with pytest.raises(TypeError):
+            score_candidate("tests/test_x.py", 4000, self._TOKENS, _EMPTY, _ENTRY)
+        with pytest.raises(TypeError):
+            score_candidate("tests/test_x.py", 4000, self._TOKENS,
+                            _EMPTY, _ENTRY, True)
+
+
+class TestDemotionReRanksButNeverEvicts:
+    """`MIN_SCORE_THRESHOLD` drops a file from context entirely, and both
+    metrics used to justify this change -- rank of the first source file,
+    count of tests and docs in the top 10 -- improve monotonically when a file
+    DISAPPEARS. Neither could detect that cost, so it has to be pinned here.
+
+    Measured before the floor: a one-hit test file at depth 1 went 0.55 ->
+    0.19 against a 0.2 threshold. Not demoted; deleted.
+    """
+
+    _TOKENS = {"widget"}
+
+    def test_a_file_that_would_be_admitted_stays_admitted(self):
+        plain = _score("tests/test_widget.py", self._TOKENS, demote=False)
+        demoted = _score("tests/test_widget.py", self._TOKENS, demote=True)
+
+        assert plain >= MIN_SCORE_THRESHOLD
+        assert demoted >= MIN_SCORE_THRESHOLD, "the penalty evicted rather than re-ranked"
+        assert demoted < plain, "...but it must still rank lower"
+
+    def test_a_file_that_would_be_dropped_anyway_is_unaffected(self):
+        """The floor must not RESCUE a file the score already rejected."""
+        plain = _score("tests/deep/nested/test_x.py", set(), demote=False)
+        demoted = _score("tests/deep/nested/test_x.py", set(), demote=True)
+
+        assert plain < MIN_SCORE_THRESHOLD
+        assert demoted < MIN_SCORE_THRESHOLD
+
+    def test_the_floor_does_not_apply_to_non_test_files(self):
+        low = _score("src/neo/z.py", set(), demote=True)
+        assert low < MIN_SCORE_THRESHOLD
 
 
 class TestBothPathsShareOneRule:
