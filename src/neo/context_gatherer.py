@@ -32,14 +32,49 @@ DISCRIMINATIVE_MAX_LINE_FRACTION = 0.25  # A token on >25% of a file's lines is 
 TEST_PENALTY = 0.4         # Multiplier; a test file retains 60% of its score
 
 
+# Test-file conventions across the languages neo indexes. Anchored on
+# component and word boundaries, because the first version was
+# `rel_path.startswith("test")` -- an unanchored prefix with no separator,
+# which is the same defect class as `"spec" in prompt` matching "in-spec-tor".
+# Measured against real conventions, that version was wrong on 9 of 11 cases:
+# it missed Go, .NET, JS/TS, Jest, RSpec and JUnit entirely, and claimed
+# `testdata/`, `testing/` and `testbed/` -- ordinary source directories -- as
+# tests.
+#
+# It looked correct only because the corpus it was measured on is a single
+# Python repo, where it matched 99 of 295 files with no false positives.
+_TEST_DIR_NAMES = frozenset({"test", "tests", "spec", "specs", "__tests__"})
+_TEST_BASENAME_RE = re.compile(
+    r"""
+      ^test_                 # Python:  test_foo.py
+    | _test\.                # Go:      foo_test.go
+    | _spec\.                # RSpec:   user_spec.rb
+    | \.test\.               # Jest:    foo.test.ts
+    | \.spec\.               # Angular: foo.spec.ts
+    | ^Test[A-Z0-9]          # JUnit:   TestFoo.java
+    | Tests?\.               # .NET:    FooTests.cs / FooTest.cs
+    """,
+    re.VERBOSE,
+)
+
+
 def is_test_path(rel_path: str) -> bool:
-    """Whether `rel_path` looks like a test file."""
-    return (
-        rel_path.startswith("test")
-        or rel_path.startswith("tests" + os.sep)
-        or "/tests/" in rel_path
-        or os.path.basename(rel_path).startswith("test_")
-    )
+    """Whether `rel_path` looks like a test file, in any language neo indexes.
+
+    Matched on whole path COMPONENTS and on basename boundaries, never on a
+    bare prefix. `testdata/`, `testing/` and `testbed/` are ordinary source
+    directories and must survive; `Foo.Tests/` is not.
+    """
+    parts = [part for part in re.split(r"[\\/]", rel_path) if part]
+    if not parts:
+        return False
+
+    for component in parts[:-1]:
+        lowered = component.lower()
+        if lowered in _TEST_DIR_NAMES or lowered.endswith(".tests"):
+            return True
+
+    return bool(_TEST_BASENAME_RE.search(parts[-1]))
 
 
 # Word-boundary anchored, which the substring version this replaces was not.
@@ -574,7 +609,7 @@ def infer_language(path: str) -> Optional[str]:
 
 def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
                     git_recent: set[str], entry_points: set[str],
-                    demote_tests: bool = False) -> float:
+                    *, demote_tests: bool) -> float:
     """Score a candidate file for relevance.
 
     `demote_tests` applies the same `TEST_PENALTY` the ProjectIndex boost has
@@ -584,14 +619,32 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     subject's filename tokens -- `test_car_adapter.py` matches {adapter, car}
     where `adapters.py` matches {adapter} -- so on the keyword path it can
     only ever outrank the code it tests, and then the implementation takes a
-    size penalty on top. Measured over 12 code prompts: the first source file
-    ranked 4.50 on average, and 5.58 of the top 10 slots went to tests and
-    docs. With the penalty applied: 1.75 and 4.41. Doc-seeking prompts
-    improve too (2.16 -> 3.00 docs in the top 10), because demoting tests
-    leaves room rather than competing with documentation.
+    size penalty on top.
 
-    Off by default so the existing pure-scoring tests keep their meaning; the
-    gatherer passes it per prompt via `prompt_targets_tests`.
+    Measured over 12 self-chosen code prompts on THIS repo: the first source
+    file ranked 4.50 on average and 5.58 of the top 10 slots went to tests and
+    docs; with the penalty, 1.75 and 4.41. Six doc-seeking prompts went
+    2.16 -> 3.00 docs in the top 10, because demoting tests leaves room rather
+    than competing with documentation. Treat those numbers as DIRECTIONAL: the
+    prompts are self-chosen and unlabelled, the corpus is a single Python
+    repo, and a mean over an unbounded rank is dominated by its worst case.
+    The harness is not in the tree, so nobody -- including the author -- can
+    re-run them as written.
+
+    Keyword-only and REQUIRED. It was briefly optional-defaulting-to-False so
+    that existing pure-scoring tests would not need editing -- which is a
+    production default shaped around test convenience, and the default was the
+    buggy behaviour. The call site reads `not prompt_targets_tests(...)`, so a
+    forgotten argument would have failed open toward exactly the defect this
+    fixes. One production caller; no reason for a default at all.
+
+    The penalty RE-RANKS and must not EVICT. Scaling bonuses can push a file
+    under `MIN_SCORE_THRESHOLD`, which drops it from context entirely: a test
+    file with one token hit at depth 1 goes 0.55 -> 0.19 against a 0.2 floor.
+    Both metrics used to justify this change -- rank of the first source file,
+    count of tests and docs in the top 10 -- improve monotonically when a file
+    DISAPPEARS, so neither could have detected that cost. A file that would
+    have been admitted stays admitted, ranked below everything else.
     """
     score = 0.0
     name_lower = rel_path.lower()
@@ -651,7 +704,15 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
 
     # Demote tests, unless the prompt is about testing. Same constant and
     # same predicate as the ProjectIndex boost path -- see `is_test_path`.
+    # The multiplier lands here, on the accumulated BONUSES and before the
+    # additive penalties below, so it does not shrink those penalties too.
+    # `forfeited` records what it removed; the floor is applied at the end,
+    # because everything after this line is subtractive and a floor applied
+    # here would be eaten by the depth penalty (measured: 0.24 -> 0.19,
+    # straight back under the threshold).
+    forfeited = 0.0
     if demote_tests and is_test_path(rel_path):
+        forfeited = score * (1.0 - TEST_PENALTY)
         score *= TEST_PENALTY
 
     # Penalize by depth
@@ -662,6 +723,14 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     # anti-correlated with relevance. BugLocator's rVSM (ICSE 2012) ranks
     # larger files HIGHER for this exact task; BM25's `b` handles the real
     # concern with bounded, corpus-derived length normalization.
+
+    # Re-rank, never evict. `score + forfeited` reconstructs the undemoted
+    # final score exactly, because every step after the multiplier is
+    # additive. A test file that would have been admitted without the penalty
+    # stays admitted, ranked beneath everything above the threshold; one that
+    # would have been dropped anyway is unaffected.
+    if forfeited and score + forfeited >= MIN_SCORE_THRESHOLD:
+        score = max(score, MIN_SCORE_THRESHOLD)
 
     return max(0.0, score)
 
@@ -979,7 +1048,12 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # with no diff text and could never be verified or learned from.
     explicit_paths = extract_explicit_paths(config.prompt)
 
-    # One decision per run, shared with the ProjectIndex boost path below.
+    # Computed once here. The ProjectIndex boost path calls the same pure
+    # function on the same argument rather than receiving this value, so the
+    # two agree by construction -- but the earlier comment claimed they
+    # "shared" a decision that was never passed anywhere, and in a file whose
+    # thesis is that two copies drift, an unearned claim of sharing is the
+    # rot starting.
     demote_tests = not prompt_targets_tests(config.prompt)
 
     # Score all candidates

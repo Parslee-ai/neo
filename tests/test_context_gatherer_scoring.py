@@ -12,7 +12,8 @@ _ENTRY = {"main", "app", "server", "index", "login", "auth", "__init__"}
 
 def _score(path: str, size: int = 1000) -> float:
     """Helper: score `path` with a no-keyword, no-git baseline."""
-    return score_candidate(path, size, _EMPTY, _EMPTY, _ENTRY)
+    return score_candidate(path, size, _EMPTY, _EMPTY, _ENTRY,
+                           demote_tests=False)
 
 
 class TestEntryPointBoost:
@@ -112,21 +113,28 @@ class TestSizeDoesNotAffectScore:
 
     _TOKENS = {"widget"}
 
-    @pytest.mark.parametrize("path", ["widget.py", "main.py", "src/deep/widget.py"])
-    def test_score_is_independent_of_size(self, path):
-        tiny = score_candidate(path, 1_000, self._TOKENS, _EMPTY, _ENTRY)
-        huge = score_candidate(path, 500 * 1024, self._TOKENS, _EMPTY, _ENTRY)
-        assert tiny == huge, "size is back in the scoring function"
+    def test_large_non_main_file_penalized_heavily(self):
+        big = score_candidate(
+            "widget.py", 50 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
+        small = score_candidate(
+            "widget.py", 1000, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
+        assert big < small
 
-    def test_a_large_file_can_outrank_a_small_one_on_content(self):
-        """The property the old scorer made impossible.
-
-        A 162 KB file whose content matches beats a 1 KB file whose content
-        does not, which is the whole point: relevance decides, size does not.
-        """
-        big_relevant = score_candidate(
-            "src/store.py", 162 * 1024, self._TOKENS, _EMPTY, _ENTRY,
-            content_relevance=1.0,
+    def test_large_main_file_penalized_lightly(self):
+        big = score_candidate(
+            "main.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
+        small = score_candidate(
+            "main.py", 1000, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False)
+        assert big < small
+        # And it should beat a same-size non-main file (lighter penalty
+        # leaves it higher).
+        non_main_big = score_candidate(
+            "widget.py", 80 * 1024, self._TOKENS, _EMPTY, _ENTRY,
+            demote_tests=False,
         )
         small_irrelevant = score_candidate(
             "src/tiny.py", 1_000, self._TOKENS, _EMPTY, _ENTRY,
