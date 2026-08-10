@@ -554,15 +554,43 @@
   `LMAdapter` installed in the engine's own `self.lm` slot), because a renderer that
   walked the context dict would be a second implementation of the seven prompt
   builders, free to drift the moment one changed — the duplicated-rule shape that put
-  `EXCLUDED_DIR_NAMES` in two places. `DryRunComplete` derives from `BaseException`,
+  `EXCLUDED_DIR_NAMES` in two places. What it shows is the adapter's INPUT, not the
+  wire payload: Anthropic hoists `system` into a separate kwarg, Google remaps roles,
+  Ollama flattens, CAR adds `intent_json`, and no provider is resolved at all because
+  the flag deliberately requires no credentials. The output says so rather than
+  claiming exactness it cannot have.
+  `DryRunComplete` derives from `BaseException`,
   not `Exception`: `_process_guarded` converts anything its `except Exception` catches
   into a `FAILED` lifecycle event, and reporting a dry run as a crash would be one
-  more way of misdescribing the run. **A dry run mutates nothing** — the old
-  implementation had that for free by never reaching the engine, so `dry_run=True`
-  now skips `detect_implicit_feedback`, the one pre-inference call that both changes
-  confidence and saves. Pinned by `test_dry_run_skips_the_one_call_that_saves`; the
-  file-diffing test beside it is a backstop only and stays green either way, because
-  that call is a no-op without a prior session.
+  more way of misdescribing the run. An ordinary exception is NOT a safe substitute —
+  `_deliberate` has its own `except Exception` that would swallow it and silently
+  fall back to the fast path.
+  **The panel is forced OFF** under `dry_run`. This is correctness, not tidiness:
+  `_build_car_role_factory` calls `create_adapter("car", model=m)` per role and uses
+  `self.lm` only as the fallback, so `RecordingLM` never intercepts it. With
+  `car-server` reachable — the normal setup here, since the observer autostarts off
+  it — a novel prompt under `--dry-run` ran the full panel against real models, spent
+  real money, never raised `DryRunComplete`, and printed ordinary output. Measured: 4
+  real adapters built. It is also the honest scope, since the panel's later prompts
+  are built from earlier model responses and cannot be shown without making the calls
+  the flag exists to avoid.
+  **A dry run does not modify the fact store**, which is narrower than "mutates
+  nothing" and is the claim that survives measurement. The old implementation got it
+  for free by never constructing a `FactStore`; `FactStore.initialize` runs
+  `prune_stale_facts` → `demote_unhelpful_facts` → `purge_dead_facts` and then
+  **saves**, and `demote_unhelpful_facts` lowers confidence and invalidates facts — so
+  reaching the engine at all meant a "read-only" inspection was aging the store it
+  inspected. `FactStore(read_only=True)` makes `save()` a no-op at the single write
+  choke point, which a new caller cannot forget; `dry_run` also skips
+  `detect_implicit_feedback`. Retrieval still marks facts accessed in memory, and
+  `metrics.jsonl` still records the run — deliberately: the two events it writes
+  (`execution_context_resolved`, `retrieve`) are read by neither `citation-stats`
+  (which filters `citation_survival`) nor `learning-stats` (which reads the episode
+  ledger), so observability costs nothing here.
+  Under `--json` the report is the single stdout document and a terminal `completed`
+  event is emitted, because writing prose to stderr broke both `--json` invariants at
+  once: zero documents on stdout, and every source line beginning with `{` became a
+  counterfeit event.
 - Project index (`index/project_index.py`, `index/language_parser.py`; full
   notes in `docs/tree-sitter-setup.md`). Three invariants, each of which was
   violated and each of which produced an index that could not answer a question

@@ -305,7 +305,19 @@ class FactStore:
         facts_dir: Optional[Path] = None,
         episodes_dir: Optional[Path] = None,
         emit_metrics: bool = True,
+        read_only: bool = False,
     ):
+        # `read_only` makes `save()` a no-op. It exists for `--dry-run`, which
+        # promises to report what Neo would do without perturbing what Neo
+        # knows. Asserting that in a docstring was not enough: `initialize()`
+        # runs `prune_stale_facts` -> `demote_unhelpful_facts` ->
+        # `purge_dead_facts` and then SAVES, and `demote_unhelpful_facts`
+        # lowers confidence and invalidates facts. That fires before any
+        # inference, so a "read-only" inspection was aging the very store it
+        # was inspecting. Enforcing it at the single write choke point is
+        # ~3 lines and cannot be forgotten by a new caller, which threading a
+        # flag through every retrieval path could.
+        self.read_only = read_only
         self.codebase_root = codebase_root
         self._config = config
         self._lm_adapter = lm_adapter
@@ -2541,6 +2553,8 @@ class FactStore:
     def save(self) -> None:
         """Save facts to scoped JSON files.
 
+        A no-op when ``read_only`` is set; see ``__init__``.
+
         EVERY scope file is written with a best-effort merge (not just global):
         re-read the file and preserve any fact present on disk but absent from
         memory, so a concurrent writer's *additions* survive. This matters most
@@ -2579,6 +2593,8 @@ class FactStore:
         (favor recorded reinforcement), not a lossless merge; lossless would
         need a per-fact operation log, which is a deliberate non-goal.
         """
+        if self.read_only:
+            return
         for path, scope in (
             (self._global_path, FactScope.GLOBAL),
             (self._org_path, FactScope.ORG),

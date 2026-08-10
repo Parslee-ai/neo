@@ -296,6 +296,7 @@ class TestRankingPolicyStaysSingleSourced:
 
     def test_both_retrieval_paths_produce_the_same_ordering(self):
         import time
+        from unittest.mock import patch
 
         import numpy as np
 
@@ -308,7 +309,14 @@ class TestRankingPolicyStaysSingleSourced:
         query = np.random.rand(16)
         now = time.time()
 
-        assembled = ContextAssembler()._score_facts(facts, query)
+        # `now` is pinned rather than captured twice. Recall decay is a
+        # function of elapsed time, so two `time.time()` calls make the
+        # comparison depend on wall-clock drift between them -- green on a
+        # quiet laptop, a coin-flip on a loaded CI runner, and the failure
+        # would read as "my change broke ranking". That is the #183 shape,
+        # and #183 is why latency is no longer a correctness gate here.
+        with patch("neo.memory.context.time.time", return_value=now):
+            assembled = ContextAssembler()._score_facts(facts, query)
         sims = batched_cosine([f.embedding for f in facts], query)
         direct = sorted(
             [(f, rank_score(f, s, now)) for f, s in zip(facts, sims)],
@@ -316,9 +324,8 @@ class TestRankingPolicyStaysSingleSourced:
         )
 
         assert [f.id for f, _ in assembled] == [f.id for f, _ in direct]
-        # Scores agree to floating-point noise; they differ only by the
-        # microseconds between the two `now` captures feeding recall decay.
-        assert max(abs(a - b) for (_, a), (_, b) in zip(assembled, direct)) < 1e-6
+        # Identical inputs and one clock: exact equality, no tolerance.
+        assert [s for _, s in assembled] == [s for _, s in direct]
 
     def test_no_module_recomputes_the_formula_inline(self):
         """The structural half. The differential above only compares the two
@@ -327,18 +334,34 @@ class TestRankingPolicyStaysSingleSourced:
         """
         import pathlib
 
+        import ast
+
         src = pathlib.Path(__file__).resolve().parents[1] / "src" / "neo"
+        # By PATH, not by name: `src/neo/models.py` and
+        # `src/neo/memory/models.py` both exist, so a name check exempted the
+        # wrong file too and a formula pasted into the former was invisible.
+        definition_site = src / "memory" / "models.py"
+
         offenders = []
         for path in src.rglob("*.py"):
-            if path.name == "models.py":
-                continue  # the one legitimate definition site
-            text = path.read_text()
-            for lineno, line in enumerate(text.splitlines(), 1):
-                stripped = line.strip()
-                if stripped.startswith("#") or stripped.startswith(('"', "'")):
+            if path == definition_site:
+                continue
+            # Parsed, not grepped. A line filter cannot tell a call from
+            # prose: `success_bonus(...)` inside a multi-line docstring, or a
+            # trailing `# not success_bonus(x)`, both read as offenders, and
+            # the `startswith` guard only ever skipped a docstring's FIRST
+            # line. The AST sees calls and nothing else.
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:  # pragma: no cover - not our file to fix
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
                     continue
-                if "success_bonus(" in line or "provenance_bonus(" in line:
-                    offenders.append(f"{path.relative_to(src)}:{lineno}")
+                func = node.func
+                name = getattr(func, "id", None) or getattr(func, "attr", None)
+                if name in ("success_bonus", "provenance_bonus"):
+                    offenders.append(f"{path.relative_to(src)}:{node.lineno}")
 
         assert not offenders, (
             "the ranking formula is being recomputed outside models.py: "
