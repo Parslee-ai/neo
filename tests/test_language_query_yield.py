@@ -27,15 +27,20 @@ Five languages -- java, go, c, ruby, php -- have no corpus anywhere in the
 local checkout, so until this file they had never been run against source in
 any form, only compiled.
 
-**Standing limit**: that is still true of the CORPUS, not of the queries. The
-fixtures here are hand-written, so every query is exercised against code
-somebody wrote to exercise it. A hand-written fixture cannot surface the
-constructs a real codebase uses and the fixture author did not think of -- an
-`extends` with a generic parameter, a namespaced base class, a mixin applied
-through `Module.included`. So a green run means "the query works on the shapes
-we know about", not "the query is complete". When a real ruby or php
-repository becomes available, re-run the yield measurement against it before
-trusting these numbers.
+**Standing limit, narrower than it first looked.** No ruby or php source
+exists anywhere in the local checkout, which is why these languages went
+unvalidated. But the GRAMMARS are installed, so "wait for a real repository"
+was the wrong conclusion and it cost real bugs: the first version of these
+fixtures used a bare `class Impl < Base` and a bare `implements Greeter`, so
+they agreed with queries that silently dropped `ActiveRecord::Base` and
+`\\Foo\\Bar` -- every namespaced supertype in both ecosystems. A fixture
+written by the query's author proves the query matches the fixture.
+
+The fixtures are now framework-shaped rather than minimal: Rails
+(`< ActiveRecord::Base`, `include ActiveSupport::Concern`) and PSR/Laravel
+(`extends \\Foo\\BaseImpl implements \\ArrayAccess`, an 8.1 enum, a trait
+`use`). Write the next one the same way -- copy a real declaration from a real
+framework, do not invent a tidy one.
 """
 
 import pathlib
@@ -85,6 +90,11 @@ int add(int a, int b) { return a + b; }
 
 int main(void) { printf("%d", add(1, 2)); return 0; }
 """,
+    # Framework-shaped, not hand-shaped. The first version of this fixture
+    # used a bare `class Impl < Base` and a bare `include Greetable`, so it
+    # agreed with a query that could not see `ActiveRecord::Base` -- a fixture
+    # written by the query's author proves the query matches the fixture and
+    # nothing else. `scope_resolution` is what real Ruby looks like.
     "ruby": """require 'set'
 require_relative 'helper'
 
@@ -94,14 +104,10 @@ module Greetable
   end
 end
 
-class Base
-  def seed
-    1
-  end
-end
-
-class Impl < Base
+class ApplicationRecord < ActiveRecord::Base
+  include ActiveSupport::Concern
   include Greetable
+  extend Forwardable
 
   def initialize(n)
     @n = n
@@ -112,6 +118,8 @@ class Impl < Base
   end
 end
 """,
+    # PSR/Laravel-shaped. The earlier fixture had no namespaced supertype, so
+    # it agreed with a query that silently dropped every one of them.
     "php": """<?php
 namespace App;
 
@@ -120,11 +128,15 @@ use App\\Support\\Str;
 
 function helper(int $x): int { return $x + 1; }
 
-interface Extended extends Greeter {}
+interface Extended extends \\Psr\\Log\\LoggerInterface {}
 
-abstract class BaseImpl {}
+trait Loggable { public function log(): void {} }
 
-class Impl extends BaseImpl implements Greeter, Countable {
+enum Status: string implements Greeter { case Active = 'active'; }
+
+class Impl extends \\Foo\\BaseImpl implements \\ArrayAccess, Countable {
+    use Loggable;
+
     public function greet(string $n): string { return "hi $n"; }
     private function total(array $xs): int { return count($xs); }
 }
@@ -277,27 +289,38 @@ class TestClosedCoverageGaps:
         assert set(QUERIES) - set(EDGE_QUERIES) == set()
 
     def test_php_extracts_inheritance_and_interfaces(self):
-        """`class Impl extends BaseImpl implements Greeter, Countable` and
-        `interface Extended extends Greeter` all yield edges now. Previously
-        php declared only `imports`, so every php class hierarchy was absent.
+        """Namespaced supertypes are the point.
 
-        Asserted on `edge_type`, the field `CodeEdge` actually declares -- an
-        earlier version read `getattr(e, "kind", getattr(e, "type", ""))`,
-        neither of which exists, so the set was always `{""}` and the
-        assertion could not fail.
+        `class Impl extends \\Foo\\BaseImpl implements \\ArrayAccess,
+        Countable` yielded exactly ONE edge before this -- `Impl implements
+        Countable` -- because the pattern required `name` as a direct child of
+        `base_clause` and the real shape is `base_clause -> qualified_name ->
+        name`. Silent PARTIAL extraction, which is worse than a total miss:
+        the consumer sees a plausible answer with no signal that two thirds of
+        it is absent. Exactly what the `_CS_BASE_TYPES` comment 150 lines
+        above the query warns about.
         """
         source = FIXTURES["php"]
         path = pathlib.Path(tempfile.mkdtemp()) / "a.php"
         path.write_text(source)
         edges = parser_edges(path, source)
 
-        assert {e.edge_type for e in edges} == {"imports", "inherits", "implements"}
-        assert ("Impl", "BaseImpl") in {(e.source_symbol, e.target_symbol)
-                                        for e in edges if e.edge_type == "inherits"}
-        assert {"Greeter", "Countable"} <= {e.target_symbol for e in edges
-                                            if e.edge_type == "implements"}
+        inherits = {(e.source_symbol, e.target_symbol)
+                    for e in edges if e.edge_type == "inherits"}
+        implements = {(e.source_symbol, e.target_symbol)
+                      for e in edges if e.edge_type == "implements"}
+
+        assert ("Impl", "BaseImpl") in inherits          # namespaced extends
+        assert ("Extended", "LoggerInterface") in inherits  # interface extends
+        assert ("Impl", "ArrayAccess") in implements     # namespaced interface
+        assert ("Impl", "Countable") in implements       # bare interface
+        assert ("Status", "Greeter") in implements       # PHP 8.1 enum
+        assert ("Impl", "Loggable") in implements        # trait use
 
     def test_ruby_extracts_requires_inheritance_and_mixins(self):
+        """`class ApplicationRecord < ActiveRecord::Base` is the single most
+        common inheritance statement in the Ruby ecosystem and produced no
+        edge at all until the `scope_resolution` arm was added."""
         source = FIXTURES["ruby"]
         path = pathlib.Path(tempfile.mkdtemp()) / "a.rb"
         path.write_text(source)
@@ -308,9 +331,11 @@ class TestClosedCoverageGaps:
             by_type.setdefault(edge.edge_type, set()).add(edge.target_symbol)
 
         assert by_type["imports"] == {"set", "helper"}
-        assert ("Impl", "Base") in {(e.source_symbol, e.target_symbol)
-                                    for e in edges if e.edge_type == "inherits"}
-        assert "Greetable" in by_type["implements"]
+        assert ("ApplicationRecord", "Base") in {
+            (e.source_symbol, e.target_symbol)
+            for e in edges if e.edge_type == "inherits"
+        }
+        assert {"Concern", "Greetable", "Forwardable"} <= by_type["implements"]
 
     def test_ruby_import_predicate_is_enforced(self):
         """`require` is an ordinary method call, so the pattern matches any
