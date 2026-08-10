@@ -25,7 +25,7 @@ Limits: commit subjects are terser and better-formed than real prompts; ground
 truth is what a commit CHANGED, a subset of what a developer needed to READ;
 content is read at HEAD while the commit is historical.
 
-See docs/plans/2026-08-10-file-selection-retrieval-plan.md.
+Diagnosis and plan: ~/git/working/2026-08-10-neo-file-selection-plan.md
 """
 
 import json
