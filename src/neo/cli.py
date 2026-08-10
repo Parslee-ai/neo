@@ -695,6 +695,29 @@ def _configure_logging(args) -> None:
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
 
+def _report_dry_run(args, calls) -> None:
+    """Single exit for every dry-run report, in both output modes.
+
+    One function because there are TWO ways a dry run ends -- a recorded
+    call, and `process()` returning without ever making one (VERIFY, or the
+    budget-skip branch) -- and the second was missing the `--json` handling
+    the first had.
+    """
+    if args.json:
+        print(json.dumps({
+            "dry_run": True,
+            "calls": calls,
+            "note": (
+                "messages as Neo hands them to the adapter; the provider "
+                "adapter restructures them (Anthropic hoists system, Google "
+                "remaps roles, Ollama flattens, CAR adds intent_json)"
+            ),
+        }, indent=2))
+        _emit_dry_run_terminal_event()
+    else:
+        print(render(calls), file=sys.stderr)
+
+
 def _emit_dry_run_terminal_event() -> None:
     """Close the JSONL stream a dry run opened.
 
@@ -705,7 +728,18 @@ def _emit_dry_run_terminal_event() -> None:
     """
     from neo.events import JsonlSink, NeoEvent, NeoEventType
 
-    JsonlSink(sys.stderr).emit(NeoEvent(
+    sink = JsonlSink(sys.stderr)
+    # Close `reasoning` first. Invariant 3 ("every phase_completed has a
+    # phase_started") survives without this, but the converse does not: the
+    # dry run raises out of an OPEN reasoning phase, so a host tracking open
+    # phases is left with one that never closes.
+    sink.emit(NeoEvent(
+        type=NeoEventType.PHASE_COMPLETED,
+        phase="reasoning",
+        message="dry run: stopped before inference",
+        data={"status": "dry_run"},
+    ))
+    sink.emit(NeoEvent(
         type=NeoEventType.COMPLETED,
         message="dry run: context assembled, no inference performed",
     ))
@@ -1218,7 +1252,14 @@ def main():
                 # and the budget-skip branch closes reasoning as `skipped`.
                 # Without this the command exits 0 having printed ordinary
                 # output, and the operator reads it as the dry-run report.
-                print(render([]), file=sys.stderr)
+                #
+                # Routed through the same helper as the recorded-call branch.
+                # It previously inlined `render([])` to stderr with no --json
+                # handling, so `--stdin-json --json --dry-run` in VERIFY mode
+                # emitted zero stdout documents -- the identical invariant
+                # break, on the same command, fixed on one path and not its
+                # twin five lines away.
+                _report_dry_run(args, [])
                 sys.exit(0)
         except DryRunComplete as complete:
             # Not an error path. `DryRunComplete` is a BaseException so the
@@ -1234,20 +1275,7 @@ def main():
             # because the engine raised past its own COMPLETED emit, and
             # STARTED-then-silence is precisely what a host cannot
             # distinguish from a crash or a hang.
-            if args.json:
-                print(json.dumps({
-                    "dry_run": True,
-                    "calls": complete.calls,
-                    "note": (
-                        "messages as Neo hands them to the adapter; the "
-                        "provider adapter restructures them (Anthropic "
-                        "hoists system, Google remaps roles, Ollama "
-                        "flattens, CAR adds intent_json)"
-                    ),
-                }, indent=2))
-                _emit_dry_run_terminal_event()
-            else:
-                print(render(complete.calls), file=sys.stderr)
+            _report_dry_run(args, complete.calls)
             sys.exit(0)
     except TimeoutError as e:
         error_output = {

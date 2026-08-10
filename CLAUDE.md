@@ -582,15 +582,26 @@
   reaching the engine at all meant a "read-only" inspection was aging the store it
   inspected. `FactStore(read_only=True)` makes `save()` a no-op at the single write
   choke point, which a new caller cannot forget; `dry_run` also skips
-  `detect_implicit_feedback`. Retrieval still marks facts accessed in memory, and
-  `metrics.jsonl` still records the run — deliberately: the two events it writes
-  (`execution_context_resolved`, `retrieve`) are read by neither `citation-stats`
-  (which filters `citation_survival`) nor `learning-stats` (which reads the episode
-  ledger), so observability costs nothing here.
-  Under `--json` the report is the single stdout document and a terminal `completed`
-  event is emitted, because writing prose to stderr broke both `--json` invariants at
-  once: zero documents on stdout, and every source line beginning with `{` became a
-  counterfeit event.
+  `detect_implicit_feedback` and `_complete_learning_episode`. Retrieval still marks
+  facts accessed in memory, and `metrics.jsonl` still records the run —
+  deliberately: the two events it writes (`execution_context_resolved`, `retrieve`)
+  are read by neither `citation-stats` (which filters `citation_survival`) nor
+  `learning-stats` (which reads the episode ledger), so observability costs nothing.
+  **That argument was measured on the fast path and briefly untrue on another.**
+  VERIFY mode reasons without an LM call, so `process()` returns NORMALLY and never
+  raises `DryRunComplete`; `_complete_learning_episode` then wrote an episode file
+  AND a `citation_survival` metric — the exact two surfaces the sentence above
+  claims are untouched. Measured on a clean HOME: 1 episode, 1 `citation_survival`.
+  Gating that call is what makes the claim true; do not narrow the gate to the
+  recorded-call path.
+  Under `--json` the report is the single stdout document (`{dry_run, calls, note}`
+  — a second schema, discriminated by `dry_run: true`, with no `orchestrator` key;
+  `test_host_adapter_parity.py` does not know about it) and a terminal
+  `phase_completed(reasoning)` + `completed` pair is emitted. Writing prose to
+  stderr broke both `--json` invariants at once: zero documents on stdout, and every
+  source line beginning with `{` became a counterfeit event. **Both dry-run exits
+  route through `cli._report_dry_run`** — there are two, the recorded call and the
+  normal return, and the second shipped without the `--json` handling the first had.
 - Project index (`index/project_index.py`, `index/language_parser.py`; full
   notes in `docs/tree-sitter-setup.md`). Three invariants, each of which was
   violated and each of which produced an index that could not answer a question
