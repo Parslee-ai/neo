@@ -551,12 +551,33 @@
   `pi_boost + hist_boost + _symbol_score` and applies an adaptive limit and a byte
   budget. A first-pass harness overstated R@10 by 0.14 against the real CLI. Validate
   any in-process replica against `--dry-run` output before trusting a sweep.
-- Debugging: `neo --dry-run "your query"` assembles the full context (file selection,
-  fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
-  the LM, then exits without making the LLM call. Faster iteration on context-gatherer
-  and retrieval changes than waiting for an inference round trip. **Use it before
-  believing any claim about what Neo "saw"** — the two defects below were both
-  invisible from the outside and presented as the model being unhelpful.
+- Debugging: `neo --dry-run "your query"` runs the real engine — file selection, fact
+  retrieval, constraints, four-layer assembly — and prints the **exact messages** that
+  would go to the provider, then exits without making the LLM call. Faster iteration on
+  context-gatherer and retrieval changes than waiting for an inference round trip.
+  **Use it before believing any claim about what Neo "saw"** — the two defects below
+  were both invisible from the outside and presented as the model being unhelpful.
+  This bullet described the tool's *intent* for a long time and not its behaviour: the
+  flag used to exit in `cli.main` **before the engine was constructed**, so three of
+  the four things listed above never ran and the output was the file list alone. The
+  Execution Envelope, retrieved facts, and the REPOSITORY CONTEXT block with its
+  truncation markers — the #178 work, whose entire point is that a cut be visible —
+  were all uninspectable through the tool built for inspecting them. An instrument
+  that under-reports sends the operator to the wrong knob, which is the same failure
+  as a cap that blames itself for an absence it did not cause.
+  **The prompt is recorded, never rebuilt** (`neo.dry_run.RecordingLM` is a real
+  `LMAdapter` installed in the engine's own `self.lm` slot), because a renderer that
+  walked the context dict would be a second implementation of the seven prompt
+  builders, free to drift the moment one changed — the duplicated-rule shape that put
+  `EXCLUDED_DIR_NAMES` in two places. `DryRunComplete` derives from `BaseException`,
+  not `Exception`: `_process_guarded` converts anything its `except Exception` catches
+  into a `FAILED` lifecycle event, and reporting a dry run as a crash would be one
+  more way of misdescribing the run. **A dry run mutates nothing** — the old
+  implementation had that for free by never reaching the engine, so `dry_run=True`
+  now skips `detect_implicit_feedback`, the one pre-inference call that both changes
+  confidence and saves. Pinned by `test_dry_run_skips_the_one_call_that_saves`; the
+  file-diffing test beside it is a backstop only and stays green either way, because
+  that call is a no-op without a prior session.
 - Project index (`index/project_index.py`, `index/language_parser.py`; full
   notes in `docs/tree-sitter-setup.md`). Three invariants, each of which was
   violated and each of which produced an index that could not answer a question

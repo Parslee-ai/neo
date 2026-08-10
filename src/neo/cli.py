@@ -38,6 +38,7 @@ from neo.models import (  # noqa: E402, F401
     CodeSuggestion, StaticCheckResult, NeoOutput, RegenerateStats, LMAdapter,
     ProposedChange, classify_task_type,
 )
+from neo.dry_run import DryRunComplete, RecordingLM, render  # noqa: E402
 from neo import progress  # noqa: E402
 from neo.operating_mode import AuthorityPolicy, OperatingMode  # noqa: E402
 from neo.execution_context import execution_fields_from_dict  # noqa: E402
@@ -708,6 +709,36 @@ def _configure_logging(args) -> None:
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
 
+def _print_selected_files(gathered) -> None:
+    """Report the gatherer's choice: which files, which lines, what score.
+
+    Kept even though the assembled prompt is printed in full below it. The
+    prompt shows the file CONTENT that survived; this shows the ranking that
+    produced it, including the score — the number an operator needs when the
+    right file is missing and they want to know whether it lost or was never
+    eligible.
+    """
+    print("\n=== DRY RUN: files selected, in rank order ===\n", file=sys.stderr)
+    for gf in gathered:
+        lines_info = f" (lines {gf.start}-{gf.end})" if gf.start else ""
+        print(
+            f"  {gf.rel_path}{lines_info} - {gf.bytes} bytes "
+            f"(score: {gf.score:.2f})",
+            file=sys.stderr,
+        )
+
+
+def _print_supplied_files(context_files) -> None:
+    """The same report for callers that supplied files instead of gathering."""
+    print("\n=== DRY RUN: files supplied by the caller ===\n", file=sys.stderr)
+    for cf in context_files:
+        content = cf.content or ""
+        print(
+            f"  {cf.path} - {len(content.encode('utf-8'))} bytes",
+            file=sys.stderr,
+        )
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # Parse arguments
@@ -1061,6 +1092,10 @@ def main():
         if not args.dry_run:
             _print_neo_greeting(prompt, working_dir)
 
+        # Bound before the branch: `--no-scan` skips the gatherer entirely and
+        # the dry-run report below still has to say something truthful.
+        gathered = []
+
         # Gather context from working directory unless --no-scan
         if not args.no_scan:
             from neo.context_gatherer import gather_context, gather_context_semantic, GatherConfig
@@ -1101,20 +1136,12 @@ def main():
             progress.note("Invoking LLM inference...")
 
             if args.dry_run:
-                print("\n=== DRY RUN: Context that would be sent ===\n", file=sys.stderr)
-                for gf in gathered:
-                    lines_info = f" (lines {gf.start}-{gf.end})" if gf.start else ""
-                    print(f"  {gf.rel_path}{lines_info} - {gf.bytes} bytes (score: {gf.score:.2f})", file=sys.stderr)
-                print(f"\nPrompt: {prompt[:200]}...\n", file=sys.stderr)
-                sys.exit(0)
+                _print_selected_files(gathered)
 
-        if args.dry_run:
-            print("\n=== DRY RUN: Context that would be sent ===\n", file=sys.stderr)
-            for cf in neo_input.context_files:
-                content = cf.content or ""
-                print(f"  {cf.path} - {len(content.encode('utf-8'))} bytes", file=sys.stderr)
-            print(f"\nPrompt: {prompt[:200]}...\n", file=sys.stderr)
-            sys.exit(0)
+        if args.dry_run and not gathered:
+            # No gatherer ran (explicit --file / stdin), so report what the
+            # caller supplied instead of printing nothing above the prompt.
+            _print_supplied_files(neo_input.context_files)
 
     if neo_input.operating_mode is OperatingMode.AGENT:
         print(json.dumps({
@@ -1148,8 +1175,17 @@ def main():
                 if cfg_level is not None:
                     logging.getLogger().setLevel(cfg_level)
 
+        # `--dry-run` resolves no provider and needs no credentials: it makes
+        # no call, so requiring an API key to find out what Neo would have
+        # sent is a barrier with nothing behind it. The old implementation got
+        # this by exiting before this line; now it is explicit, because moving
+        # the stop into the engine moved it PAST adapter construction and
+        # briefly reintroduced the requirement (caught by
+        # `test_no_scan_dry_run_does_not_require_api_key`).
         adapter = (
-            _VerificationOnlyAdapter()
+            RecordingLM()
+            if args.dry_run
+            else _VerificationOnlyAdapter()
             if neo_input.operating_mode is OperatingMode.VERIFY
             else resolve_adapter(config)
         )
@@ -1173,8 +1209,16 @@ def main():
             codebase_root=neo_input.working_directory,
             config=config,
             event_sink=JsonlSink(sys.stderr) if args.json else None,
+            dry_run=args.dry_run,
         )
-        output = engine.process(neo_input)
+        try:
+            output = engine.process(neo_input)
+        except DryRunComplete as complete:
+            # Not an error path. `DryRunComplete` is a BaseException so the
+            # engine's own `except Exception` cannot mistake assembly-finished
+            # for a crash; see `neo.dry_run`.
+            print(render(complete.calls), file=sys.stderr)
+            sys.exit(0)
     except TimeoutError as e:
         error_output = {
             "error": "RequestTimeout",

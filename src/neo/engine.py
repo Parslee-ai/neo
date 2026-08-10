@@ -186,8 +186,12 @@ class NeoEngine:
         config: Optional[Any] = None,  # NeoConfig instance
         execution_adapter: Optional[ExecutionAdapter] = None,
         event_sink: Optional[NeoEventSink] = None,
+        dry_run: bool = False,
     ):
         self.lm = lm_adapter
+        # Assemble for real, stop before inference, mutate nothing. See
+        # `neo.dry_run` for why the prompt is recorded rather than rebuilt.
+        self.dry_run = dry_run
         self.exemplar_index = exemplar_index
         self.context: Optional[NeoInput] = None
         self.enable_persistent_memory = enable_persistent_memory
@@ -1027,8 +1031,21 @@ class NeoEngine:
         # Store for outcome recording
         self.last_difficulty = difficulty
 
-        # Phase 0: Detect implicit feedback from request history
-        if self.persistent_memory and neo_input.operating_mode.allows_learning:
+        # Phase 0: Detect implicit feedback from request history.
+        #
+        # Skipped under `dry_run`. This is the one call before inference that
+        # both mutates fact confidence and SAVES, and `--dry-run` used to exit
+        # in the CLI before the engine existed, so it had no side effects at
+        # all. Gaining them while fixing what the flag reports would be a poor
+        # trade: an operator runs a dry run precisely when they do not want to
+        # perturb the thing they are inspecting. Retrieval still marks facts
+        # accessed in memory, which is why nothing on this path may save --
+        # pinned by `test_dry_run_does_not_mutate_the_fact_store`.
+        if (
+            self.persistent_memory
+            and neo_input.operating_mode.allows_learning
+            and not self.dry_run
+        ):
             current_request = {
                 "prompt": neo_input.prompt,
                 "timestamp": time.time(),
