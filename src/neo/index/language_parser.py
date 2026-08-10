@@ -431,10 +431,66 @@ EDGE_QUERIES = {
             (namespace_use_declaration
                 (namespace_use_clause (qualified_name) @module)) @import
         """,
+        # `base_clause` is `extends`, and BOTH declaration kinds carry it:
+        # `class X extends Y` and `interface X extends Y`. Covering only
+        # `class_declaration` compiles fine and silently drops every
+        # interface hierarchy — the shape that left C# inheritance missing
+        # from every index for months.
+        'inheritance': """
+            [
+                (class_declaration
+                    name: (name) @class_name
+                    (base_clause (name) @base))
+                (interface_declaration
+                    name: (name) @class_name
+                    (base_clause (name) @base))
+            ] @class_def
+        """,
+        # Separate node type from `base_clause`, and it holds a LIST:
+        # `implements Greeter, Countable` yields two `name` children.
+        'implements': """
+            (class_declaration
+                name: (name) @class_name
+                (class_interface_clause (name) @interface)) @class_def
+        """,
     },
-    # Ruby imports are method calls (`require`, `require_relative`) rather
-    # than syntactic forms — skipped here. Adding them would need either
-    # a method-call pattern match or a runtime-style heuristic.
+    'ruby': {
+        # Ruby has no syntactic import: `require` and `require_relative` are
+        # ordinary method calls, which is why this language had no edge
+        # queries at all and contributed nodes to the graph and never edges.
+        # The `#match?` predicate is what makes the method-call form
+        # tractable — without it the pattern matches every call taking a
+        # string, so `puts 'hello'` would become an import edge. Verified
+        # that the predicate is actually applied by this tree-sitter version
+        # rather than silently ignored: see
+        # `test_ruby_import_predicate_is_enforced`.
+        'imports': """
+            (call
+                method: (identifier) @_method
+                arguments: (argument_list (string) @module)
+                (#match? @_method "^(require|require_relative)$")) @import
+        """,
+        # `class Impl < Base`. The node type is `class`, not
+        # `class_declaration`, and the name is a `constant`.
+        'inheritance': """
+            (class
+                name: (constant) @class_name
+                (superclass (constant) @base)) @class_def
+        """,
+        # Ruby expresses "implements" as a mixin — `include`, `extend` and
+        # `prepend` are again method calls, inside the class body. Mapped to
+        # the `implements` edge type because that is what they mean to a
+        # reader: this class gains that module's interface.
+        'implements': """
+            (class
+                name: (constant) @class_name
+                (body_statement
+                    (call
+                        method: (identifier) @_method
+                        arguments: (argument_list (constant) @interface)
+                        (#match? @_method "^(include|extend|prepend)$")))) @class_def
+        """,
+    },
 }
 
 EDGE_QUERIES['tsx'] = EDGE_QUERIES['typescript']
