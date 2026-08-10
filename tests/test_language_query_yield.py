@@ -26,6 +26,16 @@ methods, no top-level function).
 Five languages -- java, go, c, ruby, php -- have no corpus anywhere in the
 local checkout, so until this file they had never been run against source in
 any form, only compiled.
+
+**Standing limit**: that is still true of the CORPUS, not of the queries. The
+fixtures here are hand-written, so every query is exercised against code
+somebody wrote to exercise it. A hand-written fixture cannot surface the
+constructs a real codebase uses and the fixture author did not think of -- an
+`extends` with a generic parameter, a namespaced base class, a mixin applied
+through `Module.included`. So a green run means "the query works on the shapes
+we know about", not "the query is complete". When a real ruby or php
+repository becomes available, re-run the yield measurement against it before
+trusting these numbers.
 """
 
 import pathlib
@@ -76,6 +86,7 @@ int add(int a, int b) { return a + b; }
 int main(void) { printf("%d", add(1, 2)); return 0; }
 """,
     "ruby": """require 'set'
+require_relative 'helper'
 
 module Greetable
   def greet(n)
@@ -83,7 +94,13 @@ module Greetable
   end
 end
 
-class Impl
+class Base
+  def seed
+    1
+  end
+end
+
+class Impl < Base
   include Greetable
 
   def initialize(n)
@@ -103,7 +120,11 @@ use App\\Support\\Str;
 
 function helper(int $x): int { return $x + 1; }
 
-class Impl implements Greeter {
+interface Extended extends Greeter {}
+
+abstract class BaseImpl {}
+
+class Impl extends BaseImpl implements Greeter, Countable {
     public function greet(string $n): string { return "hi $n"; }
     private function total(array $xs): int { return count($xs); }
 }
@@ -116,6 +137,12 @@ _EXT = {"java": ".java", "go": ".go", "c": ".c", "ruby": ".rb", "php": ".php"}
 @pytest.fixture(scope="module")
 def parser():
     return TreeSitterParser()
+
+
+def parser_edges(path, source):
+    """Module-level edge extraction, so the closure tests below can call it
+    without threading the fixture through."""
+    return TreeSitterParser().extract_edges(path, source) or []
 
 
 def _captures(parser, language, table, query_name):
@@ -237,40 +264,76 @@ class TestEndToEndYield:
         assert parser.extract_edges(path, source)
 
 
-class TestKnownCoverageGaps:
-    """Pinned so the gaps stay visible, and so closing one updates a test
-    rather than silently changing behaviour."""
+class TestClosedCoverageGaps:
+    """These two gaps were pinned as failing-when-fixed tests, and the pins
+    have now fired. Kept as the inverse assertions so a regression that
+    removes the queries fails here rather than going quiet -- which is the
+    whole failure mode this file exists for."""
 
-    def test_ruby_declares_no_edge_queries(self):
-        """Ruby is the only language with chunk queries and no edge queries,
-        so ruby files contribute nodes to the graph and never edges. Delete
-        this test when ruby edge queries land -- its failure is the signal
-        that the gap closed.
+    def test_every_language_with_chunks_also_declares_edges(self):
+        """Ruby used to be the sole exception, contributing nodes to the
+        graph and never edges: no require/inherit/mixin relationship from any
+        ruby file in any index."""
+        assert set(QUERIES) - set(EDGE_QUERIES) == set()
+
+    def test_php_extracts_inheritance_and_interfaces(self):
+        """`class Impl extends BaseImpl implements Greeter, Countable` and
+        `interface Extended extends Greeter` all yield edges now. Previously
+        php declared only `imports`, so every php class hierarchy was absent.
+
+        Asserted on `edge_type`, the field `CodeEdge` actually declares -- an
+        earlier version read `getattr(e, "kind", getattr(e, "type", ""))`,
+        neither of which exists, so the set was always `{""}` and the
+        assertion could not fail.
         """
-        assert set(QUERIES) - set(EDGE_QUERIES) == {"ruby"}
-
-    def test_php_has_imports_but_no_inheritance(self, parser):
-        """`class Impl implements Greeter` yields an edge in java, c_sharp
-        and typescript, and nothing in php.
-
-        Asserted on `edge_type`, the field `CodeEdge` actually declares. An
-        earlier version of this test read `getattr(e, "kind", getattr(e,
-        "type", ""))` -- neither attribute exists, so the set was always
-        `{""}` and the assertion could not fail. In a file whose subject is
-        "a query that matches nothing is indistinguishable from one that
-        failed to compile", that was an assertion indistinguishable from no
-        assertion.
-        """
-        assert set(EDGE_QUERIES["php"]) == {"imports"}
-
         source = FIXTURES["php"]
         path = pathlib.Path(tempfile.mkdtemp()) / "a.php"
         path.write_text(source)
-        edges = parser.extract_edges(path, source) or []
+        edges = parser_edges(path, source)
 
-        assert edges, "fixture should still yield import edges"
-        assert {e.edge_type for e in edges} == {"imports"}
+        assert {e.edge_type for e in edges} == {"imports", "inherits", "implements"}
+        assert ("Impl", "BaseImpl") in {(e.source_symbol, e.target_symbol)
+                                        for e in edges if e.edge_type == "inherits"}
+        assert {"Greeter", "Countable"} <= {e.target_symbol for e in edges
+                                            if e.edge_type == "implements"}
 
+    def test_ruby_extracts_requires_inheritance_and_mixins(self):
+        source = FIXTURES["ruby"]
+        path = pathlib.Path(tempfile.mkdtemp()) / "a.rb"
+        path.write_text(source)
+        edges = parser_edges(path, source)
+
+        by_type = {}
+        for edge in edges:
+            by_type.setdefault(edge.edge_type, set()).add(edge.target_symbol)
+
+        assert by_type["imports"] == {"set", "helper"}
+        assert ("Impl", "Base") in {(e.source_symbol, e.target_symbol)
+                                    for e in edges if e.edge_type == "inherits"}
+        assert "Greetable" in by_type["implements"]
+
+    def test_ruby_import_predicate_is_enforced(self):
+        """`require` is an ordinary method call, so the pattern matches any
+        call taking a string. Only the `#match?` predicate separates an
+        import from `puts 'hello'`.
+
+        If a future tree-sitter release stopped applying predicates in
+        `QueryCursor.captures`, the query would keep compiling and start
+        emitting an import edge per string-argument call -- silent, and in
+        the noisiest possible direction. This is the test that notices.
+        """
+        source = "require 'set'\nputs 'hello'\nlog_error 'boom'\n"
+        path = pathlib.Path(tempfile.mkdtemp()) / "b.rb"
+        path.write_text(source)
+
+        targets = {e.target_symbol for e in parser_edges(path, source)}
+        assert targets == {"set"}, (
+            f"predicate not applied: {targets} -- every string-argument call "
+            f"became an import"
+        )
+
+
+class TestJavascriptGap:
     def test_javascript_imports_are_esm_only(self, parser):
         """The js imports query matches `import_statement`. CommonJS
         `require()` is a call expression and yields nothing, so a codebase on
