@@ -42,18 +42,26 @@ Two more reasons BM25 is the right instrument rather than another bonus:
   identifier and its parts lets a query saying "user by id" reach
   `getUserById`.
 
-Measured END-TO-END through the real CLI, `PYTHONPATH` pinned per tree, over
-cases mined from git history (commit subject as query, changed non-test files
-as ground truth). One table, one harness generation -- an earlier draft of this
-docstring carried FIRST-PASS numbers from a harness that called
-`score_candidate` directly and so never saw the re-rank, the adaptive limit or
-the byte budget, and those numbers disagreed with CLAUDE.md's by enough that
-`car` appeared as both 0.969 and 0.507:
+Measured END-TO-END through the real CLI by `tools/rank_mine_eval.py`, which
+ships alongside this module -- `PYTHONPATH` pinned per tree, cases mined from
+git history (commit subject as query, changed non-test files as ground truth),
+50 per repo, recency signal off (`--no-git`), zero failed cases:
 
     repo   cases   R@10 before -> after     MRR before -> after
-    neo      60        0.078 -> 0.603        0.082 -> 0.655
-    car      50        0.210 -> 0.487        0.149 -> 0.233
-    quip     50        0.213 -> 0.850        0.188 -> 0.735
+    neo      50        0.301 -> 0.742        0.304 -> 0.771
+    car      50        0.180 -> 0.472        0.162 -> 0.425
+    quip     50        0.174 -> 0.696        0.158 -> 0.643
+
+One table, one harness generation -- and note what that discipline costs, since
+this docstring has now broken it twice. An early draft carried FIRST-PASS
+numbers from a harness that called `score_candidate` directly and so never saw
+the re-rank, the adaptive limit or the byte budget; they disagreed with
+CLAUDE.md's by enough that `car` appeared as both 0.969 and 0.507. The draft
+that replaced them (neo 0.078 -> 0.603, car 0.210 -> 0.487, quip 0.213 -> 0.850)
+then outlived its own harness, which was never committed and cannot be re-run.
+Those figures are superseded and are NOT comparable with the table above: a
+different instrument, not a corrected arithmetic. CLAUDE.md's retrieval section
+carries the same table and the same caveat; if you change one, change both.
 
 Neo already shipped this BM25 (`neo.memory.bm25`, Lucene-style with IDF
 smoothing) and already used hybrid dense+sparse fusion for FACT retrieval.

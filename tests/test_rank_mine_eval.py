@@ -116,19 +116,37 @@ class TestRankFilesFailsClosed:
 
 
 class TestSubjectFiltering:
-    def test_conventional_prefix_is_stripped_before_the_skip_test(self):
-        """`chore: bump version to 0.39.0` was mined as a real case."""
-        subject = "chore: bump version to 0.39.0"
-        stripped = rme._CONVENTIONAL_PREFIX_RE.sub("", subject)
+    """Asserts on the PREDICATES `mine_cases` calls, not on a composition the
+    test performs itself. Composing the two regexes here would stay green while
+    `mine_cases` dropped the prefix strip -- i.e. green through the exact
+    regression the first case below is named for."""
 
-        assert rme._SKIP_SUBJECT_RE.match(stripped)
-        assert not rme._SKIP_SUBJECT_RE.match(subject)   # why the strip is needed
+    @pytest.mark.parametrize("subject", [
+        "chore: bump version to 0.39.0",     # the one that was mined for real
+        "bump version to 0.39.0",
+        "chore(release): v1.2.3 and the notes",
+        "Merge branch 'main' into feature",
+        "revert: the thing that broke prod",
+        "wip: still figuring this out",
+    ])
+    def test_non_work_subjects_are_skipped(self, subject):
+        assert rme.is_skippable(subject)
 
-    def test_real_work_survives_the_filter(self):
-        subject = "fix(gatherer): select files by content, not by filename"
-        stripped = rme._CONVENTIONAL_PREFIX_RE.sub("", subject)
+    @pytest.mark.parametrize("subject", [
+        "fix(gatherer): select files by content, not by filename",
+        "add retry logic to the CAR adapter",
+        "feat(index): apportion chunk slots by symbol count",
+    ])
+    def test_real_work_survives_the_filter(self, subject):
+        assert not rme.is_skippable(subject)
 
-        assert not rme._SKIP_SUBJECT_RE.match(stripped)
+
+class TestGroundTruth:
+    HEAD = {
+        "src/neo/context_gatherer.py", "src/latest/protest.py", "lib/attestation.cs",
+        "tests/test_store.py", "src/__tests__/a.ts", "a/b_test.go",
+        "src/foo.spec.ts", "spec/models/user.rb", "README.md", "gone.py",
+    }
 
     @pytest.mark.parametrize("path", [
         "tests/test_store.py", "src/__tests__/a.ts", "a/b_test.go",
@@ -136,10 +154,41 @@ class TestSubjectFiltering:
     ])
     def test_test_files_are_not_ground_truth(self, path):
         """They are demoted by design; counting them would score that as a bug."""
-        assert rme._TEST_RE.search(path)
+        assert not rme.is_ground_truth(path, self.HEAD)
 
     @pytest.mark.parametrize("path", [
         "src/neo/context_gatherer.py", "src/latest/protest.py", "lib/attestation.cs",
     ])
-    def test_source_files_are_not_mistaken_for_tests(self, path):
-        assert not rme._TEST_RE.search(path)
+    def test_source_files_are_ground_truth(self, path):
+        """`protest`/`attestation` guard the test regex against over-matching."""
+        assert rme.is_ground_truth(path, self.HEAD)
+
+    def test_non_source_is_excluded(self):
+        assert not rme.is_ground_truth("README.md", self.HEAD)
+
+    def test_a_file_deleted_since_the_commit_is_excluded(self):
+        """Unfindable at HEAD, so scoring it as a miss would penalise nothing."""
+        assert not rme.is_ground_truth("src/removed.py", self.HEAD)
+
+
+class TestOutputFormatContract:
+    """The parser reads human output, so the CLI's format is a contract.
+
+    Hand-writing the format in a parser test proves only that the parser
+    matches the test. This asserts against the string the CLI actually emits.
+    """
+
+    def test_parser_matches_the_line_the_cli_emits(self):
+        import inspect
+
+        from neo import cli
+
+        source = inspect.getsource(cli)
+        # The dry-run printer's own format string, rendered with real values.
+        rendered = "  src/neo/store.py (lines 1-140) - 6183 bytes (score: 4.23)"
+
+        assert "=== DRY RUN" in source, "dry-run marker renamed; parser is blind"
+        assert rme._DRY_RUN_LINE.match(rendered), (
+            "the parser no longer matches the CLI's selected-file line -- every "
+            "case would return [] and the run would report a confident 0.000"
+        )

@@ -541,9 +541,12 @@
   (1) The venv installs neo EDITABLE against `src/`, so running
   `.venv/bin/python -m neo.cli` from a git worktree of another commit executes THIS
   tree's code against that tree's files — a "baseline" run that is not the baseline.
-  Every A/B needs `PYTHONPATH=<that tree>/src`. Measured on the superseded harness
-  generation: it made main look like MRR 0.613 against a real figure of 0.082 (the
-  current harness puts main at 0.294 — different instrument, same trap). (2) Calling `score_candidate` directly
+  Every A/B needs `PYTHONPATH=<that tree>/src`, and `rank_mine_eval` now REFUSES to
+  run unless the tree it was handed is the tree `import neo` actually resolves to —
+  mandatory is not the same as effective, since the editable `.pth` silently catches
+  a typo'd path and measures the working checkout twice. Measured on the superseded
+  harness generation: it made main look like MRR 0.613 against a real figure of
+  0.082 (the current harness puts main at 0.304 — different instrument, same trap). (2) Calling `score_candidate` directly
   measures the FIRST-PASS ranking only; `gather_context` then re-ranks with
   `pi_boost + hist_boost + _symbol_score` and applies an adaptive limit and a byte
   budget. A first-pass harness overstated R@10 by 0.14 against the real CLI. Validate
@@ -666,7 +669,9 @@
   was never what carried the result.
   **The re-rank is LOAD-BEARING, not redundant** (`pi_boost` + `_symbol_score` +
   `hist_boost`, applied after the first-pass score). Disabling it on the real CLI
-  takes R@1 from 0.344 to **0.044** and MRR from 0.646 to **0.261**. An earlier
+  takes R@1 from 0.344 to **0.044** and MRR from 0.646 to **0.261** — a
+  SUPERSEDED-generation ablation (pre-`--no-git`, uncommitted harness), so read
+  those four numbers against each other and never against the table above. An earlier
   version of this note claimed the opposite, from a weight sweep that landed
   everywhere in 0.66–0.68 — measured at k=10, where every configuration is flat, and
   through an in-process replica that omits the byte budget and adaptive limit, i.e.
@@ -676,7 +681,8 @@
   contributes nothing measurable (identical results with it disabled) while
   `_symbol_score` carries most of the effect.
   RRF fusion with the dense channel LOSES to BM25 alone (0.596 best-weighted vs
-  0.693) — dense returns ~25 files against BM25's ~180 and is half as accurate. Treat
+  0.693, also superseded-generation and unstamped when first recorded) — dense
+  returns ~25 files against BM25's ~180 and is half as accurate. Treat
   that as provisional: it was measured at k=10 before the same cutoff problem was
   understood, and the docstring deferring it to a chunk-allocation fix is stale
   because that fix landed in the same branch. Re-measure at k=3/k=5 before relying on

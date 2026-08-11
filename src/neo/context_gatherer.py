@@ -489,10 +489,12 @@ def extract_prompt_tokens(prompt: str) -> set[str]:
     return tokens
 
 
-# Enough to clear any organic score (filename overlap caps at +1.8, the two
-# re-rank boosts at +1.0 and +1.2). Naming a path is the least ambiguous signal
-# a prompt can carry, so it outranks every heuristic rather than competing with
-# them.
+# Enough to clear any organic score: content caps at +3.0 (CONTENT_WEIGHT),
+# filename overlap at +0.45 (0.15 x min(hits, 3)), the two re-rank boosts at
+# +1.0 and +1.2. Naming a path is the least ambiguous signal a prompt can
+# carry, so it outranks every heuristic rather than competing with them.
+# The +1.8 this comment used to claim for filename overlap was the pre-BM25
+# weight; it dropped to a tie-breaker when content became the dominant term.
 EXPLICIT_PATH_BOOST = 10.0
 
 # Loose: real filtering is "does this match a file we actually found", which no

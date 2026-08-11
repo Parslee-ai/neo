@@ -50,12 +50,18 @@ by two paths that are routine rather than exotic:
    the arm you care about most.
 
 So the default is to switch the leaking signal OFF. `neo --dry-run` already
-takes `--no-git`, which gates `git_recent` and nothing else -- `_history_boost`
-and every other re-rank channel stay live -- and `tools/rank_eval.py` has been
-passing it all along. Measuring with recency enabled costs a real signal
-(ablated at +0.021 R@10) but buys absolute numbers that are not partly an echo
-of the answer key, which is the better trade for an A/B whose whole purpose is
-comparing two rankers.
+takes `--no-git`, which gates `git_recent` and nothing else, and
+`tools/rank_eval.py` has been passing it all along. Turning it off costs a real
+signal (ablated at +0.021 R@10 on the superseded harness generation -- an
+unstamped figure, quoted here for scale, not as a current measurement) and buys
+absolute numbers that are not partly an echo of the answer key, which is the
+better trade for an A/B whose whole purpose is comparing two rankers.
+
+`_history_boost` and the other re-rank channels stay live under `--no-git`.
+That means UNGATED, not clean: `_history_boost` reads the FactStore, which past
+neo runs against this same repo populated. Different provenance, same family.
+CLAUDE.md measures its contribution as nil, so it is not moving these numbers,
+but do not read "stays live" as "is uncontaminated".
 
 `--with-git` re-enables it to measure the full shipped pipeline. That run is
 contaminated by construction, so it also reports `contaminated_cases` (ground
@@ -79,6 +85,17 @@ at HEAD. That keeps small, well-described, surviving implementation changes and
 discards broad refactors, test-only work, deleted and renamed-away files, and
 every commit whose author wrote a poor message. Read the result as a proxy for
 focused maintenance prompts, not as a fair sample of what a developer asks.
+
+**The leak that no flag removes.** Cases are queried with a commit subject and
+scored against the files as they exist at HEAD -- that is, AFTER that commit
+landed. The subject's terms are in the file partly because the commit put them
+there, so the ranker is reading a corpus that has already seen the answer.
+BugLocator, cited approvingly by the module this measures, indexes the pre-fix
+snapshot for exactly this reason; this harness does not. `--no-git` does
+nothing about it. Both arms inherit it, so the direction survives -- but it is
+why the absolutes remain upper bounds even at the default, and it is the reason
+not to read a headline R@10 as "the ranker finds the right file 74% of the
+time" on prompts written before the work exists.
 
 Then the metric's own validity: a commit subject is terser and better-formed
 than a real prompt, and ground truth is what the commit CHANGED, which is
@@ -117,6 +134,35 @@ _SKIP_SUBJECT_RE = re.compile(
 _DRY_RUN_LINE = re.compile(r"^\s{2}(\S.*?)(?:\s+\(lines\s[\d-]+\))?\s+-\s+[\d,]+\s+bytes")
 
 
+def is_skippable(subject: str) -> bool:
+    """A subject that names no work is not a query.
+
+    The prefix strip and the skip test live TOGETHER here rather than being
+    composed at the call site: `chore: bump version to 0.39.0` was mined as a
+    real case because `_SKIP_SUBJECT_RE` anchors at `^` and the conventional
+    prefix sat in front of it. Composed at the call site, a test can only pin
+    the composition it performs itself, which stays green while `mine_cases`
+    drops the strip.
+
+    Tested BOTH ways round, because some skip words are themselves valid
+    conventional-commit types: `revert: the thing that broke prod` and `wip:
+    still figuring this out` have their own skip word consumed as a prefix and
+    read as ordinary work on the stripped subject alone. A revert's changed
+    files are a removal, which is not ground truth for its own subject.
+    """
+    stripped = _CONVENTIONAL_PREFIX_RE.sub("", subject)
+    return bool(_SKIP_SUBJECT_RE.match(subject) or _SKIP_SUBJECT_RE.match(stripped))
+
+
+def is_ground_truth(path: str, head_files: set[str]) -> bool:
+    """Whether a changed file counts as an answer for the case it came from."""
+    return (
+        path in head_files                               # still exists to be found
+        and os.path.splitext(path)[1] in _SOURCE_EXTS
+        and not _TEST_RE.search(path)                    # demoted by design
+    )
+
+
 def _git(repo: str, *args: str) -> str:
     # Timeout so a hung git (a lock, a prompting credential helper) fails the
     # run instead of parking it forever with no output.
@@ -142,18 +188,11 @@ def mine_cases(repo: str, want: int, skip_recent: int, max_files: int) -> list[d
             continue
         sha, subject = line.split("\x1f", 1)
         subject = subject.strip()
-        if len(subject) < 20 or _SKIP_SUBJECT_RE.match(
-            _CONVENTIONAL_PREFIX_RE.sub("", subject)
-        ):
+        if len(subject) < 20 or is_skippable(subject):
             continue
 
         changed = _git(repo, "show", "--name-only", "--format=", sha).splitlines()
-        truth = {
-            f for f in changed
-            if f in head_files                       # still exists to be found
-            and os.path.splitext(f)[1] in _SOURCE_EXTS
-            and not _TEST_RE.search(f)
-        }
+        truth = {f for f in changed if is_ground_truth(f, head_files)}
         # A 40-file sweep commit is one case with 40 equal answers -- noise, not
         # a query anyone would type. A 0-file case has nothing to find.
         if not 1 <= len(truth) <= max_files:
@@ -165,11 +204,42 @@ def mine_cases(repo: str, want: int, skip_recent: int, max_files: int) -> list[d
     return cases
 
 
+def assert_tree_is_effective(tree: str) -> None:
+    """Prove `--tree` actually won, rather than trusting that it did.
+
+    Mandatory is not the same as effective. The venv's editable install is a
+    `.pth` naming this checkout, so a `--tree` that points at a typo, a pruned
+    worktree or one directory too high does not fail -- `import neo` quietly
+    falls through to the working tree, BOTH arms run the same code, and the run
+    completes with a full ranking and `failed_cases: 0`. That is the 0.613
+    against 0.082 error, unguarded, inside the tool written to prevent it.
+    """
+    src = os.path.join(tree, "src")
+    if not os.path.isdir(os.path.join(src, "neo")):
+        raise SystemExit(f"--tree {tree!r} has no src/neo -- it would silently "
+                         f"fall back to the installed copy and measure the same "
+                         f"code twice")
+    loaded = subprocess.run(
+        [sys.executable, "-c", "import neo, sys; sys.stdout.write(neo.__file__)"],
+        env={**os.environ, "PYTHONPATH": src}, capture_output=True, text=True,
+        timeout=120,
+    ).stdout.strip()
+    if not loaded.startswith(os.path.realpath(src)) and \
+            not loaded.startswith(src):
+        raise SystemExit(f"--tree {tree!r} did not take effect: `import neo` "
+                         f"resolved to {loaded!r}. Every figure from this run "
+                         f"would describe that tree, not the one you named.")
+
+
 def recent_files(repo: str, window: int = 50) -> set[str]:
     """The recency set the scorer actually reads -- history AND working tree.
 
     Mirrors `context_gatherer.get_git_recent_files` so a run can report how much
-    of its own ground truth the scorer was handed for free.
+    of its own ground truth the scorer was handed for free. `window` MUST match
+    that function's hardcoded `-50`; it is deliberately not wired to
+    `--skip-recent`, which is a different quantity (how far back to start
+    mining). Passing the latter here under-reports contamination whenever it is
+    lowered -- an error in the flattering direction.
     """
     recent = set()
     for line in _git(repo, "status", "--porcelain").splitlines():
@@ -271,6 +341,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    assert_tree_is_effective(args.tree)
     cases = mine_cases(args.repo, args.cases, args.skip_recent, args.max_truth_files)
     if not cases:
         print("no eligible cases mined -- widen --max-truth-files or lower "
@@ -293,11 +364,24 @@ def main() -> int:
               "CLI invocation", file=sys.stderr)
         return 1
 
+    # Fail-closed on the HEADER is not enough. A per-line format change keeps
+    # the banner and parses to nothing, so every case returns [] and the run
+    # reports a confident R@10 0.000 with failed_cases: 0 -- "scored every case
+    # zero" coming back through a different door. A live trigger exists today:
+    # the CLI's second dry-run printer emits ABSOLUTE paths, which parse fine
+    # and match no repo-relative ground truth. Nothing parsed anywhere is a
+    # broken instrument, never a result.
+    if not any(scored_ranks):
+        print("the CLI ran and the DRY RUN banner was found, but NOT ONE case "
+              "yielded a parsable file line -- the output format has moved. "
+              "This is a parser failure, not a score of zero.", file=sys.stderr)
+        return 1
+
     # Only meaningful when the recency signal is live; with --no-git the scorer
     # never reads it, so reporting a count would imply a leak that cannot occur.
     contaminated = dirty = None
     if args.with_git:
-        recent = recent_files(args.repo, args.skip_recent)
+        recent = recent_files(args.repo)   # the scorer's window, not --skip-recent
         contaminated = sum(1 for c in scored_cases if set(c["truth"]) & recent)
         dirty = bool(_git(args.repo, "status", "--porcelain").strip())
 
@@ -309,6 +393,11 @@ def main() -> int:
     result["repo"] = args.repo
     result["tree"] = args.tree
     result["skip_recent"] = args.skip_recent
+    # --skip-recent counts back from HEAD, so two arms measured at different
+    # HEADs score different case sets. Without this stamp a delta between runs
+    # cannot be attributed to the change under test rather than to the window
+    # having moved -- which has already happened once on this branch.
+    result["repo_head"] = _git(args.repo, "rev-parse", "HEAD").strip()[:12]
 
     if args.json:
         print(json.dumps(result, indent=2))
