@@ -23,8 +23,11 @@ confident wrong numbers:
 1. **The venv installs neo EDITABLE against `src/`.** Running the CLI from a
    worktree of another commit executes THIS tree's code against THAT tree's
    files. A "baseline" run that is not the baseline: it made main look like
-   MRR 0.613 when its real figure is 0.082. `--tree` is therefore mandatory
-   and is exported as `PYTHONPATH`; there is no default.
+   MRR 0.613 against a real figure of 0.082 -- both SUPERSEDED-generation
+   numbers, quoted for the size of the error and not as measurements, since
+   this harness puts main's neo MRR at 0.304. `--tree` is therefore mandatory,
+   is made absolute before use, is checked against what `import neo` actually
+   resolves to, and is exported as `PYTHONPATH`; there is no default.
 2. **`score_candidate` is not the pipeline.** `gather_context` re-ranks with
    `pi_boost + hist_boost + _symbol_score`, then applies an adaptive limit and
    a byte budget -- exactly the stages that decide the tight cutoffs. An
@@ -212,7 +215,15 @@ def assert_tree_is_effective(tree: str) -> None:
     worktree or one directory too high does not fail -- `import neo` quietly
     falls through to the working tree, BOTH arms run the same code, and the run
     completes with a full ranking and `failed_cases: 0`. That is the 0.613
-    against 0.082 error, unguarded, inside the tool written to prevent it.
+    against 0.082 error (superseded generation, see the module docstring),
+    unguarded, inside the tool written to prevent it.
+
+    Caller MUST pass an absolute path. This resolves from the HARNESS's cwd
+    while `rank_files` hands the same string to a child running with
+    `cwd=repo`, so a relative `--tree` checks one directory and measures
+    another -- and Python drops a nonexistent `PYTHONPATH` entry without a
+    word, which leaves this guard green while the run uses the installed copy.
+    `main` absolutizes both paths before calling here.
     """
     src = os.path.join(tree, "src")
     if not os.path.isdir(os.path.join(src, "neo")):
@@ -341,6 +352,13 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    # Absolute BEFORE anything reads them. Both are handed to children running
+    # with `cwd=repo`, while the guard below resolves them from the HARNESS's
+    # cwd -- so `--repo ~/git/car --tree .` checked one directory and measured
+    # another, and Python drops a nonexistent PYTHONPATH entry silently, which
+    # put the guard green while both arms ran the installed copy.
+    args.tree = os.path.abspath(args.tree)
+    args.repo = os.path.abspath(args.repo)
     assert_tree_is_effective(args.tree)
     cases = mine_cases(args.repo, args.cases, args.skip_recent, args.max_truth_files)
     if not cases:
@@ -398,11 +416,18 @@ def main() -> int:
     # cannot be attributed to the change under test rather than to the window
     # having moved -- which has already happened once on this branch.
     result["repo_head"] = _git(args.repo, "rev-parse", "HEAD").strip()[:12]
+    # And the TREE's revision, which is the object the two arms actually differ
+    # by. `result["tree"]` is a mutable path, not a generation: it says where
+    # the ranker was read from, never which ranker it was.
+    result["tree_head"] = _git(args.tree, "rev-parse", "HEAD").strip()[:12]
 
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"\nrepo={args.repo}  tree={args.tree}  cases={result['cases']}  "
+        # The generation stamp belongs in the header people copy tables out of,
+        # not only in --json.
+        print(f"\nrepo={args.repo}@{result['repo_head']}  "
+              f"tree={args.tree}@{result['tree_head']}  cases={result['cases']}  "
               f"skip_recent={args.skip_recent}  "
               f"git_recency={'ON' if args.with_git else 'off (--no-git)'}")
         if failed:

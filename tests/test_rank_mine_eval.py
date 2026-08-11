@@ -174,21 +174,97 @@ class TestGroundTruth:
 class TestOutputFormatContract:
     """The parser reads human output, so the CLI's format is a contract.
 
-    Hand-writing the format in a parser test proves only that the parser
-    matches the test. This asserts against the string the CLI actually emits.
+    The format string is EXTRACTED from `cli.py` and rendered here, rather than
+    hand-written. A hand-written literal only proves the parser matches the
+    test: change `- {gf.bytes} bytes` to `- {gf.bytes}b` in the CLI and a
+    literal-based test stays green while every case parses to nothing.
     """
 
-    def test_parser_matches_the_line_the_cli_emits(self):
+    def _cli_format_string(self):
         import inspect
 
         from neo import cli
 
-        source = inspect.getsource(cli)
-        # The dry-run printer's own format string, rendered with real values.
-        rendered = "  src/neo/store.py (lines 1-140) - 6183 bytes (score: 4.23)"
+        for line in inspect.getsource(cli).splitlines():
+            if "bytes (score:" in line and "print(" in line:
+                return line[line.index('f"'):].split('"')[1]
+        pytest.fail("the dry-run selected-file print was not found in cli.py -- "
+                    "the parser's contract has moved and this test is blind")
 
-        assert "=== DRY RUN" in source, "dry-run marker renamed; parser is blind"
+    def test_parser_matches_the_format_the_cli_actually_uses(self):
+        fmt = self._cli_format_string()
+        rendered = (fmt
+                    .replace("{gf.rel_path}", "src/neo/store.py")
+                    .replace("{lines_info}", " (lines 1-140)")
+                    .replace("{gf.bytes}", "6183")
+                    .replace("{gf.score:.2f}", "4.23"))
+
         assert rme._DRY_RUN_LINE.match(rendered), (
-            "the parser no longer matches the CLI's selected-file line -- every "
-            "case would return [] and the run would report a confident 0.000"
+            f"parser no longer matches the CLI's line format {fmt!r} -- every "
+            f"case would return [] and the run would report a confident 0.000"
         )
+
+    def test_parser_matches_it_without_a_line_range_too(self):
+        fmt = self._cli_format_string()
+        rendered = (fmt
+                    .replace("{gf.rel_path}", "src/neo/store.py")
+                    .replace("{lines_info}", "")
+                    .replace("{gf.bytes}", "6183")
+                    .replace("{gf.score:.2f}", "4.23"))
+
+        assert rme._DRY_RUN_LINE.match(rendered)
+
+    def test_the_marker_the_parser_splits_on_still_exists(self):
+        import inspect
+
+        from neo import cli
+
+        assert "=== DRY RUN" in inspect.getsource(cli), (
+            "dry-run marker renamed; the parser fails closed on it, so every "
+            "run would abort rather than mislead -- but fix the parser"
+        )
+
+
+class TestGuards:
+    """The two guards added because each was a way to publish a wrong number.
+
+    Verifying a guard by hand once is how a guard goes unpinned and looks
+    pinned -- the same failure as naming a constant in a docstring while
+    asserting only a direction.
+    """
+
+    def test_a_tree_without_src_neo_is_refused(self, tmp_path):
+        with pytest.raises(SystemExit) as exc:
+            rme.assert_tree_is_effective(str(tmp_path))
+
+        assert "src/neo" in str(exc.value)
+
+    def test_a_tree_that_does_not_win_the_import_is_refused(self, tmp_path,
+                                                            monkeypatch):
+        """Structure alone is not proof: the editable .pth can still win."""
+        (tmp_path / "src" / "neo").mkdir(parents=True)
+
+        def fake_run(*args, **kwargs):
+            return subprocess.CompletedProcess(
+                args, 0, stdout="/somewhere/else/neo/__init__.py")
+        monkeypatch.setattr(rme.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit) as exc:
+            rme.assert_tree_is_effective(str(tmp_path))
+
+        assert "did not take effect" in str(exc.value)
+
+    def test_a_tree_that_wins_the_import_is_accepted(self, tmp_path, monkeypatch):
+        (tmp_path / "src" / "neo").mkdir(parents=True)
+        resolved = str(tmp_path / "src" / "neo" / "__init__.py")
+
+        def fake_run(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout=resolved)
+        monkeypatch.setattr(rme.subprocess, "run", fake_run)
+
+        rme.assert_tree_is_effective(str(tmp_path))   # must not raise
+
+    def test_nothing_parsed_anywhere_is_a_failure_not_a_zero(self):
+        """`any()` over the rankings is the whole guard; pin its truth table."""
+        assert not any([[], [], []])          # every case parsed nothing -> fail
+        assert any([[], ["a.py"], []])        # one case parsed -> a real result
