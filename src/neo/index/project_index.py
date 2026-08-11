@@ -405,21 +405,33 @@ class ProjectIndex:
 
     @staticmethod
     def _cap_chunks(chunks: List[CodeChunk], cap: int) -> List[CodeChunk]:
-        """Trim to `cap` by round-robin across files, never by slicing.
+        """Trim to `cap` by PROPORTIONAL apportionment across files.
 
-        Slicing a language-ordered list is the same defect the file budget
-        was just fixed for, one function later and with the fix's own work
-        as its victim. Chunks arrive grouped by file, and files arrive
-        grouped by language, so `chunks[:1000]` on a 300-file C# repo kept
-        1000 C# chunks and dropped every TypeScript and Python chunk the
-        allocator had just fought to include — 63 of 100 selected files
-        contributed nothing at all.
+        Never by slicing. Chunks arrive grouped by file and files by language,
+        so `chunks[:cap]` on a 300-file C# repo kept 1000 C# chunks and dropped
+        every TypeScript and Python chunk the file allocator had just fought to
+        include — 63 of 100 selected files contributing nothing.
 
-        Round-robin needs no language awareness: taking every file's first
-        chunk before any file's second means the apportionment already done
-        at file-selection time carries through, and every selected file is
-        represented as long as there are at least as many slots as files
-        (100 files against a 1000-chunk cap by default).
+        Round-robin fixed that and introduced a subtler version of the same
+        bias. Taking every file's first chunk before any file's second gives
+        every file the SAME share regardless of how much is in it, so a 9 KB
+        utility was fully represented while the modules the repository is
+        built on were not:
+
+            src/neo/memory/store.py    82 symbols,  6 indexed,   7%
+            src/neo/engine.py          95 symbols,  6 indexed,   6%
+            src/neo/text_budget.py      4 symbols,  4 indexed, 100%
+
+        A file cannot be retrieved for what was never indexed, so the semantic
+        channel was blind to 93% of the two files most likely to be relevant —
+        the same anti-correlation the file scorer's size penalty had, arrived
+        at independently and for a defensible reason.
+
+        Proportional-with-a-floor keeps what round-robin was protecting (every
+        selected file is represented, so none is invisible) and spends the rest
+        where the code is. `_allocate_slots` already implements exactly this
+        apportionment for the file budget, so it is reused rather than
+        reimplemented and the two cannot drift.
         """
         if len(chunks) <= cap:
             return chunks
@@ -428,24 +440,13 @@ class ProjectIndex:
         for chunk in chunks:
             by_file.setdefault(chunk.file_path, []).append(chunk)
 
+        allocation = ProjectIndex._allocate_slots(
+            {path: len(group) for path, group in by_file.items()}, cap
+        )
+
         kept: List[CodeChunk] = []
-        depth = 0
-        while len(kept) < cap:
-            # `added` rather than a precomputed max depth: the early return
-            # above guarantees more chunks than slots, so the cap is always
-            # what stops this — but a loop whose termination depends on an
-            # invariant established elsewhere should still be able to stop
-            # on its own.
-            added = False
-            for group in by_file.values():
-                if depth < len(group):
-                    kept.append(group[depth])
-                    added = True
-                    if len(kept) >= cap:
-                        break
-            if not added:
-                break
-            depth += 1
+        for path, group in by_file.items():
+            kept.extend(group[: allocation.get(path, 0)])
         return kept
 
     def _select_files(

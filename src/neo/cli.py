@@ -624,8 +624,8 @@ def _format_selection_report(report: Optional[dict]) -> list[str]:
     if report.get('chunks_capped'):
         lines.append(
             f"[Neo] Kept {report['chunks_kept']} of {report['chunks_extracted']} "
-            f"chunks (cap {report['max_chunks']}); each indexed file keeps its "
-            f"first chunks before any file keeps a second"
+            f"chunks (cap {report['max_chunks']}); slots are apportioned in "
+            f"proportion to each file's symbol count, with a floor of one"
         )
     # A selected file can be absent from the index for two unrelated reasons,
     # and they get separate lines because they have separate remedies — one of
