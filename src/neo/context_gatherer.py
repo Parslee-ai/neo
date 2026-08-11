@@ -11,6 +11,7 @@ Approximates Claude Code/Codex ergonomics with:
 """
 
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -58,7 +59,26 @@ class GatherConfig:
 
 
 def load_gitignore_patterns(root: str) -> list[str]:
-    """Load patterns from .gitignore and .ignore files."""
+    """Load patterns from .gitignore and .ignore files.
+
+    The defaults below apply even when a repo's `.gitignore` says nothing,
+    because the worst offenders are routinely untracked-but-not-ignored.
+    A nested checkout or an agent worktree is a SECOND COPY of a tree, so it
+    does not merely add noise — it competes with the originals for the same
+    context slots and wins as often as it loses. Measured on one live repo,
+    a single prompt came back holding `LedgerActiveStateMonotonicityTests.cs`
+    six times and `AUTHENTICATION_ARCHITECTURE.md` six times, one per agent
+    worktree, at identical scores: 12 of 16 selected files were duplicates
+    of two.
+
+    Only the worktree LAYOUTS are excluded, never the agent directories that
+    contain them — see the comment on those entries. An earlier cut excluded
+    `.claude`/`.codex`/`.car` outright and justified it by noting that
+    `agent_context.discover` globs independently and so still delivers
+    CLAUDE.md. That was true and beside the point: `discover` handles
+    markdown only, so the skill *source* under those directories had no
+    other route and simply vanished.
+    """
     patterns = []
 
     # Default ignore patterns
@@ -67,6 +87,28 @@ def load_gitignore_patterns(root: str) -> list[str]:
         'node_modules', '.env', '*.key', '*.pem', '*.secret',
         '.neo', 'venv', 'env', '.venv', 'dist', 'build',
         '*.egg-info', '.tox', '.coverage', 'htmlcov',
+        # Agent worktrees — second copies of a tree, which do not merely add
+        # noise but compete with the originals for the same context slots.
+        #
+        # Named by LAYOUT, not by either bare component, because both of the
+        # obvious shortcuts hide committed source:
+        #   `worktrees`  alone hides `src/worktrees/manager.ts` — a worktree
+        #                MANAGER keeps its source in a directory named for
+        #                the thing it manages.
+        #   `.claude`    alone hides 60 tracked skill implementations across
+        #   `.codex`     two local repos, e.g.
+        #   `.car`       `.claude/skills/deploy-app/scripts/deploy_verify.py`.
+        # Both are the same error: excluding a container for what sometimes
+        # sits inside it. `.worktrees` stays a bare component — that dotted
+        # name is unambiguously machine-generated.
+        '.worktrees', '**/.claude/worktrees', '**/.codex/worktrees', '**/.car/worktrees',
+        # Build output and dependency trees the list above missed.
+        'obj', 'bower_components', 'site-packages', 'Pods', 'Carthage',
+        '.next', '.nuxt', '.svelte-kit', '.output',
+        # Tool caches.
+        '.mypy_cache', '.pytest_cache', '.ruff_cache', '.nox', '.eggs',
+        # Editor / IDE.
+        '.idea', '.vscode', '.vs',
     ])
 
     for ignore_file in ['.gitignore', '.ignore']:
@@ -81,26 +123,192 @@ def load_gitignore_patterns(root: str) -> list[str]:
     return patterns
 
 
+@functools.lru_cache(maxsize=2048)
+def _path_glob(pattern: str) -> "re.Pattern":
+    """Compile a gitignore glob where `*` does NOT cross a path separator.
+
+    `fnmatch` is component-blind: its `*` spans `/`, so `/*.png` — meaning
+    "a PNG at the repository root" — matched
+    `docs/audits/.../img/concept-5-b.png` six directories down. Measured
+    against `git check-ignore` over 7,534 on-disk paths, that was the last
+    class of over-exclusion left once anchoring and negation were right.
+
+    `*` matches within one component, `**` spans components, `?` is one
+    non-separator character. Character classes are translated rather than
+    passed through — see `_class_body` for why `[!a-z]` and `[]]` cannot
+    survive a copy. A pattern that will not compile degrades to a literal
+    match rather than raising.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if char == '*':
+            if pattern[i:i + 3] == '**/':
+                # `**/foo` matches `foo` at any depth INCLUDING the root, so
+                # the separator has to be part of the optional group. Emitting
+                # `.*` + a literal `/` would require at least one leading
+                # component and miss the root case.
+                out.append('(?:.*/)?')
+                i += 3
+                continue
+            if pattern[i:i + 2] == '**':
+                # `**` spans components only when it is a whole component —
+                # delimited by separators or the ends of the pattern. Glued to
+                # ordinary characters (`a**b`) git treats it as a plain star,
+                # so it must stay inside one component.
+                before_ok = i == 0 or pattern[i - 1] == '/'
+                after_ok = i + 2 == len(pattern) or pattern[i + 2] == '/'
+                if before_ok and after_ok:
+                    out.append('.*')
+                    i += 2
+                    continue
+            out.append('[^/]*')
+        elif char == '?':
+            out.append('[^/]')
+        elif char == '[':
+            body, end = _class_body(pattern, i)
+            if body is None:
+                out.append(re.escape(char))
+            else:
+                out.append(body)
+                i = end
+                continue
+        else:
+            out.append(re.escape(char))
+        i += 1
+
+    try:
+        return re.compile('(?s:' + ''.join(out) + r')\Z')
+    except re.error:
+        # A pattern that will not compile must not take the process with it.
+        # `should_ignore` runs on every directory and every file of every
+        # walk, so one unparseable `.gitignore` line would turn any neo
+        # invocation into a traceback. `fnmatch`, which this replaced, could
+        # not crash — it degraded to a non-match. Match the literal instead.
+        return re.compile(re.escape(pattern) + r'\Z')
+
+
+def _class_body(pattern: str, start: int) -> tuple:
+    """Translate a glob character class at `start` into a regex class.
+
+    Returns `(regex_text, index_after)`, or `(None, start)` when the class is
+    unterminated and the `[` should be treated as a literal.
+
+    Two things `fnmatch` gets right that a raw pass-through does not:
+
+    - Glob negates with `[!…]`, regex with `[^…]`. Passing `[!a-z]` through
+      unchanged yields a class containing a literal `!` plus `a-z` — the
+      exact inverse of the intended set, silently.
+    - A `]` in FIRST position is a literal member, not the terminator, which
+      is the POSIX spelling for "a class containing `]`". Scanning for the
+      first `]` cuts `[]]` into an empty class and leaves the rest of the
+      regex unbalanced.
+    """
+    i = start + 1
+    negated = i < len(pattern) and pattern[i] in '!^'
+    if negated:
+        i += 1
+    # A leading `]` is a member, so it cannot end the class.
+    if i < len(pattern) and pattern[i] == ']':
+        i += 1
+    close = pattern.find(']', i)
+    if close == -1:
+        return None, start
+    members = pattern[start + 1 + (1 if negated else 0):close]
+    # Escape a backslash so the class cannot terminate early or introduce an
+    # escape the author did not write. `[` is escaped for a different reason:
+    # it is already a literal inside a regex class, but Python emits
+    # `FutureWarning: Possible nested set` for `[[`, and a `.gitignore`
+    # containing `[[]` would print that on every neo invocation. Escaping is
+    # semantically identical and silent.
+    #
+    # The ORDER is load-bearing and must not be swapped: doubling runs first,
+    # so `[` -> `\[` inserts a backslash the doubling pass can no longer eat.
+    # Reversed, `[\[]` would double the backslash this line just added and
+    # re-open the nested set it exists to close.
+    members = members.replace('\\', '\\\\').replace('[', r'\[')
+    body = f"[{'^' if negated else ''}{members}]"
+    # A wildcard class must not consume `/` no matter how it was written:
+    # `a[/]b` matching `a/b` would let one component's rule reach across a
+    # separator, which is the same defect as `*` crossing one.
+    return f"(?:(?!/){body})", close + 1
+
+
 def should_ignore(rel_path: str, patterns: list[str], is_dir: bool = False) -> bool:
-    """Check if path matches any ignore pattern."""
-    path_with_slash = rel_path + '/' if is_dir else rel_path
+    """Check if `rel_path` matches any gitignore-style pattern.
 
-    for pattern in patterns:
-        # Handle directory-specific patterns
-        if pattern.endswith('/'):
-            if is_dir and fnmatch.fnmatch(path_with_slash, pattern):
-                return True
-        # Handle negation patterns
-        elif pattern.startswith('!'):
+    Two properties decide every case, and the old branch structure conflated
+    them, so they are now read off the pattern once and applied uniformly:
+
+    - **anchored** — a leading `/`, or a `/` anywhere inside the pattern.
+      Both mean "match from the repository root", not at arbitrary depth.
+    - **directory-only** — a trailing `/`. Matches a directory and everything
+      beneath it, never a file of that name.
+
+    The previous shape tested `pattern.endswith('/')` first and returned from
+    that branch, so an UNANCHORED directory rule never reached the
+    match-at-any-depth logic and was silently treated as root-anchored.
+    `build/` did not match `src/build`, `node_modules/` did not match
+    `pkg/node_modules/x.js`. That is the form 80% of real directory rules in
+    this workspace take — the anchored form the earlier fix addressed is 19%,
+    and nearly all of those live in a single repo.
+    """
+    # Separator-agnostic: `iter_paths` builds candidates with `os.path.join`,
+    # which emits backslashes on Windows. Splitting on '/' alone silently
+    # stopped pruning every nested `node_modules` there.
+    parts = [p for p in re.split(r'[\\/]', rel_path) if p]
+    if not parts:
+        return False
+    norm = '/'.join(parts)
+
+    # LAST match wins, which is gitignore's rule and the reason negation has
+    # to be evaluated rather than skipped. Returning on the first match makes
+    # `!` unreachable by construction. A real repo here pairs
+    # `.claude/*` with `!.claude/skills/`, and skipping the second hid seven
+    # git-tracked files that `git check-ignore` reports as NOT ignored.
+    ignored = False
+
+    for raw in patterns:
+        negated = raw.startswith('!')
+        pattern = raw[1:] if negated else raw
+
+        anchored = pattern.startswith('/')
+        if anchored:
+            pattern = pattern[1:]
+        dir_only = pattern.endswith('/')
+        pattern = pattern.strip('/')
+        if not pattern:
             continue
-        # Standard glob matching
-        elif fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(path_with_slash, pattern):
-            return True
-        # Match pattern anywhere in path
-        elif '/' not in pattern and fnmatch.fnmatch(os.path.basename(rel_path), pattern):
-            return True
+        # A slash inside the pattern anchors it to the root too, which is
+        # gitignore's rule and not an extra of ours.
+        anchored = anchored or '/' in pattern
 
-    return False
+        if anchored:
+            matched = (
+                (_path_glob(pattern).match(norm) and (is_dir or not dir_only))
+                # Everything beneath a matched directory.
+                or _path_glob(pattern + '/**').match(norm)
+            )
+        else:
+            # Unanchored: the pattern matches a COMPONENT at any depth. A
+            # non-final component is necessarily a directory, so everything
+            # below it goes; a final component only goes if the rule permits
+            # files.
+            # Same compiler as the anchored branch. Using `fnmatch` here
+            # meant one glob dialect for `docs/[!_]*.md` and another for
+            # `[!_]*.md` — identical syntax, opposite meaning, selected by
+            # whether the pattern happened to contain a slash.
+            matched = any(
+                _path_glob(pattern).match(part)
+                and (index < len(parts) - 1 or is_dir or not dir_only)
+                for index, part in enumerate(parts)
+            )
+
+        if matched:
+            ignored = not negated
+
+    return ignored
 
 
 def iter_paths(root: str, includes: list[str], excludes: list[str], exts: Optional[list[str]]) -> list[tuple[str, str, int]]:

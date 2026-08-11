@@ -156,10 +156,11 @@ class TestExclusions:
 
     @pytest.mark.parametrize(
         "excluded_dir",
-        # Named in EXCLUDED_DIR_NAMES: not plausible source directory names,
-        # and routinely untracked-but-not-gitignored.
-        ['node_modules', '.git', 'obj', '__pycache__', '.venv', '.claude',
-         '.next', '.worktrees', 'worktrees', 'Pods',
+        # Covered by the shared `load_gitignore_patterns` defaults: not
+        # plausible source directory names, and routinely
+        # untracked-but-not-gitignored.
+        ['node_modules', '.git', 'obj', '__pycache__', '.venv',
+         '.next', '.worktrees', 'Pods',
          # Excluded via the shared context_gatherer defaults, so the index
          # and prompt assembly agree on what counts as source.
          'dist', 'build', 'venv'],
@@ -242,6 +243,43 @@ class TestExclusions:
         _, report = index._select_files(["**/*.js", "**/*.js"], 100)
 
         assert report['excluded'] == 1
+
+    @pytest.mark.parametrize("path", [
+        ".claude/skills/deploy-app/scripts/deploy_verify.py",
+        ".codex/skills/x/run.py",
+        ".car/agents/thing.py",
+        "src/worktrees/manager.py",
+    ])
+    def test_tracked_agent_source_is_indexed(self, tmp_path, path):
+        """The INDEX side of the same rule the gatherer got.
+
+        Deleting `.claude`/`worktrees` from the old exclusion list only
+        removed a negative assertion. Nothing said these are now indexed, so
+        re-adding a name list tomorrow would break this silently and no test
+        would notice. One live repo has 319 tracked files under `.claude/`.
+        """
+        _write(tmp_path, "real.py", "def real(): pass\n")
+        _write(tmp_path, path, "def agent_helper(): return 1\n")
+
+        index = ProjectIndex(str(tmp_path))
+        selected, _ = index._select_files(["**/*.py"], 100)
+
+        assert path in {str(p.relative_to(index.repo_root)) for p, _ in selected}
+
+    @pytest.mark.parametrize("path", [
+        ".claude/worktrees/a/src/copy.py",
+        ".codex/worktrees/issue-1/src/copy.py",
+        ".worktrees/PAR-1/copy.py",
+    ])
+    def test_worktree_copies_are_still_not_indexed(self, tmp_path, path):
+        """The other half: the copies must stay out."""
+        _write(tmp_path, "real.py", "def real(): pass\n")
+        _write(tmp_path, path, "def copy_of_real(): pass\n")
+
+        index = ProjectIndex(str(tmp_path))
+        selected, _ = index._select_files(["**/*.py"], 100)
+
+        assert path not in {str(p.relative_to(index.repo_root)) for p, _ in selected}
 
     def test_a_file_named_like_an_excluded_dir_is_kept(self, tmp_path):
         """Only directory components are matched, never the filename."""
