@@ -46,6 +46,9 @@ export NEO_OBSERVER_AUTOSTART=0
 # Warm-up (page cache, interpreter start); result discarded.
 "$NEO_BIN" --dry-run --cwd "$REPO" "warm up" >/dev/null 2>&1
 
+# Header and rows go through the SAME pipe, or results.csv lands headerless and the
+# aggregation below silently reads the first measurement as its column names.
+{
 echo "id,shape,run,wall_seconds,max_rss_bytes,files_selected"
 for entry in "${PROMPTS[@]}"; do
   id="${entry%%|*}"; rest="${entry#*|}"
@@ -67,3 +70,45 @@ for entry in "${PROMPTS[@]}"; do
     echo "$id,$shape,$run,$wall,$rss,$nfiles"
   done
 done
+} | tee "$OUT/results.csv"
+
+# The published aggregates are derived here rather than by hand, so the doc's
+# "exact command to reproduce" contract covers the headline numbers too.
+#
+# Median, not mean, for wall-clock (a single scheduler stall skews a small mean).
+# Max, not mean, for RSS (a peak is a peak).
+# Distinct file counts are reported BOTH as the per-prompt sum and as the battery
+# UNION. They differ -- a file selected by two prompts is one file -- and quoting
+# the sum as a distinct count inflates it. Report the union.
+python3 - "$OUT" <<'PY'
+import csv, statistics, collections, sys, pathlib
+out = pathlib.Path(sys.argv[1])
+rows = list(csv.DictReader(open(out / "results.csv")))
+by = collections.defaultdict(list)
+for r in rows:
+    by[(r["id"], r["shape"])].append((float(r["wall_seconds"]), int(r["max_rss_bytes"])))
+
+print("\n=== M2 aggregates ===")
+print(f"{'id':<4}{'shape':<14}{'median_s':>10}{'min_s':>8}{'max_s':>8}{'peak_RSS_MiB':>14}")
+walls, rsss = [], []
+for (pid, shape), v in sorted(by.items()):
+    w = [x[0] for x in v]; m = [x[1] for x in v]
+    walls += w; rsss += m
+    print(f"{pid:<4}{shape:<14}{statistics.median(w):>10.2f}{min(w):>8.2f}{max(w):>8.2f}"
+          f"{max(m)/1048576:>14.1f}")
+peak = max(rsss)
+print(f"\nBATTERY median wall = {statistics.median(walls):.2f}s "
+      f"(n={len(walls)}, min {min(walls):.2f}, max {max(walls):.2f})")
+print(f"BATTERY peak ru_maxrss = {peak} B = {peak/1048576:.1f} MiB = {peak/1e9:.2f} GB")
+print(f"vs M2 targets (<=5s / <=500MB): {statistics.median(walls)/5:.2f}x time, "
+      f"{peak/500e6:.2f}x memory")
+
+union, persum, entries = set(), 0, 0
+for f in sorted(out.glob("P*_run1.files")):
+    e = [l.strip() for l in f.read_text().splitlines() if l.strip()]
+    entries += len(e); persum += len(set(e)); union |= set(e)
+print(f"\nselected: {entries} entries | {persum} sum-of-per-prompt-distinct "
+      f"| {len(union)} BATTERY UNION distinct")
+(out / "union.files").write_text("\n".join(sorted(union)) + "\n")
+print(f"union written to {out / 'union.files'} (feed this to the G1 check)")
+PY

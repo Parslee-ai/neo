@@ -22,8 +22,12 @@ nothing in this document is estimated, projected, or interpolated.
 | **M1** recall@10 (`neo_current`) | 0.212 | 0.244 | **0.097** | — |
 | **M2** wall-clock, median | — | — | **10.54 s** | ≤ 5 s |
 | **M2** peak RSS (`ru_maxrss`) | — | — | **1.43 GB** | ≤ 500 MB |
-| **G1-inv** gitignored files selected | — | — | **0 / 171** | 0 |
-| **G1-inv** duplicate copies selected | — | — | **0 / 171** | 0 |
+| **G1-inv** gitignored files selected | — | — | **0 / 141** | 0 |
+| **G1-inv** duplicate copies selected | — | — | **0 / 141** | 0 |
+
+141 is the **union** of distinct files the selector put in context across all six
+battery prompts (180 context entries in total). Count the union, never the sum of
+per-prompt counts — see the G1 section.
 
 Three readings, stated plainly:
 
@@ -136,7 +140,7 @@ three repos, not just the one it cares about.
 | `neo_current` | 0.043 | 0.098 | 0.146 | 0.212 | 0.418 | 0.136 |
 | `bm25_content` | 0.266 | 0.541 | 0.612 | 0.695 | 0.740 | 0.559 |
 | `dense` | *not measured* | | | | | |
-| `rrf_bm25_dense` | 0.266 | 0.541 | 0.612 | 0.695 | 0.740 | 0.559 |
+| `rrf_bm25_dense` | *not measured* | | | | | |
 
 **aieweb** — 221 evaluable cases
 
@@ -145,7 +149,7 @@ three repos, not just the one it cares about.
 | `neo_current` | 0.053 | 0.117 | 0.182 | 0.244 | 0.296 | 0.180 |
 | `bm25_content` | 0.417 | 0.683 | 0.757 | 0.823 | 0.880 | 0.726 |
 | `dense` | *not measured* | | | | | |
-| `rrf_bm25_dense` | 0.417 | 0.683 | 0.757 | 0.823 | 0.880 | 0.726 |
+| `rrf_bm25_dense` | *not measured* | | | | | |
 
 **m365dotnet** — 173 evaluable cases
 
@@ -154,7 +158,7 @@ three repos, not just the one it cares about.
 | `neo_current` | 0.006 | 0.029 | 0.035 | 0.097 | 0.146 | 0.051 |
 | `bm25_content` | 0.284 | 0.559 | 0.684 | 0.813 | 0.877 | 0.607 |
 | `dense` | *not measured* | | | | | |
-| `rrf_bm25_dense` | 0.284 | 0.559 | 0.684 | 0.813 | 0.877 | 0.607 |
+| `rrf_bm25_dense` | *not measured* | | | | | |
 
 Harness cost, for scheduling later runs: neo 22.8 s / 131 MB, aieweb 45.1 s / 165 MB,
 m365dotnet 275.5 s / 800 MB.
@@ -174,7 +178,8 @@ for r in ['neo','aieweb','m365dotnet']:
 # neo 0 / aieweb 0 / m365dotnet 0
 ```
 
-Because `rrf_bm25_dense` degrades to `bmr` when `dn` is empty, its row is a duplicate
+Because `rrf_bm25_dense` degrades to `bmr` when `dn` is empty, its row would be a
+byte-for-byte duplicate
 of `bm25_content` and carries no independent information either. Both rows are
 recorded as **not measured**, not as zero.
 
@@ -264,8 +269,10 @@ background observer sweep cannot land inside a timed run.
 **Battery: median wall-clock 10.54 s** (n = 18, min 7.45, max 11.97).
 **Battery: peak `ru_maxrss` 1,434,402,816 bytes = 1368.0 MiB = 1.43 GB.**
 
-Against the M2 targets of ≤ 5 s and ≤ 500 MB: **2.1× over on time, 2.7× over on
-memory.**
+Against the M2 targets of ≤ 5 s and ≤ 500 MB: **2.1× over on time, 2.87× over on
+memory.** (1,434,402,816 B ÷ 500 MB. The plan states the target in MB, so the ratio is
+computed in MB — reading `ru_maxrss` as MiB against a MiB target gives 2.74× and
+understates the overage by 5%. Pick one base; this document uses the plan's.)
 
 Two things worth noting about the shape of the result:
 
@@ -285,8 +292,15 @@ cd <neo-worktree>
 tools/m2_battery.sh "$PWD/.venv-eval/bin/neo" <platform-root>/m365dotnet /tmp/m2_m365
 ```
 
-Prints one CSV row per timed run and writes each run's raw `/usr/bin/time -l` output
-and selected-file list into the output directory.
+Prints one CSV row per timed run, then prints the **aggregates published above** —
+per-prompt median/min/max wall, per-prompt peak RSS, the battery median and peak, and
+the ratios against the M2 targets. The aggregation is in the script rather than done by
+hand, so every number in the M2 tables comes out of this one command.
+
+It also writes into the output directory: each run's raw `/usr/bin/time -l` capture
+(`<id>_run<n>.txt`), each run's selected-file list (`<id>_run<n>.files`), the raw
+`results.csv`, and `union.files` — the distinct union across the battery, which is the
+input to the G1 check below.
 
 ---
 
@@ -308,10 +322,18 @@ worktrees** under `.worktrees/`, which is exactly the condition that produced th
 | P4 | 30 | 29 | 0 | 0 | 0 | 0 |
 | P5 | 30 | 28 | 0 | 0 | 0 | 0 |
 | P6 | 30 | 28 | 0 | 0 | 0 | 0 |
-| **TOTAL** | **180** | **171** | **0** | **0** | **0** | **0** |
+| *sum of rows* | 180 | 171 | 0 | 0 | 0 | 0 |
+| **BATTERY UNION** | **180** | **141** | **0** | **0** | **0** | **0** |
 
 **G1-inv holds.** Post-#186 this is not "near zero", it is zero, on the repo with the
-worst duplicate exposure on this machine.
+worst duplicate exposure on this machine — and it holds computed either way, over the
+141-file union and over the 171 per-prompt selections with repeats.
+
+**Read the union row, not the sum row.** 171 is the sum of the six per-prompt distinct
+counts, which counts a file once per prompt that selected it; the battery selected
+**141** distinct files in total, so 30 files were picked by more than one prompt. The
+sum row is kept only to make the double-count visible. A later goal that reports a true
+union and compares it to 171 will see a 17% "coverage regression" that never happened.
 
 Definitions, so a later re-measure counts the same things:
 
@@ -329,10 +351,13 @@ Definitions, so a later re-measure counts the same things:
 
 Two observations that are *not* G1 violations but belong on the record:
 
-- **180 context entries cover 171 distinct files.** Nine slots are a second window of
-  a file already selected. That is `MAX_CHUNKS_PER_FILE` working as designed, not
-  duplication — but it means "30 files selected" overstates coverage by ~5%, and any
-  later goal reporting a file count should say which it is counting.
+- **180 context entries cover 141 distinct files.** Battery-wide, 23 of the 180 entries
+  are a second window of a file already selected — `MAX_CHUNKS_PER_FILE` working as
+  designed, not duplication. Within a single prompt the effect is smaller (30 entries →
+  28–29 distinct). So "30 files selected" overstates that prompt's coverage by ~5%, and
+  a raw entry count overstates battery coverage by 28%. Any later goal reporting a file
+  count must say which of the three it is counting: entries, per-prompt distinct, or
+  union.
 - **Named paths were pinned.** P1's `Program.cs` and P2's `EntitlementsController.cs`
   each appear (2 windows each). That is a G2-inv spot check, not a G2-inv
   measurement — the full G2 battery is Goal 3's deliverable.
@@ -343,20 +368,29 @@ Run the M2 battery first (it writes the per-prompt selected-file lists), then:
 
 ```bash
 python3 - <<'PY'
-import subprocess, hashlib, os, collections
+import subprocess, hashlib, os, collections, glob
 REPO = "<platform-root>/m365dotnet"
-for pid in ["P1","P2","P3","P4","P5","P6"]:
-    paths = sorted({l.strip() for l in open(f"/tmp/m2_m365/{pid}_run1.files") if l.strip()})
-    ig = subprocess.run(["git","-C",REPO,"check-ignore","--stdin"],
+
+def g1(label, paths):
+    paths = sorted(set(paths))
+    ig = subprocess.run(["git", "-C", REPO, "check-ignore", "--stdin"],
                         input="\n".join(paths), capture_output=True, text=True)
     ignored = [l for l in ig.stdout.splitlines() if l.strip()]
     h, missing = collections.defaultdict(list), []
     for rel in paths:
-        try: h[hashlib.sha256(open(os.path.join(REPO,rel),'rb').read()).hexdigest()].append(rel)
+        try: h[hashlib.sha256(open(os.path.join(REPO, rel), 'rb').read()).hexdigest()].append(rel)
         except OSError: missing.append(rel)
-    dup = sum(len(v)-1 for v in h.values() if len(v) > 1)
-    wt  = [p for p in paths if p.startswith(".worktrees/") or "/.worktrees/" in p]
-    print(pid, len(paths), len(ignored), dup, len(wt), len(missing))
+    dup = sum(len(v) - 1 for v in h.values() if len(v) > 1)
+    wt = [p for p in paths if p.startswith(".worktrees/") or "/.worktrees/" in p]
+    print(label, len(paths), len(ignored), dup, len(wt), len(missing))
+
+print("label distinct ignored dup in_worktrees unresolvable")
+union = set()
+for pid in ["P1", "P2", "P3", "P4", "P5", "P6"]:
+    p = [l.strip() for l in open(f"/tmp/m2_m365/{pid}_run1.files") if l.strip()]
+    union |= set(p)
+    g1(pid, p)
+g1("UNION", union)   # <- the row the headline quotes
 PY
 ```
 
