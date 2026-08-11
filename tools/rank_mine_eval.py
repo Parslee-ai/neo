@@ -207,7 +207,23 @@ def mine_cases(repo: str, want: int, skip_recent: int, max_files: int) -> list[d
     return cases
 
 
-def assert_tree_is_effective(tree: str) -> None:
+def _git_head(path: str) -> str:
+    """Short HEAD, or a marker -- never an exception.
+
+    `--tree` is not required to be a git checkout, and stamping it must not be
+    able to destroy a run. Computed BEFORE the case loop for the same reason:
+    a `git worktree prune`d checkout still has `src/neo`, so it passes the
+    effectiveness guard, ranks all 50 cases, and only then discovers it cannot
+    be stamped -- ~100 seconds of subprocess work thrown away with a traceback
+    pointing at a string format instead of at the real problem.
+    """
+    try:
+        return _git(path, "rev-parse", "HEAD").strip()[:12]
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return "not-a-git-checkout"
+
+
+def assert_tree_is_effective(tree: str, repo: str) -> None:
     """Prove `--tree` actually won, rather than trusting that it did.
 
     Mandatory is not the same as effective. The venv's editable install is a
@@ -218,12 +234,20 @@ def assert_tree_is_effective(tree: str) -> None:
     against 0.082 error (superseded generation, see the module docstring),
     unguarded, inside the tool written to prevent it.
 
-    Caller MUST pass an absolute path. This resolves from the HARNESS's cwd
-    while `rank_files` hands the same string to a child running with
-    `cwd=repo`, so a relative `--tree` checks one directory and measures
-    another -- and Python drops a nonexistent `PYTHONPATH` entry without a
-    word, which leaves this guard green while the run uses the installed copy.
-    `main` absolutizes both paths before calling here.
+    Two ways this guard could check one directory while the run measured
+    another, both closed here, and the second is why it takes `repo`:
+
+    1. A RELATIVE `--tree` resolved against the harness's cwd while
+       `rank_files` handed the same string to a child running with `cwd=repo`.
+       Python drops a nonexistent `PYTHONPATH` entry without a word, so the
+       guard stayed green while the run used the installed copy. `main`
+       absolutizes both paths before calling here.
+    2. The PROBE must run from `cwd=repo`, exactly as `rank_files` does.
+       Python puts the cwd at `sys.path[0]`, AHEAD of `PYTHONPATH`, for both
+       `-c` and `-m` -- so a repo containing a top-level `neo/` package
+       shadows the named tree in the measurement while a probe run from
+       anywhere else sees nothing wrong. None of neo, car or quip has such a
+       directory today; a guard is the one place that is not an argument.
     """
     src = os.path.join(tree, "src")
     if not os.path.isdir(os.path.join(src, "neo")):
@@ -232,6 +256,7 @@ def assert_tree_is_effective(tree: str) -> None:
                          f"code twice")
     loaded = subprocess.run(
         [sys.executable, "-c", "import neo, sys; sys.stdout.write(neo.__file__)"],
+        cwd=repo,   # resolve imports the way the measurement does; see above
         env={**os.environ, "PYTHONPATH": src}, capture_output=True, text=True,
         timeout=120,
     ).stdout.strip()
@@ -359,7 +384,10 @@ def main() -> int:
     # put the guard green while both arms ran the installed copy.
     args.tree = os.path.abspath(args.tree)
     args.repo = os.path.abspath(args.repo)
-    assert_tree_is_effective(args.tree)
+    assert_tree_is_effective(args.tree, args.repo)
+    # Stamped up front: nothing about identifying the two inputs should be
+    # discoverable only after a 50-case run has already been spent.
+    repo_head, tree_head = _git_head(args.repo), _git_head(args.tree)
     cases = mine_cases(args.repo, args.cases, args.skip_recent, args.max_truth_files)
     if not cases:
         print("no eligible cases mined -- widen --max-truth-files or lower "
@@ -415,11 +443,11 @@ def main() -> int:
     # HEADs score different case sets. Without this stamp a delta between runs
     # cannot be attributed to the change under test rather than to the window
     # having moved -- which has already happened once on this branch.
-    result["repo_head"] = _git(args.repo, "rev-parse", "HEAD").strip()[:12]
+    result["repo_head"] = repo_head
     # And the TREE's revision, which is the object the two arms actually differ
     # by. `result["tree"]` is a mutable path, not a generation: it says where
     # the ranker was read from, never which ranker it was.
-    result["tree_head"] = _git(args.tree, "rev-parse", "HEAD").strip()[:12]
+    result["tree_head"] = tree_head
 
     if args.json:
         print(json.dumps(result, indent=2))

@@ -11,7 +11,9 @@ What is pinned below is therefore the arithmetic and the fail-closed paths,
 not the mining (which needs a real repository).
 """
 import importlib.util
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -235,9 +237,32 @@ class TestGuards:
 
     def test_a_tree_without_src_neo_is_refused(self, tmp_path):
         with pytest.raises(SystemExit) as exc:
-            rme.assert_tree_is_effective(str(tmp_path))
+            rme.assert_tree_is_effective(str(tmp_path), str(tmp_path))
 
         assert "src/neo" in str(exc.value)
+
+    def test_the_probe_runs_from_the_repo_the_measurement_runs_from(
+            self, tmp_path, monkeypatch):
+        """cwd lands at sys.path[0], AHEAD of PYTHONPATH.
+
+        A probe run from anywhere else cannot see a repo-local `neo/` package
+        shadowing the named tree, so the guard would pass while the run
+        measured the shadow.
+        """
+        (tmp_path / "src" / "neo").mkdir(parents=True)
+        repo = tmp_path / "somerepo"
+        repo.mkdir()
+        seen = {}
+
+        def fake_run(*args, **kwargs):
+            seen["cwd"] = kwargs.get("cwd")
+            return subprocess.CompletedProcess(
+                args, 0, stdout=str(tmp_path / "src" / "neo" / "__init__.py"))
+        monkeypatch.setattr(rme.subprocess, "run", fake_run)
+
+        rme.assert_tree_is_effective(str(tmp_path), str(repo))
+
+        assert seen["cwd"] == str(repo)
 
     def test_a_tree_that_does_not_win_the_import_is_refused(self, tmp_path,
                                                             monkeypatch):
@@ -250,7 +275,7 @@ class TestGuards:
         monkeypatch.setattr(rme.subprocess, "run", fake_run)
 
         with pytest.raises(SystemExit) as exc:
-            rme.assert_tree_is_effective(str(tmp_path))
+            rme.assert_tree_is_effective(str(tmp_path), str(tmp_path))
 
         assert "did not take effect" in str(exc.value)
 
@@ -262,9 +287,42 @@ class TestGuards:
             return subprocess.CompletedProcess(args, 0, stdout=resolved)
         monkeypatch.setattr(rme.subprocess, "run", fake_run)
 
-        rme.assert_tree_is_effective(str(tmp_path))   # must not raise
+        rme.assert_tree_is_effective(str(tmp_path), str(tmp_path))   # no raise
 
-    def test_nothing_parsed_anywhere_is_a_failure_not_a_zero(self):
-        """`any()` over the rankings is the whole guard; pin its truth table."""
-        assert not any([[], [], []])          # every case parsed nothing -> fail
-        assert any([[], ["a.py"], []])        # one case parsed -> a real result
+    def test_relative_paths_are_absolutized_before_the_guard_sees_them(
+            self, tmp_path, monkeypatch):
+        """The headline fix of b45cc92, which was verified by hand only.
+
+        `--repo x --tree .` resolved `.` against the harness's cwd while the
+        measurement ran with `cwd=repo` -- guard green, wrong tree measured.
+        """
+        (tmp_path / "src" / "neo").mkdir(parents=True)
+        (tmp_path / "repo").mkdir()
+        monkeypatch.chdir(tmp_path)
+        seen = {}
+
+        def fake_guard(tree, repo):
+            seen["tree"], seen["repo"] = tree, repo
+            raise SystemExit("stop here -- only the paths are under test")
+        monkeypatch.setattr(rme, "assert_tree_is_effective", fake_guard)
+        monkeypatch.setattr(sys, "argv",
+                            ["rank_mine_eval.py", "--repo", "repo", "--tree", "."])
+
+        with pytest.raises(SystemExit):
+            rme.main()
+
+        assert os.path.isabs(seen["tree"]) and os.path.isabs(seen["repo"])
+        assert seen["tree"] == str(tmp_path.resolve())
+
+
+class TestHeadStamp:
+    def test_a_non_git_tree_stamps_instead_of_exploding(self, tmp_path):
+        """`--tree` need not be a git checkout, and a prune'd worktree passes
+        the effectiveness guard. Raising here discarded a finished 50-case run
+        with a traceback pointing at a string format."""
+        assert rme._git_head(str(tmp_path)) == "not-a-git-checkout"
+
+    def test_a_real_checkout_stamps_a_short_sha(self):
+        head = rme._git_head(str(Path(__file__).resolve().parent.parent))
+
+        assert len(head) == 12 and head != "not-a-git-checkout"

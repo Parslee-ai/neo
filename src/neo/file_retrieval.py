@@ -69,9 +69,11 @@ File selection used none of it.
 
 **Fusion is deliberately absent, provisionally.** RRF over BM25 + the existing
 dense channel measured WORSE than BM25 alone (0.596 best-weighted vs 0.693
-R@10): dense returns ~25 files against BM25's ~180 and is roughly half as
-accurate, so equal-weight fusion lets a short low-quality list promote
-mediocre hits, and no weighting recovered past BM25-only.
+R@10 -- SUPERSEDED-generation figures, unstamped when first recorded, and not
+comparable with the table above): dense returns ~25 files against BM25's ~180
+and is roughly half as accurate, so equal-weight fusion lets a short
+low-quality list promote mediocre hits, and no weighting recovered past
+BM25-only.
 
 Two caveats on that number, both found in review and both worth respecting
 before it is treated as settled. It was measured at k=10, and k=10 is where
