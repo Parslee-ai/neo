@@ -536,6 +536,17 @@
   asked git for the same remote 3× — ~100 forks/cycle, ~26k/week. Staleness is
   bounded to one cycle because a stale hit would write facts under the wrong
   `project_id`.
+- **Measuring retrieval changes: pin `PYTHONPATH`, and measure the REAL pipeline.**
+  Two traps, both hit during the BM25 work, both producing confident wrong numbers.
+  (1) The venv installs neo EDITABLE against `src/`, so running
+  `.venv/bin/python -m neo.cli` from a git worktree of another commit executes THIS
+  tree's code against that tree's files — a "baseline" run that is not the baseline.
+  Every A/B needs `PYTHONPATH=<that tree>/src`. Measured: it made main look like
+  MRR 0.613 when its real figure is 0.082. (2) Calling `score_candidate` directly
+  measures the FIRST-PASS ranking only; `gather_context` then re-ranks with
+  `pi_boost + hist_boost + _symbol_score` and applies an adaptive limit and a byte
+  budget. A first-pass harness overstated R@10 by 0.14 against the real CLI. Validate
+  any in-process replica against `--dry-run` output before trusting a sweep.
 - Debugging: `neo --dry-run "your query"` assembles the full context (file selection,
   fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
   the LM, then exits without making the LLM call. Faster iteration on context-gatherer
@@ -615,12 +626,38 @@
   `test_every_chunk_query_compiles` /
   `test_every_edge_query_compiles` prove compilation ONLY, so a new query still
   needs its own behavioural assertion.
-- Context selection (`context_gatherer`): **a path named in the prompt is pinned**
-  (`EXPLICIT_PATH_BOOST=10.0`, chosen to exceed every organic signal combined —
-  filename overlap caps at +1.8, the re-rank boosts at +1.0 and +1.2). Without it a
-  spelled-out path competed on generic filename-token overlap and lost:
-  `src/neo/subcommands.py` ranked **163rd of 296** on a prompt naming it, below its
-  own test file, because an 86KB file takes a heavy size penalty. The file never
+- Context selection (`context_gatherer`): **files are ranked by BM25 over their
+  CONTENT** (`neo.file_retrieval`), not by their path. Until 2026-08 they were: the
+  scorer took `(rel_path, size, prompt_tokens, git_recent, entry_points)` and the
+  file was first opened *after* selection, only to chunk what had already been
+  chosen. Every other defect in that scorer followed from having no content signal,
+  and the dominant term was `score -= 0.01 * size_kb`, uncapped, against a realistic
+  positive signal of +0.6 to +2.1 — so a file with one keyword hit was unrankable
+  above 60 KB. `src/neo/memory/store.py` scored **0.000** and ranked 200th of 284 for
+  "fix the fact store supersession threshold", because it is 162 KB. Ground truth ran
+  31–177 KB against a corpus median of 10 KB: central files are large *because* they
+  are central. That had already been noticed once and patched with a seven-name stem
+  whitelist, which rescued `engine.py` (−0.13) and left `store.py` (−1.62) — a 12×
+  disparity decided by whether someone had thought of the name. **The sign was wrong,
+  not the magnitude**: BugLocator's rVSM (ICSE 2012) ranks larger files *higher* for
+  this exact task, and BM25's `b` handles the concern with bounded, corpus-derived
+  length normalization. Measured end-to-end over cases mined from git history
+  (commit subject = query, changed non-test files = ground truth), R@10 / MRR:
+  neo 0.078→0.606 / 0.082→0.644, car 0.210→0.507 / 0.149→0.250, quip 0.213→0.857 /
+  0.188→0.698. `tools/rank_eval.py` is the harness.
+  **Two negative results, recorded so they are not retried.** RRF fusion with the
+  dense channel LOSES to BM25 alone (0.596 best-weighted vs 0.693) — dense returns
+  ~25 files against BM25's ~180 and is half as accurate — even after chunk allocation
+  was fixed. And a sweep of the re-rank weights (`pi_boost`, `_symbol_score`,
+  history: damped to 0.3, to 0.5, each disabled, content doubled) lands everywhere in
+  0.66–0.68, so the re-rank is *redundant* with content ranking rather than fighting
+  it. Four filename-tuning fixes were also measured and rejected; the filename is not
+  the evidence, the file is.
+  **A path named in the prompt is still pinned** (`EXPLICIT_PATH_BOOST=10.0`, chosen
+  to exceed every organic signal combined — content caps at +3.0, the re-rank boosts
+  at +1.0 and +1.2). Without it a spelled-out path competed on generic filename-token
+  overlap and lost: `src/neo/subcommands.py` ranked **163rd of 296** on a prompt
+  naming it, below its own test file, because an 86KB file took a heavy size penalty. The file never
   reached context, so the model correctly refused to patch code it had not seen and
   emitted NO diff — and a suggestion with no diff text can never be git-verified,
   which is a major reason only ~32% of suggestions were verifiable.
