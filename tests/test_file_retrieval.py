@@ -212,14 +212,21 @@ class TestConstantsArePinned:
 
     def test_normalize_ceiling_default(self):
         """Mutating the default to 0.05 left all 156 selection tests green and
-        cost R@10 0.875 -> 0.750 on the real CLI."""
+        cost R@10 0.875 -> 0.750 on the real CLI.
+
+        That R@10 is the `tools/rank_eval.py` generation -- 12 hand-labelled
+        prompts, this repo. It is NOT comparable with the cross-repo R@10 in
+        `neo.file_retrieval`, which is `tools/rank_mine_eval.py` over git-mined
+        cases. Same label, different instrument; keep the generation attached.
+        """
         from neo.file_retrieval import normalize
 
         assert normalize({"a": 4.0, "b": 2.0})["a"] == pytest.approx(1.0)
 
     def test_max_indexed_chars_value(self):
         """Mutating 200_000 -> 2_000 left all 156 selection tests green and
-        cost R@10 0.875 -> 0.750."""
+        cost R@10 0.875 -> 0.750 (the `tools/rank_eval.py` labelled generation,
+        not the cross-repo mined one -- see `test_normalize_ceiling_default`)."""
         from neo.file_retrieval import MAX_INDEXED_CHARS
 
         assert MAX_INDEXED_CHARS == 200_000

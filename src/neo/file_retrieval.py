@@ -134,11 +134,21 @@ def _read(path: str, limit: int = MAX_INDEXED_CHARS) -> str:
     That is not merely wasted work: BM25's length normalization divides by the
     corpus average document length, so binary blobs make every real file's
     length penalty depend on how many PDFs happen to sit in the repository.
-    Measured on this repo before the probe: 5 PDFs were 1.7% of documents and
-    **32.9% of all tokens**, and dropping them moved `avgdl` from 2773 to 1892.
     A size term whose behaviour depends on something unrelated to relevance is
     the exact defect this module exists to remove; letting it back in through
     the corpus statistics would be the same bug by another door.
+
+    Measured on this repo, through the real candidate path: the probe catches
+    **8 of 289 candidates (2.8%) carrying 27.5% of all tokens**, and dropping
+    them moves `avgdl` from 2760 to 2059.
+
+    Read those figures with their conditions attached, because they move. Four
+    of the eight are `.ruff_cache` blobs, so the exact share depends on whether
+    anyone has run ruff since the last clean -- an earlier measurement on a
+    cleaner tree recorded 5 PDFs at 1.7% of documents and 32.9% of tokens. What
+    is stable, and what the probe is for, is the shape: a low single-digit
+    percentage of documents carrying roughly a third of the corpus tokens, and
+    an `avgdl` inflated by a third by files no query will ever want.
     """
     try:
         with open(path, "rb") as raw:
