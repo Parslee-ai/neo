@@ -541,8 +541,9 @@
   (1) The venv installs neo EDITABLE against `src/`, so running
   `.venv/bin/python -m neo.cli` from a git worktree of another commit executes THIS
   tree's code against that tree's files — a "baseline" run that is not the baseline.
-  Every A/B needs `PYTHONPATH=<that tree>/src`. Measured: it made main look like
-  MRR 0.613 when its real figure is 0.082. (2) Calling `score_candidate` directly
+  Every A/B needs `PYTHONPATH=<that tree>/src`. Measured on the superseded harness
+  generation: it made main look like MRR 0.613 against a real figure of 0.082 (the
+  current harness puts main at 0.294 — different instrument, same trap). (2) Calling `score_candidate` directly
   measures the FIRST-PASS ranking only; `gather_context` then re-ranks with
   `pi_boost + hist_boost + _symbol_score` and applies an adaptive limit and a byte
   budget. A first-pass harness overstated R@10 by 0.14 against the real CLI. Validate
@@ -643,10 +644,23 @@
   this exact task, and BM25's `b` handles the concern with bounded, corpus-derived
   length normalization. Measured end-to-end over cases mined from git history
   (commit subject = query, changed non-test files = ground truth), R@10 / MRR:
-  neo 0.078→0.603 / 0.082→0.655, car 0.210→0.487 / 0.149→0.233, quip 0.213→0.850 /
-  0.188→0.735, at `CONTENT_WEIGHT = 3.0`. `tools/rank_eval.py` is the harness, and
-  the numbers must be measured through the REAL CLI with `PYTHONPATH` pinned — see
-  the measurement warning above.
+  neo 0.275→0.732 / 0.294→0.787, car 0.192→0.502 / 0.160→0.398, quip 0.175→0.720 /
+  0.166→0.658, at `CONTENT_WEIGHT = 3.0`. **`tools/rank_mine_eval.py` is the
+  harness** — not `tools/rank_eval.py`, which is a different instrument (12
+  hand-labelled prompts, this repo, recall@k, no MRR) and was named here in error
+  while the real one went uncommitted, leaving the figures unreproducible. Quoting
+  a number from one under the other's name is how `car` got into the record twice
+  at 0.969 and 0.507; keep the generation attached. An earlier generation of these
+  same figures read neo 0.078→0.603 / 0.082→0.655 — superseded, and not comparable,
+  because the harness that produced it no longer exists to re-run.
+  **The absolute values are upper bounds, and the tool says so per run.** The
+  scorer's recency signal holds PATHS, so a case mined below the commit window
+  whose truth file was touched again inside it is still contaminated — 48 of 50
+  cases on this repo, because neo's churn concentrates in exactly the files most
+  likely to be ground truth. `--drop-contaminated` empties the sample outright
+  here rather than cleaning it. Direction is the robust part; treat magnitudes as
+  bounded, and re-run on a CLEAN checkout of both trees, since a dirty working
+  tree puts every edited path into the same signal.
   **The re-rank is LOAD-BEARING, not redundant** (`pi_boost` + `_symbol_score` +
   `hist_boost`, applied after the first-pass score). Disabling it on the real CLI
   takes R@1 from 0.344 to **0.044** and MRR from 0.646 to **0.261**. An earlier
@@ -654,7 +668,8 @@
   everywhere in 0.66–0.68 — measured at k=10, where every configuration is flat, and
   through an in-process replica that omits the byte budget and adaptive limit, i.e.
   exactly the stages that make the re-rank matter. Both errors are the ones
-  `tools/rank_eval.py` warns about in its own docstring. Per channel, `hist_boost`
+  `tools/rank_mine_eval.py` warns about in its own docstring (`rank_eval.py` was
+  cited here and carries neither warning). Per channel, `hist_boost`
   contributes nothing measurable (identical results with it disabled) while
   `_symbol_score` carries most of the effect.
   RRF fusion with the dense channel LOSES to BM25 alone (0.596 best-weighted vs
