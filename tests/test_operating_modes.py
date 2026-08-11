@@ -231,6 +231,12 @@ def test_verify_cli_needs_no_provider_and_agent_cli_fails_before_provider(tmp_pa
         },
         "intent": {"type": "verify_attempt"},
         "outcome": {"status": "passed", "summary": "checks passed"},
+        "validation_observations": [{
+            "observation_id": "legacy-proof",
+            "gate_id": "legacy-1",
+            "status": "passed",
+            "actual_exit_code": 0,
+        }],
         "role": "verifier",
     }
 

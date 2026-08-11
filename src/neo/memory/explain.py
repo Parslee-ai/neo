@@ -70,6 +70,11 @@ def _episode_summary(episode: LearningEpisode) -> dict[str, Any]:
         "episode_id": episode.episode_id,
         "session_id": episode.session_id,
         "task_id": episode.task_id,
+        "goal_id": episode.goal_id,
+        "parent_task_id": episode.parent_task_id,
+        "trace_id": episode.trace_id,
+        "discovery_source": episode.discovery_source,
+        "repositories_touched": list(episode.repositories_touched),
         "objective": episode.objective,
         "repository_revision": episode.repository_revision,
         "final_outcome": episode.final_outcome,
@@ -169,8 +174,38 @@ def explain_fact(
                         "tool_name": item.tool_name,
                         "summary": item.summary,
                         "repository_revision": item.repository_revision,
+                        "gate_id": item.gate_id,
+                        "observed_at": item.observed_at,
+                        "state_fingerprint": item.state_fingerprint,
+                        "evidence_sha256": item.evidence_sha256,
+                        "source": item.source,
+                        "waiver_reason": item.waiver_reason,
                     }
                     for item in episode.verification
+                ],
+                "validation_gates": [
+                    {
+                        "gate_id": item.gate_id,
+                        "description": item.description,
+                        "kind": item.kind,
+                        "boundary": item.boundary,
+                        "required": item.required,
+                        "repository_revision": item.repository_revision,
+                        "state_fingerprint": item.state_fingerprint,
+                    }
+                    for item in episode.validation_gates
+                ],
+                "hypotheses": [
+                    {
+                        "hypothesis_id": item.hypothesis_id,
+                        "statement": item.statement,
+                        "status": item.status,
+                        "falsifying_test": item.falsifying_test,
+                        "supporting_observation_ids": item.supporting_observation_ids,
+                        "contradicting_observation_ids": item.contradicting_observation_ids,
+                        "public_claim_safe": item.public_claim_safe,
+                    }
+                    for item in episode.hypotheses
                 ],
                 "outcome_details": episode.outcome_details,
             })

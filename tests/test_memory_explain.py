@@ -9,10 +9,12 @@ from pathlib import Path
 import pytest
 
 from neo.memory.episodes import (
+    HypothesisEvidence,
     LearningEpisode,
     LearningEpisodeStore,
     MemoryMutationEvidence,
     RetrievedFactEvidence,
+    ValidationGateEvidence,
     VerificationEvidence,
 )
 from neo.memory.explain import (
@@ -64,6 +66,20 @@ def test_explanation_joins_support_conflict_retrieval_and_mutation(tmp_path):
         status="passed",
         tool_name="pytest",
         summary="focused tests passed",
+        gate_id="focused-suite",
+    ))
+    support.validation_gates.append(ValidationGateEvidence(
+        gate_id="focused-suite",
+        description="Focused validation suite",
+        boundary="integration-enabled",
+    ))
+    support.hypotheses.append(HypothesisEvidence(
+        hypothesis_id="h-validation",
+        statement="The missing guard caused the failure",
+        status="confirmed",
+        falsifying_test="Restore the guard and rerun the suite",
+        supporting_observation_ids=["verify-1"],
+        public_claim_safe=True,
     ))
     support.memory_mutations.append(MemoryMutationEvidence(
         mutation_id="mutation-1",
@@ -118,6 +134,8 @@ def test_explanation_joins_support_conflict_retrieval_and_mutation(tmp_path):
     assert explanation["fact"]["source_candidate_id"] == "candidate-1"
     assert explanation["supporting_evidence"][0]["episode_id"] == "support-1"
     assert explanation["supporting_evidence"][0]["verification"][0]["status"] == "passed"
+    assert explanation["supporting_evidence"][0]["validation_gates"][0]["gate_id"] == "focused-suite"
+    assert explanation["supporting_evidence"][0]["hypotheses"][0]["status"] == "confirmed"
     assert explanation["contradicting_evidence"][0]["final_outcome"] == "regression"
     assert explanation["retrieval_history"][0]["score"] == pytest.approx(0.8125)
     assert explanation["retrieval_history"][0]["used_in_reasoning"] is True

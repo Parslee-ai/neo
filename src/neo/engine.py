@@ -18,6 +18,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -583,7 +584,9 @@ class NeoEngine:
         from neo.agent_context import discover as discover_agent_docs
         from neo.memory.episodes import (
             ContextSelection,
+            HypothesisEvidence,
             LearningEpisode,
+            ValidationGateEvidence,
             content_hash,
             redact_sensitive_text,
             repository_state,
@@ -615,7 +618,8 @@ class NeoEngine:
             except Exception:
                 model = ""
 
-        return LearningEpisode(
+        identity = self.resolved_execution_context.execution_identity
+        episode = LearningEpisode(
             objective=redact_sensitive_text(neo_input.prompt),
             project_id=self.episode_store.project_id,
             repository_root=self.codebase_root or "",
@@ -627,7 +631,63 @@ class NeoEngine:
             operating_mode=neo_input.operating_mode.value,
             authority=(neo_input.authority.public_summary() if neo_input.authority else {}),
             execution_context=self._safe_execution_context_dict(),
+            goal_id=identity.goal_id,
+            parent_task_id=identity.parent_task_id,
+            trace_id=identity.trace_id,
+            discovery_source=redact_sensitive_text(identity.discovery_source),
+            blocking_goal_reason=redact_sensitive_text(identity.blocking_goal_reason),
+            repositories_touched=list(identity.repositories_touched),
+            artifact_refs=[content_hash(item) for item in identity.artifact_refs],
+            validation_gates=[
+                ValidationGateEvidence(
+                    gate_id=item.gate_id,
+                    description=redact_sensitive_text(item.description),
+                    kind=item.kind,
+                    boundary=item.boundary,
+                    required=item.required,
+                    expected_exit_code=item.expected_exit_code,
+                    expected_value=(
+                        item.expected_value
+                        if isinstance(item.expected_value, (int, float, bool))
+                        or item.expected_value is None
+                        else {
+                            "sha256": content_hash(json.dumps(
+                                item.expected_value, sort_keys=True, default=str,
+                            )),
+                            "size": len(json.dumps(item.expected_value, default=str)),
+                        }
+                    ),
+                    state_fingerprint=item.state_fingerprint,
+                    repository_revision=item.repository_revision,
+                    allow_waiver=item.allow_waiver,
+                    source=item.source,
+                )
+                for item in self.resolved_execution_context.validation_gates
+            ],
+            hypotheses=[
+                HypothesisEvidence(
+                    hypothesis_id=item.hypothesis_id,
+                    statement=redact_sensitive_text(item.statement),
+                    status=item.status,
+                    prior_status=item.prior_status,
+                    competing_explanations=[
+                        redact_sensitive_text(value)
+                        for value in item.competing_explanations
+                    ],
+                    falsifying_test=redact_sensitive_text(item.falsifying_test),
+                    supporting_observation_ids=list(item.supporting_observation_ids),
+                    contradicting_observation_ids=list(item.contradicting_observation_ids),
+                    source=item.source,
+                    public_claim_safe=item.public_claim_safe,
+                )
+                for item in self.resolved_execution_context.hypotheses
+            ],
         )
+        if identity.session_id:
+            episode.session_id = identity.session_id
+        if identity.task_id:
+            episode.task_id = identity.task_id
+        return episode
 
     def _safe_execution_context_dict(self) -> dict[str, Any]:
         """Return a bounded, secret-redacted envelope safe for local evidence."""
@@ -638,7 +698,10 @@ class NeoEngine:
                 return "[TRUNCATED]"
             sensitive_payload_key = any(
                 token in key.lower()
-                for token in ("content", "source", "code", "diff", "patch")
+                for token in (
+                    "content", "source", "code", "diff", "patch", "artifact",
+                    "actual_value", "expected_value", "evidence",
+                )
             )
             if sensitive_payload_key and value not in (None, ""):
                 serialized = json.dumps(value, sort_keys=True, default=str)
@@ -1054,7 +1117,7 @@ class NeoEngine:
                     status="fallback",
                 )
                 self._emit(
-                    NeoEventType.HYPOTHESIS_REJECTED,
+                    NeoEventType.REASONING_FALLBACK,
                     phase=PHASE_REASONING,
                     message=self._voice("panel_rejected"),
                 )
@@ -1074,12 +1137,24 @@ class NeoEngine:
                 "suggestions": len(code_suggestions),
             }
 
-        if plan:
+        self._adopt_plan_hypotheses(plan)
+        for hypothesis in self.resolved_execution_context.hypotheses:
+            event_type = {
+                "candidate": NeoEventType.HYPOTHESIS_FORMED,
+                "supported": NeoEventType.HYPOTHESIS_UPDATED,
+                "confirmed": NeoEventType.HYPOTHESIS_CONFIRMED,
+                "rejected": NeoEventType.HYPOTHESIS_REJECTED,
+                "contradicted": NeoEventType.HYPOTHESIS_CONTRADICTED,
+            }[hypothesis.status]
             self._emit(
-                NeoEventType.HYPOTHESIS_FORMED,
+                event_type,
                 phase=PHASE_REASONING,
-                message=plan[0].description,
-                plan_steps=len(plan),
+                message=hypothesis.statement,
+                hypothesis_id=hypothesis.hypothesis_id,
+                prior_status=hypothesis.prior_status,
+                status=hypothesis.status,
+                supporting_observation_ids=hypothesis.supporting_observation_ids,
+                contradicting_observation_ids=hypothesis.contradicting_observation_ids,
             )
         for trace in simulation_traces or []:
             for issue in trace.issues_found:
@@ -1350,10 +1425,11 @@ class NeoEngine:
             metadata=metadata,
         )
 
-        from neo.execution_context import assess_loop
+        from neo.execution_context import assess_loop, assess_validation
         goal_assessment, strategy_assessment = assess_loop(
             self.resolved_execution_context
         )
+        validation_assessment = assess_validation(self.resolved_execution_context)
         from neo.memory.metrics import record as record_memory_metric
         record_memory_metric(
             "loop_assessed",
@@ -1364,14 +1440,30 @@ class NeoEngine:
             goal_status=goal_assessment.status,
             progress=goal_assessment.progress,
             strategy_decision=strategy_assessment.decision,
+            validation_required=validation_assessment.required,
+            validation_passed=validation_assessment.passed,
+            validation_failed=validation_assessment.failed,
+            validation_pending=validation_assessment.pending,
         )
         recommended_next_action: dict[str, Any] = {}
-        if plan:
+        if validation_assessment.blocking_gate_ids:
+            gate_id = validation_assessment.blocking_gate_ids[0]
+            gate = next(
+                (item for item in self.resolved_execution_context.validation_gates
+                 if item.gate_id == gate_id),
+                None,
+            )
+            recommended_next_action = {
+                "type": "validation",
+                "gate_id": gate_id,
+                "description": gate.description if gate else "Supply compatible validation evidence",
+            }
+        elif plan:
             recommended_next_action = {
                 "description": plan[0].description,
                 "rationale": plan[0].rationale,
             }
-        if code_suggestions:
+        if code_suggestions and recommended_next_action.get("type") != "validation":
             recommended_next_action["suggestion_id"] = code_suggestions[0].suggestion_id
             recommended_next_action["file_path"] = code_suggestions[0].file_path
 
@@ -1402,11 +1494,53 @@ class NeoEngine:
             metadata=metadata,
             goal_assessment=goal_assessment,
             strategy_assessment=strategy_assessment,
+            validation_assessment=validation_assessment,
+            hypotheses=list(self.resolved_execution_context.hypotheses),
             recommended_next_action=recommended_next_action,
             orchestrator=orchestrator,
         )
         self._log_usage_telemetry(output, neo_input)
         return output
+
+    def _adopt_plan_hypotheses(self, plan: list[PlanStep]) -> None:
+        """Keep model-generated causal claims provisional and episode-local."""
+        existing = {
+            item.hypothesis_id for item in self.resolved_execution_context.hypotheses
+        }
+        generated = []
+        for step in plan:
+            for hypothesis in step.hypotheses:
+                if hypothesis.hypothesis_id in existing:
+                    continue
+                hypothesis.status = "candidate"
+                hypothesis.prior_status = ""
+                hypothesis.supporting_observation_ids = []
+                hypothesis.contradicting_observation_ids = []
+                hypothesis.public_claim_safe = False
+                generated.append(hypothesis)
+                existing.add(hypothesis.hypothesis_id)
+                if len(generated) >= 20:
+                    break
+            if len(generated) >= 20:
+                break
+        if not generated:
+            return
+        self.resolved_execution_context.hypotheses.extend(generated)
+        episode = self.current_learning_episode
+        if episode is None:
+            return
+        from neo.memory.episodes import HypothesisEvidence, redact_sensitive_text
+        episode.hypotheses.extend(HypothesisEvidence(
+            hypothesis_id=item.hypothesis_id,
+            statement=redact_sensitive_text(item.statement),
+            status="candidate",
+            competing_explanations=[
+                redact_sensitive_text(value) for value in item.competing_explanations
+            ],
+            falsifying_test=redact_sensitive_text(item.falsifying_test),
+            source="neo_reasoning",
+            public_claim_safe=False,
+        ) for item in generated)
 
     def _persist_simulation_episodes(
         self,
@@ -1483,6 +1617,29 @@ class NeoEngine:
                 code_sha256=content_hash(suggestion.code_block),
             ))
 
+        resolved_context = getattr(self, "resolved_execution_context", None)
+        validation_gates = list(getattr(resolved_context, "validation_gates", []))
+        validation_observations = list(
+            getattr(resolved_context, "validation_observations", [])
+        )
+        gates_by_id = {item.gate_id: item for item in validation_gates}
+        for observation in validation_observations:
+            gate = gates_by_id.get(observation.gate_id)
+            episode.verification.append(VerificationEvidence(
+                verification_id=observation.observation_id,
+                kind=gate.kind if gate else "external",
+                status=observation.status,
+                tool_name=observation.tool_name,
+                summary=redact_sensitive_text(observation.summary),
+                repository_revision=observation.repository_revision,
+                gate_id=observation.gate_id,
+                observed_at=observation.observed_at,
+                state_fingerprint=observation.state_fingerprint,
+                evidence_sha256=observation.evidence_sha256,
+                source=observation.source,
+                waiver_reason=redact_sensitive_text(observation.waiver_reason),
+            ))
+
         if static_checks:
             for check in static_checks:
                 severities = {str(d.get("severity", "")).lower() for d in check.diagnostics}
@@ -1512,6 +1669,10 @@ class NeoEngine:
         metadata["verification_verdict"] = aggregate_verification_status(
             episode.verification
         )
+        if resolved_context is not None:
+            from neo.execution_context import assess_validation
+            gate_assessment = assess_validation(resolved_context)
+            episode.outcome_details["validation_assessment"] = asdict(gate_assessment)
         if metadata["verification_verdict"] == "failed":
             for evidence in episode.retrieved_facts:
                 if evidence.used_in_reasoning is True:
@@ -2833,6 +2994,19 @@ RULES:
             ))
         for question in next_questions[:3]:
             cautions.append(self._voice("caution_open_question", question=question))
+        resolved_context = getattr(self, "resolved_execution_context", None)
+        if resolved_context is not None:
+            from neo.execution_context import assess_validation
+            gate_assessment = assess_validation(resolved_context)
+            for gate_id in gate_assessment.blocking_gate_ids[:3]:
+                cautions.append(self._voice("caution_validation_blocked", gate_id=gate_id))
+            for hypothesis in resolved_context.hypotheses:
+                if not hypothesis.public_claim_safe:
+                    cautions.append(self._voice(
+                        "caution_hypothesis_provisional",
+                        hypothesis_id=hypothesis.hypothesis_id,
+                        status=hypothesis.status,
+                    ))
 
         # Narration: phase-by-phase, in the order it happened.
         narration = [
@@ -3600,6 +3774,14 @@ Never include analysis, explanations, or text outside the block.
     "description": "Step description (max 500 chars)",
     "rationale": "Why this step is needed (max 1000 chars)",
     "dependencies": [],
+    "hypotheses": [
+      {{
+        "hypothesis_id": "h_1",
+        "statement": "A falsifiable causal claim, not a plan step",
+        "competing_explanations": ["The strongest alternative explanation"],
+        "falsifying_test": "The next discriminating test"
+      }}
+    ],
     "schema_version": "3"
   }},
   ...
@@ -3642,6 +3824,9 @@ The plan addresses the key constraints by...
 - dependencies must be array of integers (step indices 0, 1, 2..., NOT string IDs)
 - description: max 500 characters
 - rationale: max 1000 characters
+- hypotheses is optional; use it only for genuine causal uncertainty
+- every hypothesis must name a competing explanation and a falsifying test
+- hypotheses are candidates, never established facts or completion evidence
 - schema_version must be "3" (string, not "v3")
 
 Generate a clear, step-by-step plan with explicit dependencies."""
@@ -4029,10 +4214,24 @@ Generate unified diff patches. Keep changes minimal and isolated."""
         # Convert ParseResult.data to list[PlanStep]
         plan_steps = []
         for item in result.data:
+            from neo.execution_context import HypothesisRecord
             plan_steps.append(PlanStep(
                 description=item.get("description", ""),
                 rationale=item.get("rationale", ""),
-                dependencies=item.get("dependencies", [])
+                dependencies=item.get("dependencies", []),
+                hypotheses=[
+                    HypothesisRecord(
+                        hypothesis_id=value.get("hypothesis_id", ""),
+                        statement=value.get("statement", ""),
+                        status="candidate",
+                        competing_explanations=value.get("competing_explanations", []),
+                        falsifying_test=value.get("falsifying_test", ""),
+                        source="neo_reasoning",
+                        public_claim_safe=False,
+                    )
+                    for value in item.get("hypotheses", [])
+                    if isinstance(value, dict)
+                ],
             ))
 
         return plan_steps

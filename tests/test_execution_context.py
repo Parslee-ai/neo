@@ -11,7 +11,10 @@ from neo.execution_context import (
     ProgressSignal,
     SuccessCriterion,
     TrajectoryContext,
+    ValidationGate,
+    ValidationObservation,
     assess_loop,
+    assess_validation,
     execution_fields_from_dict,
     resolve_execution_context,
 )
@@ -133,6 +136,9 @@ def test_success_requires_explicit_criterion_and_iteration_limit_blocks():
         prompt="Assess checkout",
         goal=GoalSpec("Checkout tests pass"),
         success_criteria=[SuccessCriterion("command", "pytest checkout", 0)],
+        validation_observations=[ValidationObservation(
+            "checkout-pass", "legacy-1", "passed", actual_exit_code=0,
+        )],
         outcome=OutcomeContext("passed", summary="exit 0"),
     ))
     goal, strategy = assess_loop(verified)
@@ -146,6 +152,70 @@ def test_success_requires_explicit_criterion_and_iteration_limit_blocks():
     goal, strategy = assess_loop(exhausted)
     assert goal.status == "blocked"
     assert strategy.decision == "stop_blocked"
+
+
+def test_aggregate_success_cannot_satisfy_incomplete_validation_matrix():
+    context = resolve_execution_context(NeoInput(
+        prompt="Assess both integration modes",
+        validation_gates=[
+            ValidationGate("car-off", "CAR disabled suite", boundary="integration-disabled"),
+            ValidationGate("car-on", "CAR enabled suite", boundary="integration-enabled"),
+        ],
+        validation_observations=[
+            ValidationObservation("off-pass", "car-off", "passed"),
+        ],
+        outcome=OutcomeContext("success", summary="CAR-off passed"),
+    ))
+
+    validation = assess_validation(context)
+    goal, strategy = assess_loop(context)
+
+    assert validation.passed == 1
+    assert validation.pending == 1
+    assert validation.blocking_gate_ids == ["car-on"]
+    assert goal.status == "unverifiable"
+    assert strategy.decision == "continue"
+
+
+def test_stale_or_incompatible_evidence_never_passes_a_gate():
+    context = resolve_execution_context(NeoInput(
+        prompt="Assess current revision",
+        validation_gates=[ValidationGate(
+            "suite", "Current suite", expected_exit_code=0,
+            repository_revision="new-revision",
+        )],
+        validation_observations=[ValidationObservation(
+            "old-pass", "suite", "passed", actual_exit_code=1,
+            repository_revision="old-revision",
+        )],
+    ))
+
+    validation = assess_validation(context)
+    assert validation.passed == 0
+    assert validation.pending == 1
+    assert validation.stale_gate_ids == ["suite"]
+
+
+def test_explicit_waiver_requires_gate_policy_and_reason():
+    denied = resolve_execution_context(NeoInput(
+        prompt="Assess unavailable device gate",
+        validation_gates=[ValidationGate("device", "Physical device")],
+        validation_observations=[ValidationObservation(
+            "waiver", "device", "waived", waiver_reason="No device available",
+        )],
+    ))
+    allowed = resolve_execution_context(NeoInput(
+        prompt="Assess unavailable device gate",
+        validation_gates=[ValidationGate(
+            "device", "Physical device", allow_waiver=True,
+        )],
+        validation_observations=[ValidationObservation(
+            "waiver", "device", "waived", waiver_reason="No device available",
+        )],
+    ))
+
+    assert assess_loop(denied)[1].decision == "stop_blocked"
+    assert assess_loop(allowed)[1].decision == "stop_success"
 
 
 def test_advisory_role_suppresses_unrequested_implementation():

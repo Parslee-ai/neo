@@ -13,6 +13,26 @@ SENTINEL_END = "<<<END:{kind}>>>"  # Labeled to prevent collisions in multi-bloc
 
 
 # JSON Schema definitions
+HYPOTHESIS_SCHEMA = {
+    "type": "object",
+    "required": [
+        "hypothesis_id", "statement", "competing_explanations", "falsifying_test",
+    ],
+    "properties": {
+        "hypothesis_id": {
+            "type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+        },
+        "statement": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "competing_explanations": {
+            "type": "array", "items": {"type": "string", "maxLength": 500},
+            "maxItems": 10,
+        },
+        "falsifying_test": {"type": "string", "minLength": 1, "maxLength": 1000},
+    },
+    "additionalProperties": False,
+}
+
+
 PLAN_STEP_SCHEMA = {
     "type": "object",
     "required": ["id", "description", "rationale", "dependencies", "schema_version"],
@@ -81,6 +101,12 @@ PLAN_STEP_SCHEMA = {
             "items": {"type": "string", "maxLength": 500},
             "maxItems": 10,
             "description": "Verification checks to run after step execution (Solver-Critic-Verifier pattern)"
+        },
+        "hypotheses": {
+            "type": "array",
+            "items": HYPOTHESIS_SCHEMA,
+            "maxItems": 5,
+            "description": "Falsifiable candidate causal claims; omit for non-diagnostic steps",
         },
         "expanded": {
             "type": "boolean",

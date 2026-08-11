@@ -92,6 +92,13 @@ Four invariants are load-bearing and pinned by tests:
    then going silent was worse than never emitting: a host could not distinguish
    a crash from a hang.
 
+Hypothesis events describe actual falsifiable claims, not generic plan progress.
+`hypothesis_formed` carries a hypothesis ID and candidate claim;
+`hypothesis_updated`, `hypothesis_confirmed`, `hypothesis_rejected`, and
+`hypothesis_contradicted` carry evidence-backed transitions. A failed reasoning
+panel emits `reasoning_fallback` instead of falsely claiming that a hypothesis
+was rejected. Plan steps without structured hypotheses emit no hypothesis event.
+
 The first phase is named `context`, **not** `retrieval` — it covers file
 gathering only. The original name overstated its span, which is what forced
 `MEMORY_FOUND` to work around it. A phase whose name overstates what it covers
@@ -217,7 +224,8 @@ low-confidence caution: its confidence is a pass/fail verdict, not
 self-assessed certainty, so "verify before acting" is circular there.
 
 `cautions` is the field that matters most: low confidence, failed checks,
-simulation issues, absent static analysis, open questions. The plugin contract
+simulation issues, absent static analysis, open questions, missing proof for
+required gates, and causal claims that remain unsafe to publish. The plugin contract
 requires hosts to surface all of them. A confident-sounding recommendation must
 not bury the reasons to doubt it. Two consequences:
 

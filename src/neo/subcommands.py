@@ -794,6 +794,30 @@ def _handle_evaluate_learning(args) -> None:
         raise SystemExit(1)
 
 
+def _handle_evaluate_execution(args) -> None:
+    """Run and render the deterministic proof-aware loop benchmark."""
+    from neo.memory.execution_evaluation import run_execution_evaluation
+
+    corpus = Path(args.corpus).resolve() if getattr(args, "corpus", None) else None
+    report = run_execution_evaluation(corpus_path=corpus)
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        status = "PASS" if report.accepted else "FAIL"
+        print(f"[Neo] execution-loop evaluation — {status}")
+        print(
+            f"  benchmark={report.benchmark_id} latency={report.latency_ms:.1f}ms "
+            f"model-calls={report.model_calls} tokens={report.token_usage}"
+        )
+        for scenario in report.scenarios:
+            marker = "PASS" if scenario.passed else "FAIL"
+            print(f"    [{marker}] {scenario.id}")
+        for failure in report.acceptance_failures:
+            print(f"  failure: {failure}")
+    if not report.accepted:
+        raise SystemExit(1)
+
+
 def _handle_citation_stats(args) -> None:
     """Summarize citation_survival events from metrics.jsonl: how often a
     retrieved [fact:id] survives into reasoning, and WHICH detector earns the
@@ -1227,6 +1251,9 @@ def handle_memory(args):
     if action == "evaluate-learning":
         _handle_evaluate_learning(args)
         return
+    if action == "evaluate-execution":
+        _handle_evaluate_execution(args)
+        return
     if action == "citation-stats":
         _handle_citation_stats(args)
         return
@@ -1303,7 +1330,7 @@ def handle_memory(args):
         print(
             "Usage: neo memory "
             "{replay-feedback|prune|observer|issues|rules|audit|import|explain|"
-            "evaluate-learning} ..."
+            "evaluate-learning|evaluate-execution} ..."
         )
         return
 

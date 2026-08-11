@@ -12,7 +12,14 @@ from neo.memory.episodes import (
 )
 from neo.memory.models import ContextResult, Fact
 from neo.models import ContextFile, NeoInput
-from neo.execution_context import GoalSpec, IntentSpec
+from neo.execution_context import (
+    ExecutionIdentity,
+    GoalSpec,
+    HypothesisRecord,
+    IntentSpec,
+    ValidationGate,
+    ValidationObservation,
+)
 
 
 class _CombinedLM:
@@ -233,6 +240,10 @@ def test_verification_aggregate_is_fail_closed():
     assert aggregate_verification_status(evidence) == "unavailable"
     evidence.append(VerificationEvidence("v3", "compile", "failed"))
     assert aggregate_verification_status(evidence) == "failed"
+    assert aggregate_verification_status([
+        VerificationEvidence("v4", "device", "waived"),
+        VerificationEvidence("v5", "test", "passed"),
+    ]) == "waived"
 
 
 def test_retrieved_fact_score_and_context_inclusion_are_traced():
@@ -442,12 +453,61 @@ def test_execution_envelope_is_persisted_with_explicit_inference_provenance(
     ))
 
     episode = engine.episode_store.load(output.metadata["learning_episode_id"])
-    assert episode.schema_version == EPISODE_SCHEMA_VERSION == 3
+    assert episode.schema_version == EPISODE_SCHEMA_VERSION == 4
     assert episode.execution_context["goal"]["origin"] == "explicit"
     assert episode.execution_context["intent"]["origin"] == "explicit"
     assert "SECRET_SOURCE_PAYLOAD" not in json.dumps(episode.execution_context)
     assert episode.execution_context["current_state"]["source_code"]["sha256"]
     assert output.goal_assessment.status == "in_progress"
+
+
+def test_v4_engine_episode_preserves_identity_gates_and_hypotheses(
+    tmp_path, monkeypatch,
+):
+    engine = NeoEngine(
+        lm_adapter=_CombinedLM(),
+        enable_persistent_memory=False,
+        codebase_root=str(tmp_path),
+    )
+    monkeypatch.setattr(engine, "_car_route_capability", lambda prompt: (False, 0, None))
+    monkeypatch.setattr(engine, "_run_static_checks", lambda suggestions, constraints=None: [])
+
+    output = engine.process(NeoInput(
+        prompt="Diagnose the boundary",
+        validation_gates=[ValidationGate("probe", "Run the causal probe")],
+        validation_observations=[ValidationObservation(
+            "probe-pass", "probe", "passed", summary="probe passed",
+        )],
+        hypotheses=[HypothesisRecord(
+            "h1", "Duplicate injection is causal", status="confirmed",
+            falsifying_test="Remove the second injection",
+            supporting_observation_ids=["probe-pass"],
+            public_claim_safe=True,
+        )],
+        execution_identity=ExecutionIdentity(
+            session_id="session-external",
+            goal_id="goal-commercial",
+            task_id="task-deadpan",
+            parent_task_id="task-commercial",
+            trace_id="trace-1",
+            discovery_source="user_path_review",
+            repositories_touched=["studio", "runtime"],
+            artifact_refs=["movie-output.mov"],
+        ),
+    ))
+
+    episode = engine.episode_store.load(output.metadata["learning_episode_id"])
+    assert episode.session_id == "session-external"
+    assert episode.task_id == "task-deadpan"
+    assert episode.parent_task_id == "task-commercial"
+    assert episode.validation_gates[0].gate_id == "probe"
+    assert episode.verification[0].gate_id == "probe"
+    assert episode.hypotheses[0].status == "confirmed"
+    assert episode.memory_candidates == []
+    assert episode.artifact_refs[0] != "movie-output.mov"
+    assert "movie-output.mov" not in json.dumps(episode.to_dict())
+    assert output.validation_assessment.passed == 1
+    assert output.strategy_assessment.decision == "stop_success"
 
 
 class TestSuggestionVerifiability:

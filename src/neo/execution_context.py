@@ -6,8 +6,9 @@ as provisional and are never authoritative enough to become durable policy.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
@@ -45,6 +46,81 @@ class SuccessCriterion:
     expected_exit_code: Optional[int] = None
     description: str = ""
     expected_value: Any = None
+
+
+VALIDATION_STATUSES = frozenset({
+    "passed", "failed", "warning", "unavailable", "skipped", "pending", "waived",
+})
+HYPOTHESIS_STATUSES = frozenset({
+    "candidate", "supported", "confirmed", "rejected", "contradicted",
+})
+
+
+@dataclass
+class ValidationGate:
+    """One explicit proof obligation for completion."""
+
+    gate_id: str
+    description: str
+    kind: str = "state"
+    boundary: str = ""
+    required: bool = True
+    expected_exit_code: Optional[int] = None
+    expected_value: Any = None
+    state_fingerprint: str = ""
+    repository_revision: str = ""
+    allow_waiver: bool = False
+    source: str = "explicit"
+
+
+@dataclass
+class ValidationObservation:
+    """Caller-observed evidence linked to exactly one validation gate."""
+
+    observation_id: str
+    gate_id: str
+    status: str = "unavailable"
+    summary: str = ""
+    actual_exit_code: Optional[int] = None
+    actual_value: Any = None
+    tool_name: str = ""
+    observed_at: Optional[float] = None
+    state_fingerprint: str = ""
+    repository_revision: str = ""
+    evidence_sha256: str = ""
+    source: str = "caller"
+    waiver_reason: str = ""
+
+
+@dataclass
+class HypothesisRecord:
+    """A falsifiable, episode-local causal claim; never durable truth itself."""
+
+    hypothesis_id: str
+    statement: str
+    status: str = "candidate"
+    prior_status: str = ""
+    competing_explanations: list[str] = field(default_factory=list)
+    falsifying_test: str = ""
+    supporting_observation_ids: list[str] = field(default_factory=list)
+    contradicting_observation_ids: list[str] = field(default_factory=list)
+    source: str = "caller"
+    public_claim_safe: bool = False
+
+
+@dataclass
+class ExecutionIdentity:
+    """Stable caller-controlled identity across goals, tasks, and repositories."""
+
+    session_id: str = ""
+    goal_id: str = ""
+    task_id: str = ""
+    parent_task_id: str = ""
+    trace_id: str = ""
+    discovery_source: str = ""
+    blocking_goal_reason: str = ""
+    repositories_touched: list[str] = field(default_factory=list)
+    artifact_refs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -123,6 +199,10 @@ class ResolvedExecutionContext:
     intent: DerivedValue
     constraints: list[str]
     success_criteria: list[SuccessCriterion]
+    validation_gates: list[ValidationGate]
+    validation_observations: list[ValidationObservation]
+    hypotheses: list[HypothesisRecord]
+    execution_identity: ExecutionIdentity
     attempt: Optional[AttemptContext]
     outcome: Optional[OutcomeContext]
     progress: Optional[ProgressSignal]
@@ -151,6 +231,21 @@ class ResolvedExecutionContext:
                     item.description or item.command or item.type
                     for item in self.success_criteria[:8]
                 )
+            )
+        if self.validation_gates:
+            parts.append(
+                "validation gates: " + "; ".join(
+                    f"{item.gate_id}={item.description}"
+                    for item in self.validation_gates[:12]
+                )
+            )
+        for item in self.validation_observations[:12]:
+            parts.append(
+                f"validation observation: {item.gate_id}={item.status} {item.summary}"
+            )
+        for item in self.hypotheses[:5]:
+            parts.append(
+                f"hypothesis: {item.hypothesis_id}={item.status} {item.statement}"
             )
         if self.attempt:
             parts.append(f"attempt: {self.attempt.summary}")
@@ -191,6 +286,28 @@ class ResolvedExecutionContext:
                 for item in self.success_criteria[:8]
             ]
             lines.append("Success criteria: " + "; ".join(criteria))
+        if self.validation_gates:
+            lines.append(
+                "Validation gates: " + "; ".join(
+                    f"{item.gate_id} ({'required' if item.required else 'optional'}): "
+                    f"{item.description}"
+                    for item in self.validation_gates[:12]
+                )
+            )
+        if self.validation_observations:
+            lines.append(
+                "Validation evidence: " + "; ".join(
+                    f"{item.gate_id}={item.status}"
+                    for item in self.validation_observations[:12]
+                )
+            )
+        if self.hypotheses:
+            lines.append(
+                "Hypotheses: " + "; ".join(
+                    f"{item.hypothesis_id}={item.status}: {item.statement}"
+                    for item in self.hypotheses[:5]
+                )
+            )
         if self.attempt:
             lines.append(f"Current attempt: {self.attempt.summary}")
         if self.outcome:
@@ -233,6 +350,19 @@ class GoalAssessment:
 class StrategyAssessment:
     decision: str
     reason: str
+
+
+@dataclass
+class ValidationAssessment:
+    required: int
+    passed: int
+    failed: int
+    pending: int
+    unavailable: int
+    waived: int
+    blocking_gate_ids: list[str] = field(default_factory=list)
+    stale_gate_ids: list[str] = field(default_factory=list)
+    unknown_observation_gate_ids: list[str] = field(default_factory=list)
 
 
 # Honest coarse confidence bands for DERIVED (non-explicit) values. A keyword
@@ -298,6 +428,23 @@ def resolve_execution_context(neo_input) -> ResolvedExecutionContext:
     if neo_input.success_criteria:
         criteria = list(neo_input.success_criteria)
 
+    gates = list(neo_input.validation_gates)
+    if not gates and criteria:
+        gates = [
+            ValidationGate(
+                gate_id=f"legacy-{index}",
+                description=item.description or item.command or item.type,
+                kind=item.type,
+                expected_exit_code=item.expected_exit_code,
+                expected_value=item.expected_value,
+                source="legacy_success_criterion",
+            )
+            for index, item in enumerate(criteria, 1)
+        ]
+    gates = _deduplicate_gates(gates)
+    observations = _deduplicate_observations(neo_input.validation_observations)
+    hypotheses = _normalize_hypotheses(neo_input.hypotheses, observations, gates)
+
     if neo_input.intent is not None and (
         neo_input.intent.type.strip() or neo_input.intent.description.strip()
     ):
@@ -307,8 +454,8 @@ def resolve_execution_context(neo_input) -> ResolvedExecutionContext:
         value, confidence = _infer_intent(neo_input.prompt, neo_input.error_trace, role)
         intent = DerivedValue(value, "inferred", confidence)
 
-    if not criteria:
-        unknowns.append("No explicit success criterion was supplied")
+    if not gates:
+        unknowns.append("No explicit validation gate was supplied")
 
     return ResolvedExecutionContext(
         task=neo_input.prompt,
@@ -316,6 +463,10 @@ def resolve_execution_context(neo_input) -> ResolvedExecutionContext:
         intent=intent,
         constraints=list(neo_input.constraints),
         success_criteria=criteria,
+        validation_gates=gates,
+        validation_observations=observations,
+        hypotheses=hypotheses,
+        execution_identity=neo_input.execution_identity,
         attempt=neo_input.attempt,
         outcome=neo_input.outcome,
         progress=neo_input.progress,
@@ -327,6 +478,66 @@ def resolve_execution_context(neo_input) -> ResolvedExecutionContext:
     )
 
 
+def assess_validation(context: ResolvedExecutionContext) -> ValidationAssessment:
+    """Join declared gates to observations without trusting aggregate success prose."""
+    gates = {item.gate_id: item for item in context.validation_gates}
+    latest: dict[str, ValidationObservation] = {}
+    unknown: list[str] = []
+    for observation in context.validation_observations:
+        if observation.gate_id not in gates:
+            unknown.append(observation.gate_id)
+            continue
+        current = latest.get(observation.gate_id)
+        current_time = current.observed_at if current and current.observed_at is not None else -1.0
+        observed_time = observation.observed_at if observation.observed_at is not None else -1.0
+        if current is None or observed_time >= current_time:
+            latest[observation.gate_id] = observation
+
+    passed = failed = pending = unavailable = waived = 0
+    blocking: list[str] = []
+    stale: list[str] = []
+    required = [item for item in context.validation_gates if item.required]
+    for gate in required:
+        observation = latest.get(gate.gate_id)
+        if observation is None or observation.status == "pending":
+            pending += 1
+            blocking.append(gate.gate_id)
+            continue
+        compatible, is_stale = _observation_matches_gate(gate, observation)
+        if is_stale:
+            pending += 1
+            blocking.append(gate.gate_id)
+            stale.append(gate.gate_id)
+        elif observation.status == "passed" and compatible:
+            passed += 1
+        elif (
+            observation.status == "waived"
+            and gate.allow_waiver
+            and bool(observation.waiver_reason.strip())
+        ):
+            waived += 1
+        elif observation.status == "failed" or (
+            observation.status == "passed" and not compatible
+        ):
+            failed += 1
+            blocking.append(gate.gate_id)
+        else:
+            unavailable += 1
+            blocking.append(gate.gate_id)
+
+    return ValidationAssessment(
+        required=len(required),
+        passed=passed,
+        failed=failed,
+        pending=pending,
+        unavailable=unavailable,
+        waived=waived,
+        blocking_gate_ids=list(dict.fromkeys(blocking)),
+        stale_gate_ids=list(dict.fromkeys(stale)),
+        unknown_observation_gate_ids=list(dict.fromkeys(unknown)),
+    )
+
+
 def assess_loop(context: ResolvedExecutionContext) -> tuple[GoalAssessment, StrategyAssessment]:
     """Deterministically assess loop state from observed evidence, never confidence."""
     outcome_status = (context.outcome.status.lower() if context.outcome else "")
@@ -335,19 +546,36 @@ def assess_loop(context: ResolvedExecutionContext) -> tuple[GoalAssessment, Stra
         context.trajectory.max_iterations is not None
         and context.trajectory.iteration >= context.trajectory.max_iterations
     )
+    validation = assess_validation(context)
+    complete = bool(
+        validation.required
+        and validation.passed + validation.waived == validation.required
+    )
 
-    if outcome_status in {"passed", "succeeded", "success"} and context.success_criteria:
+    if complete:
         goal_status = GoalStatus.SATISFIED
         decision = StrategyDecision.STOP_SUCCESS
-        reason = "Observed outcome reports success against explicit completion criteria"
+        reason = "Every required validation gate has compatible observed evidence"
     elif exhausted:
         goal_status = GoalStatus.BLOCKED
         decision = StrategyDecision.STOP_BLOCKED
         reason = "The caller-provided iteration limit has been reached"
-    elif not context.success_criteria and outcome_status in {"passed", "succeeded", "success"}:
+    elif validation.failed:
+        goal_status = GoalStatus.IN_PROGRESS
+        decision = StrategyDecision.CHANGE_STRATEGY
+        reason = "One or more required validation gates failed or had incompatible evidence"
+    elif not context.validation_gates and outcome_status in {"passed", "succeeded", "success"}:
         goal_status = GoalStatus.UNVERIFIABLE
         decision = StrategyDecision.STOP_BLOCKED
-        reason = "Success was reported but no explicit criterion makes it verifiable"
+        reason = "Success was reported but no explicit validation gate makes it verifiable"
+    elif validation.unavailable:
+        goal_status = GoalStatus.UNVERIFIABLE
+        decision = StrategyDecision.STOP_BLOCKED
+        reason = "Required validation evidence is unavailable, skipped, warning, or invalid"
+    elif validation.pending and outcome_status in {"passed", "succeeded", "success"}:
+        goal_status = GoalStatus.UNVERIFIABLE
+        decision = StrategyDecision.CONTINUE
+        reason = "Aggregate success was reported but required validation gates remain pending"
     elif direction in {"regressed", "unchanged", "no_progress", "worse"}:
         goal_status = GoalStatus.IN_PROGRESS
         decision = StrategyDecision.CHANGE_STRATEGY
@@ -366,7 +594,13 @@ def assess_loop(context: ResolvedExecutionContext) -> tuple[GoalAssessment, Stra
         reason = "Observed evidence does not justify stopping or abandoning the strategy"
 
     evidence = "No explicit progress evidence supplied"
-    if context.progress:
+    if context.validation_gates:
+        evidence = (
+            f"validation gates: {validation.passed} passed, {validation.failed} failed, "
+            f"{validation.pending} pending, {validation.unavailable} unavailable, "
+            f"{validation.waived} waived"
+        )
+    elif context.progress:
         evidence = (
             f"{context.progress.metric}: {context.progress.before!r} -> "
             f"{context.progress.after!r} ({context.progress.direction})"
@@ -378,6 +612,24 @@ def assess_loop(context: ResolvedExecutionContext) -> tuple[GoalAssessment, Stra
         GoalAssessment(goal_status.value, direction, evidence),
         StrategyAssessment(decision.value, reason),
     )
+
+
+def _observation_matches_gate(
+    gate: ValidationGate,
+    observation: ValidationObservation,
+) -> tuple[bool, bool]:
+    stale = bool(
+        (gate.repository_revision and gate.repository_revision != observation.repository_revision)
+        or (gate.state_fingerprint and gate.state_fingerprint != observation.state_fingerprint)
+    )
+    if stale:
+        return False, True
+    if gate.expected_exit_code is not None:
+        if observation.actual_exit_code != gate.expected_exit_code:
+            return False, False
+    if gate.expected_value is not None and observation.actual_value != gate.expected_value:
+        return False, False
+    return True, False
 
 
 def execution_fields_from_dict(data: dict[str, Any]) -> dict[str, Any]:
@@ -477,6 +729,22 @@ def execution_fields_from_dict(data: dict[str, Any]) -> dict[str, Any]:
     except ValueError:
         role = CallerRole.PLANNER
 
+    gates = [
+        _validation_gate(item, index)
+        for index, item in enumerate(data.get("validation_gates", [])[:50], 1)
+        if isinstance(item, dict)
+    ] if isinstance(data.get("validation_gates", []), list) else []
+    observations = [
+        _validation_observation(item, index)
+        for index, item in enumerate(data.get("validation_observations", [])[:100], 1)
+        if isinstance(item, dict)
+    ] if isinstance(data.get("validation_observations", []), list) else []
+    hypotheses = [
+        _hypothesis(item, index)
+        for index, item in enumerate(data.get("hypotheses", [])[:20], 1)
+        if isinstance(item, dict)
+    ] if isinstance(data.get("hypotheses", []), list) else []
+
     return {
         "goal": goal,
         "intent": intent,
@@ -485,6 +753,10 @@ def execution_fields_from_dict(data: dict[str, Any]) -> dict[str, Any]:
             _criterion(item) for item in data.get("success_criteria", [])
             if isinstance(item, dict)
         ] if isinstance(data.get("success_criteria", []), list) else [],
+        "validation_gates": gates,
+        "validation_observations": observations,
+        "hypotheses": hypotheses,
+        "execution_identity": _execution_identity(data.get("execution_identity")),
         "attempt": attempt,
         "outcome": outcome,
         "progress": progress,
@@ -509,8 +781,240 @@ def _criterion(item: dict[str, Any]) -> SuccessCriterion:
         command=str(item.get("command", "")),
         expected_exit_code=(expected_exit if isinstance(expected_exit, int) else None),
         description=str(item.get("description", "")),
-        expected_value=item.get("expected_value"),
+        expected_value=_bounded_value(item.get("expected_value")),
     )
+
+
+def _bounded_text(value: Any, maximum: int = 500) -> str:
+    return str(value or "")[:maximum]
+
+
+def _identifier(value: Any, fallback: str) -> str:
+    raw = _bounded_text(value, 128).strip()
+    normalized = "".join(ch for ch in raw if ch.isalnum() or ch in "-_.:")
+    return normalized or fallback
+
+
+def _validation_gate(item: dict[str, Any], index: int) -> ValidationGate:
+    expected_exit = item.get("expected_exit_code")
+    return ValidationGate(
+        gate_id=_identifier(item.get("gate_id"), f"gate-{index}"),
+        description=_bounded_text(item.get("description") or item.get("command") or "validation gate"),
+        kind=_bounded_text(item.get("kind") or item.get("type") or "state", 64),
+        boundary=_bounded_text(item.get("boundary"), 100),
+        required=bool(item.get("required", True)),
+        expected_exit_code=expected_exit if isinstance(expected_exit, int) else None,
+        expected_value=_bounded_value(item.get("expected_value")),
+        state_fingerprint=_bounded_text(item.get("state_fingerprint"), 128),
+        repository_revision=_bounded_text(item.get("repository_revision"), 128),
+        allow_waiver=bool(item.get("allow_waiver", False)),
+        source=_bounded_text(item.get("source") or "explicit", 64),
+    )
+
+
+def _validation_observation(item: dict[str, Any], index: int) -> ValidationObservation:
+    status = _bounded_text(item.get("status") or "unavailable", 32).lower()
+    if status not in VALIDATION_STATUSES:
+        status = "unavailable"
+    actual_exit = item.get("actual_exit_code")
+    observed_at = item.get("observed_at")
+    return ValidationObservation(
+        observation_id=_identifier(item.get("observation_id"), f"observation-{index}"),
+        gate_id=_identifier(item.get("gate_id"), f"unknown-{index}"),
+        status=status,
+        summary=_bounded_text(item.get("summary"), 1000),
+        actual_exit_code=actual_exit if isinstance(actual_exit, int) else None,
+        actual_value=_bounded_value(item.get("actual_value")),
+        tool_name=_bounded_text(item.get("tool_name"), 100),
+        observed_at=float(observed_at) if isinstance(observed_at, (int, float)) else None,
+        state_fingerprint=_bounded_text(item.get("state_fingerprint"), 128),
+        repository_revision=_bounded_text(item.get("repository_revision"), 128),
+        evidence_sha256=_bounded_text(item.get("evidence_sha256"), 128),
+        source=_bounded_text(item.get("source") or "caller", 64),
+        waiver_reason=_bounded_text(item.get("waiver_reason"), 500),
+    )
+
+
+def _hypothesis(item: dict[str, Any], index: int) -> HypothesisRecord:
+    status = _bounded_text(item.get("status") or "candidate", 32).lower()
+    if status not in HYPOTHESIS_STATUSES:
+        status = "candidate"
+    return HypothesisRecord(
+        hypothesis_id=_identifier(item.get("hypothesis_id"), f"hypothesis-{index}"),
+        statement=_bounded_text(item.get("statement"), 1000),
+        status=status,
+        prior_status=_bounded_text(item.get("prior_status"), 32).lower(),
+        competing_explanations=[_bounded_text(v) for v in _strings(item.get("competing_explanations"))[:10]],
+        falsifying_test=_bounded_text(item.get("falsifying_test"), 1000),
+        supporting_observation_ids=[_identifier(v, "") for v in _strings(item.get("supporting_observation_ids"))[:20] if _identifier(v, "")],
+        contradicting_observation_ids=[_identifier(v, "") for v in _strings(item.get("contradicting_observation_ids"))[:20] if _identifier(v, "")],
+        source=_bounded_text(item.get("source") or "caller", 64),
+        public_claim_safe=bool(item.get("public_claim_safe", False)),
+    )
+
+
+def _execution_identity(value: Any) -> ExecutionIdentity:
+    if not isinstance(value, dict):
+        return ExecutionIdentity()
+    return ExecutionIdentity(
+        session_id=_identifier(value.get("session_id"), "") if value.get("session_id") else "",
+        goal_id=_identifier(value.get("goal_id"), "") if value.get("goal_id") else "",
+        task_id=_identifier(value.get("task_id"), "") if value.get("task_id") else "",
+        parent_task_id=_identifier(value.get("parent_task_id"), "") if value.get("parent_task_id") else "",
+        trace_id=_identifier(value.get("trace_id"), "") if value.get("trace_id") else "",
+        discovery_source=_bounded_text(value.get("discovery_source"), 100),
+        blocking_goal_reason=_bounded_text(value.get("blocking_goal_reason"), 500),
+        repositories_touched=[_bounded_text(v, 200) for v in _strings(value.get("repositories_touched"))[:20]],
+        artifact_refs=[_bounded_text(v, 200) for v in _strings(value.get("artifact_refs"))[:20]],
+    )
+
+
+def _bounded_value(value: Any) -> Any:
+    """Keep scalar comparisons exact and large structured evidence hash-only."""
+    if isinstance(value, str):
+        if len(value) <= 2000:
+            return value
+        return {
+            "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            "size": len(value),
+        }
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    serialized = json.dumps(value, sort_keys=True, default=str)
+    if len(serialized) <= 2000:
+        try:
+            return json.loads(serialized)
+        except json.JSONDecodeError:
+            return serialized
+    return {
+        "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "size": len(serialized),
+    }
+
+
+def _deduplicate_gates(items: list[ValidationGate]) -> list[ValidationGate]:
+    result: list[ValidationGate] = []
+    seen: set[str] = set()
+    duplicate_counts: dict[str, int] = {}
+    for item in items[:50]:
+        if item.gate_id in seen:
+            duplicate_counts[item.gate_id] = duplicate_counts.get(item.gate_id, 0) + 1
+            item = replace(
+                item,
+                gate_id=(
+                    f"invalid-duplicate-{item.gate_id}-{duplicate_counts[item.gate_id]}"
+                )[:128],
+                source="duplicate_gate_id",
+            )
+        seen.add(item.gate_id)
+        result.append(item)
+    return result
+
+
+def _deduplicate_observations(
+    items: list[ValidationObservation],
+) -> list[ValidationObservation]:
+    result: list[ValidationObservation] = []
+    counts: dict[str, int] = {}
+    for item in items[:100]:
+        counts[item.observation_id] = counts.get(item.observation_id, 0) + 1
+    duplicate_index: dict[str, int] = {}
+    for item in items[:100]:
+        if counts[item.observation_id] > 1:
+            duplicate_index[item.observation_id] = (
+                duplicate_index.get(item.observation_id, 0) + 1
+            )
+            item = replace(
+                item,
+                observation_id=(
+                    f"invalid-duplicate-{item.observation_id}-"
+                    f"{duplicate_index[item.observation_id]}"
+                )[:128],
+                status="unavailable",
+                source="duplicate_observation_id",
+            )
+        result.append(item)
+    return result
+
+
+def _normalize_hypotheses(
+    items: list[HypothesisRecord],
+    observations: list[ValidationObservation],
+    gates: list[ValidationGate],
+) -> list[HypothesisRecord]:
+    by_id = {item.observation_id: item for item in observations}
+    gates_by_id = {item.gate_id: item for item in gates}
+    result: list[HypothesisRecord] = []
+    seen: set[str] = set()
+    for original in items[:20]:
+        item = replace(
+            original,
+            competing_explanations=list(original.competing_explanations),
+            supporting_observation_ids=list(original.supporting_observation_ids),
+            contradicting_observation_ids=list(original.contradicting_observation_ids),
+        )
+        if item.hypothesis_id in seen or not item.statement.strip():
+            continue
+        seen.add(item.hypothesis_id)
+        allowed_transitions = {
+            "": HYPOTHESIS_STATUSES,
+            "candidate": frozenset({"candidate", "supported", "rejected"}),
+            "supported": frozenset({"supported", "confirmed", "rejected"}),
+            "confirmed": frozenset({"confirmed", "contradicted"}),
+            "rejected": frozenset({"rejected", "candidate"}),
+            "contradicted": frozenset({"contradicted", "candidate"}),
+        }
+        if (
+            item.prior_status in HYPOTHESIS_STATUSES
+            and item.status not in allowed_transitions[item.prior_status]
+        ):
+            item.status = item.prior_status
+            item.public_claim_safe = False
+        supporting = [
+            by_id[item_id]
+            for item_id in item.supporting_observation_ids
+            if item_id in by_id
+            and by_id[item_id].status == "passed"
+            and by_id[item_id].gate_id in gates_by_id
+            and _observation_matches_gate(
+                gates_by_id[by_id[item_id].gate_id], by_id[item_id]
+            ) == (True, False)
+        ]
+        contradicting = [
+            by_id[item_id]
+            for item_id in item.contradicting_observation_ids
+            if item_id in by_id and by_id[item_id].status == "failed"
+        ]
+        if (
+            item.prior_status in {"rejected", "contradicted"}
+            and item.status == "candidate"
+            and not supporting
+            and not contradicting
+        ):
+            item.status = item.prior_status
+            item.public_claim_safe = False
+        if contradicting and item.status not in {"rejected", "contradicted"}:
+            item.status = "contradicted" if item.status == "confirmed" else "rejected"
+        elif (
+            item.status in {"rejected", "contradicted"}
+            and not contradicting
+            and item.prior_status not in {"rejected", "contradicted"}
+        ):
+            item.status = "supported" if supporting else "candidate"
+            item.public_claim_safe = False
+        elif item.status == "confirmed" and (
+            not item.falsifying_test.strip()
+            or not any(observation.status == "passed" for observation in supporting)
+        ):
+            item.status = "supported" if supporting else "candidate"
+            item.public_claim_safe = False
+        elif item.status == "supported" and not supporting:
+            item.status = "candidate"
+            item.public_claim_safe = False
+        if item.status != "confirmed":
+            item.public_claim_safe = False
+        result.append(item)
+    return result
 
 
 def _bounded_json(value: Any, max_chars: int) -> str:

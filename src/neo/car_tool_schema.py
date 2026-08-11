@@ -157,6 +157,98 @@ def tool_schema() -> dict[str, Any]:
                 },
                 "constraints": {"type": "array", "items": {"type": "string"}},
                 "success_criteria": {"type": "array", "items": {"type": "object"}},
+                "validation_gates": {
+                    "type": "array", "maxItems": 50,
+                    "items": {
+                        "type": "object", "required": ["gate_id", "description"],
+                        "properties": {
+                            "gate_id": {"type": "string"},
+                            "description": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "boundary": {"type": "string"},
+                            "required": {"type": "boolean", "default": True},
+                            "expected_exit_code": {"type": "integer"},
+                            "expected_value": {},
+                            "state_fingerprint": {"type": "string"},
+                            "repository_revision": {"type": "string"},
+                            "allow_waiver": {"type": "boolean", "default": False},
+                        },
+                    },
+                },
+                "validation_observations": {
+                    "type": "array", "maxItems": 100,
+                    "items": {
+                        "type": "object",
+                        "required": ["observation_id", "gate_id", "status"],
+                        "properties": {
+                            "observation_id": {"type": "string"},
+                            "gate_id": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": [
+                                    "passed", "failed", "warning", "unavailable",
+                                    "skipped", "pending", "waived",
+                                ],
+                            },
+                            "summary": {"type": "string"},
+                            "actual_exit_code": {"type": "integer"},
+                            "actual_value": {},
+                            "tool_name": {"type": "string"},
+                            "observed_at": {"type": "number"},
+                            "state_fingerprint": {"type": "string"},
+                            "repository_revision": {"type": "string"},
+                            "evidence_sha256": {"type": "string"},
+                            "waiver_reason": {"type": "string"},
+                        },
+                    },
+                },
+                "hypotheses": {
+                    "type": "array", "maxItems": 20,
+                    "items": {
+                        "type": "object", "required": ["hypothesis_id", "statement"],
+                        "properties": {
+                            "hypothesis_id": {"type": "string"},
+                            "statement": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": [
+                                    "candidate", "supported", "confirmed", "rejected",
+                                    "contradicted",
+                                ],
+                            },
+                            "prior_status": {"type": "string"},
+                            "competing_explanations": {
+                                "type": "array", "items": {"type": "string"},
+                            },
+                            "falsifying_test": {"type": "string"},
+                            "supporting_observation_ids": {
+                                "type": "array", "items": {"type": "string"},
+                            },
+                            "contradicting_observation_ids": {
+                                "type": "array", "items": {"type": "string"},
+                            },
+                            "public_claim_safe": {"type": "boolean", "default": False},
+                        },
+                    },
+                },
+                "execution_identity": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "goal_id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "parent_task_id": {"type": "string"},
+                        "trace_id": {"type": "string"},
+                        "discovery_source": {"type": "string"},
+                        "blocking_goal_reason": {"type": "string"},
+                        "repositories_touched": {
+                            "type": "array", "items": {"type": "string"},
+                        },
+                        "artifact_refs": {
+                            "type": "array", "items": {"type": "string"},
+                        },
+                    },
+                },
                 "attempt": {
                     "type": "object",
                     "properties": {
@@ -209,7 +301,7 @@ def tool_schema() -> dict[str, Any]:
             "description": "Structured NeoOutput. See neo_output_to_dict for the shape.",
             "properties": {
                 "goal_assessment": {
-                    "type": "object",
+                    "type": ["object", "null"],
                     "properties": {
                         "status": {"type": "string"},
                         "progress": {"type": "string"},
@@ -217,7 +309,7 @@ def tool_schema() -> dict[str, Any]:
                     },
                 },
                 "strategy_assessment": {
-                    "type": "object",
+                    "type": ["object", "null"],
                     "properties": {
                         "decision": {
                             "type": "string",
@@ -228,6 +320,8 @@ def tool_schema() -> dict[str, Any]:
                         "reason": {"type": "string"},
                     },
                 },
+                "validation_assessment": {"type": ["object", "null"]},
+                "hypotheses": {"type": "array", "items": {"type": "object"}},
                 "recommended_next_action": {"type": "object"},
             },
         },
@@ -346,6 +440,10 @@ def neo_output_to_dict(output: NeoOutput) -> dict[str, Any]:
         "strategy_assessment": (
             asdict(output.strategy_assessment) if output.strategy_assessment else None
         ),
+        "validation_assessment": (
+            asdict(output.validation_assessment) if output.validation_assessment else None
+        ),
+        "hypotheses": [asdict(item) for item in output.hypotheses],
         "recommended_next_action": dict(output.recommended_next_action),
     }
 

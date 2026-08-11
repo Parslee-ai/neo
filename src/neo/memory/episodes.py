@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # record as `.corrupt-*` instead — recoverable, not silently downgraded). The
 # version gate is the forward-compat mechanism; the drop is only for
 # partial/malformed records.
-EPISODE_SCHEMA_VERSION = 3
+EPISODE_SCHEMA_VERSION = 4
 MAX_EPISODES_PER_PROJECT = 500
 # Quarantined (``.corrupt-*``) records escape the ``*.json`` cap; bound them
 # separately so a project that periodically hits a malformed/future record
@@ -143,6 +143,45 @@ class VerificationEvidence:
     summary: str = ""
     diagnostics_count: int = 0
     repository_revision: str = ""
+    gate_id: str = ""
+    observed_at: Optional[float] = None
+    state_fingerprint: str = ""
+    evidence_sha256: str = ""
+    source: str = ""
+    waiver_reason: str = ""
+
+
+@dataclass
+class ValidationGateEvidence:
+    """Privacy-conscious declaration of one completion proof obligation."""
+
+    gate_id: str = ""
+    description: str = ""
+    kind: str = "state"
+    boundary: str = ""
+    required: bool = True
+    expected_exit_code: Optional[int] = None
+    expected_value: Any = None
+    state_fingerprint: str = ""
+    repository_revision: str = ""
+    allow_waiver: bool = False
+    source: str = "explicit"
+
+
+@dataclass
+class HypothesisEvidence:
+    """Episode-local falsifiable claim and its evidence-backed state."""
+
+    hypothesis_id: str = ""
+    statement: str = ""
+    status: str = "candidate"
+    prior_status: str = ""
+    competing_explanations: list[str] = field(default_factory=list)
+    falsifying_test: str = ""
+    supporting_observation_ids: list[str] = field(default_factory=list)
+    contradicting_observation_ids: list[str] = field(default_factory=list)
+    source: str = "caller"
+    public_claim_safe: bool = False
 
 
 VERIFICATION_KINDS = frozenset({
@@ -150,14 +189,16 @@ VERIFICATION_KINDS = frozenset({
     "user_acceptance", "user_modification", "later_regression",
 })
 VERIFICATION_STATUSES = frozenset({
-    "passed", "failed", "warning", "unavailable", "skipped",
+    "passed", "failed", "warning", "unavailable", "skipped", "pending", "waived",
 })
 
 
 def aggregate_verification_status(evidence: list[VerificationEvidence]) -> str:
     """Return a deterministic, fail-closed verdict for heterogeneous evidence."""
     statuses = {item.status for item in evidence}
-    for status in ("failed", "warning", "unavailable", "skipped", "passed"):
+    for status in (
+        "failed", "warning", "unavailable", "skipped", "pending", "waived", "passed",
+    ):
         if status in statuses:
             return status
     return "skipped"
@@ -203,6 +244,13 @@ class LearningEpisode:
     episode_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    goal_id: str = ""
+    parent_task_id: str = ""
+    trace_id: str = ""
+    discovery_source: str = ""
+    blocking_goal_reason: str = ""
+    repositories_touched: list[str] = field(default_factory=list)
+    artifact_refs: list[str] = field(default_factory=list)
     schema_version: int = EPISODE_SCHEMA_VERSION
     started_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
@@ -223,6 +271,8 @@ class LearningEpisode:
     suggestions: list[SuggestionEvidence] = field(default_factory=list)
     applied_actions: list[dict[str, Any]] = field(default_factory=list)
     verification: list[VerificationEvidence] = field(default_factory=list)
+    validation_gates: list[ValidationGateEvidence] = field(default_factory=list)
+    hypotheses: list[HypothesisEvidence] = field(default_factory=list)
     final_outcome: str = "pending"
     outcome_details: dict[str, Any] = field(default_factory=dict)
     memory_mutations: list[MemoryMutationEvidence] = field(default_factory=list)
@@ -257,6 +307,19 @@ class LearningEpisode:
             episode_id=str(data.get("episode_id") or uuid.uuid4().hex),
             session_id=str(data.get("session_id") or uuid.uuid4().hex),
             task_id=str(data.get("task_id") or uuid.uuid4().hex),
+            goal_id=str(data.get("goal_id", "")),
+            parent_task_id=str(data.get("parent_task_id", "")),
+            trace_id=str(data.get("trace_id", "")),
+            discovery_source=str(data.get("discovery_source", "")),
+            blocking_goal_reason=str(data.get("blocking_goal_reason", "")),
+            repositories_touched=[
+                str(item) for item in data.get("repositories_touched", [])
+                if isinstance(item, str)
+            ],
+            artifact_refs=[
+                str(item) for item in data.get("artifact_refs", [])
+                if isinstance(item, str)
+            ],
             schema_version=EPISODE_SCHEMA_VERSION,
             started_at=float(data.get("started_at", time.time())),
             completed_at=data.get("completed_at"),
@@ -277,6 +340,10 @@ class LearningEpisode:
             suggestions=_coerce_list(SuggestionEvidence, data.get("suggestions", [])),
             applied_actions=list(data.get("applied_actions", [])),
             verification=verification,
+            validation_gates=_coerce_list(
+                ValidationGateEvidence, data.get("validation_gates", [])
+            ),
+            hypotheses=_coerce_list(HypothesisEvidence, data.get("hypotheses", [])),
             final_outcome=str(data.get("final_outcome", "pending")),
             outcome_details=dict(data.get("outcome_details", {})),
             memory_mutations=_coerce_list(MemoryMutationEvidence, data.get("memory_mutations", [])),

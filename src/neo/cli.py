@@ -366,6 +366,17 @@ def parse_args():
             help='Retain isolated benchmark facts and episodes under this directory',
         )
 
+        evaluate_execution_p = subparsers.add_parser(
+            'evaluate-execution',
+            help='Run deterministic validation-gate and hypothesis safety gates',
+        )
+        evaluate_execution_p.add_argument(
+            '--json', action='store_true', help='Emit the report as JSON',
+        )
+        evaluate_execution_p.add_argument(
+            '--corpus', help='Override the versioned execution benchmark corpus path',
+        )
+
         citation_p = subparsers.add_parser(
             'citation-stats',
             help='Summarize [fact:id] citation-survival from metrics.jsonl '
@@ -445,6 +456,7 @@ def parse_args():
         epilog="""subcommands (run `neo <subcommand> --help` for details):
   neo memory <action>     replay-feedback | prune | observer | issues | rules |
                           audit | import | explain | evaluate-learning |
+                          evaluate-execution |
                           citation-stats | learning-stats
   neo construct <action>  list | show | search | index
   neo car status          report detected CAR runtime surfaces
@@ -737,7 +749,10 @@ def main():
         or (hasattr(args, 'config') and args.config)
         or (
             getattr(args, 'memory_action', None)
-            in {'observer', 'explain', 'evaluate-learning', 'issues', 'rules', 'audit'}
+            in {
+                'observer', 'explain', 'evaluate-learning', 'evaluate-execution',
+                'issues', 'rules', 'audit',
+            }
         )
     ):
         try:
@@ -1293,6 +1308,11 @@ def main():
                 asdict(output.strategy_assessment)
                 if output.strategy_assessment else None
             ),
+            "validation_assessment": (
+                asdict(output.validation_assessment)
+                if output.validation_assessment else None
+            ),
+            "hypotheses": [asdict(item) for item in output.hypotheses],
             "recommended_next_action": output.recommended_next_action,
             "orchestrator": asdict(output.orchestrator),
         }

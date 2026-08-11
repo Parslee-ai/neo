@@ -10,9 +10,27 @@ invocation therefore separates four concepts that a task-shaped prompt cannot:
 - **attempt** — the action already taken or currently being evaluated;
 - **outcome** — observed evidence after that attempt.
 
-`NeoInput` also accepts explicit constraints, success criteria, progress,
+`NeoInput` also accepts explicit constraints, success criteria, validation gates,
+gate-linked observations, falsifiable hypotheses, execution identity, progress,
 trajectory, current state, caller role, and requested output. Every field is
-optional for backward compatibility.
+optional for wire compatibility; omitted proof is never treated as success.
+
+## Proof-aware validation matrix
+
+`success_criteria` remains accepted and is normalized to required legacy gates.
+New callers should send `validation_gates` plus `validation_observations` with an
+explicit `gate_id` join. A generic `outcome.status=success` is only a summary: it
+cannot satisfy one gate, much less several boundary configurations.
+
+Required gates fail closed. `passed` evidence must match any expected exit code,
+value, repository revision, and state fingerprint. Stale evidence becomes
+pending. `skipped`, `warning`, invalid, and `unavailable` evidence is
+unverifiable. A waiver counts only when the gate explicitly permits it and the
+observation supplies a reason. Duplicate gate IDs become separate invalid
+obligations rather than collapsing two requirements into one.
+
+The output includes `validation_assessment` counts and blocking gate IDs. When a
+gate blocks completion, `recommended_next_action` names that proof obligation.
 
 ## Provisional inference
 
@@ -59,10 +77,31 @@ Every output adds:
 ```
 
 The deterministic decisions are `continue`, `change_strategy`, `stop_success`,
-and `stop_blocked`. Success requires both an observed success outcome and an
-explicit success criterion. Exhausting a caller-supplied iteration limit stops
-blocked. Missing verification is never success, and model confidence is not an
-input to the assessment.
+and `stop_blocked`. Success requires compatible observations for every required
+validation gate. Aggregate outcome prose and model confidence are not inputs to
+that decision. Exhausting a caller-supplied iteration limit stops blocked.
+Missing verification is never success.
+
+## Falsifiable hypotheses
+
+Hypotheses are separate from plan steps. Each carries an ID, candidate status,
+competing explanations, a falsifying test, and supporting or contradicting
+observation IDs. `confirmed` requires a falsifier plus compatible passing
+evidence; `rejected` or `contradicted` requires failed contradicting evidence.
+Unsupported caller claims are downgraded deterministically.
+
+Planning responses may propose structured hypotheses, but Neo forces every
+model-generated claim to `candidate`, clears evidence links, and marks it unsafe
+for publication. Hypotheses remain episode-local and never bypass the existing
+independently accepted evidence-learning route.
+
+## Goal and task provenance
+
+`execution_identity` lets a host preserve session, goal, task, parent task, and
+trace IDs across Neo calls. It also records the discovery source, the reason an
+emergent task blocks its parent goal, repositories touched, and hashed artifact
+references. This distinguishes an overarching user goal from defects discovered
+while pursuing it and avoids treating cwd as task identity.
 
 ## Procedural outcome memory
 

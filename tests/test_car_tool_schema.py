@@ -70,7 +70,8 @@ class TestToolSchema:
         for field in (
             "goal", "intent", "constraints", "success_criteria", "attempt",
             "outcome", "progress", "trajectory", "current_state", "role",
-            "requested_output",
+            "requested_output", "validation_gates", "validation_observations",
+            "hypotheses", "execution_identity",
         ):
             assert field in properties
         assert set(properties["role"]["enum"]) == {role.value for role in CallerRole}
@@ -78,6 +79,8 @@ class TestToolSchema:
         assert set(returns["strategy_assessment"]["properties"]["decision"]["enum"]) == {
             "continue", "change_strategy", "stop_success", "stop_blocked",
         }
+        assert "validation_assessment" in returns
+        assert "hypotheses" in returns
 
     def test_schema_is_not_idempotent(self):
         # Every call should re-run the pipeline (memory updates, etc.).
@@ -281,5 +284,7 @@ class TestNeoOutputToDict:
         )
         d = neo_output_to_dict(output)
         json.dumps(d)  # must not raise
+        from jsonschema import validate
+        validate(instance=d, schema=tool_schema()["returns"])
         assert d["plan"] == []
         assert d["metadata"] == {}

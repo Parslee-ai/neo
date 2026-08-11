@@ -168,4 +168,11 @@
   confidence-scored provisional context; never promote an inferred goal or intent as
   durable truth. Retrieval is conditioned on the resolved envelope. Loop stop/change
   decisions must use observed progress/outcome evidence, never model confidence alone.
+  Proof-aware callers should declare `validation_gates` and link each
+  `validation_observation` by `gate_id`; aggregate success never satisfies missing
+  gates, and stale/skipped/unavailable evidence fails closed. `hypotheses` are
+  episode-local falsifiable claims with explicit evidence transitions, never durable
+  truth by generation. `execution_identity` preserves goal/task/parent/session and
+  cross-repository provenance. Run `neo memory evaluate-execution --json` for the
+  deterministic zero-model safety gate.
 - When creating a pull request, always use the PR template included in the repo.

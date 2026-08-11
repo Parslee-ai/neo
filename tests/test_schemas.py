@@ -179,3 +179,24 @@ def test_plan_step_risk_enum():
     }
     with pytest.raises(ValidationError):
         validate(instance=invalid_step, schema=PLAN_STEP_SCHEMA)
+
+
+def test_plan_step_accepts_only_falsifiable_structured_hypotheses():
+    plan_step = {
+        "id": "ps_5",
+        "description": "Discriminate between causes",
+        "rationale": "Avoid publishing the first plausible explanation",
+        "dependencies": [],
+        "schema_version": SCHEMA_VERSION,
+        "hypotheses": [{
+            "hypothesis_id": "h_latency",
+            "statement": "Prompt size causes the latency increase",
+            "competing_explanations": ["Concurrent probes saturated the runner"],
+            "falsifying_test": "Repeat serially at fixed prompt sizes",
+        }],
+    }
+    validate(instance=plan_step, schema=PLAN_STEP_SCHEMA)
+
+    del plan_step["hypotheses"][0]["falsifying_test"]
+    with pytest.raises(ValidationError):
+        validate(instance=plan_step, schema=PLAN_STEP_SCHEMA)

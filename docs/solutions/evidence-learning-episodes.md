@@ -14,7 +14,7 @@ These records are deliberately separate from `~/.neo/facts/`:
 - facts are generalized knowledge;
 - creating an episode does not promote or increase the authority of a fact.
 
-## Version 2 contents
+## Version 4 contents
 
 Each record has stable episode, session, and task identifiers plus:
 
@@ -27,6 +27,10 @@ Each record has stable episode, session, and task identifiers plus:
 - normalized deterministic-check results;
 - pending or terminal outcome state;
 - fact mutations performed by the current legacy persistence path.
+- caller-controlled goal, parent-task, trace, discovery, and cross-repository
+  provenance;
+- declared validation gates and gate-linked observations;
+- episode-local hypotheses, falsifiers, evidence links, and publication safety.
 
 Raw repository context, generated code, and diffs are not duplicated into the
 episode store. SHA-256 digests provide correlation while keeping the evidence
@@ -37,8 +41,10 @@ ledger from becoming a second sensitive-source corpus.
 - Each record is written through a same-directory temporary file and atomic
   replace.
 - Storage is bounded to the newest 500 records per project.
-- Version 1 and partial pre-v1 records load with conservative defaults: missing verification
+- Versions 1–3 and partial pre-v1 records load with conservative defaults: missing verification
   remains absent, never passed.
+- Ungated legacy verification remains visible but cannot satisfy an identified
+  version-4 gate.
 - Legacy `static_check` and `downstream_outcome` evidence kinds migrate in
   memory to the normalized v2 vocabulary without rewriting source records.
 - Malformed or unsupported future records are renamed with a `.corrupt-*`

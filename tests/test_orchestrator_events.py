@@ -19,6 +19,7 @@ from neo.events import (
     RecordingSink,
     safe_emit,
 )
+from neo.execution_context import HypothesisRecord, ValidationGate
 from neo.models import NeoInput, ProposedChange, TaskType
 from neo.operating_mode import OperatingMode
 from neo.schemas import SCHEMA_VERSION
@@ -28,7 +29,7 @@ def _block(kind, payload):
     return f"<<<NEO:SCHEMA=v3:KIND={kind}>>>\n{json.dumps(payload)}\n<<<END:{kind}>>>"
 
 
-def _response(*, issues=None, confidence=0.9):
+def _response(*, issues=None, confidence=0.9, hypotheses=None):
     plan = [{
         "id": "ps_1",
         "description": "Add a guard clause before the deref",
@@ -37,6 +38,8 @@ def _response(*, issues=None, confidence=0.9):
         "risk": "low",
         "schema_version": SCHEMA_VERSION,
     }]
+    if hypotheses is not None:
+        plan[0]["hypotheses"] = hypotheses
     sim = [{
         "n": 1,
         "input_data": "empty string",
@@ -198,10 +201,67 @@ def test_events_never_claim_a_phase_that_already_closed():
             )
 
 
-def test_leading_plan_step_surfaces_as_a_hypothesis():
+def test_plan_step_is_not_mislabeled_as_a_hypothesis():
     _, sink = _run(_response())
+    assert not sink.of_type(NeoEventType.HYPOTHESIS_FORMED)
+
+
+def test_explicit_falsifiable_hypothesis_surfaces_with_identity():
+    sink = RecordingSink()
+    engine = NeoEngine(
+        lm_adapter=FakeLM(_response()),
+        enable_persistent_memory=False,
+        event_sink=sink,
+    )
+    engine.process(NeoInput(
+        prompt="fix the parser",
+        hypotheses=[HypothesisRecord(
+            "h-parser", "Empty input reaches the dereference",
+            falsifying_test="Call the parser with an empty token",
+        )],
+    ))
+
     formed = sink.of_type(NeoEventType.HYPOTHESIS_FORMED)
-    assert formed[0].message == "Add a guard clause before the deref"
+    assert formed[0].message == "Empty input reaches the dereference"
+    assert formed[0].data["hypothesis_id"] == "h-parser"
+
+
+def test_model_generated_hypothesis_is_forced_to_episode_local_candidate():
+    response = _response(hypotheses=[{
+        "hypothesis_id": "h-generated",
+        "statement": "Empty input reaches the dereference",
+        "competing_explanations": ["Tokenizer rejects the input earlier"],
+        "falsifying_test": "Trace an empty token through the parser",
+    }])
+    output, sink = _run(response)
+
+    assert output.hypotheses[0].hypothesis_id == "h-generated"
+    assert output.hypotheses[0].status == "candidate"
+    assert output.hypotheses[0].public_claim_safe is False
+    assert sink.of_type(NeoEventType.HYPOTHESIS_FORMED)
+
+
+def test_host_summary_surfaces_missing_proof_and_provisional_claims():
+    sink = RecordingSink()
+    engine = NeoEngine(
+        lm_adapter=FakeLM(_response()),
+        enable_persistent_memory=False,
+        event_sink=sink,
+    )
+    output = engine.process(NeoInput(
+        prompt="fix the parser",
+        validation_gates=[ValidationGate("user-path", "Exercise the real user path")],
+        hypotheses=[HypothesisRecord(
+            "h-parser", "Empty input reaches the dereference",
+            falsifying_test="Call the parser with an empty token",
+        )],
+    ))
+
+    assert any("user-path" in item for item in output.orchestrator.cautions)
+    assert any("h-parser" in item for item in output.orchestrator.cautions)
+    assert output.recommended_next_action["gate_id"] == "user-path"
+    assert "suggestion_id" not in output.recommended_next_action
+    assert "file_path" not in output.recommended_next_action
 
 
 # ------------------------------------------------- branches with their own shape
@@ -312,7 +372,8 @@ def test_panel_fallback_closes_its_phase_and_opens_a_second_one(monkeypatch):
     assert len(
         [e for e in sink.of_type(NeoEventType.PHASE_STARTED) if e.phase == "reasoning"]
     ) == 2
-    assert sink.of_type(NeoEventType.HYPOTHESIS_REJECTED)
+    assert sink.of_type(NeoEventType.REASONING_FALLBACK)
+    assert not sink.of_type(NeoEventType.HYPOTHESIS_REJECTED)
 
 
 def test_a_failed_run_still_emits_a_terminal_event():

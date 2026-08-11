@@ -79,6 +79,8 @@ own analysis while implying it came from Neo.
 2. Surface every entry in `orchestrator.cautions`.
 3. Mention significant rejected hypotheses and risks from the event stream.
    What Neo ruled out is often more useful than what he settled on.
+   Treat `hypotheses` with `public_claim_safe=false` as provisional even when
+   their prose sounds certain. Do not publish them as causal facts.
 4. Do not dump raw traces, full simulation output, or the event stream itself.
 5. **Attribute explicitly.** You call Neo inside your own coding loop and keep
    working afterwards, so there is no visible boundary between his reasoning
@@ -88,7 +90,9 @@ own analysis while implying it came from Neo.
 6. **Neo's result is an input, not the deliverable.** Continue the task —
    inspect files, make the change, run the tests — and report the combined
    outcome. `recommended_next_action` in the JSON names a concrete starting
-   point.
+   point. When its type is `validation`, complete that named gate before
+   repeating a success claim; `validation_assessment.blocking_gate_ids` is the
+   authoritative list of remaining proof obligations.
 
 ## Neo's voice
 

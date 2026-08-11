@@ -79,6 +79,8 @@ orchestrator_voice:
     caution_unverified_skipped: "I ran out of time before the checkers. This code is unverified."
     caution_unverified_no_tools: "No checkers on this machine. This code is unverified."
     caution_open_question: "Still open: {question}"
+    caution_validation_blocked: "Proof still missing for required gate {gate_id}."
+    caution_hypothesis_provisional: "Causal claim {hypothesis_id} is still {status}; do not publish it as fact."
     caution_overflow: "({count} more like these. Read the full output.)"
 
     # Progress and lifecycle — stage-neutral, same reason.

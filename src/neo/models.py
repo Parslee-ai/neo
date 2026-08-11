@@ -20,12 +20,17 @@ from neo.execution_context import (
     CallerRole,
     GoalAssessment,
     GoalSpec,
+    HypothesisRecord,
     IntentSpec,
     OutcomeContext,
     ProgressSignal,
     StrategyAssessment,
     SuccessCriterion,
     TrajectoryContext,
+    ExecutionIdentity,
+    ValidationAssessment,
+    ValidationGate,
+    ValidationObservation,
 )
 from neo.operating_mode import AuthorityPolicy, OperatingMode
 
@@ -181,6 +186,10 @@ class NeoInput:
     intent: Optional[IntentSpec] = None
     constraints: list[str] = field(default_factory=list)
     success_criteria: list[SuccessCriterion] = field(default_factory=list)
+    validation_gates: list[ValidationGate] = field(default_factory=list)
+    validation_observations: list[ValidationObservation] = field(default_factory=list)
+    hypotheses: list[HypothesisRecord] = field(default_factory=list)
+    execution_identity: ExecutionIdentity = field(default_factory=ExecutionIdentity)
     attempt: Optional[AttemptContext] = None
     outcome: Optional[OutcomeContext] = None
     progress: Optional[ProgressSignal] = None
@@ -228,6 +237,7 @@ class PlanStep:
     retrieval_keys: list[str] = field(default_factory=list)
     failure_signatures: list[str] = field(default_factory=list)
     verifier_checks: list[str] = field(default_factory=list)
+    hypotheses: list[HypothesisRecord] = field(default_factory=list)
     expanded: bool = False  # Track if this step has been expanded from seed
     # MapCoder-style per-step confidence (paper 2405.11403): scaled to [0, 1].
     # Default 1.0 so legacy single-plan paths behave as before. Future
@@ -325,6 +335,8 @@ class NeoOutput:
     metadata: dict[str, Any] = field(default_factory=dict)
     goal_assessment: Optional[GoalAssessment] = None
     strategy_assessment: Optional[StrategyAssessment] = None
+    validation_assessment: Optional[ValidationAssessment] = None
+    hypotheses: list[HypothesisRecord] = field(default_factory=list)
     recommended_next_action: dict[str, Any] = field(default_factory=dict)
     orchestrator: OrchestratorMessage = field(default_factory=OrchestratorMessage)
 

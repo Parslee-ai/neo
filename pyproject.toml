@@ -132,6 +132,7 @@ packages = ["src/neo"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "construct" = "neo/construct_library"
+"benchmarks" = "neo/benchmarks"
 
 [tool.hatch.build.targets.sdist]
 exclude = [

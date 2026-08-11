@@ -1,0 +1,159 @@
+{
+  "benchmark_id": "execution_loop_v1",
+  "latency_budget_ms": 500,
+  "scenarios": [
+    {
+      "id": "complete-matrix-stops-success",
+      "kind": "assessment",
+      "input": {
+        "prompt": "verify both modes",
+        "validation_gates": [
+          {"gate_id": "off", "description": "disabled mode"},
+          {"gate_id": "on", "description": "enabled mode"}
+        ],
+        "validation_observations": [
+          {"observation_id": "off-ok", "gate_id": "off", "status": "passed"},
+          {"observation_id": "on-ok", "gate_id": "on", "status": "passed"}
+        ]
+      },
+      "expected": {"goal_status": "satisfied", "strategy": "stop_success", "passed": 2}
+    },
+    {
+      "id": "aggregate-success-cannot-cover-missing-boundary",
+      "kind": "assessment",
+      "input": {
+        "prompt": "verify both modes",
+        "outcome": {"status": "success", "summary": "disabled mode passed"},
+        "validation_gates": [
+          {"gate_id": "off", "description": "disabled mode"},
+          {"gate_id": "on", "description": "enabled mode"}
+        ],
+        "validation_observations": [
+          {"observation_id": "off-ok", "gate_id": "off", "status": "passed"}
+        ]
+      },
+      "expected": {"goal_status": "unverifiable", "strategy": "continue", "pending": 1}
+    },
+    {
+      "id": "stale-revision-is-pending",
+      "kind": "assessment",
+      "input": {
+        "prompt": "verify current revision",
+        "validation_gates": [
+          {"gate_id": "suite", "description": "suite", "repository_revision": "new"}
+        ],
+        "validation_observations": [
+          {"observation_id": "old", "gate_id": "suite", "status": "passed", "repository_revision": "old"}
+        ]
+      },
+      "expected": {"goal_status": "in_progress", "strategy": "continue", "pending": 1, "stale": 1}
+    },
+    {
+      "id": "skipped-is-unverifiable",
+      "kind": "assessment",
+      "input": {
+        "prompt": "verify device",
+        "validation_gates": [{"gate_id": "device", "description": "device"}],
+        "validation_observations": [
+          {"observation_id": "skip", "gate_id": "device", "status": "skipped"}
+        ]
+      },
+      "expected": {"goal_status": "unverifiable", "strategy": "stop_blocked", "unavailable": 1}
+    },
+    {
+      "id": "authorized-waiver-is-explicit",
+      "kind": "assessment",
+      "input": {
+        "prompt": "verify device",
+        "validation_gates": [
+          {"gate_id": "device", "description": "device", "allow_waiver": true}
+        ],
+        "validation_observations": [
+          {"observation_id": "waive", "gate_id": "device", "status": "waived", "waiver_reason": "hardware unavailable"}
+        ]
+      },
+      "expected": {"goal_status": "satisfied", "strategy": "stop_success", "waived": 1}
+    },
+    {
+      "id": "unsupported-confirmation-is-downgraded",
+      "kind": "hypothesis",
+      "input": {
+        "prompt": "diagnose",
+        "hypotheses": [
+          {"hypothesis_id": "h1", "statement": "foreign facts are causal", "status": "confirmed", "public_claim_safe": true}
+        ]
+      },
+      "expected": {"hypothesis_status": "candidate", "public_claim_safe": false}
+    },
+    {
+      "id": "failed-falsifier-rejects-candidate",
+      "kind": "hypothesis",
+      "input": {
+        "prompt": "diagnose",
+        "validation_gates": [{"gate_id": "probe", "description": "probe"}],
+        "validation_observations": [
+          {"observation_id": "probe-failed", "gate_id": "probe", "status": "failed"}
+        ],
+        "hypotheses": [
+          {"hypothesis_id": "h1", "statement": "foreign facts are causal", "status": "candidate", "contradicting_observation_ids": ["probe-failed"]}
+        ]
+      },
+      "expected": {"hypothesis_status": "rejected", "public_claim_safe": false}
+    },
+    {
+      "id": "duplicate-gates-fail-closed",
+      "kind": "assessment",
+      "input": {
+        "prompt": "verify both",
+        "validation_gates": [
+          {"gate_id": "suite", "description": "first"},
+          {"gate_id": "suite", "description": "second"}
+        ],
+        "validation_observations": [
+          {"observation_id": "one", "gate_id": "suite", "status": "passed"}
+        ]
+      },
+      "expected": {"strategy": "continue", "passed": 1, "pending": 1}
+    },
+    {
+      "id": "task-hierarchy-survives",
+      "kind": "identity",
+      "input": {
+        "prompt": "emergent repair",
+        "execution_identity": {
+          "session_id": "session-1", "goal_id": "goal-1", "task_id": "task-2",
+          "parent_task_id": "task-1", "trace_id": "trace-1",
+          "repositories_touched": ["neo", "car"]
+        }
+      },
+      "expected": {"task_id": "task-2", "parent_task_id": "task-1", "repository_count": 2}
+    },
+    {
+      "id": "rejected-hypothesis-needs-new-evidence-to-reopen",
+      "kind": "hypothesis",
+      "input": {
+        "prompt": "diagnose again",
+        "hypotheses": [
+          {"hypothesis_id": "h1", "statement": "foreign facts are causal", "prior_status": "rejected", "status": "candidate"}
+        ]
+      },
+      "expected": {"hypothesis_status": "rejected", "public_claim_safe": false}
+    },
+    {
+      "id": "legacy-success-without-observation-is-unverifiable",
+      "kind": "assessment",
+      "input": {
+        "prompt": "legacy verify",
+        "success_criteria": [{"type": "command", "command": "pytest", "expected_exit_code": 0}],
+        "outcome": {"status": "success", "summary": "passed"}
+      },
+      "expected": {"goal_status": "unverifiable", "strategy": "continue", "pending": 1}
+    },
+    {
+      "id": "v3-episode-loads-conservatively",
+      "kind": "legacy_episode",
+      "input": {"schema_version": 3, "episode_id": "old", "objective": "old task"},
+      "expected": {"schema_version": 4, "verification_count": 0}
+    }
+  ]
+}

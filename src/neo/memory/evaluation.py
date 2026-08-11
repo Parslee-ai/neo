@@ -33,8 +33,14 @@ from neo.memory.models import Fact, FactKind, FactScope, Provenance, update_effe
 from neo.memory.outcomes import Outcome, OutcomeType
 from neo.memory.store import FactStore
 
-DEFAULT_CORPUS_PATH = (
+_SOURCE_CORPUS_PATH = (
     Path(__file__).resolve().parents[3] / "benchmarks" / "learning_loop_v1.json"
+)
+_INSTALLED_CORPUS_PATH = (
+    Path(__file__).resolve().parents[1] / "benchmarks" / "learning_loop_v1.json"
+)
+DEFAULT_CORPUS_PATH = (
+    _SOURCE_CORPUS_PATH if _SOURCE_CORPUS_PATH.exists() else _INSTALLED_CORPUS_PATH
 )
 # 2 adds `performance_within_budget` / `performance_notes` and removes latency
 # from the `accepted` decision. A consumer reading only `accepted` gets a
