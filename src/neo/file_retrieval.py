@@ -230,7 +230,8 @@ def normalize(scores: dict[str, float], ceiling: float = 1.0) -> dict[str, float
     So a ~2x separation between on-topic and off-topic exists in the raw score
     and is currently thrown away. An evidence term — scaling the whole query's
     contribution by `min(1.0, top / SATURATION)` — was implemented and
-    measured at SATURATION 10/15/20 and moved MRR by at most +0.010, which is
+    measured at SATURATION 10/15/20 and moved MRR by at most +0.010 (superseded
+    generation, like every other figure below the table above), which is
     noise. It is NOT shipped, for a reason worth stating: every prompt in the
     evaluation set is an on-topic commit subject, so the harness structurally
     cannot see the prompt class the term exists for. Adding it would be

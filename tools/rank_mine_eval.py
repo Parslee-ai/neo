@@ -216,8 +216,16 @@ def _git_head(path: str) -> str:
     effectiveness guard, ranks all 50 cases, and only then discovers it cannot
     be stamped -- ~100 seconds of subprocess work thrown away with a traceback
     pointing at a string format instead of at the real problem.
+
+    `rev-parse` searches ANCESTORS, so a non-git tree sitting inside a checkout
+    would stamp that enclosing checkout's sha -- a confidently wrong label on
+    the field whose whole point is saying which ranker ran. Compared against
+    `--show-toplevel` so only the path itself counts.
     """
     try:
+        top = _git(path, "rev-parse", "--show-toplevel").strip()
+        if os.path.realpath(top) != os.path.realpath(path):
+            return "not-a-git-checkout"
         return _git(path, "rev-parse", "HEAD").strip()[:12]
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return "not-a-git-checkout"

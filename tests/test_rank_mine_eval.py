@@ -315,6 +315,37 @@ class TestGuards:
         assert seen["tree"] == str(tmp_path.resolve())
 
 
+class TestNothingParsedIsAFailure:
+    """Marker found, zero lines parsed anywhere = the format moved.
+
+    Scored as a result it reads `R@10 0.000, failed_cases: 0` -- a confident
+    claim that the ranker found nothing, when the parser found nothing.
+    """
+
+    def _run_main(self, monkeypatch, tmp_path, ranking):
+        monkeypatch.setattr(rme, "assert_tree_is_effective", lambda t, r: None)
+        monkeypatch.setattr(rme, "_git_head", lambda p: "deadbeefcafe")
+        monkeypatch.setattr(rme, "mine_cases",
+                            lambda *a, **k: [{"sha": "abc", "query": "q",
+                                              "truth": ["a.py"]}])
+        monkeypatch.setattr(rme, "rank_files", lambda *a, **k: ranking)
+        monkeypatch.setattr(sys, "argv",
+                            ["rank_mine_eval.py", "--repo", str(tmp_path),
+                             "--tree", str(tmp_path)])
+        return rme.main()
+
+    def test_every_case_parsing_nothing_exits_nonzero(self, monkeypatch,
+                                                      tmp_path, capsys):
+        rc = self._run_main(monkeypatch, tmp_path, [])
+
+        assert rc == 1
+        assert "not one case yielded a parsable file line" in \
+            capsys.readouterr().err.lower()
+
+    def test_a_real_ranking_still_scores(self, monkeypatch, tmp_path):
+        assert self._run_main(monkeypatch, tmp_path, ["a.py"]) == 0
+
+
 class TestHeadStamp:
     def test_a_non_git_tree_stamps_instead_of_exploding(self, tmp_path):
         """`--tree` need not be a git checkout, and a prune'd worktree passes
@@ -325,4 +356,16 @@ class TestHeadStamp:
     def test_a_real_checkout_stamps_a_short_sha(self):
         head = rme._git_head(str(Path(__file__).resolve().parent.parent))
 
-        assert len(head) == 12 and head != "not-a-git-checkout"
+        assert len(head) == 12   # the marker is longer, so this excludes it
+
+    def test_a_non_git_dir_INSIDE_a_checkout_does_not_borrow_its_sha(self,
+                                                                     tmp_path):
+        """`rev-parse HEAD` searches ancestors, so this stamped the enclosing
+        repo -- a confident wrong label on the field that says which ranker
+        ran."""
+        nested = Path(__file__).resolve().parent.parent / ".tmp_nongit_probe"
+        nested.mkdir(exist_ok=True)
+        try:
+            assert rme._git_head(str(nested)) == "not-a-git-checkout"
+        finally:
+            nested.rmdir()
