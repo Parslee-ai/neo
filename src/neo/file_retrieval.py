@@ -161,6 +161,29 @@ def normalize(scores: dict[str, float], ceiling: float = 1.0) -> dict[str, float
     per query keeps those calibrated against each other: an explicitly named
     path still outranks everything, and a tie-breaker still breaks ties rather
     than deciding the ranking.
+
+    **Known limit: this preserves ORDER but discards EVIDENCE.** The top file
+    always receives the full ceiling, whether its raw score was 20 or 4. Total
+    abstention works — a query matching nothing yields `{}` and no boost at all
+    — but a WEAK best match is promoted as confidently as a strong one.
+    Measured raw top scores on this repo:
+
+        on-topic   "fix the fact store supersession threshold"   14.79
+        on-topic   "tree-sitter parser drops interfaces"         20.17
+        vague      "make it better"                               6.33
+        off-topic  "how do I bake sourdough bread"                7.48
+        gibberish  "zzqx wibble frobnicate"                       0.00
+
+    So a ~2x separation between on-topic and off-topic exists in the raw score
+    and is currently thrown away. An evidence term — scaling the whole query's
+    contribution by `min(1.0, top / SATURATION)` — was implemented and
+    measured at SATURATION 10/15/20 and moved MRR by at most +0.010, which is
+    noise. It is NOT shipped, for a reason worth stating: every prompt in the
+    evaluation set is an on-topic commit subject, so the harness structurally
+    cannot see the prompt class the term exists for. Adding it would be
+    shipping on reasoning rather than measurement. Revisit with an eval that
+    contains off-topic and vague prompts, where "return nothing" is the
+    correct answer and can be scored.
     """
     if not scores:
         return {}
