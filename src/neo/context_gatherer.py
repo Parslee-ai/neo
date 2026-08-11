@@ -30,6 +30,7 @@ MAX_CHUNK_CENTERS = 20     # Best-scoring lines considered as window centers bef
 MAX_MERGED_WINDOW_LINES = 200   # Ceiling on a merged window so one file can't eat the budget
 DISCRIMINATIVE_MAX_LINE_FRACTION = 0.25  # A token on >25% of a file's lines is noise in it
 TEST_PENALTY = 0.4         # Multiplier; a test file retains 60% of its score
+CONTENT_WEIGHT = 3.0       # Weight on normalized content BM25; see score_candidate
 
 
 # Test-file conventions across the languages neo indexes. Anchored on
@@ -629,12 +630,11 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     paths disagreed about test files and only one was ever corrected. It
     matters MORE under content BM25 than it did before, because a test file
     contains its subject's identifiers plus test scaffolding and so is often
-    the better lexical match. Measured over cases mined from git history:
-
-        repo    R@10 without   with     MRR without   with
-        neo        0.705       0.783      0.558      0.718
-        car        0.969       0.969      0.680      0.682
-        quip       0.786       0.820      0.583      0.651
+    the better lexical match. The A/B that established this was run on a
+    first-pass harness whose absolute numbers are superseded; the DIRECTION
+    held on every repo and is what the parameter rests on. For current
+    end-to-end figures see `neo.file_retrieval` — one table, one harness
+    generation, deliberately not restated here.
 
     Keyword-only and REQUIRED. It was briefly optional-defaulting-to-False so
     existing pure-scoring tests would not need editing — a production default
@@ -680,17 +680,16 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     # nothing to patch, and content BM25 identifies a central file by what is
     # in it rather than by a list of names someone maintained.
 
-    # Content relevance: the dominant term, and the only one that has read the
-    # file. Normalized to [0, 3] so it outweighs every tie-breaker combined
-    # (0.8 docs + 0.3 git + 0.2 entry = 1.3) while staying far below
-    # EXPLICIT_PATH_BOOST, which encodes an explicit user instruction.
-    score += 3.0 * content_relevance
-
     # Content relevance: the dominant term, and the only one that has read
-    # the file. Normalized to [0, 3] so it outweighs every tie-breaker
+    # the file. Scaled by CONTENT_WEIGHT so it outweighs every tie-breaker
     # combined (0.8 docs + 0.3 git + 0.2 entry + 0.45 filename = 1.75) while
     # staying far below EXPLICIT_PATH_BOOST, which encodes a user instruction.
-    score += 3.0 * content_relevance
+    #
+    # This statement appeared TWICE for three commits — the cherry-pick that
+    # merged #188's scorer with this one kept both blocks, so the effective
+    # weight was 6.0 while every docstring, comment and measurement table
+    # said 3.0. Named constant now, so the value has exactly one home.
+    score += CONTENT_WEIGHT * content_relevance
 
     # Filename overlap, kept as a weak tie-breaker rather than a primary
     # signal. It is a substring test against the whole path, so short prompt

@@ -169,3 +169,105 @@ class TestRealRepository:
             f"store.py ranked {position}; it ranked 200th of 284 under the "
             f"old scorer, because it is 162 KB"
         )
+
+
+class TestConstantsArePinned:
+    """Every constant this module turns on, asserted by VALUE.
+
+    Four survived a mutation sweep because nothing pinned them, and one of the
+    survivors is what shipped: the content term was applied twice for three
+    commits, so the effective weight was 6.0 while every docstring, comment and
+    measurement table said 3.0. The test that should have caught it named 3.0
+    in its docstring and asserted an inequality that 1.76-through-infinity
+    satisfies. Naming a number in prose while asserting a direction is how a
+    constant goes unpinned and looks pinned.
+    """
+
+    def test_content_weight_is_applied_exactly_once(self):
+        """The shipped bug, in the form that would have caught it."""
+        import pathlib
+
+        source = (pathlib.Path(__file__).resolve().parents[1]
+                  / "src" / "neo" / "context_gatherer.py").read_text()
+        assert source.count("CONTENT_WEIGHT * content_relevance") == 1
+
+    def test_content_weight_value(self):
+        from neo.context_gatherer import CONTENT_WEIGHT
+
+        assert CONTENT_WEIGHT == 3.0
+
+    def test_content_weight_outranks_every_tie_breaker_by_the_stated_margin(self):
+        """Equality, not `>`.
+
+        docs 0.8 + git 0.3 + entry 0.2 + filename 0.45 = 1.75. The margin is
+        the claim; asserting only the direction lets the weight drift anywhere
+        above it.
+        """
+        from neo.context_gatherer import CONTENT_WEIGHT
+
+        tie_breakers = 0.8 + 0.3 + 0.2 + 0.45
+        assert CONTENT_WEIGHT > tie_breakers
+        assert CONTENT_WEIGHT == pytest.approx(3.0)
+        assert CONTENT_WEIGHT / tie_breakers == pytest.approx(1.714, abs=0.01)
+
+    def test_normalize_ceiling_default(self):
+        """Mutating the default to 0.05 left all 156 selection tests green and
+        cost R@10 0.875 -> 0.750 on the real CLI."""
+        from neo.file_retrieval import normalize
+
+        assert normalize({"a": 4.0, "b": 2.0})["a"] == pytest.approx(1.0)
+
+    def test_max_indexed_chars_value(self):
+        """Mutating 200_000 -> 2_000 left all 156 selection tests green and
+        cost R@10 0.875 -> 0.750."""
+        from neo.file_retrieval import MAX_INDEXED_CHARS
+
+        assert MAX_INDEXED_CHARS == 200_000
+
+    def test_path_token_weight_value(self):
+        from neo.file_retrieval import PATH_TOKEN_WEIGHT
+
+        assert PATH_TOKEN_WEIGHT == 3
+
+
+class TestBinaryFilesAreNotIndexed:
+    """Binary content must not reach BM25.
+
+    `errors="ignore"` turned PDFs into junk tokens. Not merely wasted work:
+    BM25 divides by corpus-average document length, so binary blobs made every
+    real file's length penalty depend on how many PDFs sat in the repo.
+    Measured here: 5 PDFs were 1.7% of documents and 32.9% of all tokens, and
+    `avgdl` moved 2773 -> 1824 once they were excluded.
+    """
+
+    def test_a_nul_bearing_file_yields_no_text(self, tmp_path):
+        from neo.file_retrieval import _read
+
+        binary = tmp_path / "doc.pdf"
+        binary.write_bytes(b"%PDF-1.4\x00\x00binary\x00garbage")
+        assert _read(str(binary)) == ""
+
+    def test_undecodable_bytes_yield_no_text(self, tmp_path):
+        from neo.file_retrieval import _read
+
+        bad = tmp_path / "latin.py"
+        bad.write_bytes(b"x = '\xff\xfe not utf-8'")
+        assert _read(str(bad)) == ""
+
+    def test_real_source_still_reads(self, tmp_path):
+        from neo.file_retrieval import _read
+
+        good = tmp_path / "ok.py"
+        good.write_text("def hello():\n    return 'wörld'\n")
+        assert "hello" in _read(str(good))
+
+    def test_binaries_do_not_enter_the_index(self, tmp_path):
+        from neo.file_retrieval import build_index
+
+        (tmp_path / "a.py").write_text("def supersede(): pass\n")
+        (tmp_path / "b.pdf").write_bytes(b"%PDF\x00" + b"supersede " * 500)
+        cands = [(str(p), p.name, p.stat().st_size) for p in sorted(tmp_path.iterdir())]
+
+        scores = build_index(cands).scores("supersede")
+        assert "b.pdf" not in scores
+        assert scores.get("a.py", 0) > 0

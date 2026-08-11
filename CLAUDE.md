@@ -643,18 +643,29 @@
   this exact task, and BM25's `b` handles the concern with bounded, corpus-derived
   length normalization. Measured end-to-end over cases mined from git history
   (commit subject = query, changed non-test files = ground truth), R@10 / MRR:
-  neo 0.078→0.606 / 0.082→0.644, car 0.210→0.507 / 0.149→0.250, quip 0.213→0.857 /
-  0.188→0.698. `tools/rank_eval.py` is the harness.
-  **Two negative results, recorded so they are not retried.** RRF fusion with the
-  dense channel LOSES to BM25 alone (0.596 best-weighted vs 0.693) — dense returns
-  ~25 files against BM25's ~180 and is half as accurate — even after chunk allocation
-  was fixed. And a sweep of the re-rank weights (`pi_boost`, `_symbol_score`,
-  history: damped to 0.3, to 0.5, each disabled, content doubled) lands everywhere in
-  0.66–0.68, so the re-rank is *redundant* with content ranking rather than fighting
-  it. Four filename-tuning fixes were also measured and rejected; the filename is not
-  the evidence, the file is.
+  neo 0.078→0.603 / 0.082→0.655, car 0.210→0.487 / 0.149→0.233, quip 0.213→0.850 /
+  0.188→0.735, at `CONTENT_WEIGHT = 3.0`. `tools/rank_eval.py` is the harness, and
+  the numbers must be measured through the REAL CLI with `PYTHONPATH` pinned — see
+  the measurement warning above.
+  **The re-rank is LOAD-BEARING, not redundant** (`pi_boost` + `_symbol_score` +
+  `hist_boost`, applied after the first-pass score). Disabling it on the real CLI
+  takes R@1 from 0.344 to **0.044** and MRR from 0.646 to **0.261**. An earlier
+  version of this note claimed the opposite, from a weight sweep that landed
+  everywhere in 0.66–0.68 — measured at k=10, where every configuration is flat, and
+  through an in-process replica that omits the byte budget and adaptive limit, i.e.
+  exactly the stages that make the re-rank matter. Both errors are the ones
+  `tools/rank_eval.py` warns about in its own docstring. Per channel, `hist_boost`
+  contributes nothing measurable (identical results with it disabled) while
+  `_symbol_score` carries most of the effect.
+  RRF fusion with the dense channel LOSES to BM25 alone (0.596 best-weighted vs
+  0.693) — dense returns ~25 files against BM25's ~180 and is half as accurate. Treat
+  that as provisional: it was measured at k=10 before the same cutoff problem was
+  understood, and the docstring deferring it to a chunk-allocation fix is stale
+  because that fix landed in the same branch. Re-measure at k=3/k=5 before relying on
+  it. Four filename-tuning fixes were separately measured and rejected; the filename
+  is not the evidence, the file is.
   **A path named in the prompt is still pinned** (`EXPLICIT_PATH_BOOST=10.0`, chosen
-  to exceed every organic signal combined — content caps at +3.0, the re-rank boosts
+  to exceed every organic signal combined — content caps at +3.0 (`CONTENT_WEIGHT`), the re-rank boosts
   at +1.0 and +1.2). Without it a spelled-out path competed on generic filename-token
   overlap and lost: `src/neo/subcommands.py` ranked **163rd of 296** on a prompt
   naming it, below its own test file, because an 86KB file took a heavy size penalty. The file never

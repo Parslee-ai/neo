@@ -625,7 +625,9 @@ def _format_selection_report(report: Optional[dict]) -> list[str]:
         lines.append(
             f"[Neo] Kept {report['chunks_kept']} of {report['chunks_extracted']} "
             f"chunks (cap {report['max_chunks']}); slots are apportioned in "
-            f"proportion to each file's symbol count, with a floor of one"
+            f"proportion to each file's symbol count. Every file keeps at "
+            f"least one UNLESS there are more files than slots, in which case "
+            f"the largest take them"
         )
     # A selected file can be absent from the index for two unrelated reasons,
     # and they get separate lines because they have separate remedies — one of

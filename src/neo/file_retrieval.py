@@ -42,25 +42,36 @@ Two more reasons BM25 is the right instrument rather than another bonus:
   identifier and its parts lets a query saying "user by id" reach
   `getUserById`.
 
-Measured over 506 cases mined from git history across three repositories
-(commit subject as query, changed non-test files as ground truth):
+Measured END-TO-END through the real CLI, `PYTHONPATH` pinned per tree, over
+cases mined from git history (commit subject as query, changed non-test files
+as ground truth). One table, one harness generation -- an earlier draft of this
+docstring carried FIRST-PASS numbers from a harness that called
+`score_candidate` directly and so never saw the re-rank, the adaptive limit or
+the byte budget, and those numbers disagreed with CLAUDE.md's by enough that
+`car` appeared as both 0.969 and 0.507:
 
-    repo   cases   R@10 before   R@10 after    MRR
-    neo      207       0.223        0.697    0.143 -> 0.565
-    car       75       0.382        0.969    0.296 -> 0.621
-    quip     224       0.137        0.762    0.107 -> 0.544
+    repo   cases   R@10 before -> after     MRR before -> after
+    neo      60        0.078 -> 0.603        0.082 -> 0.655
+    car      50        0.210 -> 0.487        0.149 -> 0.233
+    quip     50        0.213 -> 0.850        0.188 -> 0.735
 
 Neo already shipped this BM25 (`neo.memory.bm25`, Lucene-style with IDF
 smoothing) and already used hybrid dense+sparse fusion for FACT retrieval.
 File selection used none of it.
 
-**Fusion is deliberately absent.** RRF over BM25 + the existing dense channel
-measured WORSE than BM25 alone (0.432 vs 0.697 R@10): the dense channel
-returns ~33 files against BM25's 183, so equal-weight fusion lets a short,
-low-quality list promote mediocre hits, and no weighting recovered past
-BM25-only. The dense channel has negative marginal value until its chunk
-allocation is fixed (`store.py` is 7% covered, `text_budget.py` 100%), which
-is tracked separately. Adding fusion here would have made retrieval worse.
+**Fusion is deliberately absent, provisionally.** RRF over BM25 + the existing
+dense channel measured WORSE than BM25 alone (0.596 best-weighted vs 0.693
+R@10): dense returns ~25 files against BM25's ~180 and is roughly half as
+accurate, so equal-weight fusion lets a short low-quality list promote
+mediocre hits, and no weighting recovered past BM25-only.
+
+Two caveats on that number, both found in review and both worth respecting
+before it is treated as settled. It was measured at k=10, and k=10 is where
+every ranking configuration on this repo is flat — the same cutoff mistake
+that produced a wrong conclusion about the re-rank being redundant. And the
+chunk-allocation defect it blames (`store.py` 7% covered against
+`text_budget.py` at 100%) was FIXED in the same branch, so the stated
+mechanism no longer holds. Re-measure at k=3/k=5 before relying on this.
 """
 
 import re
@@ -68,10 +79,16 @@ from typing import Optional
 
 from neo.memory.bm25 import BM25
 
-#: Bytes read per file when building the index. Bounds cost on generated or
-#: vendored files without truncating anything a human wrote — the largest
-#: hand-written file in this repo is 177 KB.
-MAX_INDEXED_BYTES = 200_000
+#: CHARACTERS read per file when building the index — `TextIOWrapper.read(n)`
+#: counts code points, not bytes, so on non-ASCII source this reads more bytes
+#: than the number suggests. Named for what it measures: `CLAUDE.md` already
+#: records the same defect in `_render_context_files`, where a banner summed
+#: `len(str)` and called the result bytes.
+#:
+#: Bounds cost without truncating anything a human wrote — the largest
+#: hand-written file in this repo is 177 KB. Note `iter_paths` already skips
+#: files over 512 KB, so this only bites the 200-512 KB band.
+MAX_INDEXED_CHARS = 200_000
 
 #: The path is indexed alongside the content, repeated, so "a file named for
 #: the thing" stays real evidence without being the ONLY evidence — which is
@@ -110,11 +127,27 @@ def code_tokens(text: str) -> list[str]:
     return out
 
 
-def _read(path: str, limit: int = MAX_INDEXED_BYTES) -> str:
+def _read(path: str, limit: int = MAX_INDEXED_CHARS) -> str:
+    """File text for indexing, or "" for anything that is not text.
+
+    `errors="ignore"` would happily turn a PDF into thousands of junk tokens.
+    That is not merely wasted work: BM25's length normalization divides by the
+    corpus average document length, so binary blobs make every real file's
+    length penalty depend on how many PDFs happen to sit in the repository.
+    Measured on this repo before the probe: 5 PDFs were 1.7% of documents and
+    **32.9% of all tokens**, and dropping them moved `avgdl` from 2773 to 1892.
+    A size term whose behaviour depends on something unrelated to relevance is
+    the exact defect this module exists to remove; letting it back in through
+    the corpus statistics would be the same bug by another door.
+    """
     try:
-        with open(path, encoding="utf-8", errors="ignore") as handle:
+        with open(path, "rb") as raw:
+            head = raw.read(8192)
+        if b"\x00" in head:
+            return ""
+        with open(path, encoding="utf-8") as handle:
             return handle.read(limit)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""
 
 
