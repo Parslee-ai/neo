@@ -644,8 +644,8 @@
   this exact task, and BM25's `b` handles the concern with bounded, corpus-derived
   length normalization. Measured end-to-end over cases mined from git history
   (commit subject = query, changed non-test files = ground truth), R@10 / MRR:
-  neo 0.275→0.732 / 0.294→0.787, car 0.192→0.502 / 0.160→0.398, quip 0.175→0.720 /
-  0.166→0.658, at `CONTENT_WEIGHT = 3.0`. **`tools/rank_mine_eval.py` is the
+  neo 0.301→0.742 / 0.304→0.771, car 0.180→0.472 / 0.162→0.425, quip 0.174→0.696 /
+  0.158→0.643, at `CONTENT_WEIGHT = 3.0`. **`tools/rank_mine_eval.py` is the
   harness** — not `tools/rank_eval.py`, which is a different instrument (12
   hand-labelled prompts, this repo, recall@k, no MRR) and was named here in error
   while the real one went uncommitted, leaving the figures unreproducible. Quoting
@@ -653,14 +653,17 @@
   at 0.969 and 0.507; keep the generation attached. An earlier generation of these
   same figures read neo 0.078→0.603 / 0.082→0.655 — superseded, and not comparable,
   because the harness that produced it no longer exists to re-run.
-  **The absolute values are upper bounds, and the tool says so per run.** The
-  scorer's recency signal holds PATHS, so a case mined below the commit window
-  whose truth file was touched again inside it is still contaminated — 48 of 50
-  cases on this repo, because neo's churn concentrates in exactly the files most
-  likely to be ground truth. `--drop-contaminated` empties the sample outright
-  here rather than cleaning it. Direction is the robust part; treat magnitudes as
-  bounded, and re-run on a CLEAN checkout of both trees, since a dirty working
-  tree puts every edited path into the same signal.
+  **Measure with `--no-git`, which is the default.** The scorer's recency signal
+  reads `git status --porcelain` plus the last 50 commits and holds PATHS, not
+  commits — so a case mined below the window whose truth file was touched again
+  inside it is still handed its own answer key, as is every file dirty in the tree
+  you are measuring from. `--skip-recent` does NOT fix this and a first version of
+  that docstring wrongly said it did. `neo --dry-run --no-git` gates `git_recent`
+  and nothing else (`_history_boost` and the rest of the re-rank stay live), which
+  is what `tools/rank_eval.py` had been doing all along. `--with-git` measures the
+  full pipeline and then reports `contaminated_cases` per run: with it on, 48 of 50
+  neo cases are contaminated, and the figures move by ≤0.03 — the leak is real but
+  was never what carried the result.
   **The re-rank is LOAD-BEARING, not redundant** (`pi_boost` + `_symbol_score` +
   `hist_boost`, applied after the first-pass score). Disabling it on the real CLI
   takes R@1 from 0.344 to **0.044** and MRR from 0.646 to **0.261**. An earlier

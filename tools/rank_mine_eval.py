@@ -49,12 +49,19 @@ by two paths that are routine rather than exotic:
    branch you are editing, from the tree you are editing it in, contaminates
    the arm you care about most.
 
-So this tool MEASURES the leak instead of asserting it away: every run reports
-`contaminated_cases` (cases whose ground truth intersects the live recent set)
-and refuses to stay quiet about a dirty tree. Run it on a clean checkout, and
-read the absolute figures as an upper bound on any run where that count is not
-zero. Both arms inherit the leak, so direction is the robust part -- but
-"direction survives" is not a licence to quote the magnitudes.
+So the default is to switch the leaking signal OFF. `neo --dry-run` already
+takes `--no-git`, which gates `git_recent` and nothing else -- `_history_boost`
+and every other re-rank channel stay live -- and `tools/rank_eval.py` has been
+passing it all along. Measuring with recency enabled costs a real signal
+(ablated at +0.021 R@10) but buys absolute numbers that are not partly an echo
+of the answer key, which is the better trade for an A/B whose whole purpose is
+comparing two rankers.
+
+`--with-git` re-enables it to measure the full shipped pipeline. That run is
+contaminated by construction, so it also reports `contaminated_cases` (ground
+truth intersecting the live recent set) and warns on a dirty tree; read its
+absolutes as upper bounds. Both arms inherit the leak, so direction survives --
+but "direction survives" is not a licence to quote the magnitudes.
 
 **Recall@k and hit-rate@k are different questions and are both reported.**
 A case whose commit changed 4 files scores 0.25 recall on one hit and 1.0 hit
@@ -111,8 +118,11 @@ _DRY_RUN_LINE = re.compile(r"^\s{2}(\S.*?)(?:\s+\(lines\s[\d-]+\))?\s+-\s+[\d,]+
 
 
 def _git(repo: str, *args: str) -> str:
+    # Timeout so a hung git (a lock, a prompting credential helper) fails the
+    # run instead of parking it forever with no output.
     return subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True,
+        timeout=120,
     ).stdout
 
 
@@ -171,7 +181,8 @@ def recent_files(repo: str, window: int = 50) -> set[str]:
     return {f for f in recent if f}
 
 
-def rank_files(repo: str, tree: str, query: str, timeout: int) -> Optional[list[str]]:
+def rank_files(repo: str, tree: str, query: str, timeout: int,
+               use_git: bool = False) -> Optional[list[str]]:
     """The ranked, de-duplicated file list the model would have been sent.
 
     Returns None for a run that FAILED and [] for one that completed and chose
@@ -190,8 +201,11 @@ def rank_files(repo: str, tree: str, query: str, timeout: int) -> Optional[list[
         # stderr is MERGED, not discarded: the CLI writes its progress notices
         # AND the dry-run listing to stderr, so reading stdout alone returns an
         # empty ranking for every case and scores a working pipeline at zero.
+        cmd = [sys.executable, "-m", "neo.cli", "--dry-run"]
+        if not use_git:
+            cmd.append("--no-git")     # gates git_recent only; see module docstring
         proc = subprocess.run(
-            [sys.executable, "-m", "neo.cli", "--dry-run", query],
+            [*cmd, query],
             cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, timeout=timeout,
         )
@@ -247,43 +261,26 @@ def main() -> int:
                     help="commits to skip so ground truth stays outside the "
                          "git-recency window the scorer reads (default 50)")
     ap.add_argument("--max-truth-files", type=int, default=5)
-    ap.add_argument("--drop-contaminated", action="store_true",
-                    help="score only cases whose ground truth is OUTSIDE the "
-                         "scorer's recent-file set. Shrinks the sample -- often "
-                         "sharply, because central files are edited often and are "
-                         "also the likeliest ground truth -- in exchange for "
-                         "absolute figures that mean what they say")
+    ap.add_argument("--with-git", action="store_true",
+                    help="measure the full shipped pipeline, recency signal "
+                         "included. Off by default because that signal is fed "
+                         "the answer key: the run is contaminated by "
+                         "construction and its absolutes are upper bounds")
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--k", type=int, nargs="+", default=[1, 3, 10])
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    # Mined BEFORE the contamination filter, so --drop-contaminated still gets
-    # a full-sized sample to select from rather than a filtered remnant.
-    over_mine = args.cases * 4 if args.drop_contaminated else args.cases
-    cases = mine_cases(args.repo, over_mine, args.skip_recent, args.max_truth_files)
-    if args.drop_contaminated:
-        recent_now = recent_files(args.repo, args.skip_recent)
-        cases = [c for c in cases if not (set(c["truth"]) & recent_now)][: args.cases]
+    cases = mine_cases(args.repo, args.cases, args.skip_recent, args.max_truth_files)
     if not cases:
-        # Naming the wrong knob is its own defect: these two emptinesses have
-        # nothing to do with each other, and only one of them is a settings problem.
-        if args.drop_contaminated:
-            print("every mined case was dropped as contaminated: all of their "
-                  "ground truth sits in the scorer's recent-file set. On a repo "
-                  "whose churn concentrates in a few central files this is the "
-                  "expected outcome, and it means absolute figures here cannot "
-                  "be decontaminated by sampling -- raise --skip-recent to widen "
-                  "the gap, or drop the flag and read the figures as bounds.",
-                  file=sys.stderr)
-        else:
-            print("no eligible cases mined -- widen --max-truth-files or lower "
-                  "--skip-recent", file=sys.stderr)
+        print("no eligible cases mined -- widen --max-truth-files or lower "
+              "--skip-recent", file=sys.stderr)
         return 1
 
     raw = []
     for i, case in enumerate(cases, start=1):
-        raw.append(rank_files(args.repo, args.tree, case["query"], args.timeout))
+        raw.append(rank_files(args.repo, args.tree, case["query"], args.timeout,
+                              use_git=args.with_git))
         print(f"  {i}/{len(cases)}", end="\r", file=sys.stderr, flush=True)
 
     # A failed case is DROPPED, not scored as a zero. Scoring it would let a
@@ -296,12 +293,17 @@ def main() -> int:
               "CLI invocation", file=sys.stderr)
         return 1
 
-    recent = recent_files(args.repo, args.skip_recent)
-    contaminated = sum(1 for c in scored_cases if set(c["truth"]) & recent)
-    dirty = bool(_git(args.repo, "status", "--porcelain").strip())
+    # Only meaningful when the recency signal is live; with --no-git the scorer
+    # never reads it, so reporting a count would imply a leak that cannot occur.
+    contaminated = dirty = None
+    if args.with_git:
+        recent = recent_files(args.repo, args.skip_recent)
+        contaminated = sum(1 for c in scored_cases if set(c["truth"]) & recent)
+        dirty = bool(_git(args.repo, "status", "--porcelain").strip())
 
     result = score(scored_cases, scored_ranks, sorted(args.k))
     result["failed_cases"] = failed
+    result["git_recency"] = bool(args.with_git)
     result["contaminated_cases"] = contaminated
     result["repo_dirty"] = dirty
     result["repo"] = args.repo
@@ -311,8 +313,9 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"\nrepo={args.repo}  tree={args.tree}  "
-              f"cases={result['cases']}  skip_recent={args.skip_recent}")
+        print(f"\nrepo={args.repo}  tree={args.tree}  cases={result['cases']}  "
+              f"skip_recent={args.skip_recent}  "
+              f"git_recency={'ON' if args.with_git else 'off (--no-git)'}")
         if failed:
             print(f"  WARNING: {failed} case(s) failed (timeout or non-zero exit) "
                   f"and were DROPPED, not scored")
