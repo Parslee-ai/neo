@@ -12,6 +12,17 @@ Every number here was produced by running the command printed beside it. Where a
 number could not be produced, the row says so and gives the blocking reason —
 nothing in this document is estimated, projected, or interpolated.
 
+**Two placeholders appear in the commands below**, deliberately, so the doc is not
+pinned to one developer's home directory. `<platform-root>` is the `parslee-knowledge`
+checkout that holds the child repos as subdirectories (`<platform-root>/m365dotnet`,
+`<platform-root>/aieweb`, `<platform-root>/neo`); `<neo-worktree>` is the neo worktree
+this document was produced from. Set them once before pasting anything:
+
+```bash
+export platform_root=/path/to/parslee-knowledge     # substitute for <platform-root>
+export neo_worktree=$platform_root/neo/.worktrees/g_msp4yrhu_d974cb-unified-store-goal-1
+```
+
 ---
 
 ## Headline
@@ -302,6 +313,34 @@ It also writes into the output directory: each run's raw `/usr/bin/time -l` capt
 `results.csv`, and `union.files` — the distinct union across the battery, which is the
 input to the G1 check below.
 
+### Reproducibility re-run — 2026-08-12
+
+The tables above came from an ad-hoc first pass; `tools/m2_battery.sh` was written
+afterwards to make that pass a command. A doc that publishes a script as its
+reproduction contract owes you evidence that the *committed script* produces the
+published numbers, so it was run end-to-end a second time into a clean directory
+(3 min 28 s wall). What it showed, split by what is deterministic and what is not:
+
+| quantity | first pass | committed-script re-run | verdict |
+|---|---|---|---|
+| context entries / per-prompt distinct / **union** | 180 / 171 / **141** | 180 / 171 / **141** | identical |
+| per-prompt distinct (P1…P6) | 29, 28, 29, 29, 28, 28 | 29, 28, 29, 29, 28, 28 | identical |
+| the union file set itself | — | byte-identical set | identical |
+| repeat entries: battery-wide / within-prompt | 39 / 9 | 39 / 9 | identical |
+| files picked by >1 prompt | 21 | 21 | identical |
+| G1-inv: ignored / duplicate / `.worktrees/` / unresolvable | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | identical |
+| peak `ru_maxrss` | 1368.0 MiB (2.87×) | 1368.0 MiB (2.87×) | identical |
+| **battery median wall** | **10.54 s** | **10.22 s** | ±3%, see below |
+
+**Selection is deterministic; wall-clock is not.** Every file-count, the G1 verdict and
+the RSS peak land on the same value twice. Wall-clock moved 3%, and the whole of that
+move is one scheduler stall: P4 run 1 took 19.27 s in the re-run against a 10.18 s
+run 3 on the same prompt. That is precisely why the protocol reports a median and why
+this document says to treat M2 as a same-machine before/after instrument. **The
+published baseline stays 10.54 s** — re-baselining to the second sample would be
+picking a number for no reason. A later goal comparing against it should read a
+change under ~±0.5 s as noise, not as a result.
+
 ---
 
 ## G1-invariant on m365dotnet
@@ -331,7 +370,8 @@ worst duplicate exposure on this machine — and it holds computed either way, o
 
 **Read the union row, not the sum row.** 171 is the sum of the six per-prompt distinct
 counts, which counts a file once per prompt that selected it; the battery selected
-**141** distinct files in total, so 30 files were picked by more than one prompt. The
+**141** distinct files in total. The 30-file difference is 30 *excess selections*
+spread over **21 files** that more than one prompt picked — not 30 files. The
 sum row is kept only to make the double-count visible. A later goal that reports a true
 union and compares it to 171 will see a 17% "coverage regression" that never happened.
 
@@ -351,13 +391,18 @@ Definitions, so a later re-measure counts the same things:
 
 Two observations that are *not* G1 violations but belong on the record:
 
-- **180 context entries cover 141 distinct files.** Battery-wide, 23 of the 180 entries
-  are a second window of a file already selected — `MAX_CHUNKS_PER_FILE` working as
-  designed, not duplication. Within a single prompt the effect is smaller (30 entries →
-  28–29 distinct). So "30 files selected" overstates that prompt's coverage by ~5%, and
-  a raw entry count overstates battery coverage by 28%. Any later goal reporting a file
-  count must say which of the three it is counting: entries, per-prompt distinct, or
-  union.
+- **180 context entries cover 141 distinct files.** Battery-wide, **39** of the 180
+  entries repeat a file some prompt had already selected (180 − 141) — a mix of
+  `MAX_CHUNKS_PER_FILE` second windows and the same file being picked by more than one
+  prompt. Neither is duplication in the G1 sense. Within a single prompt the effect is
+  far smaller: only **9** entries battery-wide are a second window of a file already
+  selected *by that same prompt* (180 − 171), which is what turns 30 entries into 28–29
+  distinct. So "30 files selected" overstates that prompt's coverage by ~5%, and a raw
+  entry count overstates battery coverage by 28%. Any later goal reporting a file count
+  must say which of the three it is counting: entries, per-prompt distinct, or union.
+  (Do not confuse either number with the **23** *windowed* entries in the footgun note
+  below — that is the count of entries carrying a `(lines a-b)` range, a different
+  quantity that happens to sit in the same range.)
 - **Named paths were pinned.** P1's `Program.cs` and P2's `EntitlementsController.cs`
   each appear (2 windows each). That is a G2-inv spot check, not a G2-inv
   measurement — the full G2 battery is Goal 3's deliverable.

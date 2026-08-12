@@ -49,7 +49,11 @@ export NEO_OBSERVER_AUTOSTART=0
 # Header and rows go through the SAME pipe, or results.csv lands headerless and the
 # aggregation below silently reads the first measurement as its column names.
 {
-echo "id,shape,run,wall_seconds,max_rss_bytes,files_selected"
+# Two file columns, never one. `entries` is what --dry-run emitted (a windowed file
+# is emitted once per window); `distinct_files` is that set deduplicated. The doc's
+# G1 table carries both, and a single ambiguously-named column is how a 30 in one
+# table gets compared against a 29 in another.
+echo "id,shape,run,wall_seconds,max_rss_bytes,entries,distinct_files"
 for entry in "${PROMPTS[@]}"; do
   id="${entry%%|*}"; rest="${entry#*|}"
   shape="${rest%%|*}"; prompt="${rest#*|}"
@@ -66,11 +70,28 @@ for entry in "${PROMPTS[@]}"; do
     grep -E '^  .+ - [0-9]+ bytes' "$raw" \
       | sed -E 's/^  (.+) - [0-9]+ bytes.*/\1/; s/ \(lines [0-9]+-[0-9]+\)$//' \
       > "$OUT/${id}_run${run}.files"
-    nfiles=$(sort -u "$OUT/${id}_run${run}.files" | wc -l | tr -d ' ')
-    echo "$id,$shape,$run,$wall,$rss,$nfiles"
+    nentries=$(grep -c . "$OUT/${id}_run${run}.files" || true)
+    ndistinct=$(sort -u "$OUT/${id}_run${run}.files" | grep -c . || true)
+    # No `set -e` here on purpose: `grep -c` returns 1 on zero matches and would abort
+    # mid-battery. Guard explicitly instead, so a run that measured nothing says so
+    # rather than writing an empty CSV cell that the aggregation reads as a number.
+    if [ -z "$wall" ] || [ -z "$rss" ] || [ "$nentries" -eq 0 ]; then
+      echo "FATAL: $id run $run produced no measurement (wall='$wall' rss='$rss'" \
+           "entries=$nentries); see $raw" >&2
+      exit 1
+    fi
+    echo "$id,$shape,$run,$wall,$rss,$nentries,$ndistinct"
   done
 done
 } | tee "$OUT/results.csv"
+# The brace group runs in a subshell (it is the left side of a pipe), so the guard's
+# `exit 1` above kills only that subshell. `pipefail` surfaces it here; without this
+# check the battery would print FATAL and then cheerfully aggregate a partial CSV.
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo "FATAL: measurement loop aborted (exit $status); $OUT/results.csv is incomplete." >&2
+  exit "$status"
+fi
 
 # The published aggregates are derived here rather than by hand, so the doc's
 # "exact command to reproduce" contract covers the headline numbers too.
@@ -104,11 +125,20 @@ print(f"vs M2 targets (<=5s / <=500MB): {statistics.median(walls)/5:.2f}x time, 
       f"{peak/500e6:.2f}x memory")
 
 union, persum, entries = set(), 0, 0
+seen = collections.Counter()
 for f in sorted(out.glob("P*_run1.files")):
     e = [l.strip() for l in f.read_text().splitlines() if l.strip()]
     entries += len(e); persum += len(set(e)); union |= set(e)
+    seen.update(set(e))
 print(f"\nselected: {entries} entries | {persum} sum-of-per-prompt-distinct "
       f"| {len(union)} BATTERY UNION distinct")
+# The three repeat quantities, derived rather than eyeballed. They are easy to swap
+# for each other and a wrong one shipped once: 23 windowed entries got reported as
+# the battery-wide repeat count, which is 39.
+print(f"repeat entries: {entries - len(union)} battery-wide (entries - union) | "
+      f"{entries - persum} within-prompt (entries - per-prompt-distinct)")
+print(f"files selected by >1 prompt: {sum(1 for n in seen.values() if n > 1)} "
+      f"(accounting for {persum - len(union)} excess selections)")
 (out / "union.files").write_text("\n".join(sorted(union)) + "\n")
 print(f"union written to {out / 'union.files'} (feed this to the G1 check)")
 PY
