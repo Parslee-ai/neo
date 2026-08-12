@@ -432,6 +432,7 @@ def neo_output_to_dict(output: NeoOutput) -> dict[str, Any]:
         "static_checks": [_static_check_to_dict(c) for c in output.static_checks],
         "next_questions": list(output.next_questions),
         "confidence": output.confidence,
+        "confidence_basis": output.confidence_basis,
         "notes": output.notes,
         "metadata": dict(output.metadata),
         "goal_assessment": (

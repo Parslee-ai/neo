@@ -100,6 +100,15 @@ Then:
    plainly: "Neo found…" versus "Looking at this myself…". Never present your
    own reasoning as Neo's, or the reverse.
 6. Report Neo's confidence as the number it is. Do not round it up in prose.
+7. **`confidence` may be `null`, and that is an answer, not a gap.** It means
+   the run produced nothing a confidence number could describe — read
+   `confidence_basis` and say which: `analysis_only` (Neo answered and proposed
+   no change) or `no_verifiable_change` (Neo named files but shipped no diff,
+   so those suggestions were excluded from the score). Never substitute a
+   number, never call a `null` run low-confidence, and never rank it below a
+   scored run on the strength of the missing number — an empty patch
+   self-reporting `0.96` is the exact inversion this contract exists to stop.
+   `orchestrator.summary` already states the case in Neo's voice; lead with it.
 
 ### Voice
 
@@ -161,7 +170,7 @@ Events on stderr are `{"type": ..., "phase": ..., "message": ..., "data": {...}}
 | `hypothesis_rejected` | An approach was discarded. Worth surfacing. |
 | `risk_found` | A simulation issue or failed static check. Worth surfacing. |
 | `personality_beat` | Same line as `orchestrator.personality`. |
-| `completed` | Run finished. `data.confidence`, `data.elapsed_seconds`. |
+| `completed` | Run finished. `data.confidence` (may be `null`), `data.elapsed_seconds`. |
 | `failed` | Run raised. `data.error_type`. **No final JSON result follows.** |
 
 Exactly one of `completed` or `failed` terminates every run. If you see
@@ -203,6 +212,7 @@ Use the Neo agent to debug this race condition in the task processor.
 ## Important Notes
 
 - Neo queries take 5-30 seconds (uses LLM API calls)
-- Always verify low-confidence suggestions (<0.7)
+- Always verify low-confidence suggestions (<0.7). A `null` confidence is not a
+  low one — check `confidence_basis` before saying anything about certainty.
 - Provide rich context for better results
 - Ordinary analysis is explicit `advise` and does not mutate durable memory. Use `learn` only when the user intends to record evidence; never request `agent` without explicit workspace authority and a host executor.

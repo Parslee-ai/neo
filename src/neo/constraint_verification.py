@@ -84,16 +84,116 @@ class Constraint:
 
 # Code-level markers that suggest a given constraint type is handled in the
 # generated code. Used by the static (no-exec) checker in engine.py.
+#
 # Absence of a marker is a warning, not an error — the LM may satisfy the
-# constraint through other means.
-CONSTRAINT_CODE_MARKERS: Dict[ConstraintType, tuple] = {
+# constraint through other means. That reasoning covers a different *approach*;
+# it never covered a different *language*. These tables were Python-only, so on
+# every C#/TypeScript/markdown target the expectation was unsatisfiable by
+# construction and the warning fired permanently (#196). Markers are therefore
+# keyed by language, and a language with no table produces an honest "not
+# checked" note instead of a false alarm.
+#
+# Markers are compared case-insensitively against the (comment- and
+# string-stripped) code, so they are written here in their natural casing —
+# `HashSet<` reads better in the operator-facing message than `hashset<`.
+_PYTHON_MARKERS: Dict[ConstraintType, tuple] = {
     ConstraintType.SORTED: ("sorted(", ".sort(", "heappush", "heappop", "bisect"),
     ConstraintType.INCREASING: ("sorted(", ".sort(", "bisect"),
     ConstraintType.DECREASING: ("sorted(", ".sort(", "reverse=True"),
-    ConstraintType.UNIQUE_ELEMENTS: ("set(", "dict.fromkeys"),
+    # `frozenset(` is listed in its own right: markers are matched on left
+    # identifier boundaries, so it is no longer reached as a substring of
+    # `set(` — which is the same rule that stops `offset(` reaching it.
+    ConstraintType.UNIQUE_ELEMENTS: ("set(", "frozenset(", "dict.fromkeys"),
     ConstraintType.NON_NEGATIVE: ("abs(", "max(0"),
     ConstraintType.DIVISIBILITY: ("%",),
 }
+
+_CSHARP_MARKERS: Dict[ConstraintType, tuple] = {
+    ConstraintType.SORTED: (
+        "OrderBy", ".Sort(", "Array.Sort", "SortedSet<", "SortedList<",
+        "SortedDictionary<", "PriorityQueue<", "BinarySearch",
+    ),
+    ConstraintType.INCREASING: ("OrderBy", ".Sort(", "SortedSet<", "BinarySearch"),
+    ConstraintType.DECREASING: ("OrderByDescending", ".Sort(", ".Reverse("),
+    ConstraintType.UNIQUE_ELEMENTS: (
+        "HashSet<", "ToHashSet(", ".Distinct(", ".GroupBy(", "ISet<",
+    ),
+    ConstraintType.NON_NEGATIVE: ("Math.Abs", "Math.Max(0", "Math.Clamp("),
+    ConstraintType.DIVISIBILITY: ("%",),
+}
+
+# TypeScript and JavaScript share a table: the constructs a constraint is
+# satisfied with (`Array.prototype.sort`, `new Set`) are the runtime's, not the
+# type layer's, so splitting them would duplicate every entry to no effect.
+_TYPESCRIPT_MARKERS: Dict[ConstraintType, tuple] = {
+    ConstraintType.SORTED: (".sort(", "sortBy(", "orderBy(", "toSorted("),
+    ConstraintType.INCREASING: (".sort(", "sortBy(", "toSorted("),
+    ConstraintType.DECREASING: (".sort(", ".reverse(", "toReversed(", "orderBy("),
+    # `new Set(` carries its trailing paren so it cannot be found inside
+    # `new Settings()`; `Set<` covers the annotated form.
+    ConstraintType.UNIQUE_ELEMENTS: ("new Set(", "uniq(", "uniqBy(", "Set<"),
+    ConstraintType.NON_NEGATIVE: ("Math.abs(", "Math.max(0"),
+    ConstraintType.DIVISIBILITY: ("%",),
+}
+
+LANGUAGE_CONSTRAINT_MARKERS: Dict[str, Dict[ConstraintType, tuple]] = {
+    "python": _PYTHON_MARKERS,
+    "csharp": _CSHARP_MARKERS,
+    "typescript": _TYPESCRIPT_MARKERS,
+    "javascript": _TYPESCRIPT_MARKERS,
+}
+
+# Back-compat: this name has always meant "the Python markers", and now says so.
+CONSTRAINT_CODE_MARKERS: Dict[ConstraintType, tuple] = _PYTHON_MARKERS
+
+# Extension → language label. Entries whose label is a key of
+# LANGUAGE_CONSTRAINT_MARKERS are checkable; the rest exist so the "not
+# checked" note can name what the file actually is ("not checked for
+# markdown") rather than shrugging at it.
+_EXTENSION_LANGUAGES: Dict[str, str] = {
+    ".py": "python", ".pyi": "python",
+    ".cs": "csharp", ".csx": "csharp",
+    ".ts": "typescript", ".tsx": "typescript", ".mts": "typescript",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".md": "markdown", ".markdown": "markdown",
+    ".json": "json",
+    ".yaml": "yaml", ".yml": "yaml",
+    ".txt": "text",
+    ".rs": "rust", ".go": "go", ".java": "java", ".rb": "ruby",
+    ".php": "php", ".kt": "kotlin", ".swift": "swift",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp",
+    ".sql": "sql", ".sh": "shell", ".html": "html", ".css": "css",
+}
+
+# What a path with no usable extension is called in the message. A caution
+# saying "not checked for " reads as a bug in Neo, not as a limit of Neo.
+UNKNOWN_LANGUAGE = "unknown"
+
+
+def language_for_path(file_path: str) -> str:
+    """Name the language of a suggested file, for marker lookup and messaging.
+
+    Returns a canonical name when the extension is known (``python``,
+    ``csharp``, …), the bare extension when it is not (so a note can still say
+    which kind of file went unchecked), and ``UNKNOWN_LANGUAGE`` when there is
+    no extension to go on — including the ``/`` and ``N/A`` placeholders the
+    suggestion schema uses for analysis-only answers.
+    """
+    from pathlib import PurePosixPath
+
+    path = (file_path or "").strip()
+    if not path or path in ("/", "N/A", "n/a"):
+        return UNKNOWN_LANGUAGE
+    suffix = PurePosixPath(path).suffix.lower()
+    if not suffix:
+        return UNKNOWN_LANGUAGE
+    return _EXTENSION_LANGUAGES.get(suffix, suffix.lstrip("."))
+
+
+def markers_for_language(language: str) -> Dict[ConstraintType, tuple]:
+    """Marker table for a language, or an empty mapping when there is none."""
+    return LANGUAGE_CONSTRAINT_MARKERS.get(language, {})
 
 
 class ConstraintVerifier:
