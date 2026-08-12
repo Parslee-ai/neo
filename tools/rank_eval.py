@@ -1,189 +1,97 @@
 #!/usr/bin/env python3
-"""File-selection retrieval evaluation: recall@k and MRR against ground truth.
+"""Rank-quality harness: recall@k against hand-labelled relevant files.
 
-    python tools/rank_eval.py --build-from-git . > cases.json
-    python tools/rank_eval.py --eval . cases.json
+Run: `python tools/rank_eval.py [k ...]` from the repo root.
 
-Why this exists: file ranking was tuned three times against metrics that could
-not judge it ("mean rank of the first source file", "count of tests and docs in
-the top 10"). Both reward ANY src/ file landing early regardless of relevance,
-both penalise a test file that is the correct answer, and both IMPROVE when a
-file is evicted from context entirely. Recall against labels has none of those
-properties.
+This exists because three separate attempts to improve file ranking were
+judged with metrics that could not judge them. The first two were "mean rank
+of the first source file" and "count of tests and docs in the top 10", and
+both are wrong in the same way: they reward ANY `src/` file landing early
+regardless of relevance, and they penalise a test file that is the correct
+answer. Measured live -- for "add a new CLI subcommand for exporting facts",
+one candidate change surfaced `tests/test_subcommands.py` and
+`src/neo/prompt/cli.py` (both relevant) and scored WORSE than a baseline whose
+top hits were `.pytest_cache/README.md`, `docs/mistakes.md` and
+`construct/README.md`.
 
-Labels come from git history -- commit subject as the query, changed non-test
-files as ground truth, keeping commits that touch 1-3 files. That is the
-standard construction in the bug-localization literature and it removes the two
-worst properties of a hand-written set: prompts chosen by the person evaluating
-the change, and labels that are that person's opinion.
+They are also blind to eviction: a file pushed below `MIN_SCORE_THRESHOLD`
+leaves context entirely, and both metrics IMPROVE when that happens.
 
-Report several k. Differences live at tight cutoffs, because per-file character
-caps mean a file at rank 3 contributes far more content than the same file at
-rank 9.
+Recall against labels has neither problem. The labels are the files a
+competent engineer would want in context for that prompt; they are opinions,
+but they are written down and arguable, which the previous metrics were not.
 
-Limits: commit subjects are terser and better-formed than real prompts; ground
-truth is what a commit CHANGED, a subset of what a developer needed to READ;
-content is read at HEAD while the commit is historical.
+**Report several k.** The interesting differences live at tight cutoffs,
+because per-file character caps mean a file at rank 3 contributes far more
+content than the same file at rank 9. A change can be flat at k=10 and still
+be a real improvement -- that is exactly the shape of the test-file demotion
+this harness was built to check.
 
-Diagnosis and plan: ~/git/working/2026-08-10-neo-file-selection-plan.md
+Limits, stated so the numbers are not over-read: 12 prompts, one repository,
+labels by one person, and recall ignores what else got in. It is a better
+instrument than a rank mean, not a good one.
 """
-
-import json
+import re
 import subprocess
 import sys
-import os
-import re
 
-def build(repo, max_commits=400, exts=(".py",".ts",".tsx",".js",".cs",".go",".rb",".php",".java")):
-    log = subprocess.run(
-        ["git","-C",repo,"log","--no-merges","-n",str(max_commits),
-         "--pretty=format:%H%x1f%s","--name-only"],
-        capture_output=True, text=True).stdout
-    cases=[]
-    for block in log.split("\n\n"):
-        lines = [ln for ln in block.strip().splitlines() if ln.strip()]
-        if not lines:
-            continue
-        head=lines[0]
-        if "\x1f" not in head:
-            continue
-        sha, subject = head.split("\x1f",1)
-        files=[f for f in lines[1:] if f.endswith(exts)]
-        files=[f for f in files if not re.search(r'(^|/)(tests?|spec)/|(^|/)test_|_test\.', f)]
-        # A usable case: a focused commit. Huge commits have no single answer;
-        # zero-file commits (docs-only) have no answer at all.
-        if 1 <= len(files) <= 3 and len(subject) > 15:
-            cases.append({"sha": sha, "query": subject, "files": sorted(set(files))})
-    return cases
+LABELLED = {
+ "add retry logic to the CAR adapter":
+   {"src/neo/adapters.py"},
+ "fix the fact store supersession threshold":
+   {"src/neo/memory/store.py"},
+ "why does the observer leak memory":
+   {"src/neo/memory/observer.py"},
+ "add a new CLI subcommand for exporting facts":
+   {"src/neo/subcommands.py", "src/neo/cli.py"},
+ "the transcript ingester is dropping episodes":
+   {"src/neo/memory/transcript.py"},
+ "the tree-sitter parser drops interfaces":
+   {"src/neo/index/language_parser.py"},
+ "context assembly exceeds the token budget":
+   {"src/neo/memory/context.py", "src/neo/text_budget.py"},
+ "episode promotion never fires":
+   {"src/neo/memory/store.py", "src/neo/memory/episodes.py"},
+ "the orchestrator emits no terminal event":
+   {"src/neo/events.py", "src/neo/engine.py"},
+ "fix the reasoning mode decision gate":
+   {"src/neo/reasoning_mode.py", "src/neo/engine.py"},
+ "prompt truncation markers are missing":
+   {"src/neo/text_budget.py", "src/neo/engine.py"},
+ "the A2UI inspector shows a stale fact count":
+   {"src/neo/a2ui.py"},
+}
 
-
-from collections import Counter  # noqa: E402
-from neo.context_gatherer import (iter_paths, extract_prompt_tokens, score_candidate,  # noqa: E402
-                                  get_git_recent_files)
-from neo.memory.bm25 import BM25  # noqa: E402
-
-ENTRY = {'main','app','server','index','login','auth','__init__'}
-_SPLIT = re.compile(r"[^A-Za-z0-9]+")
-_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-
-def code_tokens(text):
-    """Code-aware tokenization: split identifiers on camelCase and separators,
-    and keep BOTH the whole identifier and its parts. The literature finds this
-    is what makes BM25 beat dense retrieval on code."""
-    out = []
-    for raw in _SPLIT.split(text):
-        if not raw:
-            continue
-        low = raw.lower()
-        out.append(low)
-        parts = [p.lower() for p in _CAMEL.split(raw) if p]
-        if len(parts) > 1:
-            out.extend(parts)
-    return out
-
-def load_corpus(root, cands, cap=200_000):
-    docs, paths = [], []
-    for abs_p, rel, size in cands:
-        try:
-            with open(abs_p, encoding="utf-8", errors="ignore") as f:
-                content = f.read(cap)
-        except OSError:
-            continue
-        # Path tokens are repeated so the filename still carries weight —
-        # a file named for the thing is real evidence, just not the only one.
-        docs.append(code_tokens(rel) * 3 + code_tokens(content))
-        paths.append(rel)
-    return docs, paths
-
-def rrf(rankings, k=60):
-    """Reciprocal rank fusion. Rank-based, so it needs no score normalization
-    and no weight tuning between channels on different scales."""
-    fused = Counter()
-    for ranked in rankings:
-        for i, p in enumerate(ranked):
-            fused[p] += 1.0 / (k + i + 1)
-    return [p for p, _ in fused.most_common()]
-
-def evaluate(root, cases, ks=(1,3,5,10,20)):
-    cands = iter_paths(root, [], [], None)
-    cands = [c for c in cands if c[1].endswith((".py",".ts",".tsx",".js",".cs",".go",".rb",".php",".java"))]
-    sizes = {rel: sz for _, rel, sz in cands}
-    gr = get_git_recent_files(root)
-    docs, paths = load_corpus(root, cands)
-    bm = BM25(docs)
-    try:
-        from neo.index.project_index import ProjectIndex
-        idx = ProjectIndex(root)
-        has_idx = bool(idx.chunks)
-    except Exception:
-        idx, has_idx = None, False
-
-    strategies = ["neo_current", "bm25_content", "dense", "rrf_bm25_dense"]
-    hits = {s: {k: 0.0 for k in ks} for s in strategies}
-    mrr = {s: 0.0 for s in strategies}
-    n = 0
-
-    for case in cases:
-        want = set(case["files"])
-        if not (want & set(paths)):
-            continue  # ground truth no longer in the tree
-        n += 1
-        q = case["query"]
-
-        toks = extract_prompt_tokens(q)
-        cur = sorted(((score_candidate(r, sizes[r], toks, gr, ENTRY), r) for _, r, _ in cands), reverse=True)
-        cur = [r for _, r in cur]
-
-        qt = code_tokens(q)
-        bs = bm.scores(qt)
-        bmr = [paths[i] for i in sorted(range(len(paths)), key=lambda i: -bs[i])]
-
-        if has_idx:
-            best = {}
-            for ch in idx.retrieve(q, 60):
-                p = os.path.relpath(ch.file_path, root) if os.path.isabs(ch.file_path) else ch.file_path
-                best[p] = max(best.get(p, 0.0), float(getattr(ch, "similarity", 0.0)))
-            dn = [p for p, _ in sorted(best.items(), key=lambda kv: -kv[1])]
-        else:
-            dn = []
-
-        ranked = {"neo_current": cur, "bm25_content": bmr, "dense": dn,
-                  "rrf_bm25_dense": rrf([bmr, dn]) if dn else bmr}
-        for s, r in ranked.items():
-            for k in ks:
-                hits[s][k] += len(want & set(r[:k])) / len(want)
-            pos = next((i + 1 for i, p in enumerate(r) if p in want), None)
-            mrr[s] += 1.0 / pos if pos else 0.0
-
-    print(f"  {n} evaluable cases (of {len(cases)})\n")
-    print(f"  {'strategy':<18}" + "".join(f"{'R@'+str(k):>8}" for k in ks) + f"{'MRR':>8}")
-    for s in strategies:
-        print(f"  {s:<18}" + "".join(f"{hits[s][k]/n:>8.3f}" for k in ks) + f"{mrr[s]/n:>8.3f}")
+def selected(prompt, k=10):
+    out = subprocess.run([sys.executable, "-m", "neo.cli", "--dry-run", "--no-git",
+                          prompt, "--cwd", "."], capture_output=True, text=True, timeout=300)
+    txt = out.stdout + out.stderr
+    body = txt.split("DRY RUN", 1)[-1]
+    paths = []
+    for line in body.splitlines():
+        m = re.match(r"^  (\S+?)(?: \(lines [\d-]+\))? - \d+ bytes", line)
+        if m and m.group(1) not in paths:
+            paths.append(m.group(1))
+    return paths[:k]
 
 
-def _cli() -> int:
-    import argparse
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--build-from-git", metavar="REPO",
-                    help="mine an eval set from that repo's git history, to stdout")
-    ap.add_argument("--eval", nargs=2, metavar=("REPO", "CASES"),
-                    help="evaluate strategies for REPO against a cases file")
-    args = ap.parse_args()
+def main() -> int:
+    ks = [int(a) for a in sys.argv[1:]] or [3, 5, 10, 20]
+    widest = max(ks)
+    cache = {p: selected(p, widest) for p in LABELLED}
 
-    if args.build_from_git:
-        cases = build(args.build_from_git)
-        print(json.dumps(cases, indent=1))
-        print(f"# {len(cases)} cases", file=sys.stderr)
-        return 0
-    if args.eval:
-        repo, casefile = args.eval
-        cases = [c for c in json.load(open(casefile))
-                 if not c["query"].lower().startswith("release ")]
-        evaluate(repo, cases)
-        return 0
-    ap.print_help()
-    return 1
+    for k in ks:
+        total = 0.0
+        misses = []
+        for prompt, want in LABELLED.items():
+            got = set(cache[prompt][:k])
+            total += len(want & got) / len(want)
+            if not (want & got):
+                misses.append(prompt)
+        print(f"  recall@{k:<3} = {total / len(LABELLED):.3f}"
+              f"   prompts with no relevant file: {len(misses)}")
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(_cli())
+    raise SystemExit(main())

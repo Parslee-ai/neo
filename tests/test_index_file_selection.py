@@ -718,3 +718,81 @@ class TestReportFormatting:
         }))
         assert "200" in joined
         assert "7" in joined
+
+
+class TestChunkAllocationIsProportional:
+    """Chunk slots go where the code is, not one-per-file-per-round.
+
+    Round-robin replaced a list slice for a good reason — `chunks[:cap]` on a
+    language-ordered list kept 1000 C# chunks and dropped every other language.
+    But taking every file's first chunk before any file's second gives every
+    file the SAME COUNT regardless of how much is in it, which is a subtler
+    version of the same bias. Measured on this repo before the change:
+
+        src/neo/memory/store.py    82 symbols,  6 indexed,   7%
+        src/neo/engine.py          95 symbols,  6 indexed,   6%
+        src/neo/text_budget.py      4 symbols,  4 indexed, 100%
+
+    A file cannot be retrieved for what was never indexed, so the semantic
+    channel was blind to 93% of the two files most likely to be relevant.
+    After: every file lands at roughly the same COVERAGE FRACTION instead.
+    """
+
+    @staticmethod
+    def _chunks(spec):
+        """`spec` maps file path -> number of chunks that file produces."""
+        from neo.index.project_index import CodeChunk
+        out = []
+        for path, count in spec.items():
+            for i in range(count):
+                out.append(CodeChunk(
+                    file_path=path, chunk_id=f"{path}:{i}", content=f"c{i}",
+                    chunk_type="function", start_line=i, end_line=i,
+                ))
+        return out
+
+    def test_a_big_file_gets_more_slots_than_a_small_one(self):
+        from neo.index.project_index import ProjectIndex
+
+        kept = ProjectIndex._cap_chunks(
+            self._chunks({"big.py": 80, "small.py": 4}), cap=42
+        )
+        per = {}
+        for c in kept:
+            per[c.file_path] = per.get(c.file_path, 0) + 1
+
+        assert per["big.py"] > per["small.py"], (
+            "round-robin is back: every file got the same count regardless "
+            "of how much is in it"
+        )
+
+    def test_every_file_keeps_at_least_one_slot(self):
+        """The property round-robin was protecting. A file with zero chunks
+        indexed cannot be retrieved at all, so proportional-without-a-floor
+        would make small files invisible — trading one bias for another."""
+        from neo.index.project_index import ProjectIndex
+
+        spec = {"huge.py": 500, **{f"tiny{i}.py": 1 for i in range(20)}}
+        kept = ProjectIndex._cap_chunks(self._chunks(spec), cap=60)
+        represented = {c.file_path for c in kept}
+
+        assert represented == set(spec), "a file was allocated zero chunks"
+
+    def test_coverage_fraction_is_roughly_equal(self):
+        """The intended shape: equal FRACTION, not equal COUNT."""
+        from neo.index.project_index import ProjectIndex
+
+        spec = {"a.py": 80, "b.py": 40, "c.py": 20}
+        kept = ProjectIndex._cap_chunks(self._chunks(spec), cap=70)
+        per = {}
+        for c in kept:
+            per[c.file_path] = per.get(c.file_path, 0) + 1
+
+        fractions = [per[p] / spec[p] for p in spec]
+        assert max(fractions) - min(fractions) < 0.25, f"uneven: {fractions}"
+
+    def test_under_cap_returns_everything_untouched(self):
+        from neo.index.project_index import ProjectIndex
+
+        chunks = self._chunks({"a.py": 3, "b.py": 2})
+        assert ProjectIndex._cap_chunks(chunks, cap=99) is chunks

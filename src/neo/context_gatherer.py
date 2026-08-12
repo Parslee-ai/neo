@@ -29,6 +29,71 @@ MAX_CHUNKS_PER_FILE = 2    # Cap chunks per file so one large file doesn't domin
 MAX_CHUNK_CENTERS = 20     # Best-scoring lines considered as window centers before merging
 MAX_MERGED_WINDOW_LINES = 200   # Ceiling on a merged window so one file can't eat the budget
 DISCRIMINATIVE_MAX_LINE_FRACTION = 0.25  # A token on >25% of a file's lines is noise in it
+TEST_PENALTY = 0.4         # Multiplier; a test file retains 60% of its score
+CONTENT_WEIGHT = 3.0       # Weight on normalized content BM25; see score_candidate
+
+
+# Test-file conventions across the languages neo indexes. Anchored on
+# component and word boundaries, because the first version was
+# `rel_path.startswith("test")` -- an unanchored prefix with no separator,
+# which is the same defect class as `"spec" in prompt` matching "in-spec-tor".
+# Measured against real conventions, that version was wrong on 9 of 11 cases:
+# it missed Go, .NET, JS/TS, Jest, RSpec and JUnit entirely, and claimed
+# `testdata/`, `testing/` and `testbed/` -- ordinary source directories -- as
+# tests.
+#
+# It looked correct only because the corpus it was measured on is a single
+# Python repo, where it matched 99 of 295 files with no false positives.
+_TEST_DIR_NAMES = frozenset({"test", "tests", "spec", "specs", "__tests__"})
+_TEST_BASENAME_RE = re.compile(
+    r"""
+      ^test_                 # Python:  test_foo.py
+    | _test\.                # Go:      foo_test.go
+    | _spec\.                # RSpec:   user_spec.rb
+    | \.test\.               # Jest:    foo.test.ts
+    | \.spec\.               # Angular: foo.spec.ts
+    | ^Test[A-Z0-9]          # JUnit:   TestFoo.java
+    | Tests?\.               # .NET:    FooTests.cs / FooTest.cs
+    """,
+    re.VERBOSE,
+)
+
+
+def is_test_path(rel_path: str) -> bool:
+    """Whether `rel_path` looks like a test file, in any language neo indexes.
+
+    Matched on whole path COMPONENTS and on basename boundaries, never on a
+    bare prefix. `testdata/`, `testing/` and `testbed/` are ordinary source
+    directories and must survive; `Foo.Tests/` is not.
+    """
+    parts = [part for part in re.split(r"[\\/]", rel_path) if part]
+    if not parts:
+        return False
+
+    for component in parts[:-1]:
+        lowered = component.lower()
+        if lowered in _TEST_DIR_NAMES or lowered.endswith(".tests"):
+            return True
+
+    return bool(_TEST_BASENAME_RE.search(parts[-1]))
+
+
+# Word-boundary anchored, which the substring version this replaces was not.
+# `"spec" in prompt` fires on "inspector", "specific", "respective" and
+# "aspect"; measured, "the A2UI inspector shows a stale fact count" was
+# classified as a prompt about testing and every test file kept full score.
+# That was survivable while the flag only softened a cosine boost, and stops
+# being survivable now that it gates the keyword path too.
+#
+# `\btest` is a prefix rather than a whole word so "testing" and "tests"
+# match, while "latest" does not -- there is no boundary before its `test`.
+_TEST_PROMPT_RE = re.compile(r"\btest|\bpytest\b|\bspecs?\b", re.IGNORECASE)
+
+
+def prompt_targets_tests(prompt: str) -> bool:
+    """Whether the prompt is itself about testing, in which case test files
+    are the answer rather than noise and must not be demoted."""
+    return bool(_TEST_PROMPT_RE.search(prompt))
 
 
 @dataclass
@@ -424,10 +489,12 @@ def extract_prompt_tokens(prompt: str) -> set[str]:
     return tokens
 
 
-# Enough to clear any organic score (filename overlap caps at +1.8, the two
-# re-rank boosts at +1.0 and +1.2). Naming a path is the least ambiguous signal
-# a prompt can carry, so it outranks every heuristic rather than competing with
-# them.
+# Enough to clear any organic score: content caps at +3.0 (CONTENT_WEIGHT),
+# filename overlap at +0.45 (0.15 x min(hits, 3)), the two re-rank boosts at
+# +1.0 and +1.2. Naming a path is the least ambiguous signal a prompt can
+# carry, so it outranks every heuristic rather than competing with them.
+# The +1.8 this comment used to claim for filename overlap was the pre-BM25
+# weight; it dropped to a tie-breaker when content became the dominant term.
 EXPLICIT_PATH_BOOST = 10.0
 
 # Loose: real filtering is "does this match a file we actually found", which no
@@ -544,8 +611,44 @@ def infer_language(path: str) -> Optional[str]:
 
 
 def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
-                    git_recent: set[str], entry_points: set[str]) -> float:
-    """Score a candidate file for relevance."""
+                    git_recent: set[str], entry_points: set[str],
+                    *, demote_tests: bool, content_relevance: float = 0.0) -> float:
+    """
+    Two signals, in order of weight.
+
+    `content_relevance` is a normalized BM25 score over the file's CONTENT
+    (see `neo.file_retrieval`) and is the dominant term. Selection used to
+    score a path string and a byte count and never open the file; the
+    dominant term was then `score -= 0.01 * size_kb`, uncapped, which made a
+    file with one keyword hit unrankable above 60 KB. Measured, the 162 KB
+    `src/neo/memory/store.py` scored 0.000 and ranked 200th of 284 for a
+    prompt about the fact store. That penalty is gone: BugLocator's rVSM
+    (ICSE 2012) ranks larger files HIGHER for this task, and BM25's `b`
+    handles the real concern with bounded, corpus-derived normalization.
+    `size` stays in the signature but is no longer scored.
+
+    `demote_tests` applies the same `TEST_PENALTY` the ProjectIndex boost
+    always applied to its cosine — a consistency fix, since the two scoring
+    paths disagreed about test files and only one was ever corrected. It
+    matters MORE under content BM25 than it did before, because a test file
+    contains its subject's identifiers plus test scaffolding and so is often
+    the better lexical match. The A/B that established this was run on a
+    first-pass harness whose absolute numbers are superseded; the DIRECTION
+    held on every repo and is what the parameter rests on. For current
+    end-to-end figures see `neo.file_retrieval` — one table, one harness
+    generation, deliberately not restated here.
+
+    Keyword-only and REQUIRED. It was briefly optional-defaulting-to-False so
+    existing pure-scoring tests would not need editing — a production default
+    shaped around test convenience, where the default was the buggy
+    behaviour and the call site reads `not prompt_targets_tests(...)`, so a
+    forgotten argument failed OPEN toward the defect being fixed.
+
+    The penalty RE-RANKS and must not EVICT. Scaling can push a file under
+    `MIN_SCORE_THRESHOLD`, dropping it from context entirely, and rank-based
+    metrics improve when that happens — so a file that would have been
+    admitted stays admitted, ranked below everything else.
+    """
     score = 0.0
     name_lower = rel_path.lower()
     basename = os.path.basename(rel_path).lower()
@@ -570,15 +673,34 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     # like an entry point" (entry_points adds +0.2). Files that merely
     # *start* with "main" (e.g. main_v2.py) only get the entry_points
     # bonus — the stacking distinguishes "canonical" from "adjacent."
-    main_impl_stems = {"core", "engine", "main", "index", "app", "server", "lib"}
-    stem = os.path.splitext(basename)[0]
-    is_main_impl = stem in main_impl_stems
-    if is_main_impl:
-        score += 0.4
+    # The `main_impl_stems` whitelist that used to live here is gone. It gave
+    # +0.4 to seven hardcoded stems AND exempted them from the size penalty,
+    # and it existed only because that penalty was killing large central
+    # files: it rescued `engine.py` (-0.13) and left `store.py` (-1.62), a 12x
+    # disparity between two files of near-identical size decided by whether
+    # someone had thought of the name. With the penalty gone the whitelist has
+    # nothing to patch, and content BM25 identifies a central file by what is
+    # in it rather than by a list of names someone maintained.
 
-    # Keyword overlap in filename
+    # Content relevance: the dominant term, and the only one that has read
+    # the file. Scaled by CONTENT_WEIGHT so it outweighs every tie-breaker
+    # combined (0.8 docs + 0.3 git + 0.2 entry + 0.45 filename = 1.75) while
+    # staying far below EXPLICIT_PATH_BOOST, which encodes a user instruction.
+    #
+    # This statement appeared TWICE for three commits — the cherry-pick that
+    # merged #188's scorer with this one kept both blocks, so the effective
+    # weight was 6.0 while every docstring, comment and measurement table
+    # said 3.0. Named constant now, so the value has exactly one home.
+    score += CONTENT_WEIGHT * content_relevance
+
+    # Filename overlap, kept as a weak tie-breaker rather than a primary
+    # signal. It is a substring test against the whole path, so short prompt
+    # tokens match by coincidence -- `a` is inside 49 of 85 basenames here.
+    # That noise was survivable at 0.6 per hit only because nothing better
+    # existed; at 0.15 it can separate two files whose content ranks equally
+    # and little else.
     hits = sum(1 for token in prompt_tokens if token in name_lower)
-    score += 0.6 * min(hits, 3)
+    score += 0.15 * min(hits, 3)
 
     # Git recency bonus
     if rel_path in git_recent:
@@ -588,24 +710,35 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     if any(basename.startswith(ep) for ep in entry_points):
         score += 0.2
 
+    # Demote tests, unless the prompt is about testing. Same constant and
+    # same predicate as the ProjectIndex boost path -- see `is_test_path`.
+    # The multiplier lands here, on the accumulated BONUSES and before the
+    # additive penalties below, so it does not shrink those penalties too.
+    # `forfeited` records what it removed; the floor is applied at the end,
+    # because everything after this line is subtractive and a floor applied
+    # here would be eaten by the depth penalty (measured: 0.24 -> 0.19,
+    # straight back under the threshold).
+    forfeited = 0.0
+    if demote_tests and is_test_path(rel_path):
+        forfeited = score * (1.0 - TEST_PENALTY)
+        score *= TEST_PENALTY
+
     # Penalize by depth
     depth = rel_path.count(os.sep)
     score -= 0.05 * depth
 
-    # Penalize by size (god objects are code smell). main_impl files
-    # (engine.py, server.py, app.py, etc.) get a much gentler penalty
-    # — they're large *because* they're central, and the old 0.002
-    # multiplier was pushing THE relevant file (93KB engine.py) below
-    # threshold on prompts about it. New main_impl penalty is 0.001
-    # per KB-over-50, so 93KB loses 0.043 instead of 0.086.
-    size_kb = size / 1024
-    if size_kb > 10 and not is_main_impl:
-        # Penalty for large files: 10KB = -0.1, 50KB = -0.5, 100KB = -1.0
-        score -= 0.01 * size_kb
-    elif size_kb > 50 and is_main_impl:
-        # Lighter penalty for main implementation files: 50KB = 0,
-        # 100KB = -0.05, 500KB = -0.45.
-        score -= 0.001 * (size_kb - 50)
+    # No size penalty. See the docstring: it was the dominant term and it was
+    # anti-correlated with relevance. BugLocator's rVSM (ICSE 2012) ranks
+    # larger files HIGHER for this exact task; BM25's `b` handles the real
+    # concern with bounded, corpus-derived length normalization.
+
+    # Re-rank, never evict. `score + forfeited` reconstructs the undemoted
+    # final score exactly, because every step after the multiplier is
+    # additive. A test file that would have been admitted without the penalty
+    # stays admitted, ranked beneath everything above the threshold; one that
+    # would have been dropped anyway is unaffected.
+    if forfeited and score + forfeited >= MIN_SCORE_THRESHOLD:
+        score = max(score, MIN_SCORE_THRESHOLD)
 
     return max(0.0, score)
 
@@ -764,11 +897,7 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
         # they assert against named behaviors), so the FAISS index ranks
         # them above the source file the prompt is actually about.
         # Demote test-file hits unless the prompt is itself about testing.
-        prompt_lower = prompt.lower()
-        prompt_is_test = any(
-            t in prompt_lower for t in ("test", "pytest", "unit test", "spec")
-        )
-        TEST_PENALTY = 0.4  # multiplier; tests retain 60% of their cosine
+        prompt_is_test = prompt_targets_tests(prompt)
 
         boost: dict[str, float] = {}
         for chunk in chunks:
@@ -776,13 +905,7 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
             rel = os.path.relpath(chunk.file_path, root)
             sim = float(getattr(chunk, "similarity", 0.0))
             sim = max(0.0, sim)
-            is_test = (
-                rel.startswith("test")
-                or rel.startswith("tests" + os.sep)
-                or "/tests/" in rel
-                or os.path.basename(rel).startswith("test_")
-            )
-            if is_test and not prompt_is_test:
+            if is_test_path(rel) and not prompt_is_test:
                 sim *= TEST_PENALTY
             # 1.0 cosine = +1.0 boost (dominant signal); test demotion above.
             prev = boost.get(rel, 0.0)
@@ -933,11 +1056,33 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # with no diff text and could never be verified or learned from.
     explicit_paths = extract_explicit_paths(config.prompt)
 
+    # Computed once here. The ProjectIndex boost path calls the same pure
+    # function on the same argument rather than receiving this value, so the
+    # two agree by construction -- but the earlier comment claimed they
+    # "shared" a decision that was never passed anywhere, and in a file whose
+    # thesis is that two copies drift, an unearned claim of sharing is the
+    # rot starting.
+    demote_tests = not prompt_targets_tests(config.prompt)
+
+    # Read the files. This is the change: selection used to happen on the path
+    # string and the byte count alone, with content first opened afterwards to
+    # chunk whatever had already been chosen.
+    from neo.file_retrieval import build_index, normalize
+
+    file_index = build_index(candidates)
+    relevance = normalize(file_index.scores(config.prompt)) if file_index else {}
+    if relevance:
+        progress.note(f"Content relevance: {len(relevance)} files match the prompt")
+
     # Score all candidates
     scored = []
     explicit_hits = 0
     for abs_path, rel_path, size in candidates:
-        score = score_candidate(rel_path, size, prompt_tokens, git_recent, entry_points)
+        score = score_candidate(
+            rel_path, size, prompt_tokens, git_recent, entry_points,
+            demote_tests=demote_tests,
+            content_relevance=relevance.get(rel_path, 0.0),
+        )
         if matches_explicit_path(rel_path, explicit_paths):
             score += EXPLICIT_PATH_BOOST
             explicit_hits += 1
