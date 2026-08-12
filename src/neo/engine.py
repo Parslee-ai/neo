@@ -2401,11 +2401,32 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             )
 
         total_chars = sum(len(f.content or '') for f in files)
-        file_part = (
-            f"{len(shown)} of {len(files)} files"
-            if len(shown) < len(files)
-            else f"{len(files)} file{'' if len(files) == 1 else 's'}"
-        )
+        # Distinct PATHS, not entries. The gatherer hands this list one entry
+        # per window, so a file selected as two chunks arrived here as two
+        # entries and the banner called it two files — #197's defect surviving
+        # on the surface the MODEL reads, which is the one that matters most.
+        # The chunk count is still stated when it differs, because "3 files"
+        # and "5 chunks from 3 files" answer different questions.
+        shown_files = len({f.path for f in shown})
+        total_files = len({f.path for f in files})
+        if len(files) == total_files:
+            file_part = (
+                f"{shown_files} of {total_files} files"
+                if shown_files < total_files
+                else f"{total_files} file{'' if total_files == 1 else 's'}"
+            )
+        else:
+            chunk_part = (
+                f"{len(shown)} of {len(files)} chunks"
+                if len(shown) < len(files)
+                else f"{len(shown)} chunk{'' if len(shown) == 1 else 's'}"
+            )
+            from_part = (
+                f"{shown_files} of {total_files} files"
+                if shown_files < total_files
+                else f"{shown_files} file{'' if shown_files == 1 else 's'}"
+            )
+            file_part = f"{chunk_part} from {from_part}"
         # "chars", not "bytes": `len()` on a str counts code points, and the
         # old banner said bytes while summing exactly this.
         size_part = (

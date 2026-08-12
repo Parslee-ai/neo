@@ -296,6 +296,165 @@ class TestAForcedCutIsMarkedAndReported:
             assert MARKER_PREFIX in (g.content or "")
 
 
+class TestTheReportMatchesWhatHappened:
+    """Every warning here replaced one built from a cheaper predicate that said
+    something untrue. They are the whole point of the goal, so they get tests."""
+
+    def test_a_cut_pin_is_not_described_as_whole(self, repo, capsys):
+        _gather(repo, includes=["src/app/pool.py"], max_bytes=4_000)
+        err = capsys.readouterr().err
+
+        assert "pins 1 file(s) 0 whole, 1 cut and marked" in err
+        assert "file(s) whole (" not in err
+
+    def test_an_uncut_pin_is_described_as_whole(self, repo, capsys):
+        _gather(repo, includes=["src/app/config.py"])
+        err = capsys.readouterr().err
+
+        assert "pins 1 file(s) whole" in err
+
+    def test_a_ceiling_that_cannot_seat_the_markers_says_so(self, repo, capsys):
+        """The ceiling bounds pinned CONTENT. Below one marker per named file
+        the block runs over it, and the number stops meaning anything unless
+        the overshoot is stated."""
+        gathered = _gather(
+            repo,
+            includes=["src/app/*.py", "notes/*.py"],
+            max_bytes=40,
+        )
+        err = capsys.readouterr().err
+
+        assert sum(g.bytes for g in gathered) > 40
+        assert "cannot seat" in err and "even as truncation markers" in err
+        assert "Named files are never dropped" in err
+
+    def test_no_overshoot_claim_when_the_ceiling_held(self, repo, capsys):
+        """Guards the guard: the warning above must not be background noise."""
+        _gather(repo, includes=["src/app/pool.py"], max_bytes=8_000)
+        err = capsys.readouterr().err
+
+        assert "cannot seat" not in err
+
+    def test_a_byte_starved_scan_names_the_byte_cap_only(self, repo, capsys):
+        pin = repo / "notes" / "zzz_placeholder.py"
+        ceiling = len(pin.read_text(encoding="utf-8").encode("utf-8"))
+
+        gathered = _gather(
+            repo, includes=["notes/zzz_placeholder.py"], max_bytes=ceiling
+        )
+        err = capsys.readouterr().err
+
+        assert len(gathered) == 1, "fixture stopped starving the scan"
+        assert "byte budget" in err and f"--max-bytes={ceiling:,}" in err
+        assert "file budget" not in err
+
+    def test_a_file_starved_scan_names_the_file_cap_only(self, repo, capsys):
+        gathered = _gather(
+            repo, includes=["notes/zzz_placeholder.py"], max_files=1
+        )
+        err = capsys.readouterr().err
+
+        assert len(gathered) == 1, "fixture stopped starving the scan"
+        assert "file budget" in err and "--max-files=1" in err
+        assert "byte budget" not in err
+
+    def test_an_unstarved_scan_is_not_warned_about(self, repo, capsys):
+        _gather(repo, includes=["notes/zzz_placeholder.py"])
+        err = capsys.readouterr().err
+
+        assert "contributed nothing" not in err
+
+    def test_a_scan_with_nothing_to_add_blames_no_cap(self, tmp_path, capsys):
+        """The failure this replaced: a 3-file repo with 135 bytes pinned
+        against a 300,000-byte ceiling was told its budget was used up, which
+        sent the operator to two settings that would have changed nothing."""
+        (tmp_path / "only.py").write_text("ALPHA = 1\n", encoding="utf-8")
+        gathered = _gather(tmp_path, includes=["only.py"])
+        err = capsys.readouterr().err
+
+        assert [g.rel_path for g in gathered] == ["only.py"]
+        assert "found nothing to add" in err
+        assert "--max-files" not in err and "--max-bytes" not in err
+
+
+class TestTheLiteralPathRescue:
+    """A named file over the walker's 512KB per-file limit is still named.
+
+    That limit is a scan-cost guard, not a relevance judgement — the same class
+    of rule as the score threshold and the chunk cap, which a pin already
+    bypasses. Without the rescue the guarantee has an unstated cliff, and
+    #198's own reported case was a 449KB file: 63KB under it.
+    """
+
+    @pytest.fixture
+    def big_repo(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "huge.py").write_text(
+            "# database pool connection timeout\n" + "x = 1\n" * 120_000,
+            encoding="utf-8",
+        )
+        (tmp_path / "src" / "small.py").write_text(
+            "def connection_pool_timeout(): pass\n", encoding="utf-8"
+        )
+        return tmp_path
+
+    def test_the_walker_really_does_skip_it(self, big_repo):
+        from neo.context_gatherer import iter_paths
+
+        assert (big_repo / "src" / "huge.py").stat().st_size > 512_000
+        rels = [rel for _abs, rel, _size in iter_paths(str(big_repo), [], [], None)]
+        assert "src/huge.py" not in rels
+
+    def test_a_literally_named_oversize_file_is_pinned_anyway(self, big_repo):
+        gathered = _gather(big_repo, includes=["src/huge.py"], max_bytes=50_000)
+        target = [g for g in gathered if g.rel_path == "src/huge.py"]
+
+        assert target, "the named file was dropped by the walker's size limit"
+        assert target[0].pinned is True
+        assert target[0].truncated is True
+        assert MARKER_PREFIX in (target[0].content or "")
+
+    def test_the_rescue_does_not_admit_a_gitignored_file(self, tmp_path):
+        """G1-inv outranks the rescue. Admitting an ignored file would trade a
+        reported absence for an unreported presence."""
+        (tmp_path / ".gitignore").write_text("secret.py\n", encoding="utf-8")
+        (tmp_path / "secret.py").write_text("TOKEN = 1\n", encoding="utf-8")
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+
+        rels = _rels(_gather(tmp_path, includes=["secret.py"]))
+        assert "secret.py" not in rels
+
+    def test_the_rescue_does_not_admit_a_file_in_an_ignored_directory(self, tmp_path):
+        """`should_ignore` only tests the path it is handed; the walk gets
+        ancestors for free by pruning, and the rescue does not."""
+        (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build" / "out.py").write_text("X = 1\n", encoding="utf-8")
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+
+        rels = _rels(_gather(tmp_path, includes=["build/out.py"]))
+        assert "build/out.py" not in rels
+
+    def test_the_rescue_does_not_reach_outside_the_root(self, tmp_path):
+        outside = tmp_path.parent / "outside_the_root.py"
+        outside.write_text("X = 1\n", encoding="utf-8")
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+
+        rels = _rels(_gather(tmp_path, includes=["../outside_the_root.py"]))
+        assert not any("outside_the_root" in r for r in rels)
+
+    def test_a_glob_gets_no_rescue_and_the_warning_says_so(self, big_repo, capsys):
+        """Expanding a glob means walking, which is the cost the rescue avoids.
+        The limit is real, so the diagnostic names it instead of listing four
+        causes it never checked."""
+        rels = _rels(_gather(big_repo, includes=["src/hu*.py"]))
+        err = capsys.readouterr().err
+
+        assert "src/huge.py" not in rels
+        assert "matched no file" in err
+        assert "512KB" in err
+
+
 class TestCutToBytes:
     def test_content_that_fits_is_returned_untouched(self):
         text, cut = _cut_to_bytes("hello", 100)
@@ -342,7 +501,7 @@ class TestResolveIncludes:
         _gather(repo, includes=["does/not/exist.py"])
         err = capsys.readouterr().err
 
-        assert "--include" in err and "matched no scanned file" in err
+        assert "--include" in err and "matched no file" in err
 
     def test_two_patterns_matching_one_file_pin_it_once(self):
         candidates = [("/r/a.py", "a.py", 1), ("/r/b.py", "b.py", 1)]
@@ -401,3 +560,45 @@ class TestThePromptRendererHonoursThePin:
         sections, _banner, _visible = NeoEngine._render_context_files(files)
 
         assert [s.split(" ")[1] for s in sections] == ["a.py", "b.py", "c.py"]
+
+
+class TestTheBannerTheModelReadsCountsFiles:
+    """#197 on the surface that matters most.
+
+    The gatherer hands the renderer one entry per window, so two chunks of one
+    file arrived as two entries and the banner said "2 files" — to the model,
+    inside the prompt, where no operator ever sees it to doubt it.
+    """
+
+    def test_two_chunks_of_one_file_are_not_two_files(self):
+        files = [
+            ContextFile(path="a.py", content="one", line_range=(1, 5)),
+            ContextFile(path="a.py", content="two", line_range=(40, 60)),
+        ]
+        _sections, banner, _visible = NeoEngine._render_context_files(files)
+
+        assert "2 chunks from 1 file" in banner
+        assert "2 files" not in banner
+
+    def test_unchunked_files_still_read_as_files(self):
+        """The chunk count is stated only when it says something the file
+        count does not."""
+        files = [
+            ContextFile(path="a.py", content="one"),
+            ContextFile(path="b.py", content="two"),
+        ]
+        _sections, banner, _visible = NeoEngine._render_context_files(files)
+
+        assert "2 files" in banner
+        assert "chunk" not in banner
+
+    def test_the_display_cap_is_reported_in_both_units(self):
+        files = [
+            ContextFile(path=f"f{i}.py", content="x", line_range=(1, 2))
+            for i in range(_MAX_CONTEXT_FILES + 5)
+        ]
+        files.append(ContextFile(path="f0.py", content="y", line_range=(9, 10)))
+        _sections, banner, _visible = NeoEngine._render_context_files(files)
+
+        assert f"{_MAX_CONTEXT_FILES} of {len(files)} chunks" in banner
+        assert "files" in banner
