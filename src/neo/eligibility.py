@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 # Patterns that apply even when a repo's `.gitignore` says nothing, because
 # the worst offenders are routinely untracked-but-not-ignored.
@@ -324,10 +327,16 @@ def file_content_hash(path) -> str:
     budgets slots must not spend two on one piece of content. Returning `""`
     rather than raising keeps a vanished-since-the-walk file from aborting a
     build — the caller treats a falsy hash as "skip, do not count".
+
+    The catch is broad because the code it replaces was. Narrowing it to
+    `OSError` would let a `ValueError` — an embedded NUL in a path, say —
+    escape and abort an entire index build over one unreadable file, which is
+    the failure this fallback exists to prevent. One bad file costs one file,
+    not the run.
     """
     try:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    except OSError:
+    except Exception:
         return ""
 
 
@@ -443,6 +452,11 @@ def walk(root: str, policy: Optional[WalkPolicy] = None) -> WalkResult:
             # `Path.is_file` and `Path.resolve` all dereference, and the point
             # of rejecting a symlink is to not touch what it points at.
             if policy.skip_symlinks and os.path.islink(abs_path):
+                # Named, because the index used to warn here and an operator
+                # asking "why is this file not indexed?" got an answer. A
+                # policy rejection is not an ignore-rule verdict, so it is not
+                # counted into `excluded_*` — but it must not be silent.
+                logger.debug("Skipping symlink: %s", rel_path)
                 continue
             if globs is not None and not any(g.match(rel_path) for g in globs):
                 continue
@@ -465,11 +479,23 @@ def walk(root: str, policy: Optional[WalkPolicy] = None) -> WalkResult:
 
 
 def normalize_exts(exts: Optional[Iterable[str]]) -> Optional[frozenset[str]]:
-    """Build the `WalkPolicy.exts` set from either `py` or `.py` spellings."""
+    """Build the `WalkPolicy.exts` set from either `py` or `.py` spellings.
+
+    `None` — and ONLY `None` — means "no extension filter". Every other input
+    produces a set, including an empty one, because the two are opposite
+    instructions and collapsing them inverts the flag: an earlier cut returned
+    `None` for a set that normalized to empty, so `exts=[]` went from admitting
+    NOTHING (the pre-unification behaviour, where `ext not in []` is always
+    true) to admitting the entire repository. A narrowing argument must never
+    widen when it is handed nothing.
+
+    For the same reason the empty string is KEPT rather than filtered out: `""`
+    is the extension of `Makefile`, so it is a real selector, and dropping it
+    silently turned `exts=["py", ""]` into `{"py"}`.
+    """
     if exts is None:
         return None
-    normalized = frozenset(ext.lstrip('.').lower() for ext in exts if ext)
-    return normalized or None
+    return frozenset(ext.lstrip('.').lower() for ext in exts)
 
 
 def walk_paths(

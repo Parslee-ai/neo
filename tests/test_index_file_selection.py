@@ -168,7 +168,7 @@ class TestExclusions:
 
     @pytest.mark.parametrize(
         "excluded_dir",
-        # Covered by the shared `load_gitignore_patterns` defaults: not
+        # Covered by the shared `load_ignore_patterns` defaults: not
         # plausible source directory names, and routinely
         # untracked-but-not-gitignored.
         ['node_modules', '.git', 'obj', '__pycache__', '.venv',

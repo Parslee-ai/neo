@@ -24,6 +24,7 @@ from neo.eligibility import (
     compile_glob,
     load_ignore_patterns,
     should_ignore,
+    walk_paths,
 )
 
 
@@ -127,12 +128,14 @@ class TestComponentMatching:
         directory of that file is excluded."
 
         This predicate, asked about the file in isolation, says the negation
-        wins — it has no ancestor state. Both callers supply that state and
-        so reproduce git: `iter_paths` prunes `dist` before descending, and
-        `_build_exclusion_filter` tests ancestors first. The divergence is
-        therefore not user-visible, but it is real, and an earlier version of
-        this file asserted the divergence as if it were the correct answer.
-        Pinned here as a known limit rather than defended as behaviour.
+        wins — it has no ancestor state. The one caller supplies that state
+        and so reproduces git: `eligibility.walk` prunes `dist` before
+        descending, so nothing beneath it is ever asked about. (There used to
+        be a second caller with its own ancestor handling; the unification is
+        why there is now one.) The divergence is therefore not user-visible,
+        but it is real, and an earlier version of this file asserted the
+        divergence as if it were the correct answer. Pinned here as a known
+        limit rather than defended as behaviour.
         """
         # What git says: ignored, because the parent directory is excluded.
         # What this predicate says, without ancestors:
@@ -341,6 +344,62 @@ class TestWalk:
 
         assert "src/real.py" in found
         assert "nested/src/other.py" in found
+
+
+class TestExtensionFilterNarrows:
+    """`exts` is a NARROWING argument and must never widen.
+
+    Unification moved the extension check behind `normalize_exts`, and the
+    first cut of that helper returned `None` — the sentinel for "no filter" —
+    whenever the normalized set came out empty. That inverts the argument:
+    pre-unification, `exts=[]` matched nothing (`ext not in []` is always
+    true); after, it matched the entire repository. The same collapse dropped
+    the empty string, which is a real selector because `""` is the extension
+    of `Makefile`.
+
+    Only `None` may mean "no filter". Every other input yields a set.
+    """
+
+    def _repo(self, tmp_path):
+        (tmp_path / "a.py").write_text("x\n")
+        (tmp_path / "b.md").write_text("x\n")
+        (tmp_path / "Makefile").write_text("x\n")
+        return tmp_path
+
+    def _walk(self, root, exts):
+        return sorted(
+            entry.rel_path for entry in walk_paths(str(root), exts=exts).paths
+        )
+
+    def test_none_admits_every_extension(self, tmp_path):
+        root = self._repo(tmp_path)
+        assert self._walk(root, None) == ["Makefile", "a.py", "b.md"]
+
+    def test_an_empty_list_admits_nothing(self, tmp_path):
+        """The inversion, pinned. This is the regression, not a style point."""
+        root = self._repo(tmp_path)
+        assert self._walk(root, []) == []
+
+    def test_the_empty_string_selects_extensionless_files(self, tmp_path):
+        root = self._repo(tmp_path)
+        assert self._walk(root, [""]) == ["Makefile"]
+
+    def test_a_trailing_comma_does_not_silently_drop_its_selector(self, tmp_path):
+        """`--exts py,` splits to `["py", ""]`; both members must survive."""
+        root = self._repo(tmp_path)
+        assert self._walk(root, ["py", ""]) == ["Makefile", "a.py"]
+
+    def test_both_spellings_and_both_cases_are_accepted(self, tmp_path):
+        """A disclosed widening: `.py`, `py` and `PY` now agree.
+
+        Pre-unification `--exts .py` matched NOTHING (the leading dot was
+        compared against a stripped extension) and the comparison was
+        case-sensitive. Both are stated in the PR body rather than smuggled.
+        """
+        root = self._repo(tmp_path)
+        (tmp_path / "c.PY").write_text("x\n")
+        for spelling in ("py", ".py", "PY"):
+            assert self._walk(root, [spelling]) == ["a.py", "c.PY"], spelling
 
 
 class TestAgentDocsStillReachable:

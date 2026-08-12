@@ -53,7 +53,12 @@ import subprocess
 
 import pytest
 
-from neo.eligibility import DEFAULT_IGNORE_PATTERNS, WalkPolicy, walk
+from neo.eligibility import (
+    DEFAULT_IGNORE_PATTERNS,
+    WalkPolicy,
+    should_ignore,
+    walk,
+)
 
 pytestmark = pytest.mark.invariants
 
@@ -394,10 +399,25 @@ class TestAgainstThisRepository:
     def test_no_tracked_file_is_skipped_without_an_ignore_rule_saying_so(self):
         """The strong form of G4-inv on a repository nobody wrote for it.
 
-        A tracked file the walk skips is only acceptable when the repo's own
-        ignore rules independently say to skip it — that is the
-        tracked-but-ignored case below. Any OTHER skip is a defect in the
-        matcher or an over-broad default, and this is what catches it.
+        A tracked file the walk skips is acceptable only when SOME rule
+        independently accounts for it, and there are exactly two rule sets:
+        the repo's own `.gitignore` (asked of git itself) and neo's shared
+        defaults. Any OTHER skip is a defect in the matcher, and that is what
+        this catches.
+
+        The defaults are subtracted rather than folded into "git says so",
+        because they are not git's rules and asserting otherwise would be
+        false. They are also the reason this test must not simply diff
+        against `git check-ignore`:
+        `test_defaults_exclude_a_tracked_artifact_directory_on_purpose`
+        deliberately blesses a tracked file under a default-only name, so a
+        version of this assertion that knew only about `.gitignore` would
+        contradict it — green today only because this checkout happens to
+        track no `.vscode/settings.json`, `build/`, `dist/` or `obj/` file.
+        The day one is added, the naive form fails with a message accusing
+        the matcher of a defect it does not have, and the fix would look like
+        weakening the guard. Attributing each skip to the rule set that
+        caused it keeps the guard sharp AND keeps the two tests consistent.
         """
         root = self._repo_root()
         tracked = _tracked(root)
@@ -405,12 +425,18 @@ class TestAgainstThisRepository:
             pytest.skip("git work tree reports no tracked files")
 
         skipped = tracked - _walked(root, skip_symlinks=False)
-        unexplained = skipped - _check_ignore(root, skipped)
+        by_repo_rules = _check_ignore(root, skipped)
+        by_neo_defaults = {
+            path
+            for path in skipped
+            if should_ignore(path, list(DEFAULT_IGNORE_PATTERNS))
+        }
+        unexplained = skipped - by_repo_rules - by_neo_defaults
 
         assert unexplained == set(), (
             f"{len(unexplained)} of {len(tracked)} tracked files are invisible "
-            f"to the walk and no ignore rule accounts for them: "
-            f"{sorted(unexplained)[:20]}"
+            f"to the walk and neither the repo's ignore rules nor neo's "
+            f"defaults account for them: {sorted(unexplained)[:20]}"
         )
 
     def test_tracked_but_ignored_files_are_a_known_divergence_from_git(self):
@@ -432,6 +458,13 @@ class TestAgainstThisRepository:
         This test asserts the SHAPE, not the count: it is a statement that
         every divergence found is of this one kind, and it stays true if the
         repo gains or loses such files.
+
+        Scoped to the skips the REPO's rules cause, for the same reason the
+        test above subtracts them: a tracked file under a default-only name
+        is skipped by neo, not by `.gitignore`, so `git check-ignore` is
+        right to call it not-ignored and it is not an instance of this
+        divergence. Folding it in here would make this test fail for the one
+        behaviour the fixture suite explicitly blesses.
         """
         root = self._repo_root()
         tracked = _tracked(root)
@@ -439,12 +472,20 @@ class TestAgainstThisRepository:
             pytest.skip("git work tree reports no tracked files")
 
         skipped = tracked - _walked(root, skip_symlinks=False)
-        # Every skipped-but-tracked path is one the rules alone would ignore.
-        assert skipped == _check_ignore(root, skipped)
+        # Every skipped-but-tracked path is accounted for by the repo's own
+        # rules or by neo's defaults; the defaults are a separate contract.
+        by_repo_rules = _check_ignore(root, skipped)
+        by_neo_defaults = {
+            path
+            for path in skipped
+            if should_ignore(path, list(DEFAULT_IGNORE_PATTERNS))
+        }
+        assert skipped == by_repo_rules | by_neo_defaults
         # ...and git, consulting its index, disagrees with the rules for
-        # exactly these paths — which is what makes them the divergence.
-        if skipped:
-            not_ignored_because_tracked = skipped - _check_ignore_indexed(
-                root, skipped
+        # exactly the rule-caused paths — which is what makes them the
+        # divergence this test is named for.
+        if by_repo_rules:
+            not_ignored_because_tracked = by_repo_rules - _check_ignore_indexed(
+                root, by_repo_rules
             )
-            assert not_ignored_because_tracked == skipped
+            assert not_ignored_because_tracked == by_repo_rules

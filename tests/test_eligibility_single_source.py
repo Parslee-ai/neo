@@ -116,6 +116,16 @@ class TestOneDefinitionSite:
         )
 
 
+#: Modules that each historically grew their own walk. A *recursive* traversal
+#: in one of these is the regression this goal exists to prevent, so they are
+#: held to a stricter rule than the rest of the package.
+FORMER_WALKERS = (
+    "context_gatherer.py",
+    "index/project_index.py",
+    "architecture_metrics.py",
+)
+
+
 class TestNoSecondWalk:
     def test_os_walk_is_called_in_one_module_only(self):
         """A second walk is how both historical copies began."""
@@ -136,6 +146,76 @@ class TestNoSecondWalk:
         assert callers == {_relative(ELIGIBILITY)}, (
             "os.walk must be called only by the shared eligibility walk; "
             f"also called by: {sorted(callers - {_relative(ELIGIBILITY)})}"
+        )
+
+    def test_no_module_reaches_for_another_directory_traversal_primitive(self):
+        """`os.walk` is not the only spelling of "walk the filesystem".
+
+        Guarding the attribute form alone leaves `from os import walk`,
+        `os.scandir` and `os.listdir` as unwatched doors into the same
+        mistake — and a guard that names one spelling of a defect reads as
+        coverage while the other three walk past it. None of these appears
+        anywhere in the package today, so this asserts a property that
+        currently holds rather than grandfathering exceptions.
+        """
+        offenders = []
+        for path, tree in _modules():
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "os"
+                    and any(
+                        alias.name in ("walk", "scandir", "listdir")
+                        for alias in node.names
+                    )
+                ):
+                    offenders.append(f"{_relative(path)}:{node.lineno} from os import …")
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("scandir", "listdir")
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"
+                ):
+                    offenders.append(
+                        f"{_relative(path)}:{node.lineno} os.{node.func.attr}"
+                    )
+
+        assert offenders == [], (
+            "directory traversal belongs to `neo.eligibility.walk`:\n"
+            + "\n".join(offenders)
+        )
+
+    @pytest.mark.parametrize("module", FORMER_WALKERS)
+    def test_a_former_walker_does_not_recursively_glob(self, module):
+        """`Path.rglob` / `glob("**/…")` is a walk wearing a shorter name.
+
+        Scoped to the three modules that each grew their own traversal,
+        rather than banned package-wide, because neo legitimately globs its
+        OWN state directories (`~/.neo/facts`, session logs, transcript
+        dirs) and a blanket rule would have to grandfather twenty call sites
+        — at which point the next one slips in beside them. #159 was
+        `ProjectIndex` reaching for `Path.glob`, so the mechanism is watched
+        exactly where it has already fired.
+        """
+        tree = ast.parse((SRC / module).read_text())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr == "rglob":
+                offenders.append(f"{module}:{node.lineno} .rglob(")
+            elif node.func.attr in ("glob", "iglob"):
+                first = node.args[0] if node.args else None
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    if "**" in first.value:
+                        offenders.append(
+                            f"{module}:{node.lineno} .glob({first.value!r})"
+                        )
+
+        assert offenders == [], (
+            f"{module} is walking the repository again; call "
+            "`neo.eligibility.walk` instead:\n" + "\n".join(offenders)
         )
 
 
