@@ -19,13 +19,20 @@ import pytest
 
 from neo.execution_context import (
     _MAX_CONSTRAINTS,
+    _MAX_HYPOTHESES,
     _MAX_RECENT_ATTEMPTS,
     _MAX_SUCCESS_CRITERIA,
+    _MAX_VALIDATION_GATES,
+    _MAX_VALIDATION_OBSERVATIONS,
     CallerRole,
     DerivedValue,
+    ExecutionIdentity,
+    HypothesisRecord,
     ResolvedExecutionContext,
     SuccessCriterion,
     TrajectoryContext,
+    ValidationGate,
+    ValidationObservation,
 )
 from neo.text_budget import shown_of
 
@@ -37,6 +44,10 @@ def _context(**overrides):
         intent=DerivedValue("i", "explicit", 1.0),
         constraints=[],
         success_criteria=[],
+        validation_gates=[],
+        validation_observations=[],
+        hypotheses=[],
+        execution_identity=ExecutionIdentity(),
         attempt=None,
         outcome=None,
         progress=None,
@@ -131,21 +142,43 @@ class TestRetrievalQueryIsDeliberatelyUnmarked:
         assert "showing" in context.prompt_section()
 
 
+def _items(attr, n):
+    """One over-long list per capped attribute, in that attribute's own type."""
+    if attr == "constraints":
+        return [f"x{i}" for i in range(n)]
+    if attr == "success_criteria":
+        return [SuccessCriterion(type="t", description=f"x{i}") for i in range(n)]
+    if attr == "validation_gates":
+        return [ValidationGate(gate_id=f"g{i}", description=f"x{i}") for i in range(n)]
+    if attr == "validation_observations":
+        return [ValidationObservation(observation_id=f"o{i}", gate_id=f"g{i}")
+                for i in range(n)]
+    if attr == "hypotheses":
+        return [HypothesisRecord(hypothesis_id=f"h{i}", statement=f"x{i}")
+                for i in range(n)]
+    raise AssertionError(f"no item factory for {attr}")
+
+
 class TestNoBareSlicesRemain:
     @pytest.mark.parametrize("attr,cap", [
         ("constraints", _MAX_CONSTRAINTS),
         ("success_criteria", _MAX_SUCCESS_CRITERIA),
+        # The proof-aware execution sections (#200) arrived after this file was
+        # written, as three more bare slices in the one function whose docstring
+        # promises every cut is marked. They are covered here rather than in
+        # their own class precisely because this guard's premise is that a NEW
+        # capped list is the recurrence -- leaving them out would have let the
+        # guard pass while the defect it names sat three lines below the ones
+        # it checks.
+        ("validation_gates", _MAX_VALIDATION_GATES),
+        ("validation_observations", _MAX_VALIDATION_OBSERVATIONS),
+        ("hypotheses", _MAX_HYPOTHESES),
     ])
     def test_every_capped_list_in_the_section_is_annotated(self, attr, cap):
         """Generic guard: for each capped list, an over-long input must
         produce the annotation `shown_of` would generate. Adding a new capped
         list without a marker is the recurrence this file exists to catch."""
-        items = (
-            [f"x{i}" for i in range(cap + 2)]
-            if attr == "constraints"
-            else [SuccessCriterion(type="t", description=f"x{i}")
-                  for i in range(cap + 2)]
-        )
+        items = _items(attr, cap + 2)
         section = _context(**{attr: items}).prompt_section()
 
         assert shown_of(items, cap) in section
