@@ -78,7 +78,19 @@ pytest tests/test_neo.py
 
 # Run with coverage
 pytest --cov=neo
+
+# The free half of the release gate on its own: per-language selection
+# invariants, no model call. This is what the `invariants` CI job runs.
+pytest -m invariants
+
+# The paid half. The marker alone does not spend money — the module skips
+# unless NEO_RELEASE_ROUNDTRIP=1, so a plain `pytest` reports these SKIPPED
+# rather than omitting them. One real LLM call per language.
+NEO_RELEASE_ROUNDTRIP=1 pytest -m roundtrip
 ```
+
+See [`docs/release-gate.md`](docs/release-gate.md) for what each half asserts
+and why it is split that way.
 
 ### Code Formatting
 
@@ -107,8 +119,13 @@ Publishing is automated: creating a GitHub **Release** triggers `publish.yml`,
 which builds and uploads to PyPI via Trusted Publishers (OIDC — no token lives
 in the repo). The sequence is push → tag → release; do not run `twine` locally.
 
-Two things to know before you rely on it:
+Three things to know before you rely on it:
 
+- **A release gate runs first.** `build` needs `language-roundtrip`, which
+  makes one real LLM call per language (C#, TypeScript, Python) against
+  generated fixture repositories. A red language blocks the wheel. The job
+  requires the `ANTHROPIC_API_KEY` repository secret and **fails rather than
+  skips** without it. See [`docs/release-gate.md`](docs/release-gate.md).
 - **TestPyPI is not configured.** `publish-testpypi` only runs on a manual
   `workflow_dispatch`, and it currently fails at the publish step because no
   Trusted Publisher exists for this repo on TestPyPI. The `build` job and the
