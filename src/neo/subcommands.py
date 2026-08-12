@@ -16,9 +16,13 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from neo.models import RegenerateStats
+from neo.models import (
+    CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE,
+    CONFIDENCE_BASIS_SUGGESTIONS,
+    RegenerateStats,
+)
 
 if TYPE_CHECKING:
     from neo.config import NeoConfig
@@ -1464,18 +1468,65 @@ DOCUMENTATION:
 """
     print(help_text)
 
+# The numeric bands, and the fact that "no score" is not one of them. Shown on
+# every interpretation so a reader who sees `null` isn't left to guess where it
+# sits on the ladder — it doesn't sit on the ladder at all.
+_CONFIDENCE_SCALE = {
+    "0.0-0.4": "Gather more data - critical information missing",
+    "0.4-0.7": "Proceed with caution - some uncertainties remain",
+    "0.7-1.0": "Ready to implement - high confidence in approach",
+    "null": "Not applicable - this run proposed no code change to score",
+}
+
+
 def _interpret_confidence(
-    confidence: float,
+    confidence: Optional[float],
     next_questions: list[str],
     plan: list,
-    code_suggestions: list
+    code_suggestions: list,
+    confidence_basis: str = CONFIDENCE_BASIS_SUGGESTIONS,
 ) -> dict:
     """
     Interpret confidence score and provide actionable guidance.
 
     Helps users understand what the confidence score means and what to do next.
+
+    `confidence` is None when the run produced nothing a code-change score can
+    describe, and `confidence_basis` says which case that is. Those get their
+    own verdicts rather than being folded onto the numeric scale: an
+    analysis-only run used to arrive here as the sentinel 0.5 and render as
+    "Proceed with caution - some uncertainties remain", which read as a weaker
+    result than an empty patch carrying its own self-reported 0.96 (#199).
     """
-    interpretation = {}
+    interpretation: dict[str, Any] = {"confidence_basis": confidence_basis}
+
+    if confidence is None:
+        if confidence_basis == CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE:
+            interpretation["action"] = "NO_VERIFIABLE_CHANGE"
+            interpretation["message"] = (
+                "No verifiable output - suggestions named a file but carried "
+                "no diff and no code block"
+            )
+            interpretation["next_steps"] = [
+                "Treat this run as having produced nothing, not as a low-risk result",
+                "Re-run with the files the suggestion referenced actually in context",
+            ]
+        else:
+            interpretation["action"] = "ANALYSIS_ONLY"
+            interpretation["message"] = (
+                "No code change proposed - a confidence score for a patch does "
+                "not apply to this answer"
+            )
+            interpretation["next_steps"] = [
+                "Read the analysis on its own terms; there is no diff to review",
+                "Re-run with an implementation prompt if a change is what you wanted",
+            ]
+        interpretation["note"] = (
+            "Absence of a score is not a low score. Nothing here was measured "
+            "on the 0.0-1.0 code-change scale."
+        )
+        interpretation["confidence_scale"] = _CONFIDENCE_SCALE
+        return interpretation
 
     # Determine action guidance based on confidence level
     if confidence >= 0.7:
@@ -1531,11 +1582,7 @@ def _interpret_confidence(
         interpretation["note"] = "The plan itself may be valuable - low confidence indicates missing input data, not plan quality"
 
     # Add confidence scale reference
-    interpretation["confidence_scale"] = {
-        "0.0-0.4": "Gather more data - critical information missing",
-        "0.4-0.7": "Proceed with caution - some uncertainties remain",
-        "0.7-1.0": "Ready to implement - high confidence in approach"
-    }
+    interpretation["confidence_scale"] = _CONFIDENCE_SCALE
 
     return interpretation
 

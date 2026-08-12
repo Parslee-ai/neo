@@ -674,10 +674,31 @@ def _format_selection_report(report: Optional[dict]) -> list[str]:
             f"identical to an already-indexed file"
         )
     if report.get('excluded'):
-        lines.append(
-            f"[Neo] Skipped {report['excluded']} paths under excluded "
-            f"directories (worktrees, node_modules, build output, ...)"
-        )
+        # Directories and files are counted separately because they are not
+        # the same claim. The walk PRUNES an excluded directory rather than
+        # descending into it, so it does not know — and must not guess — how
+        # many files are inside. Saying "1 directory" is the honest report;
+        # the number it replaced ("200 paths") was only available because the
+        # old code walked every worktree copy in order to count it.
+        dirs = report.get('excluded_dirs')
+        files = report.get('excluded_files')
+        if dirs is None or files is None:
+            # A report from before the counts were split.
+            lines.append(
+                f"[Neo] Skipped {report['excluded']} paths under excluded "
+                f"directories (worktrees, node_modules, build output, ...)"
+            )
+        else:
+            parts = []
+            if dirs:
+                parts.append(f"{dirs} director{'y' if dirs == 1 else 'ies'}")
+            if files:
+                parts.append(f"{files} file{'' if files == 1 else 's'}")
+            lines.append(
+                f"[Neo] Skipped {' and '.join(parts)} matching exclusion "
+                f"rules (worktrees, node_modules, build output, ...); files "
+                f"inside a skipped directory are not counted"
+            )
     return lines
 
 
@@ -1464,6 +1485,7 @@ def main():
             ],
             "next_questions": output.next_questions,
             "confidence": output.confidence,
+            "confidence_basis": output.confidence_basis,
             "notes": output.notes,
             "metadata": output.metadata,
             "goal_assessment": (
@@ -1487,7 +1509,8 @@ def main():
             output.confidence,
             output.next_questions,
             output.plan,
-            output.code_suggestions
+            output.code_suggestions,
+            output.confidence_basis,
         )
         output_dict["confidence_interpretation"] = confidence_interpretation
 
@@ -1498,7 +1521,15 @@ def main():
         else:
             # Human-readable text mode
             print("\n" + "="*80)
-            print(f"CONFIDENCE: {output.confidence:.2f}")
+            if output.confidence is None:
+                # Printing "0.50" here is what made a correct analysis look
+                # like a hedged one. The interpretation carries the reason.
+                print(
+                    f"CONFIDENCE: n/a "
+                    f"({confidence_interpretation['message']})"
+                )
+            else:
+                print(f"CONFIDENCE: {output.confidence:.2f}")
             print("="*80)
 
             # The same summary a host would relay, so the terminal reader and

@@ -292,6 +292,76 @@ class CodeSuggestion:
     suggestion_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
+# Paths a suggestion uses to say "this is analysis, not a change" — the schema
+# in engine.py permits an empty `unified_diff` only for these.
+REVIEW_ONLY_PATHS = frozenset({"", "/", "N/A"})
+
+
+def suggestion_is_review_marker(suggestion: "CodeSuggestion") -> bool:
+    """True when a suggestion is the schema's "no code change" placeholder.
+
+    A run that emits only these produced an *answer*, not a patch, so there is
+    nothing for a code-change confidence number to describe.
+    """
+    return (suggestion.file_path or "").strip().upper() in {
+        path.upper() for path in REVIEW_ONLY_PATHS
+    }
+
+
+def suggestion_is_scoreable(suggestion: "CodeSuggestion") -> bool:
+    """True when a suggestion proposes a change a confidence score can describe.
+
+    Deliberately narrower than "the model returned an object". A suggestion
+    naming a real file with an empty diff AND an empty code block violates the
+    schema (engine.py's prompt: an empty diff is permitted only when
+    ``file_path`` is ``/`` or ``N/A``), yet it still carries a self-reported
+    confidence — which is how a run that produced no content scored 0.96 and
+    outranked a correct analysis at 0.50 (#199). Such a suggestion is excluded
+    from the average rather than trusted to grade a patch it did not write.
+    """
+    if suggestion_is_review_marker(suggestion):
+        return False
+    return bool(
+        (suggestion.unified_diff or "").strip()
+        or (suggestion.code_block or "").strip()
+    )
+
+
+# Why a run's `confidence` is — or is not — a number on the 0..1 scale.
+# Separating these from the scale is the whole point of #199: `0.5` used to
+# mean both "moderately uncertain" and "there was nothing to score".
+CONFIDENCE_BASIS_SUGGESTIONS = "suggestions"
+CONFIDENCE_BASIS_ANALYSIS_ONLY = "analysis_only"
+CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE = "no_verifiable_change"
+CONFIDENCE_BASIS_VERIFICATION = "verification_verdict"
+
+# Operator-facing verdicts, ordered by how much usable output the run
+# delivered — lowest first. The one relation any code depends on is that
+# NO_VERIFIABLE_CHANGE is the floor: a run that named a file and produced no
+# change must never outrank a run that actually answered. ANALYSIS_ONLY sits
+# above PROCEED_WITH_CAUTION because it carries no unverified patch to act on,
+# not because it is more certain — there is no certainty claim in it at all.
+CONFIDENCE_ACTIONS: tuple[str, ...] = (
+    "NO_VERIFIABLE_CHANGE",
+    "GATHER_MORE_DATA",
+    "PROCEED_WITH_CAUTION",
+    "ANALYSIS_ONLY",
+    "READY_TO_IMPLEMENT",
+)
+
+
+def confidence_action_rank(action: str) -> int:
+    """Rank an interpretation action on the trust ladder above.
+
+    An unrecognized action ranks below every known one: a verdict this build
+    cannot place is not evidence that anything is safe to act on.
+    """
+    try:
+        return CONFIDENCE_ACTIONS.index(action)
+    except ValueError:
+        return -1
+
+
 @dataclass
 class StaticCheckResult:
     """Results from static analysis tools."""
@@ -336,8 +406,12 @@ class NeoOutput:
     code_suggestions: list[CodeSuggestion]
     static_checks: list[StaticCheckResult]
     next_questions: list[str]
-    confidence: float
+    # None when this run produced nothing a code-change score can describe.
+    # `confidence_basis` says which case it is; never read one without the
+    # other, and never substitute a number for the absence.
+    confidence: Optional[float]
     notes: str
+    confidence_basis: str = CONFIDENCE_BASIS_SUGGESTIONS
     metadata: dict[str, Any] = field(default_factory=dict)
     goal_assessment: Optional[GoalAssessment] = None
     strategy_assessment: Optional[StrategyAssessment] = None

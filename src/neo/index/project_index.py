@@ -18,7 +18,6 @@ Design philosophy:
 - Zero hidden CPU work (all indexing is explicit or budgeted)
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -29,6 +28,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 import numpy as np
 
+from neo.eligibility import file_content_hash
 from neo.index.language_parser import TreeSitterParser
 
 # Import FAISS for fast similarity search
@@ -55,9 +55,14 @@ STALENESS_THRESHOLD = 0.1  # 10% of files changed triggers full reindex warning
 REFRESH_BUDGET_MS = 5000  # Max 5s for opportunistic refresh
 REFRESH_MAX_CHUNKS = 100  # Max chunks to update during opportunistic refresh
 
-# Path exclusions live in ONE place: `context_gatherer.load_gitignore_patterns`,
-# which both this module and prompt assembly read. A second list used to sit
-# here; see `_build_exclusion_filter` for what the duplication cost.
+# Which paths exist and are eligible is answered in ONE place — `neo.eligibility`
+# — which this module, prompt assembly and the architecture scan all call. A
+# second ignore list AND a second walk used to sit here, and the duplication
+# cost exactly what duplication costs: when the gatherer's copy was corrected
+# to stop hiding 60 git-tracked skill implementations, this copy kept hiding
+# them, and the two subsystems disagreed about `.claude` until someone diffed
+# them. `tests/test_eligibility_single_source.py` is the guard that fires if a
+# third copy appears.
 
 
 @dataclass
@@ -298,56 +303,6 @@ class ProjectIndex:
             os.unlink(tmp_name)
             raise
 
-    def _build_exclusion_filter(self):
-        """Return a predicate deciding whether a path is unfit to index.
-
-        ONE source of truth: `context_gatherer.load_gitignore_patterns`,
-        which carries both the repo's own `.gitignore` and the defaults that
-        apply when it says nothing. There used to be a second list here, and
-        the duplication cost exactly what duplication costs — when the
-        gatherer's copy was corrected to stop hiding 60 git-tracked skill
-        implementations, this copy kept hiding them, and the two subsystems
-        disagreed about `.claude` until someone diffed them. 27 of that
-        list's 31 names were already in the shared defaults; the other four
-        were the ones that had to go anyway.
-
-        `should_ignore` only ever tests the path it is handed, so a file
-        under an ignored directory does not match on its own — the walk in
-        `context_gatherer.iter_paths` prunes those directories separately.
-        This reproduces that by testing each ancestor directory, memoized so
-        a directory is judged once no matter how many files sit under it.
-
-        `should_ignore` honors negation for a path evaluated directly. This
-        caller still cannot re-include a file beneath an excluded ancestor,
-        because `dir_excluded` short-circuits first — which is also git's
-        rule, so the short-circuit is the correct behaviour rather than a
-        limitation.
-        """
-        from neo.context_gatherer import load_gitignore_patterns, should_ignore
-
-        patterns = load_gitignore_patterns(str(self.repo_root))
-        verdicts: Dict[tuple, bool] = {}
-
-        def dir_excluded(parts: tuple) -> bool:
-            if parts in verdicts:
-                return verdicts[parts]
-            verdicts[parts] = (
-                (len(parts) > 1 and dir_excluded(parts[:-1]))
-                or should_ignore("/".join(parts), patterns, is_dir=True)
-            )
-            return verdicts[parts]
-
-        def excluded(path: Path) -> bool:
-            try:
-                rel = path.relative_to(self.repo_root)
-            except ValueError:
-                return True
-            if rel.parts[:-1] and dir_excluded(rel.parts[:-1]):
-                return True
-            return should_ignore(rel.as_posix(), patterns)
-
-        return excluded
-
     @staticmethod
     def _allocate_slots(counts: Dict[str, int], budget: int) -> Dict[str, int]:
         """Divide `budget` index slots across languages by repo composition.
@@ -462,43 +417,26 @@ class ProjectIndex:
         printed "Built index" and exited 0 whether it had indexed the
         repository or 83 files of a stale worktree copy.
         """
+        from neo.eligibility import walk_paths
         from neo.languages import language_for_path
 
-        # Deduplicate at the path level first: overlapping patterns would
-        # otherwise present the same file twice — and would double-count it
-        # in the exclusion tally the operator reads.
-        is_excluded = self._build_exclusion_filter()
-        candidates: Dict[Path, None] = {}
-        excluded_paths: set = set()
-        for pattern in file_patterns:
-            for path in self.repo_root.glob(pattern):
-                if is_excluded(path):
-                    excluded_paths.add(path)
-                    continue
-                candidates.setdefault(path, None)
-        excluded = len(excluded_paths)
+        # One walk, shared with prompt assembly. It prunes ignored directories
+        # rather than globbing everything and filtering afterwards, honours the
+        # repo's own `.gitignore`, rejects symlinks without dereferencing them,
+        # and visits each file exactly once — so overlapping patterns cannot
+        # present the same file twice, nor double-count it in the exclusion
+        # tally the operator reads.
+        #
+        # Symlink rejection subsumes the outside-the-repo check this loop used
+        # to make separately: the walk starts at the repo root and never
+        # follows a link, so an admitted path is inside the repo by
+        # construction.
+        walked = walk_paths(str(self.repo_root), match_globs=file_patterns)
+        excluded = walked.excluded
 
-        # Security checks live here so a rejected file backfills from the
-        # same language's remaining candidates rather than costing a slot.
-        repo_root_resolved = self.repo_root.resolve()
         by_language: Dict[str, List[Path]] = {}
-        for path in candidates:
-            # Symlink check comes first and uses lstat: both is_file() and
-            # resolve() follow the link, and the point of rejecting symlinks
-            # is to not touch what they point at.
-            if path.is_symlink():
-                logger.warning(f"Skipping symlink: {path}")
-                continue
-            # Also covers the file-vanished-since-glob race; a missing path is
-            # not a file, and the slot it would have taken backfills below.
-            if not path.is_file():
-                logger.debug(f"Skipping non-file path: {path}")
-                continue
-            try:
-                path.resolve().relative_to(repo_root_resolved)
-            except ValueError:
-                logger.warning(f"Skipping file outside repo: {path}")
-                continue
+        for entry in walked.paths:
+            path = Path(entry.path)
             language = language_for_path(path) or path.suffix.lstrip('.')
             by_language.setdefault(language, []).append(path)
 
@@ -584,6 +522,13 @@ class ProjectIndex:
             'eligible': eligible,
             'selected': len(selected),
             'excluded': excluded,
+            # Split out because they are not the same claim. A pruned
+            # directory is one path the walk SAW and refused to descend into;
+            # it deliberately does not know how many files are inside, and
+            # inventing that number would cost the very walk the exclusion
+            # exists to avoid. See `eligibility.WalkResult`.
+            'excluded_dirs': walked.excluded_dirs,
+            'excluded_files': walked.excluded_files,
             'duplicates': duplicates,
             'max_files': max_files,
             # Truncated means THE CAP BOUND US, and the test that cannot be
@@ -1066,13 +1011,17 @@ class ProjectIndex:
         logger.info(f"Built FAISS index with {self.faiss_index.ntotal} vectors (dim={dim})")
 
     def _compute_file_hash(self, file_path: Path) -> str:
-        """Compute SHA-256 hash of file contents."""
-        try:
-            content = file_path.read_bytes()
-            return hashlib.sha256(content).hexdigest()
-        except Exception as e:
-            logger.error(f"Failed to hash {file_path}: {e}")
-            return ""
+        """SHA-256 of file contents, via the shared dedup primitive.
+
+        Kept as a method because it is the seam `_select_files` hashes
+        through and the staleness check compares against; the implementation
+        lives in `neo.eligibility` so there is one definition of "these two
+        paths hold the same bytes".
+        """
+        digest = file_content_hash(file_path)
+        if not digest:
+            logger.error(f"Failed to hash {file_path}")
+        return digest
 
     def _patterns_from_languages(self, languages: List[str]) -> List[str]:
         """Convert language names to file patterns."""
