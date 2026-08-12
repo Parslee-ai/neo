@@ -62,6 +62,16 @@ purpose:
 | `cautions` | **Never drop these.** Low confidence, failed checks, open questions. |
 | `recommended_narration` | Advisory progress lines. Reword freely. |
 
+`confidence` may be `null`, which is an answer rather than a gap: the run
+produced nothing a confidence number could describe. Read `confidence_basis`
+and report which case it is — `analysis_only` (Neo answered and proposed no
+change) or `no_verifiable_change` (Neo named files but shipped no diff, so
+those suggestions were excluded from the score). Do not substitute a number,
+do not call a `null` run low-confidence, and do not rank it beneath a scored
+run: an empty patch self-reporting `0.96` outranking a correct analysis is the
+inversion this contract exists to stop. Neo's result is an input to your work,
+not the deliverable — so state which case it is rather than papering over it.
+
 Useful event types on stderr: `memory_found` (prior facts recalled),
 `hypothesis_formed`, `hypothesis_rejected` (an approach was discarded — usually
 worth surfacing), `risk_found`, and exactly one of `completed` or `failed`
@@ -114,4 +124,5 @@ is no fallback line.
 
 - This skill uses explicit `advise` mode: it may retrieve established memory but does not create candidates or update durable memory. Use `neo --mode learn` only when the user intends to contribute outcome evidence.
 - For code review, optimization, architectural decisions, debugging, or pattern extraction, prefer the more specific Neo skills (`$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`).
-- Always verify low-confidence suggestions (< 0.7) before applying them.
+- Always verify low-confidence suggestions (< 0.7) before applying them. A
+  `null` confidence is not a low one — read `confidence_basis` first.

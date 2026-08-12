@@ -181,6 +181,30 @@ def test_both_entry_points_document_the_error_shape():
         assert '"error"' in body
 
 
+def test_both_entry_points_teach_the_null_confidence_contract():
+    """`confidence` became `Optional[float]` with a `confidence_basis` (#199).
+
+    An LLM host handed `null` under a standing instruction to "report Neo's
+    confidence as the number it is" has no guidance, and the failure mode is
+    the exact one #199 fixed: treating a run with no number as less trustworthy
+    than an empty patch that self-reported 0.96. Both surfaces must name the
+    null case and both basis values, or one host relays a contract the other
+    does not.
+    """
+    from neo.models import (
+        CONFIDENCE_BASIS_ANALYSIS_ONLY,
+        CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE,
+    )
+
+    agent = (CLAUDE_PLUGIN / "agents" / "neo.md").read_text()
+    skill = _codex_skill("neo")
+    for body in (agent, skill):
+        assert "confidence_basis" in body
+        assert "null" in body
+        assert CONFIDENCE_BASIS_ANALYSIS_ONLY in body
+        assert CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE in body
+
+
 def test_both_entry_points_require_attribution():
     """Neo's conclusions and the host's own analysis must stay separable."""
     agent = (CLAUDE_PLUGIN / "agents" / "neo.md").read_text()

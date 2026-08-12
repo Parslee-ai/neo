@@ -1239,6 +1239,7 @@ class NeoEngine:
                     tool=check.tool_name,
                 )
                 self._note_finding(f"{check.tool_name} reported errors")
+            evaluated = self._checks_that_evaluated(static_checks)
             if not static_checks:
                 summary = self._voice("phase_checks_none")
             elif failed:
@@ -1246,8 +1247,10 @@ class NeoEngine:
                     "phase_checks_failed",
                     failed=len(failed), count=len(static_checks),
                 )
+            elif not evaluated:
+                summary = self._voice("phase_checks_inconclusive")
             else:
-                summary = self._voice("phase_checks_clean", count=len(static_checks))
+                summary = self._voice("phase_checks_clean", count=len(evaluated))
             self._end_phase(
                 PHASE_STATIC_CHECKS,
                 summary,
@@ -1705,12 +1708,13 @@ class NeoEngine:
 
         if static_checks:
             for check in static_checks:
-                severities = {str(d.get("severity", "")).lower() for d in check.diagnostics}
-                status = check.status or (
-                    "failed" if "error" in severities
-                    else "warning" if check.diagnostics
-                    else "passed"
-                )
+                # Must go through _static_check_status, not a second copy of
+                # its logic: `aggregate_verification_status` ranks `warning`
+                # above `skipped`, so an inline `warning if check.diagnostics`
+                # promoted an info-only "not checked for <language>" note into
+                # the run's whole `verification_verdict` — #196's false alarm
+                # arriving through the episode ledger instead of the console.
+                status = self._static_check_status(check)
                 episode.verification.append(VerificationEvidence(
                     verification_id=uuid.uuid4().hex,
                     kind=check.kind or "neo_static",
@@ -2601,6 +2605,25 @@ RULES:
         return results
 
     @staticmethod
+    def _checks_that_evaluated(
+        checks: list[StaticCheckResult],
+    ) -> list[StaticCheckResult]:
+        """The checks that actually examined the code, `skipped` ones removed.
+
+        Every consumer that says a checker vouched for the answer — "all N
+        checker(s) clean", VERIFY's "nothing pushed back", and the caution that
+        fires when nothing checked the code at all — has to read this rather
+        than `static_checks`. A constraint check that found no marker set for
+        the target language still occupies a slot in that list, so counting
+        slots reports a run as verified by a checker that evaluated nothing,
+        and suppresses the "this code is unverified" caution that is true.
+        """
+        return [
+            check for check in checks
+            if NeoEngine._static_check_status(check) != "skipped"
+        ]
+
+    @staticmethod
     def _static_check_status(check: StaticCheckResult) -> str:
         """Normalize legacy check results without treating absence as success.
 
@@ -2628,7 +2651,12 @@ RULES:
     # it. Anything else — including a diagnostic with no severity at all —
     # counts as actionable, so an unrecognized severity fails toward being
     # surfaced rather than toward silence.
-    _INFORMATIONAL_SEVERITIES = frozenset({"info", "note", "skipped"})
+    # `information` is pyright's own spelling, passed through raw by
+    # static_analysis.py — omitting it made the one real tool that emits
+    # informational diagnostics the one tool this rule missed.
+    _INFORMATIONAL_SEVERITIES = frozenset(
+        {"info", "information", "note", "skipped"}
+    )
 
     @staticmethod
     def _is_actionable_diagnostic(diagnostic: dict[str, Any]) -> bool:
@@ -2732,15 +2760,49 @@ RULES:
             )
         return self._extract_prompt_constraints(text)
 
-    @staticmethod
-    def _strip_comments_and_strings(code: str) -> str:
-        """Best-effort strip of Python comments and string/bytes literals.
+    # Languages whose comments and literals are stripped by the C-family
+    # scanner below rather than by Python's tokenizer.
+    _C_FAMILY_LANGUAGES = frozenset({"csharp", "typescript", "javascript"})
 
-        Used before substring-matching constraint markers so the word
-        "sorted" inside a docstring or comment doesn't suppress a real
-        warning. Falls back to the original code if tokenization fails
-        (e.g. non-Python or syntactically broken input).
+    # One alternation, scanned left to right, so a construct that opens first
+    # wins: `"http://x"` is consumed as a string before `//` can be read as a
+    # comment. Best-effort by design — a C# verbatim string with a doubled
+    # quote (`@"a""b"`) ends early and leaves a fragment behind, which can only
+    # add non-marker noise to the matched text.
+    _C_FAMILY_TOKEN_RE = re.compile(
+        r"""
+          (?P<block>/\*.*?\*/)
+        | (?P<line>//[^\n]*)
+        | (?P<dquote>"(?:\\.|[^"\\\n])*")
+        | (?P<squote>'(?:\\.|[^'\\\n])*')
+        | (?P<template>`(?:\\.|[^`\\])*`)
+        """,
+        re.DOTALL | re.VERBOSE,
+    )
+
+    @staticmethod
+    def _strip_comments_and_strings(code: str, language: str = "python") -> str:
+        """Best-effort strip of comments and string literals, per language.
+
+        Used before substring-matching constraint markers so the word "sorted"
+        inside a docstring or comment doesn't suppress a real warning.
+
+        The stripper must follow the marker table's language or it defeats the
+        check it feeds. Python's `tokenize` does not fail on C#: `//` lexes as
+        floor-division, so line comments survived as code and a C# file
+        carrying `// TODO: use HashSet<int> here` matched the uniqueness marker
+        and reported a genuine miss as satisfied — the #196 fix silencing the
+        very warning it exists to make reachable, on the languages it added.
+
+        A language with no marker table never reaches the matcher, so its code
+        is returned untouched rather than run through a stripper written for
+        some other grammar.
         """
+        if language in NeoEngine._C_FAMILY_LANGUAGES:
+            return NeoEngine._C_FAMILY_TOKEN_RE.sub(" ", code)
+        if language != "python":
+            return code
+
         import io
         import tokenize
 
@@ -2755,9 +2817,15 @@ RULES:
         except Exception:
             return code
 
+    # Whitespace that touches a non-identifier character on either side; the
+    # two passes together delete exactly the spacing that is punctuation
+    # formatting and keep exactly the spacing that separates two identifiers.
+    _SPACE_BEFORE_SYMBOL_RE = re.compile(r"\s+(?![0-9A-Za-z_])")
+    _SPACE_AFTER_SYMBOL_RE = re.compile(r"(?<![0-9A-Za-z_])\s+")
+
     @staticmethod
     def _normalize_for_marker_match(text: str) -> str:
-        """Lowercase and drop all whitespace, for substring marker matching.
+        """Lowercase and normalize punctuation spacing, for marker matching.
 
         Not cosmetic. `_strip_comments_and_strings` rebuilds the source by
         joining tokens with a space, so `sorted(x)` comes back as `sorted ( x )`
@@ -2767,13 +2835,58 @@ RULES:
         sides also makes the table indifferent to the target's formatting
         (`max( 0`, `reverse = True`, `Math.Abs (`).
 
-        Whitespace removal can join two tokens into a marker that was not
-        written (`offset (` normalizes to text containing `set(`). That
-        direction is the safe one: a false match only *suppresses* a warning,
-        and absence of a marker was always a hint rather than a verdict —
-        whereas a false warning is the alarm-fatigue defect being fixed.
+        Only the spacing that is punctuation formatting is removed. Dropping
+        *all* whitespace instead looks simpler and destroys the boundaries the
+        matcher needs in both directions at once: it fuses `new HashSet<` into
+        `newhashset<`, so an identifier-boundary test rejects C#'s primary
+        uniqueness idiom, while simultaneously fusing `offset (` into text
+        containing `set(` so a plain substring test accepts a word nobody
+        wrote. Keeping the single space between two identifiers is what lets
+        `_marker_present` be strict without being wrong.
         """
-        return "".join(text.split()).lower()
+        collapsed = re.sub(r"\s+", " ", text.lower())
+        collapsed = NeoEngine._SPACE_BEFORE_SYMBOL_RE.sub("", collapsed)
+        return NeoEngine._SPACE_AFTER_SYMBOL_RE.sub("", collapsed)
+
+    @staticmethod
+    def _marker_present(marker: str, normalized_code: str) -> bool:
+        """True when `marker` occurs in normalized code, anchored on the left.
+
+        A plain substring test is too weak to be useful: `set(` matches
+        `offset(`, `reset(` and `dataset(`, and `Set<` matches `Subset<`, so
+        UNIQUE_ELEMENTS was close to inert on real Python and TypeScript —
+        every one of those suppressions silently dropping the warning the check
+        exists to raise. A marker that starts with an identifier character may
+        therefore not begin in the middle of a longer identifier.
+
+        The right edge is deliberately NOT anchored, and the asymmetry is the
+        whole design. Markers are written as prefixes of a family on purpose:
+        `OrderBy` is meant to cover `OrderByDescending`, `bisect` to cover
+        `bisect_left`, `heappush` to cover a call. Anchoring the right edge
+        rejects all three, and a rejected marker means a warning fired at code
+        that satisfies the constraint — the #196 false alarm, re-entering
+        through the matcher. Left-anchoring alone is what the observed
+        collisions actually needed; the one right-side case (`new Set` inside
+        `new Settings()`) is fixed where it belongs, by writing the marker as
+        `new Set(` in the table.
+
+        `frozenset(` is listed explicitly for the same reason: it satisfies
+        uniqueness and no longer matches `set(` now that the left edge is
+        anchored.
+        """
+        needle = NeoEngine._normalize_for_marker_match(marker)
+        if not needle:
+            return False
+        if not (needle[0].isalnum() or needle[0] == "_"):
+            return needle in normalized_code
+
+        start = normalized_code.find(needle)
+        while start != -1:
+            previous = normalized_code[start - 1] if start > 0 else ""
+            if not (previous.isalnum() or previous == "_"):
+                return True
+            start = normalized_code.find(needle, start + 1)
+        return False
 
     def _check_constraints_static(
         self,
@@ -2806,10 +2919,10 @@ RULES:
         diagnostics: list[dict[str, Any]] = []
         for sug in suggestions:
             raw = sug.code_block or sug.unified_diff or ""
-            code = self._normalize_for_marker_match(
-                self._strip_comments_and_strings(raw)
-            )
             language = language_for_path(sug.file_path)
+            code = self._normalize_for_marker_match(
+                self._strip_comments_and_strings(raw, language)
+            )
             markers = markers_for_language(language)
             for c in constraints:
                 hints = markers.get(c.type)
@@ -2826,9 +2939,7 @@ RULES:
                         "language": language,
                     })
                     continue
-                if not any(
-                    self._normalize_for_marker_match(h) in code for h in hints
-                ):
+                if not any(self._marker_present(h, code) for h in hints):
                     diagnostics.append({
                         "severity": "warning",
                         "message": (
@@ -3170,7 +3281,8 @@ RULES:
         if verification_only:
             verdict = (
                 self._voice("verify_failed", count=len(failed_checks)) if failed_checks
-                else self._voice("verify_clean") if static_checks
+                else self._voice("verify_clean")
+                if self._checks_that_evaluated(static_checks)
                 else self._voice("verify_none")
             )
             summary = self._voice(
@@ -3259,10 +3371,14 @@ RULES:
         issue_count = sum(len(t.issues_found) for t in simulation_traces or [])
         if issue_count:
             cautions.append(self._voice("caution_sim_issues", count=issue_count))
-        if code_suggestions and not static_checks:
+        if code_suggestions and not self._checks_that_evaluated(static_checks):
             # Two different facts with two different remedies: install a linter
             # versus give the run more time. The phase record already knows
             # which one happened — don't collapse them here.
+            # Reads evaluated checks, not the raw list: a constraint result
+            # that could only report "not checked for <language>" left the list
+            # non-empty and swallowed this caution, which is the one line
+            # telling the operator the code is unverified.
             skipped = any(
                 record["name"] == PHASE_STATIC_CHECKS and record["status"] == "skipped"
                 for record in self._phase_records

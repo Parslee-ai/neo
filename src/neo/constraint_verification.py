@@ -100,7 +100,10 @@ _PYTHON_MARKERS: Dict[ConstraintType, tuple] = {
     ConstraintType.SORTED: ("sorted(", ".sort(", "heappush", "heappop", "bisect"),
     ConstraintType.INCREASING: ("sorted(", ".sort(", "bisect"),
     ConstraintType.DECREASING: ("sorted(", ".sort(", "reverse=True"),
-    ConstraintType.UNIQUE_ELEMENTS: ("set(", "dict.fromkeys"),
+    # `frozenset(` is listed in its own right: markers are matched on left
+    # identifier boundaries, so it is no longer reached as a substring of
+    # `set(` — which is the same rule that stops `offset(` reaching it.
+    ConstraintType.UNIQUE_ELEMENTS: ("set(", "frozenset(", "dict.fromkeys"),
     ConstraintType.NON_NEGATIVE: ("abs(", "max(0"),
     ConstraintType.DIVISIBILITY: ("%",),
 }
@@ -126,7 +129,9 @@ _TYPESCRIPT_MARKERS: Dict[ConstraintType, tuple] = {
     ConstraintType.SORTED: (".sort(", "sortBy(", "orderBy(", "toSorted("),
     ConstraintType.INCREASING: (".sort(", "sortBy(", "toSorted("),
     ConstraintType.DECREASING: (".sort(", ".reverse(", "toReversed(", "orderBy("),
-    ConstraintType.UNIQUE_ELEMENTS: ("new Set", "uniq(", "uniqBy(", "Set<"),
+    # `new Set(` carries its trailing paren so it cannot be found inside
+    # `new Settings()`; `Set<` covers the annotated form.
+    ConstraintType.UNIQUE_ELEMENTS: ("new Set(", "uniq(", "uniqBy(", "Set<"),
     ConstraintType.NON_NEGATIVE: ("Math.abs(", "Math.max(0"),
     ConstraintType.DIVISIBILITY: ("%",),
 }

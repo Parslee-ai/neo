@@ -111,6 +111,7 @@ orchestrator_voice:
     phase_checks_clean: "All {count} checker(s) clean."
     phase_checks_failed: "{failed} of {count} checker(s) pushed back."
     phase_checks_none: "No checkers here. Nothing verified this."
+    phase_checks_inconclusive: "The checkers ran and could evaluate none of it. Treat this as unverified."
     phase_checks_considering: "Considering the checkers."
     phase_checks_skipped: "Out of time before I could run them. This is unchecked."
 
