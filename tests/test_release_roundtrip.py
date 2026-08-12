@@ -94,7 +94,9 @@ def _run_neo(fx: FixtureRepo) -> dict:
         f"\n--- stdout ---\n{proc.stdout[-4000:]}"
         f"\n--- stderr ---\n{proc.stderr[-4000:]}"
     )
-    assert proc.returncode == 0, f"neo failed for {fx.language}{detail}"
+    assert proc.returncode == 0, (
+        f"neo failed for {fx.language}: {_classify_failure(proc.stdout)}{detail}"
+    )
 
     try:
         payload = json.loads(proc.stdout)
@@ -108,6 +110,49 @@ def _run_neo(fx: FixtureRepo) -> dict:
     # zero exit carrying `error` would mean the contract itself broke.
     assert "error" not in payload, f"{fx.language}: {payload.get('error')}{detail}"
     return payload
+
+
+# Error envelopes the CLI emits that say nothing about file selection, mapped
+# to where to look instead. Naming the layer is the whole value: measured
+# live, a run failed on `ValidationError` (the model's reply missed neo's own
+# v3 start sentinel) and the default reading of a red LANGUAGE round trip
+# would have sent someone to the gatherer, which was working perfectly.
+_UNRELATED_TO_SELECTION = {
+    "ValidationError": (
+        "neo's structured parser rejected the model's reply. This is a real "
+        "release blocker — a user would get the same error — but it is NOT a "
+        "file-selection failure. Look at structured_parser.py, not the "
+        "gatherer. `pytest -m invariants` covers selection for free and will "
+        "be GREEN when this is the cause"
+    ),
+    "RequestTimeout": "the provider did not answer in time; not a selection failure",
+    "NetworkTimeout": "the network did not reach the provider; not a selection failure",
+    "ProcessingError": "an unexpected engine error; read the stderr events below",
+}
+
+
+def _classify_failure(stdout: str) -> str:
+    """Name the layer that broke, so a red gate points somewhere real.
+
+    A red per-language round trip reads as "the language broke", and for the
+    failure this gate exists to catch that is right. For the several ways an
+    invocation can fail that have nothing to do with which files were
+    selected, it is an expensive wrong turn.
+    """
+    try:
+        envelope = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return "no JSON envelope on stdout"
+
+    kind = envelope.get("error")
+    if not kind:
+        return "non-zero exit with no error envelope"
+    if kind.startswith("Failed to initialize LM adapter"):
+        return (
+            "no usable provider credential. The release job requires "
+            "ANTHROPIC_API_KEY and fails rather than skips without it"
+        )
+    return f"{kind} — {_UNRELATED_TO_SELECTION.get(kind, 'see the envelope below')}"
 
 
 @pytest.fixture(scope="module")

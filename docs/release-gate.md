@@ -102,6 +102,32 @@ Low confidence is **not** gated. A correct refusal is a legitimate answer and
 must not block a release. Absent confidence is a different matter and does
 fail — that is the serialization contract breaking.
 
+### Reading a red round trip
+
+A red per-language round trip reads as "that language broke", and for the
+failure this gate exists to catch, that is right. Several other things can
+turn it red, and the failure message names which, because sending someone to
+the gatherer for a parser problem is an expensive wrong turn.
+
+Measured during this gate's own bring-up: two consecutive local runs of the
+same commit, one 21/21 green, the next red on Python with
+`ValidationError: Failed to parse simulation traces: missing_start_sentinel`.
+The gatherer had selected the right four files both times. The model's reply
+simply did not carry neo's `<<<NEO:SCHEMA=v3:KIND=simulation>>>` sentinel.
+
+**That is not swallowed and is not retried.** A user issuing the same command
+gets the same error, so it is a genuine release blocker — and a gate that
+retries until green is the same defect as a failure that exits 0. But it is
+not a selection failure, so:
+
+- `pytest -m invariants` will be **green** when the parser is the cause. That
+  contrast is the fastest available diagnosis, and it costs nothing.
+- The assertion message names the layer (`structured_parser.py`, the
+  provider, the network, the credential) rather than leaving "neo failed".
+
+Expect this to bite occasionally. The right response is to fix the brittleness
+it exposes, not to loosen the gate.
+
 ## Running it
 
 ```bash
