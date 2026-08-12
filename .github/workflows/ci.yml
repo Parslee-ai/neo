@@ -66,7 +66,13 @@ jobs:
     # release-only would otherwise first show up on the bill.
     - name: Confirm the LLM round trip stayed opted out
       run: |
-        pytest -m roundtrip -v --no-header -rs > roundtrip-run.txt 2>&1
+        # `|| true` because GitHub runs this with `bash -e`: any non-zero
+        # pytest exit would abort the step BEFORE the cat, losing the output
+        # in exactly the case the step exists to explain. Nothing is masked —
+        # the two greps below classify every outcome. A test that ran prints
+        # `passed`/`failed` and trips the first guard; a collection error
+        # prints neither `passed` nor `skipped` and trips the second.
+        pytest -m roundtrip -v --no-header -rs > roundtrip-run.txt 2>&1 || true
         cat roundtrip-run.txt
         if grep -qE '[0-9]+ (passed|failed)' roundtrip-run.txt; then
           echo "::error::round-trip tests executed on a PR; they are release-only"
