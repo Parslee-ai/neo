@@ -251,10 +251,15 @@ that actually differ: two name a specific file (the pinning path,
 `EXPLICIT_PATH_BOOST`), two are concept-only (pure ranking, no path to pin), one is
 mixed, and one is a symptom/debug phrasing.
 
-| id | shape | prompt |
+The prompt column below is the **verbatim** string the script sends — no backticks, no
+markdown. That is not pedantry: `EXPLICIT_PATH_BOOST` matches on the path token, and a
+stray backtick is part of the prompt text a caller would actually be sending. Copy from
+`tools/m2_battery.sh`, which is the artifact of record; this table is a rendering of it.
+
+| id | shape | prompt (verbatim) |
 |---|---|---|
-| P1 | file-named | Explain what `src/Parslee.M365.Api/Program.cs` does during startup. |
-| P2 | file-named | Add a null check to the entitlements lookup in `src/Parslee.M365.Api/Controllers/EntitlementsController.cs` |
+| P1 | file-named | Explain what src/Parslee.M365.Api/Program.cs does during startup. |
+| P2 | file-named | Add a null check to the entitlements lookup in src/Parslee.M365.Api/Controllers/EntitlementsController.cs |
 | P3 | concept-only | How does the backend authenticate requests from the web app? |
 | P4 | concept-only | Where is chat history persisted and how is it retrieved? |
 | P5 | mixed | Fix the retry logic for Cosmos DB throttling in the repository layer. |
