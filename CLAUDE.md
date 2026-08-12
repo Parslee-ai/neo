@@ -633,17 +633,46 @@
      the slice kept 1000 C# chunks and dropped every other language, with 37 of
      the 100 selected files contributing nothing.
   2. **Exclusion is two layers and `bin`/`build`/`out`/`target`/`dist`/`vendor`
-     belong to neither by name.** The shared default list covers what repos forget to
-     ignore (`.worktrees`, `.claude`, `node_modules`, `obj`, virtualenvs);
-     `_build_exclusion_filter` layers the repo's own `.gitignore` on top via
-     `context_gatherer.load_gitignore_patterns`. **Footgun**: `should_ignore` only
-     tests the path handed to it, so ancestor directories must be walked
-     separately — `iter_paths` gets this via `os.walk` pruning, which the index
-     has no equivalent of. Matching is exact and case-sensitive, against
-     directory components only. The ambiguous names stay out because each is real
-     source somewhere (`src/bin/main.rs`, vendored trees; 254 tracked files under
-     `bin/`+`vendor/` across three local repos) and the asymmetry is one-sided:
-     over-excluding hides code permanently, over-including only spends slots.
+     belong to neither by name.** Both layers, and the walk that applies them,
+     live in `neo/eligibility.py` — the ONE eligibility module, consumed by
+     `context_gatherer`, `ProjectIndex` and `architecture_metrics` alike.
+     `DEFAULT_IGNORE_PATTERNS` covers what repos forget to ignore (`.worktrees`,
+     `.claude/worktrees`, `node_modules`, `obj`, virtualenvs);
+     `load_ignore_patterns` layers the repo's own root `.gitignore`/`.ignore` on
+     top, so a repo's `!negation` can re-include what a default excluded.
+     `should_ignore` only tests the path handed to it, so ancestor directories
+     must be handled separately — `walk` does that by PRUNING an ignored
+     directory instead of descending, which is git's own rule and the reason a
+     `!` beneath an excluded directory does not fire. Matching is exact and
+     case-sensitive, against directory components only. The ambiguous names stay
+     out because each is real source somewhere (`src/bin/main.rs`, vendored
+     trees; 254 tracked files under `bin/`+`vendor/` across three local repos)
+     and the asymmetry is one-sided: over-excluding hides code permanently,
+     over-including only spends slots.
+     **Three more exclusion classes are NOT gitignore, and conflating them
+     sends an operator to the wrong file**: `WalkPolicy` knobs (symlink
+     rejection, the gatherer's 512 KB `MAX_FILE_BYTES` ceiling, extension and
+     per-language glob filters) are per-consumer policy; nested `.gitignore`
+     files are not read, which under-excludes and is the accepted limit; and git
+     applies ignore rules only to files it does not already TRACK, so a file
+     added before a rule was written stays tracked while the walk still skips it
+     (four `specs/*.md` on this checkout — recorded, deliberately not fixed in a
+     pure refactor, since closing it means a `git ls-files` fork on the warm
+     path). Two tests hold the line: `test_eligibility_single_source.py`
+     AST-scans `src/` and fails on a second definition, a second `os.walk` or a
+     second exclusion list (detected by CONTENT — three sentinel directory names
+     in one literal — because a copy always renames the variable);
+     `test_eligibility_differential.py` diffs the walk against `git check-ignore`
+     over a fixture corpus AND this checkout, and fails on any tracked file
+     skipped without an ignore rule accounting for it. Both are marked
+     `invariants`, so they run in the Guard-invariant battery on every PR.
+     **Footgun**: the index's `excluded` count is now excluded PATHS SEEN
+     (`excluded_dirs` + `excluded_files`), not files under an excluded
+     directory. A pruned subtree is one path; the walk does not descend and
+     therefore does not know how many files are inside. The old "200 paths"
+     number was only available because the old code globbed the whole repo and
+     filtered afterwards — i.e. it walked every worktree copy in order to count
+     what it was about to discard.
   3. **A cap that fired must be reported.** `selection_report` carries eligible /
      selected / excluded / duplicates / chunk counts and the CLI prints them.
      `truncated` means THE CAP BOUND US and is `examined < eligible` — whether
