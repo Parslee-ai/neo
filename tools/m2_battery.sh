@@ -31,6 +31,15 @@ RUNS="${RUNS:-3}"
 
 mkdir -p "$OUT"
 
+# Clear THIS script's own artifacts from a reused output directory. The aggregation
+# below globs "$OUT"/P*_run1.files to build the battery union, so a re-run with a
+# changed prompt set would silently fold a previous run's leftovers into the union
+# and report a distinct count that no single battery produced. The pattern is pinned
+# to the exact names written below -- P<digit>_run<digit>.{files,txt} -- so pointing
+# OUT at a populated directory cannot delete anything this script did not write.
+rm -f "$OUT"/P[0-9]_run[0-9].files "$OUT"/P[0-9]_run[0-9].txt \
+      "$OUT/union.files" "$OUT/results.csv"
+
 # id|shape|prompt
 PROMPTS=(
   "P1|file-named|Explain what src/Parslee.M365.Api/Program.cs does during startup."
@@ -75,7 +84,10 @@ for entry in "${PROMPTS[@]}"; do
     # No `set -e` here on purpose: `grep -c` returns 1 on zero matches and would abort
     # mid-battery. Guard explicitly instead, so a run that measured nothing says so
     # rather than writing an empty CSV cell that the aggregation reads as a number.
-    if [ -z "$wall" ] || [ -z "$rss" ] || [ "$nentries" -eq 0 ]; then
+    # "${nentries:-0}", not "$nentries": `[ "" -eq 0 ]` does not fire under bash, it
+    # errors and falls through, which would let the very row this guard exists to
+    # catch reach the CSV.
+    if [ -z "$wall" ] || [ -z "$rss" ] || [ "${nentries:-0}" -eq 0 ]; then
       echo "FATAL: $id run $run produced no measurement (wall='$wall' rss='$rss'" \
            "entries=$nentries); see $raw" >&2
       exit 1
