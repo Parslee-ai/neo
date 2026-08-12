@@ -2343,7 +2343,22 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         """
         from dataclasses import replace
 
-        shown = files[:_MAX_CONTEXT_FILES]
+        # `--include` pins are never dropped by the file cap. Dropping one is
+        # the same silent absence as truncating one, and the flag exists to
+        # assert presence. The scan's files fill whatever slots are left, in
+        # rank order; the loop preserves the incoming order rather than
+        # hoisting pins, because that order is the bundle's own.
+        remaining_slots = _MAX_CONTEXT_FILES - sum(
+            1 for f in files if getattr(f, 'pinned', False)
+        )
+        shown: list = []
+        for f in files:
+            if getattr(f, 'pinned', False):
+                shown.append(f)
+            elif remaining_slots > 0:
+                shown.append(f)
+                remaining_slots -= 1
+
         sections: list[str] = []
         visible: list = []
         sent_chars = 0
@@ -2352,11 +2367,16 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         for f in shown:
             original = f.content or ''
             lowered = f.path.lower()
-            limit = (
-                _IMPORTANT_FILE_CHARS
-                if any(pat in lowered for pat in _IMPORTANT_FILE_PATTERNS)
-                else _CONTEXT_FILE_CHARS
-            )
+            if getattr(f, 'pinned', False):
+                # No cap. The gatherer already bounded this file by
+                # `--max-bytes` and marked the cut if it made one; a second cut
+                # here would drop that marker and report its own smaller loss
+                # as the whole of it.
+                limit = len(original)
+            elif any(pat in lowered for pat in _IMPORTANT_FILE_PATTERNS):
+                limit = _IMPORTANT_FILE_CHARS
+            else:
+                limit = _CONTEXT_FILE_CHARS
             # `visible` carries the cut content WITHOUT the marker: it feeds
             # code_smells, which reports line numbers, and the marker is our
             # prose rather than the file's.
