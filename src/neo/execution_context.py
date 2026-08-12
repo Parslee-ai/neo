@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
+from neo.text_budget import shown_of
+
 
 class CallerRole(str, Enum):
     PLANNER = "planner"
@@ -35,6 +37,26 @@ class GoalStatus(str, Enum):
     SATISFIED = "satisfied"
     BLOCKED = "blocked"
     UNVERIFIABLE = "unverifiable"
+
+
+# Caps on what `prompt_section` shows. Every one is paired with a `shown_of`
+# annotation at its use site -- an unmarked cut in prompt-bound text is the
+# defect #178 existed to remove, and this module was missed by that sweep.
+#
+# The numbers are unchanged from the bare slices they replaced: this change is
+# about making the loss VISIBLE, not about tuning how much survives. Retuning
+# them is a separate decision that wants evidence about real list lengths.
+_MAX_CONSTRAINTS = 12
+_MAX_SUCCESS_CRITERIA = 8
+_MAX_RECENT_ATTEMPTS = 3
+# The proof-aware execution sections (#200) landed while this branch was open
+# and arrived as bare `[:12]`/`[:12]`/`[:5]` slices — the same defect, three
+# more times, in the one function whose docstring promises every cut is
+# marked. Named and marked here rather than left for a later sweep, because
+# an unmarked cut beneath that docstring makes the docstring the lie.
+_MAX_VALIDATION_GATES = 12
+_MAX_VALIDATION_OBSERVATIONS = 12
+_MAX_HYPOTHESES = 5
 
 
 @dataclass
@@ -216,7 +238,16 @@ class ResolvedExecutionContext:
         return asdict(self)
 
     def retrieval_query(self) -> str:
-        """Stable goal-conditioned semantic query without raw trajectory dumps."""
+        """Stable goal-conditioned semantic query without raw trajectory dumps.
+
+        The slices below are deliberately NOT marked, unlike the visually
+        identical ones in `prompt_section`. This string is embedded and
+        compared by cosine similarity; it is never read as instructions. A
+        `[showing 8 of 13]` annotation here would be tokens in the query
+        vector, moving every retrieval slightly toward facts about
+        truncation. Marking is for text a reader could be misled by, and
+        nothing reads this.
+        """
         parts = [
             f"task: {self.task}",
             f"goal: {self.goal.value}",
@@ -268,7 +299,24 @@ class ResolvedExecutionContext:
         return "\n".join(parts)
 
     def prompt_section(self) -> str:
-        """Bounded role contract and execution frame for provider prompts."""
+        """Bounded role contract and execution frame for provider prompts.
+
+        Every cut here is MARKED. This text reaches the model through seven
+        prompt builders in `engine.py`, and the list cuts below used to be
+        bare slices: `constraints[:12]` and `success_criteria[:8]` dropped
+        their tail silently. Under a prompt that says "satisfy these
+        constraints", twelve of thirteen constraints read as thirteen — the
+        model cannot ask what it was not told exists, and neither can the
+        operator reading `--dry-run`.
+
+        This module was missed by the sweep that introduced `text_budget`
+        (#178), which found nineteen such cuts across nine prompt builders in
+        six modules. It was missed for the reason that sweep itself wrote
+        down: it looked for slices in the known prompt builders, and this one
+        is a `prompt_section()` on a dataclass, reached only indirectly
+        through `_retrieve_context`. A sweep that looks where the last bug was
+        finds the last bug.
+        """
         lines = [
             "## Execution Envelope",
             f"Goal ({self.goal.origin}, confidence={self.goal.confidence:.2f}): "
@@ -279,33 +327,45 @@ class ResolvedExecutionContext:
             f"Requested output: {self.requested_output}",
         ]
         if self.constraints:
-            lines.append("Constraints: " + "; ".join(self.constraints[:12]))
+            lines.append(
+                f"Constraints{shown_of(self.constraints, _MAX_CONSTRAINTS)}: "
+                + "; ".join(self.constraints[:_MAX_CONSTRAINTS])
+            )
         if self.success_criteria:
             criteria = [
                 item.description or item.command or item.type
-                for item in self.success_criteria[:8]
+                for item in self.success_criteria[:_MAX_SUCCESS_CRITERIA]
             ]
-            lines.append("Success criteria: " + "; ".join(criteria))
+            lines.append(
+                f"Success criteria"
+                f"{shown_of(self.success_criteria, _MAX_SUCCESS_CRITERIA)}: "
+                + "; ".join(criteria)
+            )
         if self.validation_gates:
             lines.append(
-                "Validation gates: " + "; ".join(
+                f"Validation gates"
+                f"{shown_of(self.validation_gates, _MAX_VALIDATION_GATES)}: "
+                + "; ".join(
                     f"{item.gate_id} ({'required' if item.required else 'optional'}): "
                     f"{item.description}"
-                    for item in self.validation_gates[:12]
+                    for item in self.validation_gates[:_MAX_VALIDATION_GATES]
                 )
             )
         if self.validation_observations:
             lines.append(
-                "Validation evidence: " + "; ".join(
+                f"Validation evidence"
+                f"{shown_of(self.validation_observations, _MAX_VALIDATION_OBSERVATIONS)}: "
+                + "; ".join(
                     f"{item.gate_id}={item.status}"
-                    for item in self.validation_observations[:12]
+                    for item in self.validation_observations[:_MAX_VALIDATION_OBSERVATIONS]
                 )
             )
         if self.hypotheses:
             lines.append(
-                "Hypotheses: " + "; ".join(
+                f"Hypotheses{shown_of(self.hypotheses, _MAX_HYPOTHESES)}: "
+                + "; ".join(
                     f"{item.hypothesis_id}={item.status}: {item.statement}"
-                    for item in self.hypotheses[:5]
+                    for item in self.hypotheses[:_MAX_HYPOTHESES]
                 )
             )
         if self.attempt:
@@ -323,9 +383,17 @@ class ResolvedExecutionContext:
                 f"{self.trajectory.max_iterations if self.trajectory.max_iterations is not None else 'unbounded'}"
             )
         if self.trajectory.attempts:
+            # A TAIL slice, deliberately, and marked for the same reason the
+            # head cuts are: "Recent attempts" names the intent but not the
+            # loss, so four attempts shown as three read as a complete history
+            # of a loop that has run four times. `shown_of` counts, which is
+            # all the reader needs to know something is missing.
             lines.append(
-                "Recent attempts: "
-                + _bounded_json(self.trajectory.attempts[-3:], 1500)
+                f"Recent attempts"
+                f"{shown_of(self.trajectory.attempts, _MAX_RECENT_ATTEMPTS, tail=True)}: "
+                + _bounded_json(
+                    self.trajectory.attempts[-_MAX_RECENT_ATTEMPTS:], 1500
+                )
             )
         if self.current_state:
             lines.append(

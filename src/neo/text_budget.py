@@ -140,14 +140,24 @@ def elide_middle(text: str, budget: int) -> str:
     )
 
 
-def shown_of(items: List, shown: int) -> str:
+def shown_of(items: List, shown: int, tail: bool = False) -> str:
     """Annotate an elided list with how much of it is being shown.
 
     Empty string when nothing was elided, so the annotation always means an
     omission — the same contract `truncate_marked` holds for text. Returned
     with a leading space so it can sit on a header line.
+
+    `tail=True` for a `[-n:]` slice. Which END survived is part of the
+    meaning, not decoration: "Recent attempts [showing 3 of 20]" reads as a
+    sample of twenty, where "[showing last 3 of 20]" says the loop has run
+    twenty times and you are seeing where it is now. Only one of the seven
+    call sites is a tail cut, which is exactly why the default has to be the
+    head form.
     """
-    return f" [showing {shown} of {len(items)}]" if len(items) > shown else ""
+    if len(items) <= shown:
+        return ""
+    where = "last " if tail else ""
+    return f" [showing {where}{shown} of {len(items)}]"
 
 
 def apportion(sizes: dict, budget: int) -> dict:

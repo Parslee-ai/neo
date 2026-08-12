@@ -167,8 +167,21 @@ class TestCLIGlobalFlags:
         assert "traceback" not in output_lower, f"Unexpected traceback in output: {output}"
 
     def test_no_scan_dry_run_does_not_require_api_key(self):
-        """
-        `--dry-run --no-scan` should exit before adapter initialization.
+        """`--dry-run --no-scan` must not require credentials.
+
+        The 30s budget this used to carry was calibrated to a flag that
+        exited in `cli.main` before the engine existed. `--dry-run` now runs
+        the real engine so it can report retrieved facts, which means loading
+        the embedding model -- ~0.5s against a warm cache, but a ~400MB
+        download on a cold one. This is alphabetically the first test to pay
+        that, and it timed out on all four CI runners while passing locally.
+        The budget is the fixture's, not the feature's: raised to match the
+        300s the other dry-run tests already use.
+
+        What this test asserts is unchanged, and is NOT about speed -- it is
+        that no API key is needed. The old docstring's "should exit before
+        adapter initialization" is no longer how that is achieved; the CLI
+        now installs `RecordingLM` instead of resolving a provider.
         """
         env = {
             **os.environ,
@@ -183,7 +196,7 @@ class TestCLIGlobalFlags:
             capture_output=True,
             text=True,
             env=env,
-            timeout=30,
+            timeout=300,
         )
 
         assert result.returncode == 0, f"Expected exit code 0, got {result.returncode}. stderr: {result.stderr}"

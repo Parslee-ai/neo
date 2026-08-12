@@ -183,13 +183,43 @@ class TestOutputFormatContract:
     """
 
     def _cli_format_string(self):
+        """Recover the f-string template from `cli.py`'s AST, not its text.
+
+        This used to scan source LINES for one holding both `print(` and
+        `bytes (score:`. That is a formatting assertion wearing a contract's
+        clothes: #187 moved the print into a helper and wrapped the literal
+        across two physical lines, leaving `bytes ` on one and `(score:` on
+        the next, and the scan reported "the parser's contract has moved" for
+        a format string that had not changed a character. A guard that fails
+        on a reflow trains the next reader to edit the guard.
+
+        Implicit concatenation of adjacent f-strings is ONE `JoinedStr` node,
+        so the AST sees the template whole however it is wrapped, and still
+        fails loudly if the format itself changes.
+        """
+        import ast
         import inspect
 
         from neo import cli
 
-        for line in inspect.getsource(cli).splitlines():
-            if "bytes (score:" in line and "print(" in line:
-                return line[line.index('f"'):].split('"')[1]
+        for node in ast.walk(ast.parse(inspect.getsource(cli))):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            parts = []
+            for piece in node.values:
+                if isinstance(piece, ast.Constant):
+                    parts.append(str(piece.value))
+                elif isinstance(piece, ast.FormattedValue):
+                    spec = ""
+                    if piece.format_spec is not None:
+                        spec = ":" + "".join(
+                            str(v.value) for v in piece.format_spec.values
+                            if isinstance(v, ast.Constant)
+                        )
+                    parts.append("{" + ast.unparse(piece.value) + spec + "}")
+            template = "".join(parts)
+            if "bytes (score:" in template:
+                return template
         pytest.fail("the dry-run selected-file print was not found in cli.py -- "
                     "the parser's contract has moved and this test is blind")
 

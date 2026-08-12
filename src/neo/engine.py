@@ -186,8 +186,12 @@ class NeoEngine:
         config: Optional[Any] = None,  # NeoConfig instance
         execution_adapter: Optional[ExecutionAdapter] = None,
         event_sink: Optional[NeoEventSink] = None,
+        dry_run: bool = False,
     ):
         self.lm = lm_adapter
+        # Assemble for real, stop before inference, mutate nothing. See
+        # `neo.dry_run` for why the prompt is recorded rather than rebuilt.
+        self.dry_run = dry_run
         self.exemplar_index = exemplar_index
         self.context: Optional[NeoInput] = None
         self.enable_persistent_memory = enable_persistent_memory
@@ -241,6 +245,10 @@ class NeoEngine:
                         codebase_root=codebase_root,
                         config=config,
                         lm_adapter=lm_adapter,
+                        # `initialize()` prunes, demotes and purges, then
+                        # saves -- all before inference. A dry run must not
+                        # age the store it is inspecting.
+                        read_only=dry_run,
                     )
                     # Set persistent_memory for backward compat in methods that check it
                     self.persistent_memory = self.fact_store
@@ -1027,8 +1035,21 @@ class NeoEngine:
         # Store for outcome recording
         self.last_difficulty = difficulty
 
-        # Phase 0: Detect implicit feedback from request history
-        if self.persistent_memory and neo_input.operating_mode.allows_learning:
+        # Phase 0: Detect implicit feedback from request history.
+        #
+        # Skipped under `dry_run`. This is the one call before inference that
+        # both mutates fact confidence and SAVES, and `--dry-run` used to exit
+        # in the CLI before the engine existed, so it had no side effects at
+        # all. Gaining them while fixing what the flag reports would be a poor
+        # trade: an operator runs a dry run precisely when they do not want to
+        # perturb the thing they are inspecting. Retrieval still marks facts
+        # accessed in memory, which is why nothing on this path may save --
+        # pinned by `test_dry_run_does_not_mutate_the_fact_store`.
+        if (
+            self.persistent_memory
+            and neo_input.operating_mode.allows_learning
+            and not self.dry_run
+        ):
             current_request = {
                 "prompt": neo_input.prompt,
                 "timestamp": time.time(),
@@ -1590,9 +1611,19 @@ class NeoEngine:
         self, *, code_suggestions, static_checks, reasoning_fact,
         simulation_facts, metadata,
     ) -> None:
-        """Finalize and persist the task evidence without promoting knowledge."""
+        """Finalize and persist the task evidence without promoting knowledge.
+
+        Skipped entirely under `dry_run`, and that path is reachable: VERIFY
+        mode reasons without an LM call, so `process()` returns NORMALLY and
+        never raises `DryRunComplete` -- and this method then writes an
+        episode file AND a `citation_survival` metric. Those are exactly the
+        two surfaces `learning-stats` and `citation-stats` read, so a dry run
+        was polluting both "is it learning?" dashboards. Measured on a clean
+        HOME: `--stdin-json --json --dry-run` in VERIFY mode produced 1
+        episode and 1 `citation_survival` line.
+        """
         episode = self.current_learning_episode
-        if episode is None:
+        if episode is None or self.dry_run:
             return
         from neo.memory.episodes import (
             aggregate_verification_status,
@@ -2157,8 +2188,55 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             return False, 0, None
 
     def _decide_reasoning_mode(self, context: dict[str, Any], difficulty: str, neo_input):
-        """Gate: fast vs multi-agent. Returns (ModeDecision, route_fn|None)."""
+        """Gate: fast vs multi-agent. Returns (ModeDecision, route_fn|None).
+
+        `dry_run` forces FAST, and that is a correctness requirement rather
+        than a shortcut. The panel does NOT reason through `self.lm`:
+        `_build_car_role_factory` calls `create_adapter("car", model=m)` per
+        role and uses `self.lm` only as the fallback for unassigned roles. So
+        a `RecordingLM` does not intercept the panel — on a machine with
+        `car-server` reachable, which is this project's documented normal
+        setup because the observer autostarts off it, `--dry-run` on a novel
+        prompt would run the full multi-agent panel against real models,
+        spend real money, never raise `DryRunComplete`, and print ordinary
+        output. The flag would become a no-op that bills you.
+
+        Forcing FAST is also the honest choice for what the flag reports: the
+        panel's later prompts are built from earlier model responses, so they
+        cannot be shown without making the calls that `--dry-run` exists to
+        avoid.
+        """
         from neo.reasoning_mode import decide_mode
+
+        if self.dry_run:
+            from neo.reasoning_mode import ModeDecision, ReasoningMode
+
+            # Say so, unconditionally and without asking anything. Silence
+            # would reproduce one level up the defect this flag exists to
+            # expose -- fast-path output on a machine that would have
+            # deliberated is a report about a run Neo would not have made.
+            #
+            # But the note must not overclaim either, and the obvious version
+            # did: gating on `car_available` announces a suppressed panel on
+            # any car-server machine, including for the familiar, low-effort
+            # prompts that would have taken the fast path anyway. That is the
+            # failure `shown_of` already forbids -- a marker that fires when
+            # nothing was dropped trains the reader to ignore it.
+            # Reconstructing the real answer needs `capable_model_count` and
+            # the effort tier, i.e. a CAR daemon round-trip taken purely to
+            # decide whether to print a string, under a flag that promises no
+            # calls. So the note states what is unconditionally true instead.
+            from neo import progress
+
+            progress.note(
+                "dry-run: always takes the fast path; the multi-agent panel "
+                "is never previewed (it builds real CAR adapters and would "
+                "bill you)"
+            )
+            return ModeDecision(
+                mode=ReasoningMode.FAST,
+                reason="dry-run: the panel routes around self.lm to real CAR adapters",
+            ), None
         signal = self._compute_memory_signal(context)
         explicit = (getattr(self.config, "reasoning_mode", "auto") if self.config else "auto") or "auto"
         explicit = None if explicit.lower() == "auto" else explicit.lower()
