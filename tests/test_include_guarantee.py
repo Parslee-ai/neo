@@ -364,6 +364,67 @@ class TestTheReportMatchesWhatHappened:
 
         assert "contributed nothing" not in err
 
+    def test_a_byte_cap_that_turns_candidates_away_is_named(self, tmp_path, capsys):
+        """One byte below the boundary, where the old predicate went silent.
+
+        The inner tests are `total + this_one > max_bytes`, so the ceiling can
+        reject every remaining candidate while the running total sits below it.
+        `total_bytes >= max_bytes` is False there, and the run told the
+        operator no setting would change the outcome — one byte away from
+        `--max-bytes + 1` changing it. The existing byte-cap test sets the
+        ceiling exactly equal to the pin size and lands on the `>=` boundary,
+        which is why it never saw this.
+        """
+        (tmp_path / "pin.py").write_text("PIN = 1\n", encoding="utf-8")
+        (tmp_path / "pool.py").write_text(
+            "def connection_pool_timeout():\n"
+            + "    # database pool connection timeout\n" * 25,
+            encoding="utf-8",
+        )
+        pin_bytes = len((tmp_path / "pin.py").read_bytes())
+        pool_bytes = len((tmp_path / "pool.py").read_bytes())
+        ceiling = pin_bytes + pool_bytes - 1
+
+        gathered = _gather(tmp_path, includes=["pin.py"], max_bytes=ceiling)
+        err = capsys.readouterr().err
+
+        assert len(gathered) == 1, "fixture stopped exercising the byte cap"
+        assert "byte budget" in err and f"--max-bytes={ceiling:,}" in err
+        assert "found nothing to add" not in err
+
+    def test_the_file_cap_warning_names_the_limit_that_actually_bound(
+        self, tmp_path, capsys
+    ):
+        """`--max-files=15` names a number the operator never typed.
+
+        A vague prompt pins the adaptive limit at a fixed 15 regardless of
+        `--max-files`, so the warning named a knob that could not move the
+        limit it was reporting. Both numbers now, and the relationship.
+        """
+        for i in range(20):
+            (tmp_path / f"f{i}.py").write_text(f"V{i} = {i}\n", encoding="utf-8")
+
+        _gather(tmp_path, includes=["*.py"], max_files=500, prompt="fix")
+        err = capsys.readouterr().err
+
+        assert "adaptive limit 15, from --max-files=500" in err
+        assert "--max-files=15" not in err
+
+    def test_an_unreadable_named_file_is_reported(self, repo, capsys):
+        """The one named file with no entry in the bundle. Saying nothing made
+        it the exact silent drop the guarantee exists to prevent."""
+        locked = repo / "notes" / "locked.py"
+        locked.write_text("SECRET = 1\n", encoding="utf-8")
+        locked.chmod(0o000)
+        try:
+            rels = _rels(_gather(repo, includes=["notes/locked.py"]))
+            err = capsys.readouterr().err
+        finally:
+            locked.chmod(0o644)
+
+        assert "notes/locked.py" not in rels
+        assert "could not be read" in err and "notes/locked.py" in err
+
     def test_a_scan_with_nothing_to_add_blames_no_cap(self, tmp_path, capsys):
         """The failure this replaced: a 3-file repo with 135 bytes pinned
         against a 300,000-byte ceiling was told its budget was used up, which
@@ -435,6 +496,31 @@ class TestTheLiteralPathRescue:
         rels = _rels(_gather(tmp_path, includes=["build/out.py"]))
         assert "build/out.py" not in rels
 
+    def test_the_rescue_matches_the_walker_on_symlinks(self, tmp_path):
+        """Parity with the walk is the invariant here, not strictness.
+
+        `os.walk` lists a symlinked FILE inside the root, so a `realpath`
+        check in the rescue would refuse something the walk admits and put a
+        second, stricter answer to "what is inside the root" in a codebase
+        whose plan is to have exactly one. This pins the two together, so a
+        later change to either is a visible decision rather than a drift.
+        """
+        from neo.context_gatherer import iter_paths
+
+        outside = tmp_path.parent / f"linked_{tmp_path.name}.py"
+        outside.write_text("LINKED = 1\n", encoding="utf-8")
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (root / "link.py").symlink_to(outside)
+
+        walker_admits = "link.py" in [
+            rel for _abs, rel, _size in iter_paths(str(root), [], [], None)
+        ]
+        rescue_admits = "link.py" in _rels(_gather(root, includes=["link.py"]))
+
+        assert rescue_admits is walker_admits
+
     def test_the_rescue_does_not_reach_outside_the_root(self, tmp_path):
         outside = tmp_path.parent / "outside_the_root.py"
         outside.write_text("X = 1\n", encoding="utf-8")
@@ -442,6 +528,70 @@ class TestTheLiteralPathRescue:
 
         rels = _rels(_gather(tmp_path, includes=["../outside_the_root.py"]))
         assert not any("outside_the_root" in r for r in rels)
+
+    def test_a_non_canonical_spelling_pins_the_file_once(self, repo):
+        """`./app.py` and `app.py` are one file.
+
+        The rescue keyed `pinned_rels` on the operator's raw spelling, so the
+        scan's "already pinned" guard missed and the same file went to the
+        model twice, announced as two files — a G1-inv duplicate manufactured
+        by the fix for a G2-inv absence. `./x` is what shell completion and
+        `find .` emit, so this is the ordinary spelling, not an exotic one.
+        """
+        gathered = _gather(repo, includes=["./src/app/config.py"])
+        rels = _rels(gathered)
+
+        assert rels.count("src/app/config.py") == 1
+        assert "./src/app/config.py" not in rels
+        assert len(rels) == len(set(rels))
+
+    def test_a_filename_containing_glob_punctuation_is_still_a_path(self, tmp_path):
+        """The test is "does this name a file", not "does it contain a star".
+        Classifying `a[1].py` as a glob tells the operator something false
+        about their own filename."""
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (tmp_path / "a[1].py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        rels = _rels(_gather(tmp_path, includes=["a[1].py"]))
+        assert "a[1].py" in rels
+
+    def test_an_exact_include_overrides_exts(self, repo):
+        """`--exts` narrows the search; `--include` asserts the inputs. When
+        they disagree the explicit instruction wins, and the docstring says
+        so — the two used to disagree with each other."""
+        gathered = _gather(
+            repo, includes=["notes/zzz_placeholder.py"], exts=["md"]
+        )
+
+        assert "notes/zzz_placeholder.py" in _rels(gathered)
+
+    def test_a_file_past_the_rescue_ceiling_is_not_read(self, tmp_path, monkeypatch):
+        """The walk bounds every candidate at 512KB, so the pin read was
+        bounded for free; the rescue lifts that and needs its own bound, or
+        `--include` on a multi-gigabyte artefact reads it all into memory."""
+        from neo import context_gatherer as cg
+
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (tmp_path / "artefact.bin").write_text("xxxxx\n", encoding="utf-8")
+        # `--exts py` keeps the artefact out of the walk, so admitting it can
+        # only come through the rescue — which is the path under test.
+        monkeypatch.setattr(cg, "_PIN_RESCUE_MAX_BYTES", 1)
+
+        rels = _rels(
+            _gather(tmp_path, includes=["artefact.bin"], exts=["py"])
+        )
+        assert "artefact.bin" not in rels
+
+    def test_a_file_inside_the_rescue_ceiling_is_read(self, tmp_path):
+        """Guards the guard: with the ceiling never binding, the test above
+        would pass on a rescue that had stopped working entirely."""
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (tmp_path / "artefact.bin").write_text("xxxxx\n", encoding="utf-8")
+
+        rels = _rels(
+            _gather(tmp_path, includes=["artefact.bin"], exts=["py"])
+        )
+        assert "artefact.bin" in rels
 
     def test_a_glob_gets_no_rescue_and_the_warning_says_so(self, big_repo, capsys):
         """Expanding a glob means walking, which is the cost the rescue avoids.
@@ -571,13 +721,19 @@ class TestTheBannerTheModelReadsCountsFiles:
     """
 
     def test_two_chunks_of_one_file_are_not_two_files(self):
+        """Content is deliberately past the per-file cap so BOTH clauses of the
+        banner are exercised. With short content the truncation clause never
+        renders, and this test passed while that clause still said "2 files"
+        for the same one file the first clause had just counted correctly."""
+        body = "line\n" * 2_000
         files = [
-            ContextFile(path="a.py", content="one", line_range=(1, 5)),
-            ContextFile(path="a.py", content="two", line_range=(40, 60)),
+            ContextFile(path="a.py", content=body, line_range=(1, 5)),
+            ContextFile(path="a.py", content=body, line_range=(40, 60)),
         ]
         _sections, banner, _visible = NeoEngine._render_context_files(files)
 
         assert "2 chunks from 1 file" in banner
+        assert "1 file truncated, marked inline" in banner
         assert "2 files" not in banner
 
     def test_unchunked_files_still_read_as_files(self):
@@ -601,4 +757,6 @@ class TestTheBannerTheModelReadsCountsFiles:
         _sections, banner, _visible = NeoEngine._render_context_files(files)
 
         assert f"{_MAX_CONTEXT_FILES} of {len(files)} chunks" in banner
-        assert "files" in banner
+        # Both file counts, explicitly: `"files" in banner` is satisfied by any
+        # form of the sentence and so asserts nothing about the numbers.
+        assert f"from {_MAX_CONTEXT_FILES} of {_MAX_CONTEXT_FILES + 5} files" in banner

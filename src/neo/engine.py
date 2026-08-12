@@ -2362,7 +2362,12 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         sections: list[str] = []
         visible: list = []
         sent_chars = 0
-        truncated_count = 0
+        # Distinct PATHS, like the file count beside it in the same sentence.
+        # A per-entry counter said "18 files truncated" in a banner that had
+        # just correctly said 12 files were shown — the conflation this method
+        # now fixes in its first clause, left standing in its third, where
+        # fixing the first is what made it read as a contradiction.
+        truncated_paths: set = set()
 
         for f in shown:
             original = f.content or ''
@@ -2395,7 +2400,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             visible.append(replace(f, content=content) if len(original) > limit else f)
 
             if len(original) > limit:
-                truncated_count += 1
+                truncated_paths.add(f.path)
             sections.append(
                 f"\n--- {f.path} ---\n{truncate_marked(original, limit)}"
             )
@@ -2435,9 +2440,11 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             else f"{sent_chars} chars"
         )
         note = ""
-        if truncated_count:
-            noun = "file" if truncated_count == 1 else "files"
-            note = f"; {truncated_count} {noun} truncated, marked inline"
+        if truncated_paths:
+            noun = "file" if len(truncated_paths) == 1 else "files"
+            note = (
+                f"; {len(truncated_paths)} {noun} truncated, marked inline"
+            )
         banner = f"\nREPOSITORY CONTEXT ({file_part}, {size_part}{note}):"
 
         return sections, banner, visible

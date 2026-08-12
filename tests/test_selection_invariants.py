@@ -364,13 +364,20 @@ class TestTruncationIsAlwaysMarked:
         )
 
     def test_the_banner_counts_the_truncated_files(self, repo):
+        """FILES, counted as distinct paths.
+
+        This assertion used to re-implement a per-ENTRY count, so it codified
+        the conflation it was named after rather than catching it: two windows
+        of one cut file were reported as two files truncated, in a banner whose
+        other clause had already said one file.
+        """
         gathered = _gather(repo)
         files = _as_engine_files(gathered)
         _sections, banner, _visible = NeoEngine._render_context_files(files)
 
-        cut = sum(
-            1 for f in files if len(f.content or "") > _limit_for(f.path)
-        )
+        cut = len({
+            f.path for f in files if len(f.content or "") > _limit_for(f.path)
+        })
         noun = "file" if cut == 1 else "files"
         assert f"{cut} {noun} truncated, marked inline" in banner, banner
 
