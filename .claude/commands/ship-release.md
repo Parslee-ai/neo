@@ -97,6 +97,19 @@ git push origin v{version}
 
 ### Phase 6: Create GitHub Release
 
+**The release gate runs here.** Creating the release triggers `publish.yml`,
+which will not build a wheel until `language-roundtrip` is green: one real LLM
+round trip each for C#, TypeScript and Python against generated fixture
+repositories, asserting that the language's files reach the prompt and that
+the model can name a symbol present in exactly one of them. A red language
+stops the chain at `build` and nothing reaches PyPI.
+
+The job **fails** rather than skips when `ANTHROPIC_API_KEY` is not configured
+as a repository secret — an absent credential is a red gate, not a green one.
+Configure it before the first gated release. Full details, including how to
+dry-run the gate without cutting a release, are in
+[`docs/release-gate.md`](../../docs/release-gate.md).
+
 ```bash
 gh release create v{version} \
   --title "v{version}" \
@@ -121,6 +134,7 @@ byte-identical artifacts, so a mismatch would not be visible on the release page
 ### Phase 7: Verify Publication
 
 Check that:
+- `language-roundtrip` passed — all three languages green
 - GitHub Actions workflow completed successfully
 - Package appears on PyPI: https://pypi.org/project/neo-reasoner/
 
@@ -157,6 +171,13 @@ above `publish-testpypi` in the workflow, and CONTRIBUTING.md.
 **If tag already exists**: Report conflict, suggest incrementing version
 
 **If GitHub Actions fails**: Check workflow logs at github.com/{repo}/actions
+
+**If `language-roundtrip` fails**: reproduce it for free first —
+`pytest -m invariants -v` runs the same fixtures with no model call and will
+usually name the broken invariant. If the battery is green and only the round
+trip is red, the model stopped seeing a file the gatherer still selects; run
+`NEO_RELEASE_ROUNDTRIP=1 pytest -m roundtrip -v` locally. Do not work around
+it by removing the job from `build`'s `needs`.
 
 **If PyPI publish fails**: Check Actions logs for authentication or build issues
 
