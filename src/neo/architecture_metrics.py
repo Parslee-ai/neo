@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Optional
 
+from neo.eligibility import walk_paths
 from neo.index.language_parser import QUERIES, TreeSitterParser
 from neo.languages import EXTENSION_TO_LANGUAGE
 
@@ -41,16 +42,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-# Directories we never descend into. Common venv / build / cache layouts.
-_IGNORE_DIRS = frozenset({
-    ".git", ".hg", ".svn",
-    ".venv", "venv", "env", ".env",
-    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
-    "node_modules",
-    "build", "dist", "site-packages",
-    ".neo",  # neo's own state dir if scanned
-})
 
 # A file is a "god file" if either threshold is breached. Picked so common
 # entry-point modules don't get flagged but obvious dumping-grounds do.
@@ -259,21 +250,17 @@ def _iter_source_files(root: Path) -> Iterable[Path]:
     extras = {ext for ext, lang in EXTENSION_TO_LANGUAGE.items() if lang in QUERIES}
     extras.discard(".py")  # Python is handled by the ast path regardless
 
-    for dirpath, dirnames, filenames in _safe_walk(root):
-        # Mutate dirnames in-place so os.walk skips ignored directories.
-        dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
-        for name in filenames:
-            # Exact-suffix match — `name.endswith(".c")` would also match
-            # `foo.bc`, which is not a C file.
-            suffix = Path(name).suffix.lower()
-            if suffix == ".py" or suffix in extras:
-                yield Path(dirpath) / name
-
-
-def _safe_walk(root: Path):
-    import os
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        yield dirpath, dirnames, filenames
+    # The shared walk, so this scan cannot disagree with prompt assembly and
+    # the index about what counts as source. It replaced a third hand-written
+    # ignore list; every name that list held is in the shared defaults, which
+    # additionally honour the repo's own `.gitignore` — so generated code a
+    # repo has declared generated stops being counted as a god file.
+    #
+    # Extension matching is exact and case-insensitive: `name.endswith(".c")`
+    # would also match `foo.bc`, which is not a C file.
+    wanted = {".py", *extras}
+    for entry in walk_paths(str(root), exts=wanted).paths:
+        yield Path(entry.path)
 
 
 # ---------------------------------------------------------------------------
