@@ -303,6 +303,62 @@ _CS_INHERITANCE = "[\n" + "\n".join(
 ) + "\n] @class_def"
 
 # Edge queries for relationship extraction (imports, inheritance)
+# PHP supertypes reach the query in two shapes and BOTH must be covered:
+#
+#     implements Countable          -> (name)
+#     extends \Foo\Bar             -> (qualified_name (name))   (everyday PSR)
+#
+# The narrow arm alone compiles perfectly and drops every namespaced
+# supertype without a word -- `class B extends \Foo\Bar implements
+# \ArrayAccess, Countable` yielded exactly one edge, `B implements
+# Countable`, which is worse than a total miss because the consumer has no
+# signal anything is absent. This is the same failure the `_CS_BASE_TYPES`
+# comment above documents, reproduced in a new language 150 lines below it.
+#
+# Do NOT copy the C# spelling `(qualified_name name: (name) @x)` -- PHP's
+# `qualified_name` has no `name:` field and that pattern fails to compile.
+# The unfielded direct child is the last segment, which matches C#'s
+# rightmost-segment convention.
+_PHP_BASE_TYPES = "[(name) @{cap} (qualified_name (name) @{cap})]"
+
+# Generated across declaration kinds rather than written out per kind, for
+# the reason `_CS_INHERITANCE` is generated: a hand-maintained duplicate
+# invites the next widening to be applied to some of the arms and not the
+# rest. PHP 8.1 enums carry `class_interface_clause` too, and were missed by
+# the hand-written version.
+_PHP_EXTENDS_KINDS = ("class_declaration", "interface_declaration")
+_PHP_IMPLEMENTS_KINDS = ("class_declaration", "enum_declaration")
+
+
+def _php_edge_queries() -> dict:
+    base = _PHP_BASE_TYPES.format(cap="base")
+    iface = _PHP_BASE_TYPES.format(cap="interface")
+    extends = " ".join(
+        f"({kind} name: (name) @class_name (base_clause {base}))"
+        for kind in _PHP_EXTENDS_KINDS
+    )
+    implements = " ".join(
+        f"({kind} name: (name) @class_name (class_interface_clause {iface}))"
+        for kind in _PHP_IMPLEMENTS_KINDS
+    )
+    # `use SomeTrait;` inside a class body. Mapped to `implements` for parity
+    # with Ruby's mixins in this same change: both mean "this type gains that
+    # module's surface", and two languages in one commit taking opposite
+    # stances on the same construct would not survive the next maintainer.
+    traits = (
+        f"(class_declaration name: (name) @class_name "
+        f"(declaration_list (use_declaration {iface})))"
+    )
+    return {
+        'imports': """
+            (namespace_use_declaration
+                (namespace_use_clause (qualified_name) @module)) @import
+        """,
+        'inheritance': f"[ {extends} ] @class_def",
+        'implements': f"[ {implements} {traits} ] @class_def",
+    }
+
+
 EDGE_QUERIES = {
     'python': {
         'imports': """
@@ -426,15 +482,58 @@ EDGE_QUERIES = {
             (import_declaration (identifier) @module) @import
         """,
     },
-    'php': {
+    'php': _php_edge_queries(),
+    'ruby': {
+        # Ruby has no syntactic import: `require` and `require_relative` are
+        # ordinary method calls, which is why this language had no edge
+        # queries at all and contributed nodes to the graph and never edges.
+        # The `#match?` predicate is what makes the method-call form
+        # tractable -- without it the pattern matches every call taking a
+        # string, so `puts 'hello'` becomes an import edge. Verified that this
+        # tree-sitter version actually applies predicates rather than
+        # ignoring them; see `test_ruby_import_predicate_is_enforced`.
         'imports': """
-            (namespace_use_declaration
-                (namespace_use_clause (qualified_name) @module)) @import
+            (call
+                method: (identifier) @_method
+                arguments: (argument_list (string) @module)
+                (#match? @_method "^(require|require_relative)$")) @import
+        """,
+        # `class Impl < Base`. The node type is `class`, not
+        # `class_declaration`, and the name is a `constant`.
+        #
+        # The `scope_resolution` arm is not optional politeness: the first
+        # version matched a bare `(constant)` only, so
+        # `class ApplicationRecord < ActiveRecord::Base` -- the single most
+        # common inheritance statement in the Ruby ecosystem -- produced NO
+        # edge, silently. Same defect the C# comment above warns about.
+        'inheritance': """
+            (class
+                name: (constant) @class_name
+                (superclass [
+                    (constant) @base
+                    (scope_resolution name: (constant) @base)
+                ])) @class_def
+        """,
+        # Ruby expresses "implements" as a mixin -- `include`, `extend` and
+        # `prepend` are again method calls, inside the class body. Mapped to
+        # the `implements` edge type because that is what they mean to a
+        # reader: this class gains that module's interface. `extend` adds
+        # CLASS methods rather than instance methods, so the direction
+        # differs; both are still "gains this module's surface", which is the
+        # resolution an edge consumer needs.
+        'implements': """
+            (class
+                name: (constant) @class_name
+                (body_statement
+                    (call
+                        method: (identifier) @_method
+                        arguments: (argument_list [
+                            (constant) @interface
+                            (scope_resolution name: (constant) @interface)
+                        ])
+                        (#match? @_method "^(include|extend|prepend)$")))) @class_def
         """,
     },
-    # Ruby imports are method calls (`require`, `require_relative`) rather
-    # than syntactic forms — skipped here. Adding them would need either
-    # a method-call pattern match or a runtime-style heuristic.
 }
 
 EDGE_QUERIES['tsx'] = EDGE_QUERIES['typescript']
