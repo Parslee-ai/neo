@@ -58,3 +58,10 @@ Already done inline (2026-08-11): #192 (eval harness), #186 (gitignore implement
 - Baseline/eval goals also touch m365dotnet and aieweb read-only; no writes outside neo.
 - Every PR pastes before/after M1 numbers for the three flagship repos and the invariant battery output. A goal that can't show its numbers isn't done.
 - Shepherd (Kai) watches each goal to terminal state; goalpool "done" claims are verified against the DoD, not trusted.
+
+## Review & merge governance (added 2026-08-12, Keenan's option-3 ruling)
+
+- Parslee-ai/neo is enrolled in the car-pr-review daemon (qa_enabled=false, delegation_enabled=true): every ready PR gets an adversarial review; an approve verdict auto-merges.
+- Goals open their PRs as **DRAFT** and sustain on them. The shepherd verifies the metric evidence (M1/M2 tables, invariant battery) against this plan, then flips the PR ready — `gh pr ready` is the merge decision. The daemon's review is the independent gate after it.
+- Docs/tools-only PRs may open ready (fast path). Runtime-touching goals (G2, G5–G8) MUST use the draft flow.
+- In-flight exception: Goal 2 predates this ruling and opens its PR ready; its goal-side metric stop-rule plus daemon review cover it, and the shepherd converts it to draft if it appears before evidence is verified.
