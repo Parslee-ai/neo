@@ -30,3 +30,47 @@ jobs:
 
     - name: Run tests
       run: pytest -v
+
+  # The free half of the release gate, as its own required-looking check.
+  #
+  # These assertions also run inside `test` above — this job exists so that a
+  # broken selection invariant is legible AS a broken selection invariant on
+  # the PR that caused it, rather than as one red line inside a 2,000-test
+  # matrix. That legibility is the whole point: C# was absent from Neo's index
+  # for 8.5 months (#158/#159) and the gatherer selected gitignored junk
+  # (#186), and in both cases something green was being read as evidence.
+  #
+  # No model call, no credentials, every PR. The paid per-language round trip
+  # is release-only and lives in publish.yml; see docs/release-gate.md.
+  invariants:
+    name: Guard-invariant battery
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install -e ".[dev]"
+
+    - name: Guard invariants (G1-inv..G3-inv, per language, no LLM)
+      run: pytest -m invariants -v
+
+    # Proves the negative the constraint actually cares about: the paid half
+    # was collected and did NOT run. A gate that silently stopped being
+    # release-only would otherwise first show up on the bill.
+    - name: Confirm the LLM round trip stayed opted out
+      run: |
+        pytest -m roundtrip -v --no-header -rs > roundtrip-run.txt 2>&1
+        cat roundtrip-run.txt
+        if grep -qE '[0-9]+ (passed|failed)' roundtrip-run.txt; then
+          echo "::error::round-trip tests executed on a PR; they are release-only"
+          exit 1
+        fi
+        grep -qE '[0-9]+ skipped' roundtrip-run.txt || {
+          echo "::error::no round-trip tests were collected at all"; exit 1; }

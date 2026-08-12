@@ -302,3 +302,39 @@ class TestTruncationIsAlwaysMarked:
         )
         noun = "file" if cut == 1 else "files"
         assert f"{cut} {noun} truncated, marked inline" in banner, banner
+
+
+class TestThePaidHalfStaysOptIn:
+    """The round trip must not become a per-PR cost by accident.
+
+    Deleting the env gate on `tests/test_release_roundtrip.py` turns every
+    push into three model calls, and nothing else in the suite would notice —
+    the tests would simply start passing. The bill is a slow signal; this is
+    a fast one.
+    """
+
+    def test_the_round_trip_is_gated_on_an_environment_variable(self):
+        import tests.test_release_roundtrip as roundtrip
+
+        skipifs = [
+            m for m in roundtrip.pytestmark if getattr(m, "name", "") == "skipif"
+        ]
+        assert skipifs, "the round trip module lost its opt-in gate"
+        assert "NEO_RELEASE_ROUNDTRIP" in skipifs[0].kwargs.get("reason", "")
+
+    def test_the_round_trip_carries_the_marker_the_release_job_selects(self):
+        """`pytest -m roundtrip` is what publish.yml runs. An unmarked test
+        in that module is a language silently dropped from the gate."""
+        import tests.test_release_roundtrip as roundtrip
+
+        names = [getattr(m, "name", "") for m in roundtrip.pytestmark]
+        assert "roundtrip" in names
+
+    def test_every_language_is_in_the_gate(self):
+        """Both halves iterate `LANGUAGES`, so this pins the set itself.
+
+        The plan names C#, TypeScript and Python (G5-inv). A language quietly
+        dropped from the tuple would take its round trip with it and every
+        remaining test would stay green.
+        """
+        assert set(LANGUAGES) == {"csharp", "typescript", "python"}

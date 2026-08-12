@@ -23,14 +23,80 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
+      # Same three paths as ci.yml, the Makefile and .githooks/pre-commit.
+      # This job had been linting two of them, so the release path enforced
+      # LESS than a pull request did — a release could publish code that CI
+      # would have rejected.
       - name: Lint with ruff
-        run: ruff check src/ tests/
+        run: ruff check src/ tests/ tools/
 
       - name: Run tests
         run: pytest -v
 
+  # THE RELEASE GATE. One real LLM round trip per language (C#, TypeScript,
+  # Python) against the generated fixture repos, asserting that the language's
+  # files reach the prompt and that the model can name a symbol which exists
+  # in exactly one of them.
+  #
+  # Cost-bearing model calls are approved FOR RELEASES and only for releases
+  # (Matt Liotta, 2026-08-10): "if that's what we have to do as part of the
+  # release process, we want to do it because we obviously want to catch that
+  # shit." Every push and PR gets the free half instead — the guard-invariant
+  # battery in ci.yml.
+  #
+  # `build` needs this job, so a red language blocks the wheel. It is
+  # deliberately NOT `continue-on-error` and deliberately does NOT skip when
+  # the credential is absent: an absent credential is a red gate, not a green
+  # one. The scar tissue this replaces is a class of failure where every
+  # failure printed success and exited 0.
+  #
+  # Requires the `ANTHROPIC_API_KEY` repository secret. Optional repository
+  # variable `NEO_RELEASE_MODEL` overrides the model; the default matches
+  # `adapters.create_adapter`'s own Anthropic default so the gate and the
+  # library cannot drift apart silently.
+  language-roundtrip:
+    name: Per-language LLM round trip (release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,anthropic]"
+
+      - name: Require release credentials
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not configured, so the"\
+                 "per-language round trip cannot run. A release does not"\
+                 "publish without it. Add the secret at"\
+                 "Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      # `NEO_INFERENCE_MODE=static` because CAR is not present on a runner and
+      # 'auto' would spend the attempt discovering that. `NEO_MODEL` is set
+      # explicitly: NeoConfig's provider and model defaults are independent, so
+      # switching only the provider would hand an OpenAI model name to
+      # Anthropic.
+      - name: Per-language round trip (C#, TypeScript, Python)
+        env:
+          NEO_RELEASE_ROUNDTRIP: '1'
+          NEO_PROVIDER: anthropic
+          NEO_MODEL: ${{ vars.NEO_RELEASE_MODEL || 'claude-sonnet-4-5-20250929' }}
+          NEO_INFERENCE_MODE: static
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: pytest -m roundtrip -v
+
   build:
-    needs: ci-check
+    needs: [ci-check, language-roundtrip]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
