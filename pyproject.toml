@@ -149,6 +149,19 @@ exclude = [
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = ["--import-mode=importlib", "-v"]
+markers = [
+    # The free half of the release gate: per-language selection invariants
+    # (G1-inv..G3-inv), no model call. Runs in the ordinary suite AND as its
+    # own named CI job so a break is legible on the PR that caused it.
+    "invariants: guard-invariant battery, no LLM calls (runs on every PR)",
+    # The paid half. Selecting the marker is NOT enough to spend money: the
+    # module skips unless NEO_RELEASE_ROUNDTRIP=1, so an ordinary `pytest` run
+    # reports them SKIPPED rather than silently omitting them. A gate nobody
+    # can see is the failure mode this whole goal exists to prevent. The
+    # release workflow is the only thing that sets the variable.
+    # See docs/release-gate.md.
+    "roundtrip: per-language LLM round trip, costs money (release flow only)",
+]
 filterwarnings = [
     "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
     "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
