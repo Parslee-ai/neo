@@ -235,6 +235,25 @@ for r in neo aieweb m365dotnet; do
 done
 ```
 
+**The file at that path changed meaning in #194 — read this before pasting the
+commands above into a later tree.** #194 repurposes `tools/rank_eval.py` back to
+its 12-prompt hand-labelled recall-only form and moves the git-mined,
+cross-repo, MRR-reporting harness — the one that produced every table in this
+document — to `tools/rank_mine_eval.py`. The two are not interchangeable and
+`rank_mine_eval.py` is not a drop-in: it shells out to `neo --dry-run` with
+`--no-git` rather than calling `score_candidate` in-process, so it measures the
+whole pipeline and reports different absolute numbers. Quoting one under the
+other's name is the "same label, different instrument" error `rank_mine_eval.py`
+documents in its own header.
+
+The instrument that produced this document is therefore pinned by revision, not
+by path: `git show 5bbee46:tools/rank_eval.py`. Re-running it against a
+post-#194 tree needs one edit, because `score_candidate` gained two arguments —
+pass `demote_tests=not prompt_targets_tests(query)` and
+`content_relevance=normalize(build_index(cands).scores(query)).get(rel, 0.0)`,
+which is exactly what `gather_context` now passes. #194's PR comment carries the
+before/after table produced that way.
+
 ---
 
 ## M2 — warm-call cost on m365dotnet
