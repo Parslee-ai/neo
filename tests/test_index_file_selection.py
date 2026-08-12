@@ -148,11 +148,23 @@ class TestSelectionAcrossLanguages:
 
 class TestExclusions:
     def test_worktree_files_are_excluded(self, dotnet_repo):
+        """The subtree is pruned, and the report counts the subtree.
+
+        This used to read `excluded == 200` — one per file under
+        `.worktrees/PAR-1/`. That number was only available because the old
+        selection globbed the whole repository first and filtered afterwards,
+        which meant walking every worktree copy in order to count the files it
+        was about to throw away. The shared walk prunes at `.worktrees` and
+        never descends, so it does not know how many files are inside and does
+        not claim to. One directory refused is what actually happened.
+        """
         index = ProjectIndex(str(dotnet_repo))
         selected, report = index._select_files(DEFAULT_PATTERNS, 100)
 
         assert not any('.worktrees' in str(p) for p, _ in selected)
-        assert report['excluded'] == 200
+        assert report['excluded_dirs'] == 1
+        assert report['excluded_files'] == 0
+        assert report['excluded'] == 1
 
     @pytest.mark.parametrize(
         "excluded_dir",

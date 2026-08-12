@@ -1,4 +1,4 @@
-"""Tests for what the context gatherer refuses to read.
+"""Tests for what the shared eligibility walk refuses to read.
 
 Regression coverage for a prompt that came back holding the same file six
 times. `should_ignore` did not understand a root-anchored `.gitignore`
@@ -7,6 +7,11 @@ directory, so three nested checkouts a repo deliberately ignored were walked
 anyway — and the gatherer had no exclusion of its own for agent worktrees, so
 each nested repo contributed its `.claude/worktrees/*` and `.codex/worktrees/*`
 copies too. Twelve of sixteen selected files were duplicates of two.
+
+The rules under test now live in `neo.eligibility` and are shared with the
+project index and the architecture scan; `iter_paths` is the gatherer's thin
+wrapper over that walk and is exercised here because it is the caller these
+regressions were reported against.
 """
 
 import os
@@ -14,10 +19,10 @@ import re
 
 import pytest
 
-from neo.context_gatherer import (
-    _path_glob,
-    iter_paths,
-    load_gitignore_patterns,
+from neo.context_gatherer import iter_paths
+from neo.eligibility import (
+    compile_glob,
+    load_ignore_patterns,
     should_ignore,
 )
 
@@ -162,7 +167,7 @@ class TestDefaultExclusions:
         second copy of the tree — it does not add noise, it competes with the
         originals for the same slots.
         """
-        patterns = load_gitignore_patterns(str(tmp_path))
+        patterns = load_ignore_patterns(str(tmp_path))
         assert should_ignore(name, patterns, is_dir=True), (
             f"{name!r} is not excluded by default"
         )
@@ -195,7 +200,7 @@ class TestAgentDirectoriesAreNotExcludedWholesale:
         `forge/src/worktrees/manager.ts` is git-tracked TypeScript in a repo
         that manages worktrees for a living.
         """
-        patterns = load_gitignore_patterns(str(tmp_path))
+        patterns = load_ignore_patterns(str(tmp_path))
         assert not should_ignore(path, patterns), (
             f"{path} is first-party source, not an agent worktree copy"
         )
@@ -207,7 +212,7 @@ class TestAgentDirectoriesAreNotExcludedWholesale:
         ".car/agents/thing.py",
     ])
     def test_tracked_source_under_an_agent_dir_is_kept(self, path, tmp_path):
-        patterns = load_gitignore_patterns(str(tmp_path))
+        patterns = load_ignore_patterns(str(tmp_path))
         assert not should_ignore(path, patterns), (
             f"{path} is real committed source, not a worktree copy"
         )
@@ -220,7 +225,7 @@ class TestAgentDirectoriesAreNotExcludedWholesale:
     ])
     def test_worktree_copies_are_still_excluded(self, path, tmp_path):
         """The `worktrees` component alone is what does the work."""
-        patterns = load_gitignore_patterns(str(tmp_path))
+        patterns = load_ignore_patterns(str(tmp_path))
         assert should_ignore(path, patterns)
 
 
@@ -284,7 +289,7 @@ class TestMalformedPatterns:
         # re-parsing, emitting no warning no matter how broken the escaping is.
         # Measured: with `re.purge()` removed, reverting the `[` escape leaves
         # this test PASSING.
-        _path_glob.cache_clear()
+        compile_glob.cache_clear()
         re.purge()
         for pattern in ('[[]', '[]]', '[a-]', '[!a-z]'):
             should_ignore("x", [pattern])
