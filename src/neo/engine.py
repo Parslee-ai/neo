@@ -2755,6 +2755,26 @@ RULES:
         except Exception:
             return code
 
+    @staticmethod
+    def _normalize_for_marker_match(text: str) -> str:
+        """Lowercase and drop all whitespace, for substring marker matching.
+
+        Not cosmetic. `_strip_comments_and_strings` rebuilds the source by
+        joining tokens with a space, so `sorted(x)` comes back as `sorted ( x )`
+        and the marker `sorted(` could never match — the Python half of the same
+        permanent caution #196 reported for C#: a *satisfied* constraint still
+        warned, on the one language the table was written for. Normalizing both
+        sides also makes the table indifferent to the target's formatting
+        (`max( 0`, `reverse = True`, `Math.Abs (`).
+
+        Whitespace removal can join two tokens into a marker that was not
+        written (`offset (` normalizes to text containing `set(`). That
+        direction is the safe one: a false match only *suppresses* a warning,
+        and absence of a marker was always a hint rather than a verdict —
+        whereas a false warning is the alarm-fatigue defect being fixed.
+        """
+        return "".join(text.split()).lower()
+
     def _check_constraints_static(
         self,
         suggestions: list[CodeSuggestion],
@@ -2786,7 +2806,9 @@ RULES:
         diagnostics: list[dict[str, Any]] = []
         for sug in suggestions:
             raw = sug.code_block or sug.unified_diff or ""
-            code = self._strip_comments_and_strings(raw).lower()
+            code = self._normalize_for_marker_match(
+                self._strip_comments_and_strings(raw)
+            )
             language = language_for_path(sug.file_path)
             markers = markers_for_language(language)
             for c in constraints:
@@ -2804,7 +2826,9 @@ RULES:
                         "language": language,
                     })
                     continue
-                if not any(h.lower() in code for h in hints):
+                if not any(
+                    self._normalize_for_marker_match(h) in code for h in hints
+                ):
                     diagnostics.append({
                         "severity": "warning",
                         "message": (
