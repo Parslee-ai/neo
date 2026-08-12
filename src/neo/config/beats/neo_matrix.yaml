@@ -72,12 +72,23 @@ orchestrator_voice:
     verify_clean: "nothing pushed back"
     verify_none: "no checkers could run"
 
+    # Said instead of a number when there is no code change to score. Stage
+    # -neutral like the cautions: "I have no score for this" is a fact about
+    # the run, and a terse stage must not shorten it into looking like one.
+    confidence_analysis_only: "No confidence score — I proposed no code change."
+    confidence_no_verifiable_change: >-
+      No confidence score — I named a file and produced no change to go
+      with it.
+
     # Cautions — stage-neutral by design (see the note above).
     caution_low_confidence: "I'm at {confidence} on this. Don't take it on trust — check it."
     caution_check_failed: "{tool} isn't happy: {summary}"
     caution_sim_issues: "I ran this through and hit {count} problem(s) with my own approach."
     caution_unverified_skipped: "I ran out of time before the checkers. This code is unverified."
     caution_unverified_no_tools: "No checkers on this machine. This code is unverified."
+    caution_no_verifiable_change: >-
+      {count} suggestion(s) named a file but carried no diff and no code.
+      Nothing here is verifiable — treat this as no answer, not a safe one.
     caution_open_question: "Still open: {question}"
     caution_validation_blocked: "Proof still missing for required gate {gate_id}."
     caution_hypothesis_provisional: "Causal claim {hypothesis_id} is still {status}; do not publish it as fact."
@@ -100,6 +111,7 @@ orchestrator_voice:
     phase_checks_clean: "All {count} checker(s) clean."
     phase_checks_failed: "{failed} of {count} checker(s) pushed back."
     phase_checks_none: "No checkers here. Nothing verified this."
+    phase_checks_inconclusive: "The checkers ran and could evaluate none of it. Treat this as unverified."
     phase_checks_considering: "Considering the checkers."
     phase_checks_skipped: "Out of time before I could run them. This is unchecked."
 

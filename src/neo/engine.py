@@ -35,6 +35,9 @@ from neo.events import (
 )
 from neo.text_budget import apportion, elide_middle, shown_of, truncate_marked
 from neo.models import (
+    CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE,
+    CONFIDENCE_BASIS_SUGGESTIONS,
+    CONFIDENCE_BASIS_VERIFICATION,
     AppliedAction,
     CodeSuggestion,
     ContextFile,
@@ -104,6 +107,14 @@ _DELIBERATION_TOTAL_CHARS = 6000
 
 # Per-exemplar solution text in the "Similar Past Tasks" prompt section.
 _EXEMPLAR_SOLUTION_CHARS = 100
+
+# Prior written onto a legacy memory entry when the run itself produced no
+# scoreable code change. That number is a starting weight for a stored pattern,
+# on a scale the retrieval layer owns; it is NOT the run's operator-facing
+# confidence, which is `None` in exactly this case. Both used to be 0.5, which
+# is how one value came to mean two things (#199) — keeping them separate is
+# the fix, and naming this one is what keeps them separate.
+UNSCORED_MEMORY_PRIOR = 0.5
 
 # Community-cache fallback, used only when FactStore retrieval finds nothing
 # similar enough. That is precisely when the model has the least other
@@ -493,7 +504,11 @@ class NeoEngine:
             self._emit(
                 NeoEventType.COMPLETED,
                 message=output.orchestrator.summary or self._voice("completed_fallback"),
-                confidence=round(output.confidence, 3),
+                confidence=(
+                    round(output.confidence, 3)
+                    if output.confidence is not None else None
+                ),
+                confidence_basis=output.confidence_basis,
                 elapsed_seconds=round(time.time() - start_time, 2),
             )
             return output
@@ -976,6 +991,10 @@ class NeoEngine:
             static_checks=static_checks,
             next_questions=[],
             confidence=confidence,
+            # VERIFY's number is a pass/fail verdict over checks that ran, not
+            # a self-assessment of a patch — it belongs on its own basis so no
+            # consumer reads it as one.
+            confidence_basis=CONFIDENCE_BASIS_VERIFICATION,
             enriched_context={},
             start_time=start_time,
             difficulty="verification",
@@ -1220,6 +1239,7 @@ class NeoEngine:
                     tool=check.tool_name,
                 )
                 self._note_finding(f"{check.tool_name} reported errors")
+            evaluated = self._checks_that_evaluated(static_checks)
             if not static_checks:
                 summary = self._voice("phase_checks_none")
             elif failed:
@@ -1227,8 +1247,10 @@ class NeoEngine:
                     "phase_checks_failed",
                     failed=len(failed), count=len(static_checks),
                 )
+            elif not evaluated:
+                summary = self._voice("phase_checks_inconclusive")
             else:
-                summary = self._voice("phase_checks_clean", count=len(static_checks))
+                summary = self._voice("phase_checks_clean", count=len(evaluated))
             self._end_phase(
                 PHASE_STATIC_CHECKS,
                 summary,
@@ -1254,8 +1276,17 @@ class NeoEngine:
         # error-severity diagnostics. An objective signal (static analysis
         # actually ran and is clean) is required — we do NOT early-exit when
         # static_checks is empty because no tools were available.
-        if code_suggestions and self._simulation_consensus(simulation_traces):
-            max_confidence = max((s.confidence for s in code_suggestions), default=0.0)
+        # Only suggestions that actually carry a change may gate the early
+        # exit. A self-reported 0.96 attached to an empty diff is an opinion
+        # about a patch that was never written, and EARLY_EXIT_CONFIDENCE is
+        # what decides whether the checkers run at all (#199).
+        from neo.models import suggestion_is_scoreable
+
+        scoreable_suggestions = [
+            s for s in code_suggestions if suggestion_is_scoreable(s)
+        ]
+        if scoreable_suggestions and self._simulation_consensus(simulation_traces):
+            max_confidence = max(s.confidence for s in scoreable_suggestions)
             check_statuses = [self._static_check_status(check) for check in static_checks]
             static_ran_clean = bool(check_statuses) and all(
                 status == "passed" for status in check_statuses
@@ -1291,7 +1322,7 @@ class NeoEngine:
         next_questions = self._generate_questions(
             plan, simulation_traces, code_suggestions, static_checks
         )
-        confidence = self._calculate_confidence(
+        confidence, confidence_basis = self._calculate_confidence(
             plan, simulation_traces, code_suggestions, static_checks
         )
 
@@ -1303,6 +1334,7 @@ class NeoEngine:
             static_checks=static_checks,
             next_questions=next_questions,
             confidence=confidence,
+            confidence_basis=confidence_basis,
             enriched_context=enriched_context,
             start_time=start_time,
             difficulty=difficulty,
@@ -1339,9 +1371,10 @@ class NeoEngine:
         code_suggestions: list[CodeSuggestion],
         static_checks: list[StaticCheckResult],
         next_questions: list[str],
-        confidence: float,
+        confidence: Optional[float],
         enriched_context: dict[str, Any],
         start_time: float,
+        confidence_basis: str = CONFIDENCE_BASIS_SUGGESTIONS,
         difficulty: str,
         time_budget: float,
         early_exit: bool,
@@ -1495,6 +1528,7 @@ class NeoEngine:
             static_checks=static_checks,
             next_questions=next_questions,
             confidence=confidence,
+            confidence_basis=confidence_basis,
             early_exit=early_exit,
         )
         if orchestrator.personality:
@@ -1512,6 +1546,7 @@ class NeoEngine:
             next_questions=next_questions,
             confidence=confidence,
             notes=self._generate_notes(plan, simulation_traces, static_checks),
+            confidence_basis=confidence_basis,
             metadata=metadata,
             goal_assessment=goal_assessment,
             strategy_assessment=strategy_assessment,
@@ -1673,12 +1708,13 @@ class NeoEngine:
 
         if static_checks:
             for check in static_checks:
-                severities = {str(d.get("severity", "")).lower() for d in check.diagnostics}
-                status = check.status or (
-                    "failed" if "error" in severities
-                    else "warning" if check.diagnostics
-                    else "passed"
-                )
+                # Must go through _static_check_status, not a second copy of
+                # its logic: `aggregate_verification_status` ranks `warning`
+                # above `skipped`, so an inline `warning if check.diagnostics`
+                # promoted an info-only "not checked for <language>" note into
+                # the run's whole `verification_verdict` — #196's false alarm
+                # arriving through the episode ledger instead of the console.
+                status = self._static_check_status(check)
                 episode.verification.append(VerificationEvidence(
                     verification_id=uuid.uuid4().hex,
                     kind=check.kind or "neo_static",
@@ -2569,8 +2605,35 @@ RULES:
         return results
 
     @staticmethod
+    def _checks_that_evaluated(
+        checks: list[StaticCheckResult],
+    ) -> list[StaticCheckResult]:
+        """The checks that actually examined the code, `skipped` ones removed.
+
+        Every consumer that says a checker vouched for the answer — "all N
+        checker(s) clean", VERIFY's "nothing pushed back", and the caution that
+        fires when nothing checked the code at all — has to read this rather
+        than `static_checks`. A constraint check that found no marker set for
+        the target language still occupies a slot in that list, so counting
+        slots reports a run as verified by a checker that evaluated nothing,
+        and suppresses the "this code is unverified" caution that is true.
+        """
+        return [
+            check for check in checks
+            if NeoEngine._static_check_status(check) != "skipped"
+        ]
+
+    @staticmethod
     def _static_check_status(check: StaticCheckResult) -> str:
-        """Normalize legacy check results without treating absence as success."""
+        """Normalize legacy check results without treating absence as success.
+
+        A result carrying only informational diagnostics reports `skipped`, not
+        `passed`. The distinction is load-bearing: `passed` is what lets the run
+        exit early on the strength of clean static analysis, and a checker that
+        could not evaluate anything (no marker set for the target language) has
+        supplied no such evidence. Calling that clean is how a check that
+        verified nothing ends up vouching for the answer.
+        """
         if check.status:
             return check.status
         severities = {
@@ -2578,9 +2641,43 @@ RULES:
         }
         if "error" in severities:
             return "failed"
-        if check.diagnostics:
+        if NeoEngine._actionable_diagnostics(check.diagnostics):
             return "warning"
+        if check.diagnostics:
+            return "skipped"
         return "passed"
+
+    # Severities that report a fact about the run rather than a problem with
+    # it. Anything else — including a diagnostic with no severity at all —
+    # counts as actionable, so an unrecognized severity fails toward being
+    # surfaced rather than toward silence.
+    # `information` is pyright's own spelling, passed through raw by
+    # static_analysis.py — omitting it made the one real tool that emits
+    # informational diagnostics the one tool this rule missed.
+    _INFORMATIONAL_SEVERITIES = frozenset(
+        {"info", "information", "note", "skipped"}
+    )
+
+    @staticmethod
+    def _is_actionable_diagnostic(diagnostic: dict[str, Any]) -> bool:
+        """True when a diagnostic asserts a problem the operator can act on."""
+        severity = str(diagnostic.get("severity", "")).lower()
+        return severity not in NeoEngine._INFORMATIONAL_SEVERITIES
+
+    @staticmethod
+    def _actionable_diagnostics(
+        diagnostics: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """The subset of diagnostics that should count as issues.
+
+        Issue counts, confidence penalties and next-question prompts all read
+        this rather than `len(diagnostics)`: a note saying a constraint went
+        unchecked must not be relayed as a constraint that failed.
+        """
+        return [
+            item for item in diagnostics
+            if NeoEngine._is_actionable_diagnostic(item)
+        ]
 
     def _community_fallback_learnings(self, prompt_text: str) -> str:
         """Return formatted community facts when the primary store misses.
@@ -2663,15 +2760,49 @@ RULES:
             )
         return self._extract_prompt_constraints(text)
 
-    @staticmethod
-    def _strip_comments_and_strings(code: str) -> str:
-        """Best-effort strip of Python comments and string/bytes literals.
+    # Languages whose comments and literals are stripped by the C-family
+    # scanner below rather than by Python's tokenizer.
+    _C_FAMILY_LANGUAGES = frozenset({"csharp", "typescript", "javascript"})
 
-        Used before substring-matching constraint markers so the word
-        "sorted" inside a docstring or comment doesn't suppress a real
-        warning. Falls back to the original code if tokenization fails
-        (e.g. non-Python or syntactically broken input).
+    # One alternation, scanned left to right, so a construct that opens first
+    # wins: `"http://x"` is consumed as a string before `//` can be read as a
+    # comment. Best-effort by design — a C# verbatim string with a doubled
+    # quote (`@"a""b"`) ends early and leaves a fragment behind, which can only
+    # add non-marker noise to the matched text.
+    _C_FAMILY_TOKEN_RE = re.compile(
+        r"""
+          (?P<block>/\*.*?\*/)
+        | (?P<line>//[^\n]*)
+        | (?P<dquote>"(?:\\.|[^"\\\n])*")
+        | (?P<squote>'(?:\\.|[^'\\\n])*')
+        | (?P<template>`(?:\\.|[^`\\])*`)
+        """,
+        re.DOTALL | re.VERBOSE,
+    )
+
+    @staticmethod
+    def _strip_comments_and_strings(code: str, language: str = "python") -> str:
+        """Best-effort strip of comments and string literals, per language.
+
+        Used before substring-matching constraint markers so the word "sorted"
+        inside a docstring or comment doesn't suppress a real warning.
+
+        The stripper must follow the marker table's language or it defeats the
+        check it feeds. Python's `tokenize` does not fail on C#: `//` lexes as
+        floor-division, so line comments survived as code and a C# file
+        carrying `// TODO: use HashSet<int> here` matched the uniqueness marker
+        and reported a genuine miss as satisfied — the #196 fix silencing the
+        very warning it exists to make reachable, on the languages it added.
+
+        A language with no marker table never reaches the matcher, so its code
+        is returned untouched rather than run through a stripper written for
+        some other grammar.
         """
+        if language in NeoEngine._C_FAMILY_LANGUAGES:
+            return NeoEngine._C_FAMILY_TOKEN_RE.sub(" ", code)
+        if language != "python":
+            return code
+
         import io
         import tokenize
 
@@ -2686,6 +2817,77 @@ RULES:
         except Exception:
             return code
 
+    # Whitespace that touches a non-identifier character on either side; the
+    # two passes together delete exactly the spacing that is punctuation
+    # formatting and keep exactly the spacing that separates two identifiers.
+    _SPACE_BEFORE_SYMBOL_RE = re.compile(r"\s+(?![0-9A-Za-z_])")
+    _SPACE_AFTER_SYMBOL_RE = re.compile(r"(?<![0-9A-Za-z_])\s+")
+
+    @staticmethod
+    def _normalize_for_marker_match(text: str) -> str:
+        """Lowercase and normalize punctuation spacing, for marker matching.
+
+        Not cosmetic. `_strip_comments_and_strings` rebuilds the source by
+        joining tokens with a space, so `sorted(x)` comes back as `sorted ( x )`
+        and the marker `sorted(` could never match — the Python half of the same
+        permanent caution #196 reported for C#: a *satisfied* constraint still
+        warned, on the one language the table was written for. Normalizing both
+        sides also makes the table indifferent to the target's formatting
+        (`max( 0`, `reverse = True`, `Math.Abs (`).
+
+        Only the spacing that is punctuation formatting is removed. Dropping
+        *all* whitespace instead looks simpler and destroys the boundaries the
+        matcher needs in both directions at once: it fuses `new HashSet<` into
+        `newhashset<`, so an identifier-boundary test rejects C#'s primary
+        uniqueness idiom, while simultaneously fusing `offset (` into text
+        containing `set(` so a plain substring test accepts a word nobody
+        wrote. Keeping the single space between two identifiers is what lets
+        `_marker_present` be strict without being wrong.
+        """
+        collapsed = re.sub(r"\s+", " ", text.lower())
+        collapsed = NeoEngine._SPACE_BEFORE_SYMBOL_RE.sub("", collapsed)
+        return NeoEngine._SPACE_AFTER_SYMBOL_RE.sub("", collapsed)
+
+    @staticmethod
+    def _marker_present(marker: str, normalized_code: str) -> bool:
+        """True when `marker` occurs in normalized code, anchored on the left.
+
+        A plain substring test is too weak to be useful: `set(` matches
+        `offset(`, `reset(` and `dataset(`, and `Set<` matches `Subset<`, so
+        UNIQUE_ELEMENTS was close to inert on real Python and TypeScript —
+        every one of those suppressions silently dropping the warning the check
+        exists to raise. A marker that starts with an identifier character may
+        therefore not begin in the middle of a longer identifier.
+
+        The right edge is deliberately NOT anchored, and the asymmetry is the
+        whole design. Markers are written as prefixes of a family on purpose:
+        `OrderBy` is meant to cover `OrderByDescending`, `bisect` to cover
+        `bisect_left`, `heappush` to cover a call. Anchoring the right edge
+        rejects all three, and a rejected marker means a warning fired at code
+        that satisfies the constraint — the #196 false alarm, re-entering
+        through the matcher. Left-anchoring alone is what the observed
+        collisions actually needed; the one right-side case (`new Set` inside
+        `new Settings()`) is fixed where it belongs, by writing the marker as
+        `new Set(` in the table.
+
+        `frozenset(` is listed explicitly for the same reason: it satisfies
+        uniqueness and no longer matches `set(` now that the left edge is
+        anchored.
+        """
+        needle = NeoEngine._normalize_for_marker_match(marker)
+        if not needle:
+            return False
+        if not (needle[0].isalnum() or needle[0] == "_"):
+            return needle in normalized_code
+
+        start = normalized_code.find(needle)
+        while start != -1:
+            previous = normalized_code[start - 1] if start > 0 else ""
+            if not (previous.isalnum() or previous == "_"):
+                return True
+            start = normalized_code.find(needle, start + 1)
+        return False
+
     def _check_constraints_static(
         self,
         suggestions: list[CodeSuggestion],
@@ -2695,39 +2897,80 @@ RULES:
 
         Pure textual checks with comment/string stripping. Does NOT execute
         code. Absence of a handler marker is a warning, not an error.
+
+        The markers are looked up per language. A caution may only claim "no
+        obvious handler" when a marker set for THAT language was actually
+        consulted; where none exists the constraint is reported as unchecked at
+        `info` severity, which the callers below deliberately exclude from
+        issue counts and confidence penalties. The Python-only table used to be
+        applied to every target, so a C# file satisfying uniqueness with
+        `HashSet<T>` — or a markdown file satisfying nothing at all — tripped a
+        warning that no code could ever clear (#196). A caution channel with a
+        permanent entry teaches operators to skip the channel.
         """
         if not constraints or not suggestions:
             return None
 
-        from neo.constraint_verification import CONSTRAINT_CODE_MARKERS
+        from neo.constraint_verification import (
+            language_for_path,
+            markers_for_language,
+        )
 
         diagnostics: list[dict[str, Any]] = []
         for sug in suggestions:
             raw = sug.code_block or sug.unified_diff or ""
-            code = self._strip_comments_and_strings(raw).lower()
+            language = language_for_path(sug.file_path)
+            code = self._normalize_for_marker_match(
+                self._strip_comments_and_strings(raw, language)
+            )
+            markers = markers_for_language(language)
             for c in constraints:
-                hints = CONSTRAINT_CODE_MARKERS.get(c.type)
+                hints = markers.get(c.type)
                 if not hints:
+                    diagnostics.append({
+                        "severity": "info",
+                        "message": (
+                            f"Constraint '{c.description}' was not checked: no "
+                            f"{language} marker set for constraint type "
+                            f"'{c.type.value}'"
+                        ),
+                        "constraint_type": c.type.value,
+                        "file_path": sug.file_path,
+                        "language": language,
+                    })
                     continue
-                if not any(h.lower() in code for h in hints):
+                if not any(self._marker_present(h, code) for h in hints):
                     diagnostics.append({
                         "severity": "warning",
                         "message": (
                             f"Prompt declares constraint '{c.description}' but "
-                            f"generated code shows no obvious handler "
+                            f"generated {language} code shows no obvious handler "
                             f"(expected one of: {', '.join(hints)})"
                         ),
                         "constraint_type": c.type.value,
                         "file_path": sug.file_path,
+                        "language": language,
                     })
 
         if not diagnostics:
             return None
 
+        unhandled = self._actionable_diagnostics(diagnostics)
+        unchecked = [
+            item for item in diagnostics
+            if not self._is_actionable_diagnostic(item)
+        ]
+        parts = []
+        if unhandled:
+            parts.append(f"{len(unhandled)} constraint(s) may not be handled")
+        if unchecked:
+            languages = ", ".join(sorted({item["language"] for item in unchecked}))
+            parts.append(f"{len(unchecked)} not checked ({languages})")
+
         return StaticCheckResult(
             tool_name="constraint_verifier",
             diagnostics=diagnostics,
-            summary=f"{len(diagnostics)} constraint(s) may not be handled",
+            summary="; ".join(parts),
         )
 
     def _generate_questions(
@@ -2747,11 +2990,14 @@ RULES:
                     f"Simulation found: {issue}" for issue in sim.issues_found[:2]
                 ])
 
-        # Questions from static checks
+        # Questions from static checks. Counts the actionable diagnostics only:
+        # "constraint_verifier found 1 issues" for a note saying the constraint
+        # could not be checked is the false alarm this channel must not carry.
         for check in checks:
-            if check.diagnostics:
+            actionable = self._actionable_diagnostics(check.diagnostics)
+            if actionable:
                 questions.append(
-                    f"{check.tool_name} found {len(check.diagnostics)} issues"
+                    f"{check.tool_name} found {len(actionable)} issues"
                 )
 
         # Questions from low-confidence suggestions
@@ -2770,23 +3016,67 @@ RULES:
         simulations: list[SimulationTrace],
         suggestions: list[CodeSuggestion],
         checks: list[StaticCheckResult],
-    ) -> float:
-        """Calculate overall confidence score."""
-        if not suggestions:
-            return 0.5
+    ) -> tuple[Optional[float], str]:
+        """Score the run's code suggestions, or say why there is no score.
+
+        Returns `(confidence, basis)`. `confidence` is None whenever this run
+        produced nothing a code-change score can describe, and `basis` names
+        which of those cases it was.
+
+        `0.5` used to be returned for "no suggestions" — a sentinel sitting on
+        the same scale the number is read against everywhere else, so an
+        analysis run that answered three sub-questions correctly landed on
+        "Proceed with caution - some uncertainties remain" while a run that
+        emitted an empty patch and declined to name findings scored its own
+        self-reported 0.96 and read as READY_TO_IMPLEMENT (#199). Both halves
+        of that inversion are fixed here: the sentinel comes off the scale, and
+        a suggestion naming a real file with no diff and no code block is
+        excluded from the average rather than allowed to grade a patch that
+        does not exist.
+        """
+        from neo.models import (
+            CONFIDENCE_BASIS_ANALYSIS_ONLY,
+            CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE,
+            CONFIDENCE_BASIS_SUGGESTIONS,
+            suggestion_is_review_marker,
+            suggestion_is_scoreable,
+        )
+
+        scoreable = [s for s in suggestions if suggestion_is_scoreable(s)]
+        if not scoreable:
+            # Two very different runs land here, and the operator needs to be
+            # able to tell them apart: one answered without proposing a change,
+            # the other claimed a file and delivered nothing.
+            empty_changes = [
+                s for s in suggestions if not suggestion_is_review_marker(s)
+            ]
+            basis = (
+                CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE if empty_changes
+                else CONFIDENCE_BASIS_ANALYSIS_ONLY
+            )
+            return None, basis
 
         # Average suggestion confidence
-        avg_confidence = sum(s.confidence for s in suggestions) / len(suggestions)
+        avg_confidence = sum(s.confidence for s in scoreable) / len(scoreable)
 
         # Penalty for simulation issues (reduced from 0.05 to 0.02)
         total_issues = sum(len(s.issues_found) for s in simulations)
         issue_penalty = min(0.15, total_issues * 0.02)  # Cap reduced from 0.3 to 0.15
 
-        # Penalty for static check failures (reduced from 0.02 to 0.01)
-        total_diagnostics = sum(len(c.diagnostics) for c in checks)
+        # Penalty for static check failures (reduced from 0.02 to 0.01).
+        # Informational diagnostics are excluded: a checker reporting that it
+        # had no marker set for the target language has found no fault to
+        # penalize, and docking confidence for it would be the same false alarm
+        # in a different currency.
+        total_diagnostics = sum(
+            len(self._actionable_diagnostics(c.diagnostics)) for c in checks
+        )
         check_penalty = min(0.1, total_diagnostics * 0.01)  # Cap reduced from 0.2 to 0.1
 
-        return max(0.0, min(1.0, avg_confidence - issue_penalty - check_penalty))
+        return (
+            max(0.0, min(1.0, avg_confidence - issue_penalty - check_penalty)),
+            CONFIDENCE_BASIS_SUGGESTIONS,
+        )
 
     # Used whenever the deck is missing, empty, or the wrong shape. Every
     # consumer (`_voice`, `_voice_stage`, `_generate_notes`) assumes a mapping,
@@ -2933,7 +3223,7 @@ RULES:
         self._beat_selected = True
         return self._selected_beat
 
-    def _orchestrator_beat(self, confidence: float) -> str:
+    def _orchestrator_beat(self, confidence: Optional[float]) -> str:
         """Return the host-facing personality line, or "" to stay silent.
 
         Silence is the default and the safe answer. A beat is relayed only when
@@ -2956,8 +3246,9 @@ RULES:
         code_suggestions: list[CodeSuggestion],
         static_checks: list[StaticCheckResult],
         next_questions: list[str],
-        confidence: float,
+        confidence: Optional[float],
         early_exit: bool,
+        confidence_basis: str = CONFIDENCE_BASIS_SUGGESTIONS,
     ) -> OrchestratorMessage:
         """State what this run did, so a host doesn't have to infer it.
 
@@ -2990,7 +3281,8 @@ RULES:
         if verification_only:
             verdict = (
                 self._voice("verify_failed", count=len(failed_checks)) if failed_checks
-                else self._voice("verify_clean") if static_checks
+                else self._voice("verify_clean")
+                if self._checks_that_evaluated(static_checks)
                 else self._voice("verify_none")
             )
             summary = self._voice(
@@ -3028,10 +3320,20 @@ RULES:
                 else "opener_solo", ""
             )
             confidence_lead = stage.get("confidence_lead", "")
-            confidence_text = (
-                f"{confidence_lead} {confidence:.2f}." if confidence_lead
-                else f"{confidence:.2f}."
-            )
+            if confidence is None:
+                # Saying a number here would be inventing one. Which kind of
+                # "no number" it is matters to the reader, so the two cases get
+                # two lines rather than one shrug.
+                confidence_text = self._voice(
+                    "confidence_no_verifiable_change"
+                    if confidence_basis == CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE
+                    else "confidence_analysis_only"
+                )
+            else:
+                confidence_text = (
+                    f"{confidence_lead} {confidence:.2f}." if confidence_lead
+                    else f"{confidence:.2f}."
+                )
             summary = " ".join(
                 part for part in (
                     opener,
@@ -3047,10 +3349,21 @@ RULES:
         # VERIFY reports confidence as a pass/fail verdict (0.0 on any failure),
         # not as self-assessed certainty, so the "verify this yourself" advice
         # would be both circular and wrong.
-        if not verification_only and confidence < self.LOW_CONFIDENCE:
+        if (
+            not verification_only
+            and confidence is not None
+            and confidence < self.LOW_CONFIDENCE
+        ):
             cautions.append(
                 self._voice("caution_low_confidence", confidence=f"{confidence:.2f}")
             )
+        # A run that named files and shipped no change is not a quiet outcome:
+        # its suggestions were dropped from the score precisely because they
+        # asserted an edit that is not there.
+        if confidence_basis == CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE:
+            cautions.append(self._voice(
+                "caution_no_verifiable_change", count=len(code_suggestions),
+            ))
         for check in failed_checks:
             cautions.append(self._voice(
                 "caution_check_failed", tool=check.tool_name, summary=check.summary,
@@ -3058,10 +3371,14 @@ RULES:
         issue_count = sum(len(t.issues_found) for t in simulation_traces or [])
         if issue_count:
             cautions.append(self._voice("caution_sim_issues", count=issue_count))
-        if code_suggestions and not static_checks:
+        if code_suggestions and not self._checks_that_evaluated(static_checks):
             # Two different facts with two different remedies: install a linter
             # versus give the run more time. The phase record already knows
             # which one happened — don't collapse them here.
+            # Reads evaluated checks, not the raw list: a constraint result
+            # that could only report "not checked for <language>" left the list
+            # non-empty and swallowed this caution, which is the one line
+            # telling the operator the code is unverified.
             skipped = any(
                 record["name"] == PHASE_STATIC_CHECKS and record["status"] == "skipped"
                 for record in self._phase_records
@@ -3189,7 +3506,7 @@ RULES:
         neo_input: NeoInput,
         plan: list[PlanStep],
         suggestions: list[CodeSuggestion],
-        confidence: float,
+        confidence: Optional[float],
         context: dict[str, Any],
     ):
         """Store reasoning in persistent memory for future use."""
@@ -3314,7 +3631,15 @@ RULES:
                 context=context_str,
                 reasoning=reasoning,
                 suggestion=suggestion,
-                confidence=confidence,
+                # A memory entry's confidence is a prior on how much to trust
+                # this stored pattern later — a different scale from the run's
+                # operator-facing verdict, which is why a neutral value is
+                # legitimate here and was not there (#199). Named so the next
+                # reader doesn't mistake it for the sentinel that was removed.
+                confidence=(
+                    confidence if confidence is not None
+                    else UNSCORED_MEMORY_PRIOR
+                ),
                 source_context=context,
                 code_skeleton=code_skeleton,
                 common_pitfalls=pitfalls[:5],

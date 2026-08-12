@@ -1441,6 +1441,7 @@ def main():
             ],
             "next_questions": output.next_questions,
             "confidence": output.confidence,
+            "confidence_basis": output.confidence_basis,
             "notes": output.notes,
             "metadata": output.metadata,
             "goal_assessment": (
@@ -1464,7 +1465,8 @@ def main():
             output.confidence,
             output.next_questions,
             output.plan,
-            output.code_suggestions
+            output.code_suggestions,
+            output.confidence_basis,
         )
         output_dict["confidence_interpretation"] = confidence_interpretation
 
@@ -1475,7 +1477,15 @@ def main():
         else:
             # Human-readable text mode
             print("\n" + "="*80)
-            print(f"CONFIDENCE: {output.confidence:.2f}")
+            if output.confidence is None:
+                # Printing "0.50" here is what made a correct analysis look
+                # like a hedged one. The interpretation carries the reason.
+                print(
+                    f"CONFIDENCE: n/a "
+                    f"({confidence_interpretation['message']})"
+                )
+            else:
+                print(f"CONFIDENCE: {output.confidence:.2f}")
             print("="*80)
 
             # The same summary a host would relay, so the terminal reader and
