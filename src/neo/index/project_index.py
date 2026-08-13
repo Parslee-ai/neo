@@ -439,6 +439,7 @@ class ProjectIndex:
         walked = cached_walk(
             str(self.repo_root),
             WalkPolicy(match_globs=tuple(file_patterns)),
+            record=False,
         )
         excluded = walked.excluded
 

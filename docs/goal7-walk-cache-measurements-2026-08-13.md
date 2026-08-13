@@ -46,14 +46,15 @@ cost is the ignore-pattern matching; the filesystem is nearly free.
 | arm | time | what it did |
 |---|---|---|
 | raw `os.walk`, no ignore logic, no pruning | 10.394 s | 30,839 dirs / 307,115 files |
-| `os.walk` + directory pruning only, no per-file test | **0.801 s** | 951 directories visited, 11,109 entries |
+| `os.walk` + directory pruning only, no per-file test | **0.801 s** | 951 directories visited |
 | full `eligibility.walk` as shipped | **6.853 s** | 9,378 admitted, 109 dirs + 763 files excluded |
 | `os.stat` over exactly the 9,378 admitted files | **0.102 s** | — |
 
 The second and third rows do the same traversal; the only difference is testing each
-FILE entry against the pattern set. That is **6.05 s of a 6.85 s walk**, and the
-`stat` a cache cannot avoid is 0.102 s. So a cache of directory listings would have
-saved almost nothing, and a cache of verdicts saves almost everything.
+FILE entry against the pattern set (11,219 `should_ignore` calls, counted by
+`cProfile` on the same run). That is **6.05 s of a 6.85 s walk**, and the `stat` a
+cache cannot avoid is 0.102 s. So a cache of directory listings would have saved
+almost nothing, and a cache of verdicts saves almost everything.
 
 It also settles what must NOT be cached: file sizes and mtimes cost 0.1 s to read
 fresh and are the content index's own freshness stamp, so they are read on every walk.

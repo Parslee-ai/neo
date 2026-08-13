@@ -728,17 +728,27 @@
   selection on all six prompts and byte-identical `rank_mine_eval` on all three
   flagships.
   - **The cost is the pattern matching, not the filesystem, and that decides the
-    whole design.** Measured before the cache existed: listing the 951 surviving
-    directories 0.11 s, `should_ignore` over their 11,219 entries **6.7 s**,
-    `stat` over all 9,378 admitted files 0.10 s. Caching the syscalls would have
-    saved nothing. So what is stored per directory is the VERDICTS — which
-    subdirectories survive, which filenames survive, and the exclusion counts —
-    and the directory's mtime is what says whether they still hold.
+    whole design.** Measured before the cache existed, on m365dotnet: the full
+    walk **6.85 s**; the same traversal with the per-FILE ignore test removed
+    **0.80 s**; `stat` over all 9,378 admitted files **0.10 s**. So 6.05 s of a
+    6.85 s walk is `should_ignore` (11,219 calls), and caching the syscalls
+    would have saved almost nothing. What is stored per directory is therefore
+    the VERDICTS — which subdirectories survive, which filenames survive, and
+    the exclusion counts — with the directory's stamps saying whether they hold.
   - **Directory mtime is the right key for exactly one reason**: on every POSIX
     filesystem it moves when an entry is created, deleted or renamed inside that
     directory, and does NOT move when the content of a file inside it changes.
     An edit can change what a file SAYS; it can never change whether it is
     eligible.
+  - **mtime alone is not enough, because mtime is forgeable.** `touch -r`,
+    `tar -x`, `rsync -a` and every snapshot restore write a directory's mtime
+    back to a recorded value, so a restore that adds or deletes a file can land
+    on exactly the mtime the cache holds and be reported `warm` — reproduced
+    with two lines of `os.utime`, found by the fresh-verifier pass. `ctime_ns`
+    is stored beside it: the inode change time moves on any metadata change, no
+    API restores it, and it arrives in the same `stat`. On Windows `st_ctime` is
+    a CREATION time and hence constant, which makes the extra comparison a no-op
+    there rather than a false invalidation.
   - **Sizes and mtimes are never remembered.** They come fresh from the `stat`
     the walk owes its callers anyway (0.10 s), because the content index uses
     them as ITS freshness stamp — serving a remembered mtime would make an

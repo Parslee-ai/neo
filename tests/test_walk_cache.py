@@ -421,6 +421,75 @@ class TestRacyDirectories:
         assert report.reused == report.directories
 
 
+class TestForgedTimestamps:
+    """mtime is a value a tool can restore; the cache must not trust it alone.
+
+    `touch -r`, `tar -x`, `rsync -a` and every snapshot restore write a
+    directory's mtime back to a recorded value. A restore that adds or removes
+    a file can therefore land on exactly the mtime the cache holds, and the
+    walk would report `warm` while answering with a file list from before the
+    restore. The inode change time moves on any metadata change and no API
+    restores it — and it arrives in the same `stat`.
+    """
+
+    def test_a_restored_mtime_does_not_hide_an_added_file(self, tmp_path):
+        root = _repo(tmp_path)
+        _settle(root)
+        target = root / "src" / "pkg"
+        saved = target.stat()
+
+        (target / "gamma.py").write_text("GAMMA = 3\n")
+        os.utime(target, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+        assert target.stat().st_mtime_ns == saved.st_mtime_ns
+
+        found = _cached(root)
+        assert "src/pkg/gamma.py" in found
+        assert found == _uncached(root)
+
+    def test_a_restored_mtime_does_not_hide_a_deleted_file(self, tmp_path):
+        root = _repo(tmp_path)
+        _settle(root)
+        target = root / "src" / "pkg"
+        saved = target.stat()
+
+        (target / "beta.py").unlink()
+        os.utime(target, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+
+        assert "src/pkg/beta.py" not in _cached(root)
+
+
+class TestTheWalkGuardsItselfToo:
+    """`eligibility.walk` re-states the `extra_ignores` rule its caller enforces.
+
+    `cached_walk` never hands listings to a policy carrying `extra_ignores`,
+    so this guard is unreachable through the front door — which is exactly why
+    it needs its own test: a direct `walk(root, policy, listings)` caller is
+    the case it exists for, and without this the guard is one of the few edits
+    the suite would not notice.
+    """
+
+    def test_a_negation_in_extra_ignores_is_not_answered_from_a_listing(self, tmp_path):
+        root = _repo(tmp_path)
+        # `docs/` is excluded by the repo's own rules in this fixture's second
+        # state, so the listing that records that verdict is the wrong answer
+        # to a call whose own patterns re-include it.
+        (root / ".gitignore").write_text("build/\n*.log\ndocs/\n")
+        # Out of the racy window BEFORE the listings are taken, or the guard
+        # under test never gets asked: a freshly-written tree is re-listed on
+        # the next call whatever `extra_ignores` says, and the assertion below
+        # would pass for that reason instead of this one.
+        _age(root)
+        first = eligibility.walk(str(root))
+        assert "docs/guide.md" not in _names(first)
+
+        policy = WalkPolicy(extra_ignores=("!docs/", "!docs/**"))
+        with_cache = eligibility.walk(str(root), policy, first.listings)
+        without = eligibility.walk(str(root), policy)
+
+        assert _names(with_cache) == _names(without)
+        assert "docs/guide.md" in _names(with_cache)
+
+
 class TestDegradation:
     """Every failure costs a warning and a full walk. None costs an answer."""
 
@@ -483,9 +552,35 @@ class TestDegradation:
         assert report.warning is not None
 
     def test_a_repository_that_cannot_be_walked_yields_nothing(self, tmp_path):
-        """No cache, no crash: a missing root is an empty repository."""
-        result = cached_walk(str(tmp_path / "does-not-exist"), quiet=True)
+        """No cache, no crash: a missing root is an empty repository.
+
+        And no directory either. `_save` creates `.neo/`, so writing a cache of
+        nothing turned a mistyped `--cwd` into a silent `mkdir -p` of a path
+        the operator never meant to exist — and pointed at an unmounted
+        mountpoint it would create a local directory shadowing the mount.
+        """
+        missing = tmp_path / "does-not-exist"
+        result = cached_walk(str(missing), quiet=True)
+
         assert result.paths == []
+        assert not missing.exists()
+
+    def test_an_empty_cache_is_discarded_rather_than_believed(self, tmp_path):
+        """A cache of no directories is damage, not a cache of an empty repo.
+
+        Every walk that reaches a readable root records at least the root, so
+        an empty map cannot be a true answer — and believing one made every
+        later call in that repository report `incremental` forever, which is
+        the signal `rebuilt` exists to preserve.
+        """
+        root = _repo(tmp_path)
+        expected = _cached(root)
+        raw = json.loads(cache_path(root).read_text())
+        raw["directories"] = {}
+        cache_path(root).write_text(json.dumps(raw))
+
+        assert _cached(root) == expected
+        assert walk_cache.last_report().mode == "rebuilt"
 
     def test_an_abandoned_temp_file_is_swept(self, tmp_path):
         root = _repo(tmp_path)

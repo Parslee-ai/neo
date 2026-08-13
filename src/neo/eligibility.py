@@ -414,11 +414,11 @@ class DirectoryListing:
     This is what makes the walk cacheable. Deciding whether a path is ignored
     means matching it against every pattern in the repository's effective
     ignore set, and on a large repository that pattern matching — not the
-    filesystem — is the entire cost of the walk: measured on m365dotnet,
-    11,219 `should_ignore` calls take 6.7 s of a 6.9 s walk, while listing the
-    same directories costs 0.11 s and stat-ing all 9,378 admitted files costs
-    0.10 s. Caching the syscalls would save nothing; caching the verdicts
-    saves everything.
+    filesystem — is the entire cost of the walk: measured on m365dotnet, the
+    full walk takes 6.85 s, the same traversal with the per-file ignore test
+    removed takes 0.80 s, and stat-ing all 9,378 admitted files takes 0.10 s.
+    Caching the syscalls would save almost nothing; caching the verdicts saves
+    almost everything.
 
     A verdict is a function of the entry's NAME and the pattern set, so it
     stays valid for exactly as long as the directory's entry names do. On
@@ -427,8 +427,17 @@ class DirectoryListing:
     file inside it changes, which is precisely the distinction wanted here: an
     edit cannot change who is eligible, only what they say.
 
-    Three fields exist to keep that promise honest:
+    Four fields exist to keep that promise honest:
 
+    - `ctime_ns` is stored beside `mtime_ns` because **mtime alone is
+      forgeable**. `touch -r`, `tar -x`, `rsync -a` and every snapshot restore
+      set a directory's mtime back to a recorded value, so a restore that adds
+      or removes a file can land on exactly the mtime this cache holds and be
+      reported `warm`. Reproduced with two lines of `os.utime`. The inode
+      change time moves on any metadata change and no API restores it, and it
+      arrives in the same `stat` — so the defence costs nothing. On Windows
+      `st_ctime` is a CREATION time instead, hence constant, which makes this
+      comparison a no-op there rather than a false invalidation.
     - `scanned_at_ns` pairs with `RACY_WINDOW_NS` above.
     - `symlinks` is kept beside `files` rather than dropped, because
       `WalkPolicy.skip_symlinks` is a per-consumer choice and a cache that
@@ -454,11 +463,13 @@ class DirectoryListing:
     symlinks: tuple[str, ...] = ()
     excluded_dirs: int = 0
     excluded_files: int = 0
+    ctime_ns: int = 0
 
-    def is_current(self, mtime_ns: int) -> bool:
-        """True when this listing may be reused for a directory now at `mtime_ns`."""
+    def is_current(self, mtime_ns: int, ctime_ns: int) -> bool:
+        """True when this listing may be reused for a directory now at these stamps."""
         return (
             self.mtime_ns == mtime_ns
+            and self.ctime_ns == ctime_ns
             and self.mtime_ns <= self.scanned_at_ns - RACY_WINDOW_NS
         )
 
@@ -496,6 +507,7 @@ def _read_directory(
     abs_dir: str,
     rel_dir: str,
     mtime_ns: int,
+    ctime_ns: int,
     patterns: list[str],
 ) -> Optional[DirectoryListing]:
     """List one directory and apply the ignore rules to its entries.
@@ -560,6 +572,7 @@ def _read_directory(
     # rather than starting before it. See `RACY_WINDOW_NS`.
     return DirectoryListing(
         mtime_ns=mtime_ns,
+        ctime_ns=ctime_ns,
         scanned_at_ns=time.time_ns(),
         subdirs=tuple(subdirs),
         files=tuple(files),
@@ -626,17 +639,21 @@ def walk(
     while pending:
         rel_dir, abs_dir = pending.pop()
         try:
-            dir_mtime = os.stat(abs_dir).st_mtime_ns
+            # One `stat`, two stamps. See `DirectoryListing.ctime_ns` for why
+            # the second one is not optional.
+            info = os.stat(abs_dir)
         except OSError:
             # Removed between being listed by its parent and being reached.
             continue
 
         cached = listings.get(rel_dir) if listings is not None else None
-        if cached is not None and cached.is_current(dir_mtime):
+        if cached is not None and cached.is_current(info.st_mtime_ns, info.st_ctime_ns):
             listing = cached
             reused += 1
         else:
-            listing = _read_directory(abs_dir, rel_dir, dir_mtime, patterns)
+            listing = _read_directory(
+                abs_dir, rel_dir, info.st_mtime_ns, info.st_ctime_ns, patterns
+            )
             if listing is None:
                 continue
             rescanned += 1

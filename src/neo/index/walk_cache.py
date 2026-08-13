@@ -9,9 +9,10 @@ a repository that had not changed (#210).
 **The cost is the pattern matching, not the filesystem.** Measured on
 m365dotnet before this module existed:
 
-    raw directory listing, pruned     0.11 s   951 directories
-    should_ignore over the entries    6.7  s   11,219 calls
-    stat over the admitted files      0.10 s   9,378 files
+    full walk                              6.85 s   951 directories
+    the same traversal, per-file ignore
+      test removed                         0.80 s   the syscalls alone
+    stat over the admitted files           0.10 s   9,378 files
 
 A file's ignore verdict is a function of its NAME and the repository's pattern
 set. Neither changes when a file is edited. So the verdicts are what gets
@@ -33,7 +34,7 @@ parse-whole format would spend the warm budget deserializing postings nothing
 asked for. This cache is the opposite: every directory is validated on every
 call, so the whole file is read every time — the case JSON is for, and the
 case the semantic catalog next door already uses it for. On m365dotnet the
-file is ~340 KB and parses in ~10 ms.
+file is 507 KB and parses in ~10 ms.
 
 **A gitignore edit invalidates by content, not by timestamp.** The signature
 holds a hash of the effective pattern list — the shared defaults plus the
@@ -78,7 +79,7 @@ logger = logging.getLogger(__name__)
 #: than migrated: it is derived from the working tree, so rebuilding is always
 #: available and always correct, and migration code for a cache is liability
 #: with no upside.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: Bumped when the same path and the same patterns would produce a DIFFERENT
 #: verdict than they did before — a change to `should_ignore`, to
@@ -225,7 +226,13 @@ def _load(path: Path, expected: dict[str, str]) -> tuple[
         return None, "ignore rules or Neo version changed"
 
     directories = raw.get("directories")
-    if not isinstance(directories, dict):
+    if not isinstance(directories, dict) or not directories:
+        # An EMPTY map is rejected, not accepted as a cache of nothing. Every
+        # walk that reaches a readable root records at least the root itself,
+        # so an empty map can only come from a damaged file — and treating it
+        # as usable made every later call in that repository report
+        # `incremental` forever, which is exactly the signal `rebuilt` exists
+        # to preserve.
         return None, "cache holds no directory listings"
 
     listings: dict[str, DirectoryListing] = {}
@@ -233,6 +240,7 @@ def _load(path: Path, expected: dict[str, str]) -> tuple[
         for rel_dir, entry in directories.items():
             listings[rel_dir] = DirectoryListing(
                 mtime_ns=int(entry["mtime_ns"]),
+                ctime_ns=int(entry["ctime_ns"]),
                 scanned_at_ns=int(entry["scanned_at_ns"]),
                 subdirs=tuple(entry["subdirs"]),
                 files=tuple(entry["files"]),
@@ -260,6 +268,7 @@ def _save(path: Path, sig: dict[str, str], listings: dict[str, DirectoryListing]
         "directories": {
             rel_dir: {
                 "mtime_ns": listing.mtime_ns,
+                "ctime_ns": listing.ctime_ns,
                 "scanned_at_ns": listing.scanned_at_ns,
                 "subdirs": list(listing.subdirs),
                 "files": list(listing.files),
@@ -328,6 +337,7 @@ def cached_walk(
     policy: Optional[WalkPolicy] = None,
     *,
     quiet: bool = False,
+    record: bool = True,
 ) -> WalkResult:
     """`eligibility.walk`, accelerated by and refreshed into the on-disk cache.
 
@@ -335,6 +345,14 @@ def cached_walk(
     make a call cheaper, never different. Every failure mode — no cache, a
     corrupt one, one written under different rules, an unwritable `.neo/` —
     degrades to the full walk and says so.
+
+    `record=False` is for a SECONDARY walk — the architecture scan, the index
+    build — which uses the same cache but a narrower policy. Such a walk still
+    reads and refreshes the cache; it just does not become `last_report()`.
+    The report answers "what did the eligibility walk cost this call?" for the
+    operator reading `--dry-run`, and that is the corpus walk. A later
+    extension-filtered scan overwriting it would leave the reported file count
+    describing a subset nobody asked about.
     """
     started = time.time()
     policy = policy or WalkPolicy()
@@ -349,7 +367,7 @@ def cached_walk(
         # a future caller which does gets a correct answer rather than a fast
         # wrong one.
         result = walk(repo_root, policy)
-        return _finish(result, "bypassed", started, quiet, None)
+        return _finish(result, "bypassed", started, quiet, None, record)
 
     path = cache_path(repo_root)
     sig = signature(repo_root)
@@ -372,8 +390,14 @@ def cached_walk(
     result = walk(repo_root, policy, listings)
 
     warning = None
-    if listings is None or result.rescanned_dirs:
-        warning = _save(path, sig, result.listings or {})
+    if result.listings and (listings is None or result.rescanned_dirs):
+        # `result.listings` empty means the walk read no directory at all — a
+        # root that does not exist, or one it cannot enter. Saving then would
+        # be worse than useless: `_save` creates `.neo/`, so a mistyped
+        # `--cwd` silently minted a directory tree, and pointed at an
+        # unmounted mountpoint it would create a local directory that shadows
+        # the mount. Nothing was learned, so nothing is written.
+        warning = _save(path, sig, result.listings)
 
     if listings is None:
         mode = "rebuilt" if why_not else "cold"
@@ -381,7 +405,7 @@ def cached_walk(
         mode = "incremental"
     else:
         mode = "warm"
-    return _finish(result, mode, started, quiet, warning)
+    return _finish(result, mode, started, quiet, warning, record)
 
 
 def _finish(
@@ -390,6 +414,7 @@ def _finish(
     started: float,
     quiet: bool,
     warning: Optional[str],
+    record: bool = True,
 ) -> WalkResult:
     global _LAST_REPORT
     report = WalkReport(
@@ -401,7 +426,8 @@ def _finish(
         elapsed_ms=(time.time() - started) * 1000.0,
         warning=warning,
     )
-    _LAST_REPORT = report
+    if record:
+        _LAST_REPORT = report
     if not quiet:
         progress.note(report.describe())
     return result
