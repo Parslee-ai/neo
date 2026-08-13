@@ -67,6 +67,18 @@ def repo(tmp_path):
         f"{_BULK}\n",
         encoding="utf-8",
     )
+    # A SECOND file of the same order of size. Without it the pinned/unpinned
+    # A/B cannot be run at ONE ceiling: with a single big file, any ceiling
+    # that leaves the pin block enough room also leaves the scan's max-min
+    # fair share enough room, so the control stops excerpting and the
+    # comparison proves nothing. Two big files make the scan split what the
+    # pin block gets to itself.
+    (tmp_path / "src" / "app" / "worker.py").write_text(
+        "def connection_pool_worker():\n"
+        "    '''Database connection pool worker loop.'''\n"
+        f"{_BULK}\n",
+        encoding="utf-8",
+    )
     (tmp_path / "src" / "app" / "client.py").write_text(
         "def database_client():\n    '''Database client, uses the pool.'''\n"
         "    return connection_pool_timeout()\n",
@@ -197,7 +209,11 @@ class TestIncludedFilesAreGuaranteed:
         evidence the guarantee did anything.
         """
         source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
-        ceiling = len(source.encode("utf-8"))
+        # TWICE the file, because the pin block is held to half of
+        # `--max-bytes` while anything else is eligible (`PIN_BUDGET_SHARE`).
+        # Half of this seats the pin exactly, while the scan has to split the
+        # same ceiling with `worker.py` and cannot.
+        ceiling = 2 * len(source.encode("utf-8"))
 
         control = _gather(repo, max_bytes=ceiling)
         control_pool = [g for g in control if g.rel_path == "src/app/pool.py"]
@@ -246,7 +262,8 @@ class TestIncludedFilesAreGuaranteed:
         pinned = [g.rel_path for g in _gather(repo, includes=["src/app/*.py"])
                   if g.pinned]
         assert set(pinned) == {
-            "src/app/pool.py", "src/app/client.py", "src/app/config.py"
+            "src/app/pool.py", "src/app/worker.py",
+            "src/app/client.py", "src/app/config.py",
         }
         assert len(rels) == len(set(rels))
 
