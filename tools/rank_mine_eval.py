@@ -296,7 +296,8 @@ def recent_files(repo: str, window: int = 50) -> set[str]:
 
 
 def rank_files(repo: str, tree: str, query: str, timeout: int,
-               use_git: bool = False) -> Optional[list[str]]:
+               use_git: bool = False,
+               semantic: bool = False) -> Optional[list[str]]:
     """The ranked, de-duplicated file list the model would have been sent.
 
     Returns None for a run that FAILED and [] for one that completed and chose
@@ -318,6 +319,12 @@ def rank_files(repo: str, tree: str, query: str, timeout: int,
         cmd = [sys.executable, "-m", "neo.cli", "--dry-run"]
         if not use_git:
             cmd.append("--no-git")     # gates git_recent only; see module docstring
+        if semantic:
+            # A HINT, not a lane: it raises the weight and depth of the
+            # embedding catalog inside the one pipeline. Passing it against a
+            # tree that has no catalog measures nothing, which the CLI says
+            # out loud -- read the stderr of one case before quoting a delta.
+            cmd.append("--semantic")
         proc = subprocess.run(
             [*cmd, query],
             cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -382,6 +389,10 @@ def main() -> int:
                          "construction and its absolutes are upper bounds")
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--k", type=int, nargs="+", default=[1, 3, 10])
+    ap.add_argument("--semantic", action="store_true",
+                    help="pass --semantic to every case. It biases the "
+                         "embedding catalog's weight and depth; with no "
+                         "catalog in the repo it changes nothing")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -405,7 +416,7 @@ def main() -> int:
     raw = []
     for i, case in enumerate(cases, start=1):
         raw.append(rank_files(args.repo, args.tree, case["query"], args.timeout,
-                              use_git=args.with_git))
+                              use_git=args.with_git, semantic=args.semantic))
         print(f"  {i}/{len(cases)}", end="\r", file=sys.stderr, flush=True)
 
     # A failed case is DROPPED, not scored as a zero. Scoring it would let a
@@ -456,6 +467,16 @@ def main() -> int:
     # by. `result["tree"]` is a mutable path, not a generation: it says where
     # the ranker was read from, never which ranker it was.
     result["tree_head"] = tree_head
+    result["semantic"] = bool(args.semantic)
+    # Per case, so a SUBSET can be scored without re-running 50 subprocesses.
+    # The unified-store plan asks for the concept-shaped queries reported
+    # separately from the ones that name a path, and those two populations
+    # exercise different stages of the front door -- ranking versus pinning.
+    # Re-mining to split them would be a second sample, not a subset.
+    result["per_case"] = [
+        {"query": c["query"], "truth": c["truth"], "ranked": r}
+        for c, r in zip(scored_cases, scored_ranks)
+    ]
 
     if args.json:
         print(json.dumps(result, indent=2))
