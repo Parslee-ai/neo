@@ -983,6 +983,67 @@
   global budget is DROPPED — the original bug returning through a different door.
   `_fit_to_budget` shrinks outward from the window's best line so truncation can never
   discard the line that earned the window.
+- **One retrieval front door** (`context_gatherer.gather_context`): every
+  invocation goes through ONE pipeline with one priority order — (1) paths the
+  prompt named, PINNED; (2) `--include`, pinned per ruling 1 with the scan
+  continuing; (3) keyword BM25 over the persistent content index; (4) the
+  embedding catalog, re-ranking and supplementing (3) whenever it exists.
+  `gather_context_semantic` — a second gather function with its own candidate
+  list, its own budget arithmetic and no idea what the prompt had named — is
+  **deleted**; `--semantic` is now a HINT carried on `GatherConfig.semantic`
+  that raises the catalog's weight (`SEMANTIC_WEIGHT` 1.0 →
+  `SEMANTIC_HINT_WEIGHT` = `CONTENT_WEIGHT` = 3.0) and its retrieval depth
+  (`SEMANTIC_HINT_DEPTH` = 3×). Which retrieval strategy you asked for must not
+  decide whether a guarantee applies, and it did: the semantic lane ignored
+  prompt-named paths entirely.
+  **Stage 1 is a pin, not a boost.** `EXPLICIT_PATH_BOOST` makes a named path
+  rank first, which is a weaker claim than "present" — the file could still be
+  windowed into a fragment, and a prompt naming more files than the adaptive
+  limit admits lost the last-named ones. `resolve_explicit_paths` now pins them
+  on the same terms `--include` uses. The boost STAYS on the ranking: a file can
+  only be pinned if the walk found it, so the boost covers the candidates the
+  pin pool never held (an `--exts`-narrowed list).
+  **Delivery is one entry per file, read whole from disk.** Chunking survives
+  only as a RANKING internal — it chooses WHICH region of an over-budget file
+  arrives, never how many entries a file contributes. `--max-bytes` is
+  apportioned max-min fair (`text_budget.apportion`) across the selection rather
+  than spent greedily in rank order, so a file's SIZE no longer decides how many
+  other files reach the model; `MIN_FILE_SHARE_BYTES` (512) is the floor below
+  which the ceiling reduces the file COUNT instead, and says by how many.
+  Measured branch vs main at `d5adcbc`, 50 git-mined cases × 3 flagships:
+  **MRR and R@k byte-identical in every cell**, while mean distinct files
+  delivered per query went 18.4→28.9 (neo), 22.6→28.7 (aieweb), 22.1→29.3
+  (m365dotnet) — **0 files lost, 1,190 gained, a strict superset in 150 of 150
+  cases**. The metrics do not move because the gain sits below rank 10. On the
+  M2 battery, within-prompt repeat entries went **45 → 0**: #197's "chunks
+  counted as files" is now impossible rather than merely reported. M2 median
+  wall 9.10 s → 8.97 s, peak RSS +0.24% — inside main's own 7.6–10.4 s spread.
+  Full tables: `docs/goal8-front-door-measurements-2026-08-13.md`.
+  **What the flagship M1 numbers CANNOT tell you**: none of neo, aieweb or
+  m365dotnet has a `.neo/index.json`, so stage 4 returns `{}` on all 300 of
+  those runs and is inert in both arms. Read "no regression" as measured and
+  "no concept-shaped win" as unmeasured-here, not as absent.
+  **Stage 4 is measured separately and the result is about robustness, not
+  quality.** With a catalog built on neo, the OLD `--semantic` lane scored
+  **MRR 0.000 / R@10 0.000 on all 50 cases** — it returned 1,224 files and
+  **every one was a test file**, because it read `index.retrieve()` + MMR with
+  none of the pipeline's judgement (no test demotion, no BM25, no pin) and
+  because `neo --index` had built a catalog of 99 files that are 100% tests.
+  That second half is a real upstream defect, **#213**:
+  `ProjectIndex._select_files` ranks shallowest-path-first, so on `src/<pkg>/…`
+  + `tests/…` every test is depth 2 and every source file depth 3 — 105 Python
+  files at depth 2 here, first non-test at rank 102, `--max-files` default 100.
+  Not fixed in this goal (the front door consumes the catalog; the index builds
+  it). Through the front door the same broken catalog yields 0.705 / 0.708,
+  because it is one channel of four. So `SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT`
+  is a defensible default, NOT a tuned one — re-measure it against a catalog
+  built after #213 lands, and do not quote the −0.007 MRR under the flag as a
+  property of the weight; it is a property of the catalog's contents.
+  **The renderer's per-file cap is NOT the front door's** and the two are
+  deliberately still separate: `engine._render_context_files` keeps its 3,000
+  character cut for unpinned files, with its own marker. Collapsing them would
+  either grow every prompt by ~60% or push a relevance-unaware head-cut into the
+  one place that currently keeps the relevant region.
 - Prompt-side file rendering (`engine._render_context_files`): the REPOSITORY
   CONTEXT block caps each file at `_CONTEXT_FILE_CHARS` (3000), or
   `_IMPORTANT_FILE_CHARS` (8000) when the path contains one of
