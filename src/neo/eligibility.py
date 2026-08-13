@@ -527,6 +527,18 @@ def _read_directory(
     for name in dirnames:
         if should_ignore(prefix + name, patterns, is_dir=True):
             excluded_dirs += 1
+        elif os.path.islink(os.path.join(abs_dir, name)):
+            # `os.walk(followlinks=False)` LISTS a symlinked directory and
+            # refuses to descend into it. This traversal recurses by hand, so
+            # the refusal has to be restated here or `followlinks=False`
+            # protects only the one directory read at a time — a link to an
+            # ancestor becomes an infinite descent, and a link to `/` walks the
+            # machine. Not counted as an exclusion: no ignore rule rejected it,
+            # and `skip_symlinks` does not gate this. That flag is about
+            # whether a symlinked FILE is delivered; refusing to traverse a
+            # symlinked DIRECTORY is what the walk has always done, for every
+            # caller.
+            logger.debug("Not descending into symlinked directory: %s", prefix + name)
         else:
             subdirs.append(name)
 

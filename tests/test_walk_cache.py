@@ -207,6 +207,27 @@ class TestParity:
 
         assert cache_path(root).read_text() == before
 
+    def test_a_symlinked_directory_is_listed_but_never_descended(self, tmp_path):
+        """The rule `os.walk(followlinks=False)` enforced, restated by hand.
+
+        This traversal recurses itself, so `followlinks=False` protects only
+        one directory read at a time. A link pointing at an ancestor is an
+        infinite descent and a link pointing at `/` walks the machine — this
+        test hangs rather than fails if the guard goes, which is the honest
+        shape of that defect.
+        """
+        root = _repo(tmp_path)
+        (root / "src" / "mirror").symlink_to(root / "docs", target_is_directory=True)
+        (root / "src" / "loop").symlink_to(root, target_is_directory=True)
+
+        found = _cached(root)
+
+        # The finite case fails fast and pins the same rule; the loop is what
+        # makes the consequence of losing it unbounded.
+        assert "docs/guide.md" in found
+        assert "src/mirror/guide.md" not in found
+        assert not any(name.startswith("src/loop/") for name in found)
+
     def test_a_symlink_is_still_a_policy_choice_on_a_warm_walk(self, tmp_path):
         root = _repo(tmp_path)
         (root / "src/link.py").symlink_to(root / "src/main.py")
