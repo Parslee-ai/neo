@@ -95,9 +95,19 @@ def _as_engine_files(gathered) -> list[ContextFile]:
     ]
 
 
-def _limit_for(path: str) -> int:
+def _limit_for(path: str, pinned: bool = False) -> int:
+    """The renderer's per-file character cap for `path`.
+
+    `pinned` is not a detail: `_render_context_files` applies no cap at all to
+    a pinned file, because the gatherer already bounded it by `--max-bytes` and
+    marked any cut it made. Both stages that pin — a path the prompt named and
+    an `--include` pattern — land here, so a helper that only knew about the
+    important/ordinary split reported a cut on files the renderer never cuts.
+    """
     from neo.engine import _IMPORTANT_FILE_PATTERNS
 
+    if pinned:
+        return 10**9
     lowered = path.lower()
     return (
         _IMPORTANT_FILE_CHARS
@@ -153,9 +163,10 @@ class TestNamedFileGuarantee:
 
         `--include`/named-path semantics are "the named file, whole, or with
         an explicit marker" (standing ruling 1). At the gatherer layer that
-        means no line range: the truncation that DOES happen to this file
-        happens later, at the prompt renderer, and is marked there — which is
-        what `TestTruncationIsAlwaysMarked` pins.
+        means no line range and content byte-identical to disk. It reaches the
+        prompt uncut as well, which
+        `TestTruncationIsAlwaysMarked.test_the_pinned_target_is_oversized_and_still_uncut`
+        pins at the renderer.
         """
         gathered = _gather(repo)
         target = next(g for g in gathered if g.rel_path == repo.target_rel)
@@ -172,13 +183,21 @@ class TestNamedFileGuarantee:
 class TestIncludedFileGuarantee:
     """G2-inv, `--include` half: 100% named-file presence, whole.
 
-    The prompt-named half above is a scoring pin — the file wins the ranking
-    and is then delivered like any winner, which is why the fixture target
-    still arrives cut at the renderer. `--include` is a stronger claim
-    (standing ruling 1): the operator asserted the input, so the file bypasses
-    scoring, the file cap and the chunk cap, and the renderer's per-file
-    character cap does not apply to it either. Only `--max-bytes` may cut it,
-    and that cut is marked.
+    The two halves now make the SAME claim, which is the front door's stage 1
+    and stage 2 arriving at one guarantee: the named file bypasses scoring, the
+    file cap and the chunk cap, and the renderer's per-file character cap does
+    not apply to it either. Only `--max-bytes` may cut it, and that cut is
+    marked. It used to be weaker on the prompt-named side — a scoring pin,
+    where the file won the ranking and was then delivered like any other
+    winner, so the fixture target arrived cut at the renderer. "Ranked first"
+    and "present whole" are different claims and only one of them is what a
+    caller who typed a path asked for.
+
+    Kept as a separate class rather than merged, because the two stages resolve
+    a name differently: `--include` is an `fnmatch` glob with an exact-path
+    rescue past the walker's size ceiling, and a prompt-named path is a
+    boundary-anchored match against what the walk already found. Equal
+    guarantees, different ways of failing to find the file.
 
     Asserted per language for the same reason everything else here is: a
     guarantee verified on Python alone stayed green through the 8.5 months C#
@@ -315,23 +334,47 @@ class TestTruncationIsAlwaysMarked:
         sections, _banner, _visible = NeoEngine._render_context_files(files)
 
         for f, section in zip(files, sections):
-            was_cut = len(f.content or "") > _limit_for(f.path)
+            was_cut = len(f.content or "") > _limit_for(f.path, f.pinned)
             marked = "[truncated:" in section
             assert marked is was_cut, (
                 f"{f.path}: cut={was_cut} but marker={marked}"
             )
 
-    def test_the_target_is_actually_large_enough_to_be_cut(self, repo):
+    def test_something_unpinned_is_large_enough_to_be_cut(self, repo):
         """Guards the guard: with nothing oversized the test above is vacuous.
 
-        The fixture keeps the target well past the cap for exactly this
-        reason, and this assertion is what fails if that ever stops being
-        true — rather than the marker test quietly passing on no evidence.
+        The specimen is `bulk_rel`, not the target. Naming a path used to only
+        BOOST it, so the target competed for delivery like anything else and
+        the renderer cut it; the front door pins a named path, and a pin is
+        delivered whole past the renderer's cap. Left pointing at the target,
+        this assertion would fail — and the marker test beside it would go
+        quietly vacuous, which is the outcome this exists to prevent.
+        """
+        gathered = _gather(repo)
+        bulk = next(g for g in gathered if g.rel_path == repo.bulk_rel)
+
+        assert len(bulk.content or "") > _limit_for(bulk.path)
+
+    def test_the_pinned_target_is_oversized_and_still_uncut(self, repo):
+        """G2-inv, at the end of the pipeline: a named file is not cut at all.
+
+        The target is past the renderer's per-file cap by a wide margin, so
+        "uncut" is a real result rather than a file that happened to fit.
         """
         gathered = _gather(repo)
         target = next(g for g in gathered if g.rel_path == repo.target_rel)
-
+        assert target.pinned
         assert len(target.content or "") > _limit_for(target.path)
+
+        files = _as_engine_files(gathered)
+        sections, _banner, _visible = NeoEngine._render_context_files(files)
+        target_section = next(
+            s for s in sections if repo.target_rel in s or
+            Path(repo.target_rel).name in s
+        )
+
+        assert "[truncated:" not in target_section
+        assert repo.sentinel in target_section
 
     def test_the_sentinel_survives_the_cut(self, repo):
         """The cut keeps the HEAD, and the fixture puts the sentinel there.
@@ -376,7 +419,8 @@ class TestTruncationIsAlwaysMarked:
         _sections, banner, _visible = NeoEngine._render_context_files(files)
 
         cut = len({
-            f.path for f in files if len(f.content or "") > _limit_for(f.path)
+            f.path for f in files
+            if len(f.content or "") > _limit_for(f.path, f.pinned)
         })
         noun = "file" if cut == 1 else "files"
         assert f"{cut} {noun} truncated, marked inline" in banner, banner

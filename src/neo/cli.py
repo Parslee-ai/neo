@@ -500,7 +500,12 @@ def parse_args():
         action="store_true",
         help="Disable persistent fact retrieval and learning for this request",
     )
-    p.add_argument("--semantic", action="store_true", help="Use semantic search (requires .neo/index.json)")
+    p.add_argument(
+        "--semantic", action="store_true",
+        help="Bias file selection toward the embedding catalog. A hint, not a "
+             "mode: the catalog is consulted whenever it exists, and this "
+             "reads it deeper and weighs it as heavily as the keyword index. "
+             "Says so when there is no catalog (build one with 'neo --index')")
     p.add_argument("--stdin-json", action="store_true", help="Force JSON input mode")
     p.add_argument("--stdin-text", action="store_true", help="Force text input mode")
     p.add_argument("--dry-run", action="store_true", help="Show what would be sent to model and exit")
@@ -1050,7 +1055,12 @@ def main():
                 print(line)
             print(f"[Neo] Index stored in {codebase_root}/.neo/")
             print("[Neo] Supported languages: Python, C#, TypeScript, JavaScript, Java, Go, Rust, C/C++")
-            print("[Neo] Use '--semantic' flag to enable semantic search")
+            # Not "use --semantic to enable it": the catalog is live from here
+            # on, on every invocation, with no flag. Telling the operator to
+            # pass one describes the lane that used to exist and invites them
+            # to conclude an unflagged run ignores what they just built.
+            print("[Neo] The catalog now re-ranks every run; '--semantic' "
+                  "weighs it more heavily for concept-shaped questions")
             sys.exit(0)
         except Exception as e:
             print(f"[Neo] Failed to build index: {e}", file=sys.stderr)
@@ -1286,7 +1296,7 @@ def main():
 
         # Gather context from working directory unless --no-scan
         if not args.no_scan:
-            from neo.context_gatherer import gather_context, gather_context_semantic, GatherConfig
+            from neo.context_gatherer import gather_context, GatherConfig
 
             exts = args.exts.split(',') if args.exts else None
 
@@ -1300,13 +1310,16 @@ def main():
                 max_files=args.max_files or 30,
                 diff_since=args.diff_since,
                 use_git=not args.no_git,
+                semantic=args.semantic,
             )
 
-            # Use semantic search if --semantic flag is set
-            if args.semantic:
-                gathered = gather_context_semantic(config)
-            else:
-                gathered = gather_context(config)
+            # ONE front door. `--semantic` used to route to a second gather
+            # function with its own candidate list, its own budget arithmetic
+            # and no idea what the prompt had named — so which retrieval
+            # strategy you asked for decided whether a guarantee applied. It is
+            # a hint now, carried on the config and spent inside the pipeline;
+            # see `gather_context` for the stage it biases.
+            gathered = gather_context(config)
 
             # Convert gathered files to ContextFile format
             neo_input.context_files = [
