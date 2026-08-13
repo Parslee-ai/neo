@@ -748,12 +748,18 @@ def _report_dry_run(args, calls) -> None:
                 "remaps roles, Ollama flattens, CAR adds intent_json)"
             ),
         }
-        # `--json` implies `--quiet`, so the stderr note the content index
-        # emits is suppressed on exactly the path a machine consumer reads.
-        # It is a fact about what the run cost and it belongs in the report.
-        report = _content_index_report()
-        if report is not None:
-            payload["content_index"] = report
+        # `--json` implies `--quiet`, so the stderr notes the walk cache and
+        # the content index emit are suppressed on exactly the path a machine
+        # consumer reads. They are facts about what the run cost and they
+        # belong in the report. Both keys, because the two caches fail
+        # independently: a warm index behind a cold walk and a warm walk behind
+        # a rebuilt index are different diagnoses.
+        for key, report in (
+            ("walk_cache", _walk_cache_report()),
+            ("content_index", _content_index_report()),
+        ):
+            if report is not None:
+                payload[key] = report
         print(json.dumps(payload, indent=2))
         _emit_dry_run_terminal_event()
     else:
@@ -770,6 +776,21 @@ def _content_index_report():
     """
     try:
         from neo.index.content_index import last_report
+    except ImportError:  # pragma: no cover - the module ships with neo
+        return None
+    report = last_report()
+    return report.to_dict() if report is not None else None
+
+
+def _walk_cache_report():
+    """This process's eligibility-walk report, or None if no walk ran.
+
+    Absent for the same reason as the index report above: `--no-scan` and a
+    caller that supplied its own files never walk, and an empty report would
+    read as "the walk ran and found nothing".
+    """
+    try:
+        from neo.index.walk_cache import last_report
     except ImportError:  # pragma: no cover - the module ships with neo
         return None
     report = last_report()
@@ -817,10 +838,17 @@ def _print_selected_files(gathered) -> None:
     # update or a warm read is the difference between a 60-second call and a
     # 2-second one, and it is invisible from the file list. Printed inside the
     # block rather than left to the progress note so it cannot drift away from
-    # the selection it describes.
-    report = _content_index_report()
-    if report is not None:
-        print(f"  [{report['summary']}]\n", file=sys.stderr)
+    # the selection it describes. In pipeline order — which files exist, then
+    # what they say — so the two lines read as the two stages they are.
+    summaries = [
+        report["summary"]
+        for report in (_walk_cache_report(), _content_index_report())
+        if report is not None
+    ]
+    for summary in summaries:
+        print(f"  [{summary}]", file=sys.stderr)
+    if summaries:
+        print(file=sys.stderr)
     for gf in gathered:
         lines_info = f" (lines {gf.start}-{gf.end})" if gf.start else ""
         print(

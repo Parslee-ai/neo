@@ -719,6 +719,90 @@
   `test_every_chunk_query_compiles` /
   `test_every_edge_query_compiles` prove compilation ONLY, so a new query still
   needs its own behavioural assertion.
+- Persistent eligibility walk (`index/walk_cache.py`, `eligibility.DirectoryListing`).
+  The #208 walk is **kept on disk too**, in the same `.neo/`, because once the
+  content index stopped rebuilding it became the largest single item in a warm
+  call: 4.64 s on m365dotnet to re-derive that 9,348 files are eligible, on every
+  invocation, in a repository that had not changed (#210). Warm walk now 0.16 s;
+  the canonical M2 battery went 15.63 s → **8.57 s** median with byte-identical
+  selection on all six prompts and byte-identical `rank_mine_eval` on all three
+  flagships.
+  - **The cost is the pattern matching, not the filesystem, and that decides the
+    whole design.** Measured before the cache existed, on m365dotnet: the full
+    walk **6.85 s**; the same traversal with the per-FILE ignore test removed
+    **0.80 s**; `stat` over all 9,378 admitted files **0.10 s**. So 6.05 s of a
+    6.85 s walk is `should_ignore` (11,219 calls), and caching the syscalls
+    would have saved almost nothing. What is stored per directory is therefore
+    the VERDICTS — which subdirectories survive, which filenames survive, and
+    the exclusion counts — with the directory's stamps saying whether they hold.
+  - **Directory mtime is the right key for exactly one reason**: on every POSIX
+    filesystem it moves when an entry is created, deleted or renamed inside that
+    directory, and does NOT move when the content of a file inside it changes.
+    An edit can change what a file SAYS; it can never change whether it is
+    eligible.
+  - **mtime alone is not enough, because mtime is forgeable.** `touch -r`,
+    `tar -x`, `rsync -a` and every snapshot restore write a directory's mtime
+    back to a recorded value, so a restore that adds or deletes a file can land
+    on exactly the mtime the cache holds and be reported `warm` — reproduced
+    with two lines of `os.utime`, found by the fresh-verifier pass. `ctime_ns`
+    is stored beside it: the inode change time moves on any metadata change, no
+    API restores it, and it arrives in the same `stat`. On Windows `st_ctime` is
+    a CREATION time and hence constant, which makes the extra comparison a no-op
+    there rather than a false invalidation.
+  - **Sizes and mtimes are never remembered.** They come fresh from the `stat`
+    the walk owes its callers anyway (0.10 s), because the content index uses
+    them as ITS freshness stamp — serving a remembered mtime would make an
+    edited file look unedited and turn one cache's staleness into another's.
+    `TestStampsAreNeverCached` pins it, mutation-verified.
+  - **A `.gitignore` edit invalidates by CONTENT, not by any timestamp.** No
+    directory's mtime moves when a pattern file is edited, so every stored
+    verdict looks current while every one of them may now be wrong. The
+    signature hashes the effective pattern list (shared defaults + the repo's own
+    `.gitignore`/`.ignore`), plus a `MATCHER_VERSION` for the case the patterns
+    are identical and `should_ignore` is not. Cost of an edit: one full walk,
+    then warm again.
+  - **`os.walk(followlinks=False)` had been doing work no one had named.** The
+    traversal now recurses by hand, one directory at a time, so that flag
+    protects only the single read it is passed — a link to an ancestor became an
+    infinite descent and a link to `/` walked the machine. The refusal to
+    descend into a symlinked DIRECTORY is restated explicitly and is not gated by
+    `skip_symlinks`, which is about whether a symlinked FILE is delivered.
+  - **A directory modified within `RACY_WINDOW_NS` (1 s) of being read is not
+    trusted.** Timestamp granularity is not always finer than the interval
+    between two events — HFS+ stamps whole seconds — so a directory read at E
+    with mtime M can be modified afterwards into the same bucket whenever
+    `E - M` is under one tick. Git carries the same guard under the name "racily
+    clean". Its test had to pre-create `.neo/` to mean anything: writing the
+    cache creates that directory, which moves the repository ROOT's mtime, so
+    the call after a first-ever call re-lists the root whatever the guard does —
+    the first cut of that test passed with the guard deleted.
+  - **`extra_ignores` is never served from a cache and never writes one.** A
+    caller's patterns are appended after the repo's own and gitignore is
+    last-match-wins, so a `!negation` there can re-include what a stored verdict
+    excluded — the stored verdict is not a stale answer, it is an answer to a
+    different question. Nothing in Neo takes that path today (`--exclude` is
+    applied after the walk); the guard exists so a future caller gets a correct
+    answer rather than a fast wrong one. Reported as mode `bypassed`.
+  - **JSON, not SQLite — the opposite conclusion from the same question.** Every
+    directory is validated on every call, so the file is read whole every time,
+    which is what JSON is for and what the semantic catalog beside it already
+    uses. 507 KB and ~10 ms for m365dotnet. The neighbouring content index went
+    to SQLite because a query touches ten terms of a few hundred thousand; the
+    access shape decides, not the size.
+  - The verdicts are the IGNORE layer only, so one cache serves every consumer:
+    `--exts` / `match_globs` / `max_file_bytes` / `skip_symlinks` are applied on
+    top, per call. `--index` and `architecture_metrics.compute` (which runs on
+    the outcome-detection path of every real invocation) go through the same
+    cache, so `--index` warms the walk as well as the catalog.
+  - Degradations are loud and none is fatal: a corrupt, truncated, malformed or
+    foreign-signature cache is discarded with a warning and the walk runs in
+    full; an unwritable `.neo/` costs a warning and nothing else. A malformed
+    ENTRY discards the whole file rather than the entry, because half a cache is
+    half a repository, silently. `--dry-run` names which of cold / rebuilt /
+    incremental (N of M directories) / warm / bypassed happened, in the
+    selected-files block and in the `--json` payload's `walk_cache` key. A cold
+    walk announces itself BEFORE it starts, since a first call on a large
+    repository is seconds of otherwise-silent work.
 - Persistent content index (`index/content_index.py`, `index/freshness.py`). The
   BM25 corpus above is **built once and kept on disk**, in the repository's own
   `.neo/` beside the semantic catalog, not re-derived per call. Rebuilding it per

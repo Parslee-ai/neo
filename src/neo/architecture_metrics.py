@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Optional
 
-from neo.eligibility import walk_paths
+from neo.eligibility import WalkPolicy, normalize_exts
 from neo.index.language_parser import QUERIES, TreeSitterParser
 from neo.languages import EXTENSION_TO_LANGUAGE
 
@@ -259,7 +259,18 @@ def _iter_source_files(root: Path) -> Iterable[Path]:
     # Extension matching is exact and case-insensitive: `name.endswith(".c")`
     # would also match `foo.bc`, which is not a C file.
     wanted = {".py", *extras}
-    for entry in walk_paths(str(root), exts=wanted).paths:
+    # Through the cache, because this runs on the outcome-detection path of
+    # every real invocation, not only on `--index`. The cache stores ignore
+    # verdicts, which are policy-independent, so this share the one the
+    # gatherer built and pays no walk of its own on a warm repository.
+    from neo.index.walk_cache import cached_walk
+
+    policy = WalkPolicy(exts=normalize_exts(wanted))
+    # `record=False` / `quiet=True`: this is a secondary, extension-filtered
+    # walk running after the answer is assembled. It must not narrate over the
+    # result, and it must not become the walk `--dry-run` reports — that one is
+    # the corpus walk, and this one's file count is a subset of it.
+    for entry in cached_walk(str(root), policy, quiet=True, record=False).paths:
         yield Path(entry.path)
 
 

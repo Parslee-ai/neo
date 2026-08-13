@@ -418,7 +418,8 @@ class ProjectIndex:
         printed "Built index" and exited 0 whether it had indexed the
         repository or 83 files of a stale worktree copy.
         """
-        from neo.eligibility import walk_paths
+        from neo.eligibility import WalkPolicy
+        from neo.index.walk_cache import cached_walk
         from neo.languages import language_for_path
 
         # One walk, shared with prompt assembly. It prunes ignored directories
@@ -432,7 +433,14 @@ class ProjectIndex:
         # to make separately: the walk starts at the repo root and never
         # follows a link, so an admitted path is inside the repo by
         # construction.
-        walked = walk_paths(str(self.repo_root), match_globs=file_patterns)
+        # Through the shared walk cache: `--index` is the documented
+        # cache-warmer, so it must warm the walk as well as the catalog, and
+        # on a repository the gatherer has already visited it costs nothing.
+        walked = cached_walk(
+            str(self.repo_root),
+            WalkPolicy(match_globs=tuple(file_patterns)),
+            record=False,
+        )
         excluded = walked.excluded
 
         by_language: Dict[str, List[Path]] = {}
