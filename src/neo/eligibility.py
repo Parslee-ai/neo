@@ -38,6 +38,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -389,6 +390,79 @@ class WalkPolicy:
     skip_symlinks: bool = True
 
 
+#: How close a directory's modification time may sit to the moment its entries
+#: were read before that reading stops being trustworthy.
+#:
+#: Filesystem timestamp granularity is not always finer than the interval
+#: between two events. HFS+ stamps whole seconds; a network mount can be
+#: coarser still. So a directory read at time E, whose recorded mtime is M,
+#: can be modified afterwards and land in the SAME timestamp bucket whenever
+#: `E - M` is under one granularity tick — and the next walk then compares two
+#: equal mtimes and concludes, wrongly, that nothing was added or deleted.
+#:
+#: One second is the coarsest granularity worth defending against, and the
+#: cost of the defence is that a directory touched in the second before it was
+#: read is re-listed on the next call rather than trusted. Git carries the same
+#: guard for the same reason, under the name "racily clean".
+RACY_WINDOW_NS = 1_000_000_000
+
+
+@dataclass(frozen=True)
+class DirectoryListing:
+    """The ignore-rule verdicts for the entries of ONE directory.
+
+    This is what makes the walk cacheable. Deciding whether a path is ignored
+    means matching it against every pattern in the repository's effective
+    ignore set, and on a large repository that pattern matching — not the
+    filesystem — is the entire cost of the walk: measured on m365dotnet,
+    11,219 `should_ignore` calls take 6.7 s of a 6.9 s walk, while listing the
+    same directories costs 0.11 s and stat-ing all 9,378 admitted files costs
+    0.10 s. Caching the syscalls would save nothing; caching the verdicts
+    saves everything.
+
+    A verdict is a function of the entry's NAME and the pattern set, so it
+    stays valid for exactly as long as the directory's entry names do. On
+    every POSIX filesystem a directory's mtime moves when an entry is created,
+    removed or renamed inside it — and does NOT move when the CONTENT of a
+    file inside it changes, which is precisely the distinction wanted here: an
+    edit cannot change who is eligible, only what they say.
+
+    Three fields exist to keep that promise honest:
+
+    - `scanned_at_ns` pairs with `RACY_WINDOW_NS` above.
+    - `symlinks` is kept beside `files` rather than dropped, because
+      `WalkPolicy.skip_symlinks` is a per-consumer choice and a cache that
+      recorded only one consumer's answer would silently give the other the
+      wrong one.
+    - `excluded_dirs` / `excluded_files` are counts of what THIS directory's
+      rules rejected, so a reused listing reports the same exclusion totals a
+      fresh walk would. A cache that quietly reported zero exclusions would
+      make `--dry-run`'s G1 accounting depend on whether the last call
+      happened to be warm.
+
+    What is deliberately NOT here: sizes, mtimes and content hashes of the
+    files. Those are read fresh on every walk, from the `stat` the walk owes
+    its callers anyway, because the persistent content index next door uses
+    them as its own freshness stamp — serving it a remembered mtime would make
+    an edited file look unedited and turn one cache's staleness into another's.
+    """
+
+    mtime_ns: int
+    scanned_at_ns: int
+    subdirs: tuple[str, ...]
+    files: tuple[str, ...]
+    symlinks: tuple[str, ...] = ()
+    excluded_dirs: int = 0
+    excluded_files: int = 0
+
+    def is_current(self, mtime_ns: int) -> bool:
+        """True when this listing may be reused for a directory now at `mtime_ns`."""
+        return (
+            self.mtime_ns == mtime_ns
+            and self.mtime_ns <= self.scanned_at_ns - RACY_WINDOW_NS
+        )
+
+
 @dataclass
 class WalkResult:
     """The admitted paths plus an honest account of what was left out.
@@ -399,10 +473,18 @@ class WalkResult:
     is a deliberate trade — the previous index-side count enumerated every
     file under `.worktrees/` in order to report "200 paths excluded", which
     cost a full walk of the very trees the exclusion exists to avoid.
+
+    `listings` is the walk's own record of what it decided, ready to be
+    persisted by `index.walk_cache` and handed back on the next call.
+    `reused_dirs` / `rescanned_dirs` are how much of it survived, which is the
+    only honest basis for reporting a cache as warm.
     """
     paths: list[EligiblePath]
     excluded_dirs: int = 0
     excluded_files: int = 0
+    listings: Optional[dict[str, DirectoryListing]] = None
+    reused_dirs: int = 0
+    rescanned_dirs: int = 0
 
     @property
     def excluded(self) -> int:
@@ -410,12 +492,89 @@ class WalkResult:
         return self.excluded_dirs + self.excluded_files
 
 
-def walk(root: str, policy: Optional[WalkPolicy] = None) -> WalkResult:
+def _read_directory(
+    abs_dir: str,
+    rel_dir: str,
+    mtime_ns: int,
+    patterns: list[str],
+) -> Optional[DirectoryListing]:
+    """List one directory and apply the ignore rules to its entries.
+
+    `next(os.walk(...))` rather than `os.listdir`, and that is not a stylistic
+    preference: `os.walk` is a generator that reads one directory per step, so
+    taking only its first item costs exactly one directory read and nothing
+    below it. It also keeps every directory read in this package behind a
+    single primitive, which `tests/test_eligibility_single_source.py` enforces
+    — a second traversal spelling is how both historical copies of this logic
+    began.
+
+    A directory that cannot be read yields nothing and returns `None`, which
+    is the behaviour `os.walk` had here before: one unreadable directory costs
+    that directory, not the walk.
+    """
+    walked = next(os.walk(abs_dir, followlinks=False), None)
+    if walked is None:
+        return None
+    _, dirnames, filenames = walked
+
+    prefix = '' if not rel_dir else rel_dir + '/'
+    subdirs: list[str] = []
+    files: list[str] = []
+    symlinks: list[str] = []
+    excluded_dirs = 0
+    excluded_files = 0
+
+    for name in dirnames:
+        if should_ignore(prefix + name, patterns, is_dir=True):
+            excluded_dirs += 1
+        else:
+            subdirs.append(name)
+
+    for name in filenames:
+        if should_ignore(prefix + name, patterns):
+            excluded_files += 1
+            continue
+        # Before anything that stats the target. `os.path.getsize`,
+        # `Path.is_file` and `Path.resolve` all dereference, and the point of
+        # rejecting a symlink is to not touch what it points at. Recorded
+        # rather than dropped so that `skip_symlinks=False` still gets a true
+        # answer out of a reused listing.
+        if os.path.islink(os.path.join(abs_dir, name)):
+            symlinks.append(name)
+        else:
+            files.append(name)
+
+    # AFTER the entries are in hand, so the stamp bounds the read it describes
+    # rather than starting before it. See `RACY_WINDOW_NS`.
+    return DirectoryListing(
+        mtime_ns=mtime_ns,
+        scanned_at_ns=time.time_ns(),
+        subdirs=tuple(subdirs),
+        files=tuple(files),
+        symlinks=tuple(symlinks),
+        excluded_dirs=excluded_dirs,
+        excluded_files=excluded_files,
+    )
+
+
+def walk(
+    root: str,
+    policy: Optional[WalkPolicy] = None,
+    listings: Optional[dict[str, DirectoryListing]] = None,
+) -> WalkResult:
     """The one filesystem walk. Yields every eligible file under `root`.
 
     Ignored directories are PRUNED rather than filtered per-file, which is
     both git's semantics and the difference between a warm call and a walk of
     `node_modules`.
+
+    `listings` is the previous walk's `WalkResult.listings`, if a caller kept
+    one. A directory whose mtime still matches its listing is not read again
+    and its entries are not re-tested against the pattern set; its files are
+    still `stat`-ed, because that is where their size and mtime come from and
+    those must never be remembered (see `DirectoryListing`). Passing `None` —
+    the default, and what every caller that does not want a cache does — walks
+    exactly as before.
 
     Results are sorted by `rel_path`. Directory-entry order is whatever the
     filesystem hands back, so without this a tie anywhere downstream — two
@@ -431,47 +590,73 @@ def walk(root: str, policy: Optional[WalkPolicy] = None) -> WalkResult:
         if policy.match_globs is not None
         else None
     )
+    if policy.extra_ignores:
+        # A listing records verdicts reached under the repository's OWN ignore
+        # rules. `extra_ignores` is appended after those, and gitignore is
+        # last-match-wins, so a caller's `!negation` can re-include something
+        # the recorded verdict excluded. Reusing a listing here would not be a
+        # stale answer, it would be the wrong question — so the cache is not
+        # consulted, and `index.walk_cache` does not persist one either.
+        listings = None
 
     paths: list[EligiblePath] = []
     excluded_dirs = 0
     excluded_files = 0
+    fresh: dict[str, DirectoryListing] = {}
+    reused = 0
+    rescanned = 0
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        rel_dir = os.path.relpath(dirpath, root)
-        prefix = '' if rel_dir == '.' else rel_dir.replace(os.sep, '/') + '/'
+    # `(rel_dir, abs_dir)` in step, rather than joining `root` to a POSIX
+    # `rel_dir` at use time: `rel_path` is separator-normalized by contract and
+    # `path` must stay native, and deriving one from the other produces the
+    # mixed `C:\repo\src/neo` spelling on Windows.
+    pending = [('', root)]
+    while pending:
+        rel_dir, abs_dir = pending.pop()
+        try:
+            dir_mtime = os.stat(abs_dir).st_mtime_ns
+        except OSError:
+            # Removed between being listed by its parent and being reached.
+            continue
 
-        kept: list[str] = []
-        for name in dirnames:
-            if should_ignore(prefix + name, patterns, is_dir=True):
-                excluded_dirs += 1
-            else:
-                kept.append(name)
-        # In-place, because that is how `os.walk` is told not to descend.
-        dirnames[:] = kept
+        cached = listings.get(rel_dir) if listings is not None else None
+        if cached is not None and cached.is_current(dir_mtime):
+            listing = cached
+            reused += 1
+        else:
+            listing = _read_directory(abs_dir, rel_dir, dir_mtime, patterns)
+            if listing is None:
+                continue
+            rescanned += 1
 
-        for name in filenames:
+        fresh[rel_dir] = listing
+        excluded_dirs += listing.excluded_dirs
+        excluded_files += listing.excluded_files
+
+        prefix = '' if not rel_dir else rel_dir + '/'
+        for name in listing.subdirs:
+            pending.append((prefix + name, os.path.join(abs_dir, name)))
+
+        names = listing.files
+        if not policy.skip_symlinks:
+            names = names + listing.symlinks
+        elif listing.symlinks:
+            # Named, because the index used to warn here and an operator
+            # asking "why is this file not indexed?" got an answer. A policy
+            # rejection is not an ignore-rule verdict, so it is not counted
+            # into `excluded_*` — but it must not be silent.
+            for name in listing.symlinks:
+                logger.debug("Skipping symlink: %s", prefix + name)
+
+        for name in names:
             rel_path = prefix + name
-            if should_ignore(rel_path, patterns):
-                excluded_files += 1
-                continue
-
-            abs_path = os.path.join(dirpath, name)
-            # Before anything that stats the target. `os.path.getsize`,
-            # `Path.is_file` and `Path.resolve` all dereference, and the point
-            # of rejecting a symlink is to not touch what it points at.
-            if policy.skip_symlinks and os.path.islink(abs_path):
-                # Named, because the index used to warn here and an operator
-                # asking "why is this file not indexed?" got an answer. A
-                # policy rejection is not an ignore-rule verdict, so it is not
-                # counted into `excluded_*` — but it must not be silent.
-                logger.debug("Skipping symlink: %s", rel_path)
-                continue
             if globs is not None and not any(g.match(rel_path) for g in globs):
                 continue
             if policy.exts is not None:
                 ext = os.path.splitext(name)[1].lstrip('.').lower()
                 if ext not in policy.exts:
                     continue
+            abs_path = os.path.join(abs_dir, name)
             try:
                 # One `stat`, two facts. `os.path.getsize` is a `stat` that
                 # throws the rest of the struct away, and the modification
@@ -487,7 +672,14 @@ def walk(root: str, policy: Optional[WalkPolicy] = None) -> WalkResult:
             paths.append(EligiblePath(abs_path, rel_path, size, info.st_mtime_ns))
 
     paths.sort(key=lambda entry: entry.rel_path)
-    return WalkResult(paths, excluded_dirs=excluded_dirs, excluded_files=excluded_files)
+    return WalkResult(
+        paths,
+        excluded_dirs=excluded_dirs,
+        excluded_files=excluded_files,
+        listings=fresh,
+        reused_dirs=reused,
+        rescanned_dirs=rescanned,
+    )
 
 
 def normalize_exts(exts: Optional[Iterable[str]]) -> Optional[frozenset[str]]:
