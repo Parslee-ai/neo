@@ -33,14 +33,21 @@ python -c "from tree_sitter_language_pack import get_parser; print('tree-sitter 
 # Index all supported languages (auto-detect)
 neo --index
 
-# Incrementally refresh after edits (re-embeds only changed files)
+# Re-embed only the files that changed since the last build
 neo --update
 
 # Index from a specific directory
 neo --index --cwd /path/to/project
 ```
 
-The resulting index lives at `.neo/index.json` inside the target repo and powers Neo's [Smart File Selection](../README.md#smart-file-selection).
+The resulting catalog lives at `.neo/index.json` inside the target repo and is
+**stage 4** of Neo's [Smart File Selection](../README.md#smart-file-selection) — a
+re-rank and supplement over the keyword stage, not a prerequisite for it. The
+eligibility walk and the keyword content index are separate artifacts in the same
+`.neo/` directory (`walk_cache.json`, `content_index.sqlite3`) that maintain
+themselves on every invocation; this command is an **optional cache-warmer** for the
+embedding catalog alone. A repo with no catalog still selects files on every stage
+below stage 4, and once a catalog exists it is read on every run with no flag.
 
 ### Supported Languages
 
@@ -99,7 +106,7 @@ Grammars move. `test_every_chunk_query_compiles` / `test_every_edge_query_compil
 
 ## Operational Notes
 
-- Use `neo --update` instead of `--index` after the first build — it re-embeds only changed files.
+- **The catalog is optional and its refresh is manual — unlike everything else in `.neo/`.** The walk cache and the keyword content index update inline on every invocation; the embedding catalog does not, so `neo --update` after the first build is what keeps it current (it re-embeds only changed files). A stale catalog degrades quality, never correctness: stage 4 can only add to or re-order what stage 3 found, never remove from it.
 - The index build caps at **100 files** per run by default. Override it with `neo --index --max-files N`; the same flag caps *context gathering* at 30 by default when used without `--index`, so each subsystem keeps its own floor.
 - **The cut is apportioned, not sliced.** `ProjectIndex._select_files` groups eligible files by language and gives each a share of `--max-files` proportional to how much of the repo it is, with a floor of one slot per language present (`_allocate_slots`). Before this, patterns were globbed in list order and concatenated, so whichever language globbed first ate the budget — a .NET repo of 4,272 C# files produced an index of 83 Python files and zero C#, and exited 0. Within a language, files are ordered shallowest-path-first; that is a weak heuristic, not centrality ranking.
 - **`MAX_CHUNKS_PER_REPO` (1000) is applied the same way.** `_cap_chunks` round-robins across files, so every indexed file keeps a chunk before any file keeps a second. A plain slice re-created the bug one layer down, since chunks arrive grouped by file and files grouped by language.

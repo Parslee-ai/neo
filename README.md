@@ -612,10 +612,12 @@ neo "how do I fix the authentication bug?"
 # With working directory context
 neo --cwd /path/to/project "optimize this function"
 
-# Build the per-project semantic index (powers smart file selection)
+# Optional: build the embedding catalog (adds semantic re-ranking to file selection).
+# Nothing requires this — file selection works on a fresh clone, and the walk and
+# keyword index refresh themselves on every call.
 neo --index
 
-# Incrementally refresh the index after meaningful changes (re-embeds only changed files)
+# Re-embed only the files that changed since the last --index build
 neo --update
 
 # Preview the assembled context without making an LLM call
@@ -656,8 +658,8 @@ Neo is one binary with a plain-text prompt plus a handful of subcommands. Run
 | `--dry-run` | Assemble and print the full context, then exit without an LLM call |
 | `--json` | JSONL progress events on **stderr**, one final JSON object on **stdout** (also the JSON *input* path) — see [Orchestrator output](#orchestrator-output) |
 | `--output-schema NAME_OR_PATH` | Constrain the shape of the final JSON response |
-| `--index` / `--update` / `--languages CSV` | Build, incrementally refresh, and scope the per-project semantic index |
-| `--semantic` | Use the semantic index for file selection (requires `.neo/index.json`) |
+| `--index` / `--update` / `--languages CSV` | Optional cache-warmer: build, re-embed, and scope the per-project embedding catalog. Not a prerequisite for anything — see [Smart File Selection](#smart-file-selection) |
+| `--semantic` | A hint, not a mode: reads the embedding catalog deeper and weighs it as heavily as the keyword index. The catalog is consulted on every run whether or not you pass this; with no catalog present, the flag says so |
 | `--max-bytes N` | Hard cap on total context bytes (default 300000) |
 | `--max-files N` | Cap on files: context gathering (default 30), or the index build when passed with `--index` (default 100). The index build apportions this budget across languages by repo composition and reports what the cap left out |
 | `--include GLOB` / `--exclude GLOB` | Allow/block file patterns; both repeatable |
@@ -1123,15 +1125,20 @@ out of scope — they'd add more noise than signal at this stage.
 
 ### Smart File Selection
 
-The context gatherer picks files using three signals:
+**There is one retrieval path.** Every invocation — flagged or not, on a fresh clone or a warm one — goes through the same four-stage front door in `gather_context`. No flag routes around it, and there is nothing to build first.
 
-- **ProjectIndex semantic boost**: when `.neo/index.json` exists (run `neo --index` once per repo), per-project FAISS over tree-sitter chunks projects top-k chunk hits back to per-file boosts up to +1.0 cosine. Chunks embed `symbols + imports + first ~600 chars of body`, so prompt keywords match what a file *is*, not assertion strings inside tests. Test-file matches are demoted 0.4× unless the prompt mentions test/spec.
-- **Tree-sitter symbol overlap**: the parser extracts function/class names + imports from top candidates and adds up to +1.2 for substring matches against prompt tokens (length-3 floor).
-- **EPISODE-history feedback loop**: each Neo run stashes touched file paths as `file:<rel>` tags on EPISODE facts. On the next run, the gatherer queries for similar past prompts and gives those files up to +0.5 boost — past file selections measurably influence future ones.
+1. **Paths the prompt named** — pinned. A path spelled out in the prompt carries `EXPLICIT_PATH_BOOST` (10.0), chosen to exceed every organic signal combined, so it cannot lose to a ranking.
+2. **`--include` patterns** — pinned too, and the scan keeps running alongside them rather than narrowing to them. A named file arrives whole, or with an explicit truncation marker; never silently dropped.
+3. **Keyword** — BM25 over file *content*, weighted `CONTENT_WEIGHT` (3.0), served from a persistent per-repo index that refreshes itself incrementally on every call.
+4. **Semantic** — the embedding catalog, as a **re-rank and supplement** of stage 3 whenever it exists. It can raise a file or surface one stage 3 never scored; it can never remove a file stage 3 found, because the catalog is a snapshot and a stale snapshot must not suppress a live hit.
 
-A per-file chunk cap of 2 prevents large files from eating the budget; a one-time first-run hint fires if the index is missing.
+Stages 1 and 2 assert presence; 3 and 4 rank what is left. An assertion cannot lose to a score.
 
-The index build itself apportions its budget rather than truncating whatever globbed first: files are grouped by language and given a share of `--max-files` proportional to how much of the repo they are, with a floor of one slot per language, and the `MAX_CHUNKS_PER_REPO` cut round-robins across files so every indexed file keeps a chunk. Non-source paths (`.worktrees`, `node_modules`, `.claude`, virtualenvs, plus anything the repo's own `.gitignore` names) are excluded, and byte-identical duplicates are indexed once. When a cap bites, `neo --index` says so — a capped build no longer looks the same as a complete one. See [tree-sitter setup](docs/tree-sitter-setup.md#operational-notes).
+Two further signals ride on the ranking stages: **tree-sitter symbol overlap** (function/class names + imports from top candidates, up to +1.2 for substring matches against prompt tokens, length-3 floor) and the **EPISODE-history feedback loop** (each run stashes touched paths as `file:<rel>` tags on EPISODE facts; a later similar prompt gives those files up to +0.5). Test-file matches are demoted 0.4× unless the prompt is itself about tests. Delivery is one entry per file, read whole from disk, with `--max-bytes` apportioned max-min fair across the selection.
+
+**What `--index` is, and is not.** Stages 1–3 need nothing built: the eligibility walk and the keyword index are cached in the repo's `.neo/` and brought up to date inline on every invocation, so removing `--index` from a fresh-clone workflow changes first-call latency and nothing else. `--index` builds the **embedding catalog** that stage 4 reads — tree-sitter chunks embedding `symbols + imports + first ~600 chars of body`, over FAISS, at `.neo/index.json`. Once it exists it is consulted on every run with no flag; `--semantic` only reads it deeper (3×) and raises its weight to `CONTENT_WEIGHT`. Without a catalog, stage 4 contributes nothing and a one-line tip fires.
+
+The catalog build apportions its budget rather than truncating whatever globbed first: files are grouped by language and given a share of `--max-files` proportional to how much of the repo they are, with a floor of one slot per language, and the `MAX_CHUNKS_PER_REPO` cut round-robins across files so every indexed file keeps a chunk (per-file cap 2). Non-source paths (`.worktrees`, `node_modules`, `.claude`, virtualenvs, plus anything the repo's own `.gitignore` names) are excluded, and byte-identical duplicates are indexed once. When a cap bites, `neo --index` says so — a capped build no longer looks the same as a complete one. See [tree-sitter setup](docs/tree-sitter-setup.md#operational-notes).
 
 
 ### Learning Feedback Loop

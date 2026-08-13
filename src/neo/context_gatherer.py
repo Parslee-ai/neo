@@ -434,7 +434,7 @@ def calculate_adaptive_limit(prompt: str, default_max: int = 30) -> int:
     elif specificity < 10:
         return 25  # Moderate: "review the semantic search implementation"
     else:
-        return default_max  # Specific: "review ProjectIndex.retrieve() and gather_context_semantic()"
+        return default_max  # Specific: "review ProjectIndex.retrieve() and _project_index_boost()"
 
 
 def infer_language(path: str) -> Optional[str]:
@@ -759,7 +759,14 @@ def _project_index_boost(
                     f"none at {index.snapshot_path} - ranking on the keyword "
                     "index alone; run 'neo --index' to build it")
             elif not index.snapshot_path.exists():
-                progress.note("Tip: run 'neo --index' to enable semantic file selection")
+                # Phrased as an addition, never as something being switched
+                # on: stages 1-3 already ran and this run's files were already
+                # selected. The verb "enable" belongs to the retired lane, in
+                # which the catalog WAS the selector, so its absence meant
+                # selection fell back to something lesser. It no longer does.
+                progress.note(
+                    "Tip: 'neo --index' builds the embedding catalog; stage 4 "
+                    "then re-ranks every run, with no flag")
             return {}
         chunks = index.retrieve(prompt, k=k)
 
