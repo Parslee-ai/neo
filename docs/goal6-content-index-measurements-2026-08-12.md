@@ -50,6 +50,16 @@ cases, 50 per repo, zero failed cases, `--no-git` (the default).
 Byte-identical in every cell. Repo HEADs at measurement: neo `5bbee46747c8`,
 aieweb `26fff07e0f4a`, m365dotnet `61dc4a171bdf`.
 
+**Measurement condition, disclosed because it happened mid-run.** m365dotnet is a live
+working tree on a shared machine, and an unrelated session ran `git reset` in it at
+20:58:59 (`git reflog --date=iso`) — between the m365dotnet `main` arm (20:53–21:27)
+and the `branch` arm (21:27–21:42). That reverted one modified tracked file and removed
+two untracked paths, so the two arms saw corpora differing by a handful of files. HEAD
+did not move. The arms still agree in every cell, which says the perturbation was
+immaterial to these 50 cases — it is not evidence that it could never matter, and a
+re-measure wanting a stricter guarantee should pin the tree. The neo and aieweb arms
+ran either side of no such event.
+
 ```bash
 for repo in neo aieweb m365dotnet; do
   for arm in main branch; do
