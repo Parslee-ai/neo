@@ -39,6 +39,12 @@ PROMPT_NAMING = (
     "is busy"
 )
 PROMPT_PLAIN = "Fix the connection pool timeout when the database is busy"
+# Three named paths against a one-file cap. Boosting cannot put three files
+# through one slot; only a pin can, which is what makes the cap test bite.
+PROMPT_NAMING_THREE = (
+    "Fix the connection pool timeout across src/app/pool.py, "
+    "src/app/client.py and src/app/config.py"
+)
 
 _BULK = "\n".join(
     f"    # database pool connection timeout retry line {i}" for i in range(400)
@@ -59,6 +65,16 @@ def repo(tmp_path):
     (tmp_path / "src" / "app" / "pool.py").write_text(
         "def connection_pool_timeout():\n"
         "    '''Database connection pool timeout handling.'''\n"
+        f"{_BULK}\n",
+        encoding="utf-8",
+    )
+    # See the matching note in tests/test_include_guarantee.py: a single big
+    # file cannot separate pinned from unpinned at one ceiling, because any
+    # ceiling that leaves the pin block room also leaves the scan's fair share
+    # room. `PIN_BUDGET_SHARE` holds the pin block to half.
+    (tmp_path / "src" / "app" / "worker.py").write_text(
+        "def connection_pool_worker():\n"
+        "    '''Database connection pool worker loop.'''\n"
         f"{_BULK}\n",
         encoding="utf-8",
     )
@@ -108,30 +124,39 @@ class TestStageOneIsAPin:
 
         assert named.pinned is True
 
-    def test_a_named_path_survives_a_file_cap_of_one(self, repo):
+    def test_every_named_path_survives_a_file_cap_of_one(self, repo):
         """The claim `EXPLICIT_PATH_BOOST` could not make.
 
-        +10.0 clears every organic signal combined, so the file did rank
-        first — and a prompt naming more files than the limit admits still
-        lost the ones past the cut, because ranking first is not presence.
+        The prompt names THREE files against a one-file cap, and that is the
+        whole point: with one named file the boost alone still delivers it,
+        so a single-file version of this test passes with stage 1 deleted and
+        proves nothing. A verifier reverted the pin and watched exactly that
+        happen. Boosting cannot put three files through one slot; pinning can,
+        because a pin is not competing for the slot.
         """
-        gathered = _gather(repo, prompt=PROMPT_NAMING, max_files=1)
+        gathered = _gather(repo, prompt=PROMPT_NAMING_THREE, max_files=1)
+        rels = _rels(gathered)
 
-        assert "src/app/pool.py" in _rels(gathered)
+        for named in (
+            "src/app/pool.py", "src/app/client.py", "src/app/config.py"
+        ):
+            assert named in rels, f"{named} was named and did not arrive: {rels}"
 
-    def test_the_control_run_really_does_lose_it(self, repo):
-        """Guards the guard: at `--max-files=1` the pool file must NOT arrive
-        when nothing names it, or the assertion above proves nothing."""
+    def test_the_control_run_really_does_lose_them(self, repo):
+        """Guards the guard: at `--max-files=1` exactly one file arrives when
+        nothing names them, or the assertion above proves nothing."""
         gathered = _gather(repo, prompt=PROMPT_PLAIN, max_files=1)
+
         assert len(gathered) == 1
-        # It may or may not be the top-ranked file; what must be true is that
-        # a single slot is decided by the ranking, not by a guarantee.
         assert all(not g.pinned for g in gathered)
 
     def test_a_named_path_arrives_whole_at_a_ceiling_that_would_cut_it(self, repo):
         """Same ceiling in both arms; only the naming differs."""
         source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
-        ceiling = len(source.encode("utf-8"))
+        # TWICE the file: the pin block is held to half of `--max-bytes` while
+        # anything else is eligible, so half seats the pin exactly while the
+        # scan must split the same ceiling with `worker.py`.
+        ceiling = 2 * len(source.encode("utf-8"))
 
         control = _gather(repo, prompt=PROMPT_PLAIN, max_bytes=ceiling)
         control_pool = next(
@@ -192,6 +217,11 @@ class TestStageOrder:
         gathered = _gather(repo, prompt=PROMPT_NAMING)
         pinned_positions = [i for i, g in enumerate(gathered) if g.pinned]
 
+        # Non-empty FIRST. `[] == list(range(0))` is True, so without this the
+        # assertion below passes on a run with no pins at all — which is
+        # exactly the state a reverted stage 1 leaves it in.
+        assert pinned_positions, "nothing was pinned; the assertion is vacuous"
+        assert len(gathered) > len(pinned_positions), "the scan added nothing"
         assert pinned_positions == list(range(len(pinned_positions)))
 
 
@@ -258,19 +288,40 @@ class TestTheBudgetIsApportionedNotSpent:
         small ones are funded in full and the pool file pays."""
         source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
         gathered = _gather(repo, max_bytes=len(source.encode("utf-8")))
-        rels = _rels(gathered)
+        by_rel = {g.rel_path: g for g in gathered}
 
-        assert "src/app/pool.py" in rels
-        assert "src/app/client.py" in rels
-        assert "src/app/config.py" in rels
+        for rel in ("src/app/pool.py", "src/app/client.py", "src/app/config.py"):
+            assert rel in by_rel, f"{rel} did not arrive: {sorted(by_rel)}"
+
+        # PRESENT IS NOT ENOUGH. Under a greedy spend the small files still
+        # "arrive" — as marker-only entries with a zero allowance — so an
+        # `in rels` assertion passes with apportionment reverted. A verifier
+        # swapped `apportion` for a greedy fill and watched this test stay
+        # green. What apportionment buys is that the small files arrive
+        # INTACT, so that is what is asserted.
+        for rel in ("src/app/client.py", "src/app/config.py"):
+            on_disk = (repo / rel).read_text(encoding="utf-8")
+            assert (by_rel[rel].content or "") == on_disk, (
+                f"{rel} arrived cut; the big file took its budget"
+            )
 
     def test_the_small_files_are_not_the_ones_that_pay(self, repo):
+        """Max-min fair means the LARGE files pay and the small ones do not.
+
+        `pool.py` and `worker.py` are both ~21 KB and both legitimately pay at
+        this ceiling; the assertion is about the three small files, which a
+        greedy fill in rank order would have starved entirely.
+        """
         source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
         gathered = _gather(repo, max_bytes=len(source.encode("utf-8")))
+        big = {"src/app/pool.py", "src/app/worker.py"}
 
-        for g in gathered:
-            if g.rel_path != "src/app/pool.py":
-                assert g.truncated is False, f"{g.rel_path} paid for the big file"
+        small = [g for g in gathered if g.rel_path not in big]
+        assert small, "fixture stopped delivering any small file"
+        for g in small:
+            assert g.truncated is False, f"{g.rel_path} paid for the big files"
+            on_disk = (repo / g.rel_path).read_text(encoding="utf-8")
+            assert (g.content or "") == on_disk
 
     def test_the_ceiling_is_honoured(self, repo):
         source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
@@ -278,6 +329,178 @@ class TestTheBudgetIsApportionedNotSpent:
         gathered = _gather(repo, max_bytes=ceiling)
 
         assert sum(g.bytes for g in gathered) <= ceiling
+
+
+class TestThePinBlockCannotStarveTheScan:
+    """Ruling 1 has two clauses, and funding pins to the last byte deletes one.
+
+    Measured on the M2 battery before `PIN_BUDGET_SHARE` existed: the prompt
+    naming `src/Parslee.M365.Api/Program.cs` (442,867 bytes) pinned it, spent
+    299,959 of the 300,000-byte default ceiling, and delivered **one file**
+    where main delivered 22. "The named files AND keep scanning" was satisfied
+    by deleting the second half.
+    """
+
+    def test_the_scan_still_runs_when_a_named_file_would_eat_the_ceiling(
+        self, repo
+    ):
+        source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
+        # Just over the named file's own size: without the reserve the pin
+        # takes all but a few hundred bytes and `affordable` falls to zero.
+        ceiling = len(source.encode("utf-8")) + 500
+
+        gathered = _gather(repo, prompt=PROMPT_NAMING, max_bytes=ceiling)
+        rels = _rels(gathered)
+
+        assert "src/app/pool.py" in rels
+        scan = [g for g in gathered if not g.pinned]
+        assert scan, (
+            "the pin block took the whole ceiling and the scan contributed "
+            f"nothing: {rels}"
+        )
+
+    def test_the_reserve_is_what_makes_that_true(self, repo):
+        """Guards the guard: prove the ceiling really is tight enough that an
+        unreserved pin block would have consumed it.
+
+        Without this the test above passes on any ceiling roomy enough for
+        both, which is most of them.
+        """
+        from neo.context_gatherer import MIN_FILE_SHARE_BYTES, PIN_BUDGET_SHARE
+
+        source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
+        pin_bytes = len(source.encode("utf-8"))
+        ceiling = pin_bytes + 500
+
+        # What the scan would have been left with, unreserved.
+        assert (ceiling - pin_bytes) // MIN_FILE_SHARE_BYTES == 0
+        # And what it is left with under the reserve.
+        assert (
+            ceiling - int(ceiling * PIN_BUDGET_SHARE)
+        ) // MIN_FILE_SHARE_BYTES >= 1
+
+    def test_the_held_back_pin_is_cut_marked_and_announced(self, repo, capsys):
+        source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
+        ceiling = len(source.encode("utf-8")) + 500
+
+        gathered = _gather(repo, prompt=PROMPT_NAMING, max_bytes=ceiling)
+        err = capsys.readouterr().err
+        pool = next(g for g in gathered if g.rel_path == "src/app/pool.py")
+
+        assert pool.truncated is True
+        assert MARKER_PREFIX in (pool.content or "")
+        assert "the pinned block is held to" in err.lower()
+
+    def test_a_pin_that_fits_is_not_held_back(self, repo, capsys):
+        """The reserve must not be background noise: at the default ceiling a
+        pin of this size is nowhere near half, and nothing is said."""
+        gathered = _gather(repo, prompt=PROMPT_NAMING)
+        err = capsys.readouterr().err
+        pool = next(g for g in gathered if g.rel_path == "src/app/pool.py")
+
+        assert pool.truncated is False
+        assert "held to" not in err
+
+    def test_pins_take_the_whole_ceiling_when_nothing_else_is_eligible(
+        self, tmp_path
+    ):
+        """The reserve funds a scan that can run. With no other candidate it
+        would fund nothing, so it does not apply and the pin arrives whole."""
+        (tmp_path / "only.py").write_text(
+            "def connection_pool_timeout():\n" + "    # pool timeout\n" * 200,
+            encoding="utf-8",
+        )
+        source = (tmp_path / "only.py").read_text(encoding="utf-8")
+
+        gathered = _gather(
+            tmp_path,
+            prompt="Fix the timeout in only.py",
+            max_bytes=len(source.encode("utf-8")),
+        )
+
+        assert len(gathered) == 1
+        assert gathered[0].pinned is True
+        assert gathered[0].truncated is False
+        assert gathered[0].content == source
+
+
+class TestEachCapIsChargedForWhatItRemoved:
+    """The repo's own rule: never blame a cap for an absence it did not cause.
+
+    The first version derived the file cap's verdict from the FULL candidate
+    list and then let the byte cap cut further, so whenever both bound only the
+    file cap was named. Reproduced live at `--max-files=30`: "pinned files
+    filled the file budget (--max-files=30)" on a run with 29 of 30 slots free
+    and the byte ceiling holding the count at one.
+    """
+
+    @staticmethod
+    def _many(tmp_path, n=40):
+        for i in range(n):
+            (tmp_path / f"pool_{i:02d}.py").write_text(
+                f"def connection_pool_timeout_{i}():\n"
+                + f"    # database pool connection timeout retry {i}\n" * 4,
+                encoding="utf-8",
+            )
+        return tmp_path
+
+    def test_the_byte_cap_is_named_when_it_is_the_one_holding_the_count(
+        self, tmp_path, capsys
+    ):
+        from neo.context_gatherer import MIN_FILE_SHARE_BYTES
+
+        self._many(tmp_path)
+        # Room for two files by bytes, and far more than two file slots.
+        gathered = _gather(
+            tmp_path, max_files=200, max_bytes=MIN_FILE_SHARE_BYTES * 2 + 100
+        )
+        err = capsys.readouterr().err
+
+        assert len(gathered) == 2
+        assert "--max-bytes" in err
+        assert "file budget" not in err
+
+    def test_raising_the_named_knob_actually_moves_the_number(self, tmp_path):
+        """The property a mis-attributed warning breaks. If the run names
+        `--max-bytes`, raising `--max-bytes` must change the outcome."""
+        from neo.context_gatherer import MIN_FILE_SHARE_BYTES
+
+        self._many(tmp_path)
+        tight = _gather(
+            tmp_path, max_files=200, max_bytes=MIN_FILE_SHARE_BYTES * 2 + 100
+        )
+        roomier = _gather(
+            tmp_path, max_files=200, max_bytes=MIN_FILE_SHARE_BYTES * 20 + 100
+        )
+
+        assert len(roomier) > len(tight)
+
+    def test_both_caps_are_reported_with_their_own_counts(
+        self, tmp_path, capsys
+    ):
+        """Both can bind at once, and then both are named. Reporting one
+        understates the loss and points at a knob that only half explains it."""
+        from neo.context_gatherer import MIN_FILE_SHARE_BYTES
+
+        self._many(tmp_path)
+        gathered = _gather(
+            tmp_path, max_files=10, max_bytes=MIN_FILE_SHARE_BYTES * 3 + 100
+        )
+        err = capsys.readouterr().err
+
+        assert len(gathered) == 3
+        assert "file budget" in err
+        assert "--max-bytes" in err
+
+    def test_only_the_file_cap_is_named_when_bytes_are_plentiful(
+        self, tmp_path, capsys
+    ):
+        self._many(tmp_path)
+        _gather(tmp_path, max_files=5, max_bytes=1_000_000)
+        err = capsys.readouterr().err
+
+        assert "file budget" in err
+        assert "cannot fund them above" not in err
 
 
 class _FakeChunk:
