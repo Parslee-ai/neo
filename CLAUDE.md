@@ -719,6 +719,96 @@
   `test_every_chunk_query_compiles` /
   `test_every_edge_query_compiles` prove compilation ONLY, so a new query still
   needs its own behavioural assertion.
+- Persistent content index (`index/content_index.py`, `index/freshness.py`). The
+  BM25 corpus above is **built once and kept on disk**, in the repository's own
+  `.neo/` beside the semantic catalog, not re-derived per call. Rebuilding it per
+  invocation was the entire cost of a Neo call on a large repo: the canonical M2
+  battery on m365dotnet (9,348 eligible files) measured a **53.47 s** median wall
+  and 1.95 GB peak RSS, against 18.50 s / 1.45 GB with the store (#195). Selection
+  is UNCHANGED — byte-identical selected files and rank order on all six battery
+  prompts, and byte-identical `rank_mine_eval` MRR / R@k on all three flagships
+  (neo 0.712, aieweb 0.728, m365dotnet 0.669, 50 cases each).
+  - **SQLite, not the catalog's JSON, and the access shape is the reason.** The
+    catalog is read whole (every embedding participates in every query); a keyword
+    query touches ten terms out of a few hundred thousand, so a parse-whole format
+    would spend the warm budget deserializing postings nothing asked for. Index
+    artifacts only — postings, doc lengths, hashes, a tokenizer/schema signature —
+    never a file body; delivery still reads whole files fresh from disk. Cost is
+    disk: 109 MB for m365dotnet, 5 MB for neo.
+  - **The cheap stamp decides what to HASH, never that a file changed.** size +
+    mtime come free from the walk's existing `stat` (`EligiblePath.mtime_ns`);
+    only a content-hash mismatch counts as a change, so `touch` re-stamps and
+    re-tokenizes nothing and is reported as `touched`, separately from `changed`.
+    `UNRECORDED = -1` disables the cheap path for a store that persists hashes
+    alone — and it is checked EXPLICITLY, because the first cut stamped both the
+    store and the candidate with the sentinel and `-1 == -1` reported every
+    changed file as unchanged.
+  - **Eligibility arrives from the #208 walker and is never recomputed here** —
+    `test_the_module_does_not_walk_the_filesystem` fails on an `os.walk`/`glob` in
+    the module. A file the walker stops admitting (newly gitignored, deleted) has
+    its postings dropped on the same pass, so a stale index cannot answer with an
+    excluded file. Correspondingly the gatherer now walks ONCE, unfiltered, and
+    applies `--exts`/`--include`/`--exclude` to the result: the index is a
+    property of the REPOSITORY, and letting one `--exts py` call prune it would
+    force the next call to rebuild. `--exclude` no longer prunes a directory
+    subtree (it excludes every file under it via `should_ignore`, which matches a
+    non-final component); the names that make pruning matter are in the walker's
+    shared default list.
+  - **Parity is enforced, not asserted.** `K1`/`B`/IDF are imported from
+    `neo.memory.bm25` and the document is the same expression `FileIndex` used, so
+    `TestParity` can score one corpus both ways and compare to floating point.
+    Query-term MULTIPLICITY is preserved — deduping the query before hitting the
+    postings table is a silent ranking change, since the scorer this replaces
+    iterated the token LIST. **A filtered call gets filtered statistics**:
+    `scores(prompt, candidates)` takes N, df and avgdl from `candidates`, not
+    from the whole repository. Repo-global stats were the first cut and are the
+    better IR design in the abstract; they are also a re-rank, and a
+    fresh-verifier pass caught it — unflagged runs matched main exactly while
+    `--exts py` changed all 25 selected lines. Now byte-identical under
+    `--exts`, `--exclude` and `--include` as well.
+  - Degradations are loud and none is fatal, and the **except-clause ORDER is the
+    whole mechanism**: `sqlite3.OperationalError` is a SUBCLASS of
+    `DatabaseError`, so `except DatabaseError` written first catches "database is
+    locked" and runs the corruption handler — which `os.unlink`s a perfectly good
+    store. Reproduced: the index was deleted AND the peer's committed transaction
+    went into an unlinked inode and vanished with no error anywhere. Two Neo
+    invocations in one repo is ordinary (an editor plugin and a shell), not
+    exotic. So: **locked / read-only / full** → serve this call from memory via
+    `FileIndex` and say so; **corrupt** (a `DatabaseError` that is NOT an
+    `OperationalError`) → delete and rebuild, detected while OPENING because the
+    memory fallback is permanent and a store that merely failed to open would pin
+    that repo to the full per-call rebuild forever; **tokenizer/schema** bump →
+    wipe and rebuild (no per-file hash can see it — the files did not change, the
+    tokenizer did). `cold`/`rebuilt` are reported separately though both read
+    everything: only one means something went wrong, and the corruption flag is
+    CONSUMED, or a reused instance rebuilds on every refresh forever.
+  - **A warm call opens no write transaction.** Rewriting the unchanged signature
+    unconditionally made every invocation a writer, so two ordinary overlapping
+    calls contended on the steady-state path rather than only during a rebuild —
+    which is what made the clause-order bug reachable in normal use.
+  - **A file that cannot be hashed keeps its path tokens.** `chmod 000` used to
+    delete it from the corpus permanently, while the per-call index still ranked
+    it on its name (its content simply read as empty). Permission was withdrawn
+    from the CONTENT; the name is still a real name in the repository. The empty
+    hash is safe as a comparison value because stamps are keyed by path —
+    `"" == ""` is only ever asked of one file against its own previous state.
+  - **The vocabulary is not preloaded to answer a query.** Reading every `terms`
+    row to resolve ten of them cost a few hundred thousand rows on the warm path
+    this module exists to make cheap; term ids resolve per query, and the full
+    map is loaded only when writing.
+  - Cold build is bounded and ANNOUNCED before it starts, with progress every 250
+    files — 122 s for m365dotnet's 9,348, 2.3 s for neo's 307. `--dry-run` names
+    which of cold / rebuilt / incremental (N files) / warm / memory happened, in
+    the selected-files block and in the `--json` payload's `content_index` key
+    (`--json` implies `--quiet`, so the stderr note is suppressed on exactly the
+    path a machine consumer reads).
+  - **M2's 500 MB target is NOT reachable from file selection and never was.**
+    Warm profile on m365dotnet: imports 1.2 s, eligibility walk 4.6 s, content
+    index refresh 0.4 s + scores 0.1 s, `_history_boost` 2.9 s **and +1.26 GB**.
+    The RSS is the FactStore (152 MB of JSON with 768-dim embeddings inflating to
+    ~1.3 GB of Python objects) — Goal 1's 1.43 GB baseline was never the
+    gatherer's. What remains of the warm wall-clock is the walker and the memory
+    system, in that order.
 - Context selection (`context_gatherer`): **files are ranked by BM25 over their
   CONTENT** (`neo.file_retrieval`), not by their path. Until 2026-08 they were: the
   scorer took `(rel_path, size, prompt_tokens, git_recent, entry_points)` and the
