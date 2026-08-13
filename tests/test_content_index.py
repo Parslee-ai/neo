@@ -17,7 +17,7 @@ gone wrong silently:
 """
 
 import os
-
+import sqlite3
 
 import pytest
 
@@ -258,9 +258,31 @@ class TestCorpusScope:
             subset = index.scores("supersede", ["src/store.py"])
         assert len(everything) > 1
         assert set(subset) == {"src/store.py"}
-        # The score itself is unchanged: corpus statistics are global, so
-        # narrowing the answer cannot move a file's number.
-        assert subset["src/store.py"] == pytest.approx(everything["src/store.py"])
+
+    def test_a_filtered_call_matches_a_filtered_in_memory_index(self, tmp_path):
+        """The subset is a CORPUS, not just a filter on the answer.
+
+        N, document frequency and average document length all feed BM25, and
+        the per-call index computed all three over exactly the files that call
+        admitted. Keeping them repo-global scores a `--exts py` run
+        differently from `main` — measured, all 25 selected lines changed —
+        so the subset supplies the statistics too. This test is the one that
+        fails if anyone "optimizes" that back to global.
+        """
+        _repo(tmp_path, CORPUS)
+        keep = ["src/store.py", "src/engine.py", "src/parser/lexer.py"]
+        paths = _walk(tmp_path)
+        memory = FileIndex(
+            [(p.path, p.rel_path, p.size) for p in paths if p.rel_path in keep]
+        )
+        with ContentIndex(str(tmp_path)) as index:
+            index.refresh(paths, quiet=True)
+            for prompt in ("supersede", "tokenize text", "engine process request"):
+                expected = memory.scores(prompt)
+                actual = index.scores(prompt, keep)
+                assert set(expected) == set(actual), prompt
+                for path, score in expected.items():
+                    assert actual[path] == pytest.approx(score, rel=1e-9, abs=1e-12)
 
     def test_an_unknown_candidate_path_is_simply_absent(self, tmp_path):
         _repo(tmp_path, CORPUS)
@@ -285,6 +307,23 @@ class TestDegradation:
             assert report.indexed == len(CORPUS)
             # And it still answers.
             assert index.scores("supersede")
+
+    def test_a_reused_instance_does_not_rebuild_forever(self, tmp_path):
+        """The corruption flag is consumed, not carried.
+
+        Left set, a second `refresh()` on the same object reported `rebuilt`
+        and wiped the whole repository again, long after the corruption that
+        justified the first one.
+        """
+        _repo(tmp_path, CORPUS)
+        with ContentIndex(str(tmp_path)) as index:
+            index.refresh(_walk(tmp_path), quiet=True)
+        db = tmp_path / ".neo" / ci.INDEX_FILENAME
+        db.write_bytes(b"not a database" * 64)
+        index = ContentIndex(str(tmp_path))
+        assert index.refresh(_walk(tmp_path), quiet=True).mode == "rebuilt"
+        assert index.refresh(_walk(tmp_path), quiet=True).mode == "warm"
+        index.close()
 
     def test_a_schema_bump_invalidates_cleanly(self, tmp_path, monkeypatch):
         _repo(tmp_path, CORPUS)
@@ -341,11 +380,129 @@ class TestDegradation:
         index.refresh(_walk(tmp_path), quiet=True)
         assert set(index.scores("supersede", ["src/store.py"])) == {"src/store.py"}
 
+    def test_an_unreadable_file_keeps_its_path_tokens(self, tmp_path):
+        """Permission was withdrawn from the CONTENT, not from the name.
+
+        The per-call index this replaces still ranked such a file on its path
+        tokens, because its content simply read as empty. An earlier cut of
+        `detect_changes` dropped any candidate it could not hash, which made
+        `chmod 000` delete the file from the corpus permanently — a silent
+        retrieval regression that no test would have caught.
+        """
+        _repo(tmp_path, CORPUS)
+        secret = tmp_path / "src" / "secret_alpha_module.py"
+        secret.write_text("def alpha():\n    return 'secret'\n")
+        paths = _walk(tmp_path)
+        os.chmod(secret, 0o000)
+        try:
+            memory = FileIndex([(p.path, p.rel_path, p.size) for p in paths])
+            with ContentIndex(str(tmp_path)) as index:
+                index.refresh(paths, quiet=True)
+                expected = memory.scores("secret alpha module")
+                actual = index.scores("secret alpha module")
+            assert "src/secret_alpha_module.py" in expected
+            assert set(expected) == set(actual)
+            for path, score in expected.items():
+                assert actual[path] == pytest.approx(score, rel=1e-9, abs=1e-12)
+        finally:
+            os.chmod(secret, 0o644)
+
+    def test_an_unreadable_file_is_not_re_read_every_call(self, tmp_path):
+        """The empty hash compares equal to itself, which is `touched`."""
+        _repo(tmp_path, CORPUS)
+        secret = tmp_path / "src" / "secret.py"
+        secret.write_text("def alpha():\n    pass\n")
+        os.chmod(secret, 0o000)
+        try:
+            with ContentIndex(str(tmp_path)) as index:
+                index.refresh(_walk(tmp_path), quiet=True)
+            with ContentIndex(str(tmp_path)) as index:
+                assert index.refresh(_walk(tmp_path), quiet=True).mode == "warm"
+        finally:
+            os.chmod(secret, 0o644)
+
     def test_an_empty_repository_scores_nothing_and_does_not_raise(self, tmp_path):
         with ContentIndex(str(tmp_path)) as index:
             report = index.refresh([], quiet=True)
             assert report.total_files == 0
             assert index.scores("anything") == {}
+
+
+class TestConcurrency:
+    """Two Neo processes in one repository is ordinary, not exotic."""
+
+    def test_a_peer_holding_the_write_lock_does_not_delete_the_store(
+        self, tmp_path, monkeypatch
+    ):
+        """The regression this class exists for, and it was a bad one.
+
+        `sqlite3.OperationalError` ("database is locked") is a SUBCLASS of
+        `sqlite3.DatabaseError`, so an `except DatabaseError` written first
+        caught lock contention and ran the corruption handler: `os.unlink` on
+        a perfectly good store. That throws away a valid index — 109 MB and
+        122 s of rebuild on m365dotnet — and destroys the PEER, whose
+        transaction then commits into an unlinked inode and disappears with no
+        error anywhere. Ordering the `OperationalError` clause first is the
+        entire fix, and Python matches except clauses in order, so merging or
+        reordering them reintroduces it.
+        """
+        _repo(tmp_path, CORPUS)
+        with ContentIndex(str(tmp_path)) as index:
+            index.refresh(_walk(tmp_path), quiet=True)
+        db = tmp_path / ".neo" / ci.INDEX_FILENAME
+        before = db.stat().st_ino
+
+        # A peer mid-write. Force a real lock rather than simulating one.
+        peer = sqlite3.connect(str(db), timeout=0.1)
+        peer.execute("BEGIN EXCLUSIVE")
+        peer.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('peer', '1')")
+        try:
+            # Something must be written, or the warm path never opens a
+            # transaction and the lock is never contended.
+            (tmp_path / "src" / "engine.py").write_text("def moved():\n    pass\n")
+            monkeypatch.setattr(ci, "_BUSY_TIMEOUT_MS", 200)
+            index = ContentIndex(str(tmp_path))
+            report = index.refresh(_walk(tmp_path), quiet=True)
+        finally:
+            peer.commit()
+            peer.close()
+
+        assert db.exists(), "the store was deleted by a LOCK, not by corruption"
+        assert db.stat().st_ino == before, "the store was recreated, not reused"
+        assert report.mode == "memory", report.mode
+        assert report.warning and "busy" in report.warning.lower()
+        # Degraded, but still correct and still not empty -- an empty ranking
+        # reads to the operator as "nothing here matches your prompt".
+        assert "src/store.py" in index.scores("supersede")
+        index.close()
+
+        # The peer's committed write survived, which is the half that was
+        # silently lost: it had been committing into an unlinked inode.
+        conn = sqlite3.connect(str(db))
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'peer'"
+        ).fetchone() == ("1",)
+        conn.close()
+
+    def test_a_warm_call_takes_no_write_transaction(self, tmp_path):
+        """Or every invocation is a writer and two of them collide."""
+        _repo(tmp_path, CORPUS)
+        with ContentIndex(str(tmp_path)) as index:
+            index.refresh(_walk(tmp_path), quiet=True)
+        db = tmp_path / ".neo" / ci.INDEX_FILENAME
+
+        peer = sqlite3.connect(str(db), timeout=0.1)
+        peer.execute("BEGIN EXCLUSIVE")
+        try:
+            index = ContentIndex(str(tmp_path))
+            report = index.refresh(_walk(tmp_path), quiet=True)
+            # Warm: nothing to write, so the peer's lock is irrelevant.
+            assert report.mode == "warm"
+            assert index.scores("supersede")
+            index.close()
+        finally:
+            peer.rollback()
+            peer.close()
 
 
 class TestReporting:

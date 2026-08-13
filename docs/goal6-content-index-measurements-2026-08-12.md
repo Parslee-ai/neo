@@ -80,6 +80,31 @@ for p in P1 P2 P3 P4 P5 P6; do
 done   # no output: identical selection AND order, all six
 ```
 
+**Parity holds under per-call flags too, which it did not at first.** A
+fresh-verifier pass found that repo-global corpus statistics re-ranked any call
+carrying `--exts` / `--exclude` / `--include`: unflagged runs matched `main`
+exactly while `--exts py` changed all 25 selected lines. `scores()` now takes N,
+document frequency and average document length from the candidate subset, which
+is what the per-call index did. Re-measured end-to-end on the neo repo, same
+prompt, comparing the full `--dry-run` selected-file lines (path, byte count,
+line range and score):
+
+| flags | result |
+|---|---|
+| *(none)* | IDENTICAL — 25 lines |
+| `--exts py` | IDENTICAL — 25 lines |
+| `--exts py,md` | IDENTICAL — 25 lines |
+| `--exclude docs` | IDENTICAL — 25 lines |
+| `--exclude src/neo/memory` | IDENTICAL — 25 lines |
+| `--include 'src/neo/*.py'` | IDENTICAL — 25 lines |
+
+A note on how that table was nearly wrong: a first run of this comparison
+reported "IDENTICAL (0 lines)" for every flagged row. Zsh does not word-split an
+unquoted `$flags`, so `--exts py` arrived as one argument, neo rejected it, and
+both arms selected nothing — two empty files compare equal. A vacuous PASS reads
+exactly like a real one; the row count is in the table so it cannot happen
+silently again.
+
 **Staleness, the check the plan asks for.** Ten `.cs` files in m365dotnet were each
 given a unique marker, the index was refreshed, and the marker was searched for:
 
@@ -219,4 +244,4 @@ verdict and cannot widen it.
 | A `dense` / RRF lane comparison | Unbaselined on the flagships since Goal 1 and unchanged by this goal; see that document's own note. |
 | M2 on neo or aieweb | The battery's six prompts are m365dotnet-specific by construction (they name m365dotnet paths). The plan measures M2 there. |
 | A distinct count for main's cold build | main has no persistent store; its per-call rebuild IS the 53.47 s median, and quoting it as a separate "cold" number would double-count. |
-| Concurrency measurements | Two Neo processes in one repository are handled (WAL, busy timeout, memory fallback) and unit-tested, but the contended path is not timed here. |
+| Concurrency measurements | The contended path is correct and unit-tested (`TestConcurrency` holds a real `BEGIN EXCLUSIVE` from a peer connection and asserts the store survives, the peer's commit survives, and the loser degrades to memory), but it is not TIMED here. |

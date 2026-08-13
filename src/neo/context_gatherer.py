@@ -167,13 +167,21 @@ def filter_candidates(
     keeps its `fnmatch` dialect, which is a user-facing CLI contract rather
     than a gitignore rule and was already applied after eligibility.
 
-    Note the one thing this cannot reproduce: the walk PRUNES an excluded
-    directory instead of testing every file beneath it. A `--exclude` pattern
-    naming a directory therefore no longer saves the cost of descending into
-    it. It still excludes every file under it — `should_ignore` matches a
-    non-final path component — and the directories that make pruning matter
-    (`node_modules`, `.worktrees`, build output) are in the shared default
-    list, which the walk still prunes.
+    Two things this cannot reproduce, both cost rather than correctness, and
+    stated in full because the first draft of this note understated the second:
+
+    - The walk PRUNES an excluded directory instead of testing every file
+      beneath it, so a `--exclude` naming a directory no longer saves the cost
+      of descending into it. It still excludes every file under it —
+      `should_ignore` matches a non-final path component — and the directories
+      that make pruning matter (`node_modules`, `.worktrees`, build output)
+      are in the shared default list, which the walk still prunes.
+    - A file this function drops is still INDEXED: the content index is
+      refreshed from the unfiltered walk, so an `--exts py` run reads,
+      tokenizes and stores the whole repository. That is the deliberate trade —
+      the index is a property of the repository, and pruning it to one call's
+      flags would make the next call rebuild — but it means `--exclude` does
+      not stop a file being read, only being ranked and delivered.
     """
     ext_set = eligibility.normalize_exts(exts) if exts else None
     out: list[eligibility.EligiblePath] = []

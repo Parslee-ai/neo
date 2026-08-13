@@ -759,17 +759,43 @@
     `TestParity` can score one corpus both ways and compare to floating point.
     Query-term MULTIPLICITY is preserved — deduping the query before hitting the
     postings table is a silent ranking change, since the scorer this replaces
-    iterated the token LIST. One stated difference: N/df/avgdl are global to the
-    indexed repository rather than recomputed over each call's filtered subset;
-    with no filters (every eval, every default call) the sets are identical.
-  - Degradations are loud and none is fatal: a **corrupt** store is deleted and
-    rebuilt — detected while OPENING, which matters, because the fallback is
-    permanent and a store that merely failed to open would pin that repository to
-    the full per-call rebuild forever; a **tokenizer/schema** bump wipes and
-    rebuilds (no per-file hash can see it — the files did not change, the
-    tokenizer did); an **unwritable** store still ranks correctly from memory via
-    `FileIndex` and says so. `cold`/`rebuilt` are reported separately though both
-    read everything: only one means something went wrong.
+    iterated the token LIST. **A filtered call gets filtered statistics**:
+    `scores(prompt, candidates)` takes N, df and avgdl from `candidates`, not
+    from the whole repository. Repo-global stats were the first cut and are the
+    better IR design in the abstract; they are also a re-rank, and a
+    fresh-verifier pass caught it — unflagged runs matched main exactly while
+    `--exts py` changed all 25 selected lines. Now byte-identical under
+    `--exts`, `--exclude` and `--include` as well.
+  - Degradations are loud and none is fatal, and the **except-clause ORDER is the
+    whole mechanism**: `sqlite3.OperationalError` is a SUBCLASS of
+    `DatabaseError`, so `except DatabaseError` written first catches "database is
+    locked" and runs the corruption handler — which `os.unlink`s a perfectly good
+    store. Reproduced: the index was deleted AND the peer's committed transaction
+    went into an unlinked inode and vanished with no error anywhere. Two Neo
+    invocations in one repo is ordinary (an editor plugin and a shell), not
+    exotic. So: **locked / read-only / full** → serve this call from memory via
+    `FileIndex` and say so; **corrupt** (a `DatabaseError` that is NOT an
+    `OperationalError`) → delete and rebuild, detected while OPENING because the
+    memory fallback is permanent and a store that merely failed to open would pin
+    that repo to the full per-call rebuild forever; **tokenizer/schema** bump →
+    wipe and rebuild (no per-file hash can see it — the files did not change, the
+    tokenizer did). `cold`/`rebuilt` are reported separately though both read
+    everything: only one means something went wrong, and the corruption flag is
+    CONSUMED, or a reused instance rebuilds on every refresh forever.
+  - **A warm call opens no write transaction.** Rewriting the unchanged signature
+    unconditionally made every invocation a writer, so two ordinary overlapping
+    calls contended on the steady-state path rather than only during a rebuild —
+    which is what made the clause-order bug reachable in normal use.
+  - **A file that cannot be hashed keeps its path tokens.** `chmod 000` used to
+    delete it from the corpus permanently, while the per-call index still ranked
+    it on its name (its content simply read as empty). Permission was withdrawn
+    from the CONTENT; the name is still a real name in the repository. The empty
+    hash is safe as a comparison value because stamps are keyed by path —
+    `"" == ""` is only ever asked of one file against its own previous state.
+  - **The vocabulary is not preloaded to answer a query.** Reading every `terms`
+    row to resolve ten of them cost a few hundred thousand rows on the warm path
+    this module exists to make cheap; term ids resolve per query, and the full
+    map is loaded only when writing.
   - Cold build is bounded and ANNOUNCED before it starts, with progress every 250
     files — 122 s for m365dotnet's 9,348, 2.3 s for neo's 307. `--dry-run` names
     which of cold / rebuilt / incremental (N files) / warm / memory happened, in

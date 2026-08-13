@@ -32,15 +32,15 @@ both ways and asserts the two agree to floating-point tolerance, because a
 persistence change that quietly re-ranked would be indistinguishable from a
 retrieval regression.
 
-One deliberate difference, stated because it is real: corpus statistics (N,
-document frequency, average document length) come from the whole indexed
-repository, not from the subset of files a particular call's `--exts` /
-`--exclude` / `--include` flags admit. The per-call index recomputed IDF over
-whatever that call happened to look at, so the same file could earn a
-different score depending on an unrelated flag. Global statistics are both
-standard IR practice and stable; with no filters — the shape every eval and
-every default invocation takes — the two sets are identical and so are the
-scores.
+**A filtered call gets filtered statistics.** N, document frequency and
+average document length are computed over the files that call admitted, not
+over the whole indexed repository — because the per-call index computed them
+over exactly that set, and BM25's score depends on all three. Repo-global
+statistics were the first cut and they are the more defensible IR design in
+the abstract; they are also a re-ranking. Measured: unflagged runs matched
+`main` exactly while `--exts py` changed all 25 selected lines. Parity with
+the ranker being replaced is the requirement here, so the subset is the
+corpus and `scores(prompt, candidates)` takes both from `candidates`.
 
 **Freshness is inline and cheap.** `refresh()` takes the eligibility walk's
 own output (there is no second walk, and no file-walking or exclusion logic
@@ -393,18 +393,40 @@ class ContentIndex:
                 progress.note(report.describe())
             return report
 
+        forced = "rebuilt" if self._rebuilt_from_corruption else None
+        # Consumed, not carried: leaving it set made a REUSED instance report
+        # `rebuilt` and wipe the whole repository on its second refresh, long
+        # after the corruption that justified the first one.
+        self._rebuilt_from_corruption = False
         try:
             report = self._refresh_persistent(
-                conn,
-                candidates,
-                started,
-                quiet=quiet,
-                forced_cold="rebuilt" if self._rebuilt_from_corruption else None,
+                conn, candidates, started, quiet=quiet, forced_cold=forced
+            )
+        except sqlite3.OperationalError as exc:
+            # Locked by a peer, read-only filesystem, disk full. Serve this
+            # call from memory rather than failing it — and, above all, DO NOT
+            # fall through to the corruption handler below.
+            #
+            # `OperationalError` is a SUBCLASS of `DatabaseError`, so an
+            # `except DatabaseError` written first catches lock contention and
+            # deletes the store, which is the worst available response: it
+            # throws away a valid index (109 MB and 122 s of rebuild on
+            # m365dotnet) AND destroys the peer, whose transaction then commits
+            # into an unlinked inode and vanishes without an error. Two Neo
+            # invocations in one repository is an ordinary situation — an
+            # editor plugin and a shell — not an exotic one. This clause is
+            # ordered FIRST because Python matches except clauses in order and
+            # subclass-before-superclass is the only ordering that works;
+            # `test_a_peer_holding_the_write_lock_does_not_delete_the_store`
+            # fails if it is ever moved or merged.
+            logger.warning("Content index not writable (%s); using memory", exc)
+            report = self._build_in_memory(
+                candidates, started, f"store busy or not writable ({exc})"
             )
         except sqlite3.DatabaseError as exc:
-            # Corruption is not recoverable and not worth diagnosing: the
-            # store is derived from the working tree, so throwing it away
-            # loses nothing but the time to rebuild.
+            # Genuine corruption: a malformed image, never a lock. Not worth
+            # diagnosing — the store is derived from the working tree, so
+            # throwing it away loses nothing but the time to rebuild.
             logger.warning("Content index unusable (%s); rebuilding", exc)
             self._discard_store()
             conn = self._connect()
@@ -422,11 +444,9 @@ class ContentIndex:
                         candidates, started, f"content index write failed ({second})"
                     )
         except sqlite3.Error as exc:
-            # Locked by a peer, read-only filesystem, disk full. Serve this
-            # call from memory rather than failing it.
-            logger.warning("Content index not writable (%s); using memory", exc)
+            logger.warning("Content index unavailable (%s); using memory", exc)
             report = self._build_in_memory(
-                candidates, started, f"store not writable ({exc})"
+                candidates, started, f"store unavailable ({exc})"
             )
 
         _LAST_REPORT = report
@@ -457,15 +477,26 @@ class ContentIndex:
             )
             mode = "rebuilt"
 
-        if mode is not None:
-            conn.execute("DELETE FROM postings")
-            conn.execute("DELETE FROM files")
-            conn.execute("DELETE FROM terms")
+        wipe = mode is not None
+        if wipe:
             stamps: dict[str, FileStamp] = {}
         else:
             stamps = self._load_stamps(conn)
             if not stamps:
                 mode = "cold"
+
+        # BEFORE `detect_changes`, which sha256s the whole repository on a cold
+        # build. Announcing after it meant the promised "no silent stall" still
+        # opened with a full-repo byte read in silence — small on a toy repo,
+        # a real wait on m365dotnet. The count is the candidate count rather
+        # than the work count for the same reason: the work count is not known
+        # until the hashing this line exists to announce has finished.
+        if mode in ("cold", "rebuilt") and candidates and not quiet:
+            progress.note(
+                f"Content index: no usable index for this repository - "
+                f"building one over {len(candidates)} files. This runs once; "
+                f"later calls update only what changed."
+            )
 
         changes = detect_changes(stamps, candidates, file_content_hash)
         work = changes.needs_indexing
@@ -473,40 +504,47 @@ class ContentIndex:
         if mode is None:
             mode = "incremental" if not changes.is_clean else "warm"
 
-        if mode in ("cold", "rebuilt") and work and not quiet:
-            progress.note(
-                f"Content index: no usable index for this repository - "
-                f"building one over {len(work)} files. This runs once; "
-                f"later calls update only what changed."
-            )
-
-        self._vocab = {
-            term: term_id
-            for term_id, term in conn.execute("SELECT id, term FROM terms")
-        }
-
-        with conn:  # one transaction; SQLite gives us the atomicity
-            for rel_path in changes.removed:
-                self._delete_file(conn, rel_path)
-            for index, candidate in enumerate(work, 1):
-                self._index_file(
-                    conn, candidate, changes.hashes.get(candidate.rel_path, "")
-                )
-                if not quiet and mode in ("cold", "rebuilt") and index % _PROGRESS_EVERY == 0:
-                    progress.note(
-                        f"Content index: {index}/{len(work)} files tokenized"
+        # A warm call must not open a WRITE transaction. Rewriting the
+        # (unchanged) signature unconditionally made every single invocation a
+        # writer, so two ordinary overlapping calls contended for the store on
+        # the steady-state path rather than only during a rebuild.
+        if wipe or work or changes.touched or changes.removed or stored != signature:
+            with conn:  # one transaction; SQLite gives us the atomicity
+                if wipe:
+                    conn.execute("DELETE FROM postings")
+                    conn.execute("DELETE FROM files")
+                    conn.execute("DELETE FROM terms")
+                # AFTER the wipe, never before. Loading the vocabulary first
+                # and then emptying `terms` left `_index_file` believing every
+                # term already existed, so it skipped the inserts and wrote
+                # postings pointing at deleted term ids — a rebuilt index that
+                # answered nothing.
+                self._vocab = {
+                    term: term_id
+                    for term_id, term in conn.execute("SELECT id, term FROM terms")
+                }
+                for rel_path in changes.removed:
+                    self._delete_file(conn, rel_path)
+                for index, candidate in enumerate(work, 1):
+                    self._index_file(
+                        conn, candidate, changes.hashes.get(candidate.rel_path, "")
                     )
-            for candidate in changes.touched:
-                # Content identical, metadata moved. Stamp only — re-reading
-                # would be work with a known-empty result.
-                conn.execute(
-                    "UPDATE files SET size = ?, mtime_ns = ? WHERE rel_path = ?",
-                    (candidate.size, candidate.mtime_ns, candidate.rel_path),
+                    if (not quiet and mode in ("cold", "rebuilt")
+                            and index % _PROGRESS_EVERY == 0):
+                        progress.note(
+                            f"Content index: {index}/{len(work)} files tokenized"
+                        )
+                for candidate in changes.touched:
+                    # Content identical, metadata moved. Stamp only —
+                    # re-reading would be work with a known-empty result.
+                    conn.execute(
+                        "UPDATE files SET size = ?, mtime_ns = ? WHERE rel_path = ?",
+                        (candidate.size, candidate.mtime_ns, candidate.rel_path),
+                    )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    sorted(signature.items()),
                 )
-            conn.executemany(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                sorted(signature.items()),
-            )
 
         self._load_query_state(conn)
         self._persistent = True
@@ -621,10 +659,15 @@ class ContentIndex:
     ) -> dict[str, float]:
         """BM25 score per `rel_path` for `prompt`; unmatched files are absent.
 
-        `candidates` restricts the ANSWER to a subset of the indexed corpus —
-        the files this call's `--exts` / `--include` / `--exclude` admitted.
-        It does not restrict the corpus STATISTICS; see the module docstring
-        for why that is deliberate.
+        `candidates` restricts the corpus to the subset this call's `--exts` /
+        `--include` / `--exclude` admitted — the ANSWER *and* the statistics.
+        Restricting only the answer is the obvious shortcut and it silently
+        re-ranks: N, document frequency and average document length all come
+        out of the corpus, so leaving them repo-global scores a filtered call
+        differently from the per-call index that preceded this one. Measured
+        before it was fixed: unflagged runs matched `main` exactly while
+        `--exts py` changed all 25 selected lines. Parity is the requirement,
+        so the subset is a corpus.
         """
         if not self._persistent:
             raw = self._memory_index.scores(prompt)
@@ -671,25 +714,47 @@ class ContentIndex:
         """
         by_id: dict[int, float] = {}
         doc_lens = {fid: dl for fid, dl in self._files.values()}
+
+        # The corpus is the subset when there is one, statistics included.
+        if allowed_ids is None:
+            n, avgdl = self._n, self._avgdl
+        else:
+            n = len(allowed_ids)
+            avgdl = (
+                sum(doc_lens.get(fid, 0) for fid in allowed_ids) / n if n else 0.0
+            )
+
+        # Term ids are resolved per query rather than from a preloaded
+        # vocabulary. Loading every term to answer for ten of them read the
+        # whole `terms` table — a few hundred thousand rows on a large repo —
+        # on the warm path this module exists to make cheap.
+        wanted = list(repeats)
+        placeholders = ",".join("?" * len(wanted))
+        term_ids = dict(
+            conn.execute(
+                f"SELECT term, id FROM terms WHERE term IN ({placeholders})", wanted
+            )
+        )
+
         for term, occurrences in repeats.items():
-            term_id = self._vocab.get(term)
+            term_id = term_ids.get(term)
             if term_id is None:
                 continue
             rows = conn.execute(
                 "SELECT file_id, tf FROM postings WHERE term_id = ?", (term_id,)
             ).fetchall()
+            if allowed_ids is not None:
+                rows = [r for r in rows if r[0] in allowed_ids]
             if not rows:
                 continue
-            idf = _idf(self._n, len(rows))
+            # Document frequency counts documents IN THIS CORPUS, so it is
+            # taken after the subset filter, never before.
+            idf = _idf(n, len(rows))
             for file_id, tf in rows:
-                if allowed_ids is not None and file_id not in allowed_ids:
-                    continue
                 dl = doc_lens.get(file_id, 0)
                 if dl == 0:
                     continue
-                denom_norm = (
-                    K1 * (1.0 - B + B * dl / self._avgdl) if self._avgdl > 0 else K1
-                )
+                denom_norm = K1 * (1.0 - B + B * dl / avgdl) if avgdl > 0 else K1
                 contribution = idf * (tf * (K1 + 1.0)) / (tf + denom_norm)
                 by_id[file_id] = by_id.get(file_id, 0.0) + contribution * occurrences
 

@@ -122,10 +122,25 @@ def detect_changes(
 ) -> Changes:
     """Compare the recorded stamps against what is on disk now.
 
-    A file that cannot be hashed (deleted between the walk and here, or
-    unreadable) is dropped from the result entirely rather than recorded with
-    an empty hash: an empty hash would compare equal to the next unreadable
-    file's, which is how "unreadable" silently becomes "unchanged".
+    **A file that cannot be hashed stays in the result**, carrying the empty
+    hash the hasher returned. An earlier cut dropped it — which reads as the
+    careful choice and is not, because the caller's `removed` set is
+    "everything the walk no longer admits", so dropping a candidate the walk
+    DID admit deletes it from the index. Measured: `chmod 000` on a file made
+    it vanish from the corpus permanently, while the per-call index this
+    replaces still ranked it on its path tokens (its content simply read as
+    empty). Permission was withdrawn from the CONTENT; the name is still a
+    real name in the repository, and losing it is a silent retrieval
+    regression.
+
+    The empty hash is safe as a comparison value precisely because stamps are
+    keyed by path: `"" == ""` is only ever asked of one file against its own
+    previous state, where it correctly means "still unreadable, nothing to
+    re-tokenize". It never compares two different files.
+
+    A file that vanished between the walk and here takes the same path and
+    self-heals: it is re-indexed to its path tokens now, and the next walk
+    does not list it, so it lands in `removed` then.
     """
     changes = Changes()
     seen: set[str] = set()
@@ -146,12 +161,6 @@ def detect_changes(
             continue
 
         digest = hasher(candidate.abs_path)
-        if not digest:
-            # Vanished or unreadable. It is not "unchanged" and it is not a
-            # deletion we can prove, so leave whatever is stored alone.
-            seen.discard(candidate.rel_path)
-            continue
-
         changes.hashes[candidate.rel_path] = digest
         if stamp is None:
             changes.added.append(candidate)
