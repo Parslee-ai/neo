@@ -100,8 +100,12 @@ class TestEndToEnd:
 
         assert result.returncode == 0
         # The file list survives -- it carries the SCORE, which is what an
-        # operator needs when the right file is missing.
-        assert "files selected, in rank order" in result.stderr
+        # operator needs when the right file is missing. Its header used to
+        # say "files selected"; the listing is CHUNK-level, so one file can
+        # occupy two lines and the count was the same overcount as the
+        # progress line (#197). It names entries and files separately now.
+        assert "context entr" in result.stderr and "in rank order" in result.stderr
+        assert "1 context entry from 1 file" in result.stderr
         # ...and the four things the docs promised and did not deliver.
         assert "messages Neo hands the adapter" in result.stderr
         assert "Execution Envelope" in result.stderr

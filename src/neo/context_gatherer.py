@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from neo import eligibility, progress
+from neo.text_budget import MARKER_TEMPLATE, apportion
 
 # Constants
 MIN_SCORE_THRESHOLD = 0.2  # Filter files with very low relevance (was 0.3, reduced for broad prompts)
@@ -106,6 +107,15 @@ class ContextFile:
     end: Optional[int] = None
     content: Optional[str] = None
     score: float = 0.0
+    #: Selected because `--include` named it, not because it ranked. A pinned
+    #: file bypasses `MIN_SCORE_THRESHOLD`, the rank cut, the `--max-files`
+    #: cap and `MAX_CHUNKS_PER_FILE`, and the prompt renderer does not apply
+    #: its per-file character cap to it. See `pin_included_files`.
+    pinned: bool = False
+    #: True when the `--max-bytes` ceiling forced a cut in a pinned file. The
+    #: content then carries `text_budget`'s marker; this field is what lets
+    #: the CLI report the cut without re-parsing the text.
+    truncated: bool = False
 
 
 @dataclass
@@ -810,6 +820,420 @@ def _symbol_score(
         return 0.0
 
 
+# Bytes held back from a pinned file's byte allowance so the truncation marker
+# fits inside the ceiling rather than pushing the payload over it. The marker
+# is `text_budget.MARKER_TEMPLATE` with two integers in it — 55 characters at
+# realistic sizes, all ASCII. The reserve is checked against the marker that
+# actually gets emitted, so a template change cannot silently break the bound.
+_PIN_MARKER_RESERVE = 96
+
+
+def resolve_includes(
+    candidates: list[tuple[str, str, int]],
+    includes: list[str],
+    root: Optional[str] = None,
+    excludes: Optional[list[str]] = None,
+) -> tuple[list[tuple[str, str, int]], list[str], list[str]]:
+    """Split `--include` globs into the files they matched and the ones they didn't.
+
+    `--include` used to narrow the walk, which is why an included file still
+    had to win on score: it entered the same ranking as everything else and
+    could be evicted or windowed like any candidate (#198). Standing ruling 1
+    of the unified-store plan makes it an assertion instead — the named files
+    are guaranteed, AND the ordinary scan still runs for extra context. So the
+    scan is no longer narrowed, and matching happens here, against what the
+    walk already found.
+
+    Matching against the scanned candidates rather than re-walking is
+    deliberate: a second walk with different eligibility rules would both
+    double the walk cost and put a second answer to "which files exist" in the
+    tree, which is what the unified-store plan exists to delete.
+
+    **The exact-path rescue.** Two of the walk's rules are scan-cost guards
+    rather than relevance judgements — the 512 KB per-file skip and the
+    `--exts` filter — and they are the same class of rule as
+    `MIN_SCORE_THRESHOLD` and the chunk cap, which a pin already bypasses.
+    Leaving them in force gives the guarantee unstated cliffs: #198's own
+    reported case was a 449 KB file, 63 KB under the size one. So a pattern
+    that matched no candidate is re-tested as an exact path with one `stat`,
+    and admitted when it names a real file that the walker's own ignore rules
+    do not exclude. **`--include` therefore overrides `--exts`**, deliberately:
+    `--exts` narrows the search and `--include` asserts the inputs, so when
+    they disagree the explicit instruction wins.
+
+    `.gitignore` and `--exclude` are NOT overridden — G1-inv is a hard
+    invariant and trading a reported absence for an unreported presence is the
+    worse failure — and they are enforced by calling `eligibility.should_ignore`
+    and `eligibility.load_ignore_patterns`, the same shared module the walk
+    itself uses (#208), rather than restating them. Eligibility keeps exactly
+    one definition; the rescue only chooses which of the gatherer's own budget
+    rules to skip.
+
+    A pattern that is not an exact path (a glob, or a typo) gets no rescue:
+    expanding a glob means walking, which is the cost this avoids. The test is
+    "does this name a file", not "does it contain `*`" — a real file called
+    `a[1].py` is an exact path, and classifying it as a glob on its punctuation
+    would tell the operator something false about their own filename.
+
+    **The honest limit, stated because it is a silent one.** The rescue is
+    attempted only when a pattern matched NOTHING, so a glob that matched some
+    files never reaches it — and a glob whose pattern also covers a file over
+    the walker's 512 KB ceiling delivers the smaller files and drops the large
+    one with no signal at all. `--include '*.py'` beside a 700 KB `huge.py`
+    pins the small ones and never mentions it, where `--include huge.py` pins
+    it whole. Closing that needs the walk to report which paths its size
+    ceiling skipped, which is `neo.eligibility`'s to give and this goal is
+    scoped out of. The guarantee is therefore over EXACT PATHS; a glob is a
+    search, and naming the file is what asserts it.
+
+    Order follows the pattern order the operator gave, then path order within
+    a pattern, because that is the order the byte ceiling is spent in.
+    """
+    matched: list[tuple[str, str, int]] = []
+    seen: set[str] = set()
+    unmatched: list[str] = []
+    refused: list[str] = []
+    ignore_patterns: Optional[list[str]] = None
+
+    for pattern in includes:
+        hits = sorted(
+            (c for c in candidates if fnmatch.fnmatch(c[1], pattern)),
+            key=lambda c: c[1],
+        )
+        if not hits and root is not None:
+            if ignore_patterns is None:
+                ignore_patterns = (
+                    eligibility.load_ignore_patterns(root) + list(excludes or [])
+                )
+            rescued, reason = _rescue_exact_include(root, pattern, ignore_patterns)
+            if rescued:
+                hits = [rescued]
+            elif reason:
+                # A refusal we can NAME never joins the generic bucket. The
+                # 64 MB ceiling and the symlink rule both used to surface as
+                # "matched no file - check spelling", which is three wrong
+                # causes and a fourth that told the operator an exact path IS
+                # rescued past a size limit — the opposite of what happened.
+                refused.append(f"{pattern} ({reason})")
+                continue
+        if not hits:
+            unmatched.append(pattern)
+            continue
+        for hit in hits:
+            if hit[1] not in seen:
+                seen.add(hit[1])
+                matched.append(hit)
+
+    return matched, unmatched, refused
+
+
+# Ceiling on a rescued file's size. `iter_paths` bounds every candidate at
+# 512 KB, so the pin read used to be bounded for free; the rescue lifts that
+# bound deliberately and something has to replace it, or `--include` on a
+# multi-gigabyte artefact reads the whole thing into memory (twice — `read()`
+# then `encode()`) before cutting it to `--max-bytes`. 64 MB is 128x the
+# walker's limit and ~140x #198's 449 KB case, so it is out of the way of
+# source files while still being a bound. Hitting it is REPORTED, by name and
+# with the file's size — it surfaced for one round as a generic "matched no
+# file - check spelling", which is the wrong-cause failure this goal deletes.
+_PIN_RESCUE_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _rescue_exact_include(
+    root: str, rel_path: str, ignore_patterns: list[str]
+) -> tuple[Optional[tuple[str, str, int]], Optional[str]]:
+    """Admit an exactly-named file the walk skipped, if it is really eligible.
+
+    Returns ``(entry, reason)``. `entry` is the same `(abs, rel, size)` shape
+    `iter_paths` produces. `reason` is set ONLY when this function refused a
+    path it could identify — a symlink, an escape, an ignore rule, the size
+    ceiling — and is None when the pattern simply names nothing. The caller
+    reports the two differently, because "no such file, check your spelling"
+    is actively misleading advice for a file that is right there and was
+    refused for a stated reason.
+
+    The returned `rel_path` is **normalized**, not the operator's spelling.
+    That is not tidiness: `pinned_rels` is keyed on it and the scan loop skips
+    pinned paths by membership, so returning `./app.py` for a file the walk
+    calls `app.py` sends one file to the model twice — a G1-inv duplicate
+    created by the fix for a G2-inv absence. Reproduced with
+    `--include ./app.py`, which is what shell completion and `find .` emit.
+    An ABSOLUTE path inside the root normalizes the same way, so `--include`
+    accepts the form a traceback or an IDE "copy path" produces, which is
+    already true of a path named in the prompt (`matches_explicit_path`).
+
+    Ancestor directories are tested separately, twice over, because
+    `should_ignore` only tests the path handed to it and `os.walk` never
+    descends a symlinked directory. The shared walk gets both for free by
+    pruning as it descends; a check that only tested the leaf admitted a file
+    inside an ignored directory, and a symlink check that only tested the leaf
+    admitted `linked/secret.py` through `repo/linked -> /outside` — a read of
+    a file outside the repository, through a flag, past both guards written to
+    prevent exactly that.
+
+    Symlinks are refused because `eligibility.WalkPolicy.skip_symlinks`
+    defaults to True and the shared walk therefore refuses them. Parity with
+    the walk is the invariant: a rescue that admits what the walk skips puts a
+    second, looser answer to "what is inside the root" in a codebase that just
+    finished collapsing those into one (#208).
+    """
+    if os.path.isabs(rel_path):
+        candidate = os.path.normpath(rel_path)
+    else:
+        candidate = os.path.join(root, rel_path.lstrip("/"))
+    if not os.path.isfile(candidate):
+        return None, None
+
+    normalized = os.path.relpath(candidate, root)
+    if normalized.startswith(".."):
+        return None, "outside the scan root"
+
+    # Leaf first, then every ancestor. `os.walk` does not follow a symlinked
+    # directory, so a file reachable only through one is not in the walk's
+    # world at all — and, unlike the lexical `..` test above, a symlinked
+    # ancestor can leave the repository without the path ever saying so.
+    parts = normalized.split(os.sep)
+    if os.path.islink(candidate):
+        return None, "a symlink, which the shared walk skips"
+    for depth in range(1, len(parts)):
+        ancestor = os.sep.join(parts[:depth])
+        if os.path.islink(os.path.join(root, ancestor)):
+            return None, f"reached through the symlinked directory {ancestor}/"
+        if eligibility.should_ignore(ancestor, ignore_patterns, is_dir=True):
+            return None, f"inside the ignored directory {ancestor}/"
+    if eligibility.should_ignore(normalized, ignore_patterns):
+        return None, "excluded by .gitignore or --exclude"
+
+    try:
+        size = os.path.getsize(candidate)
+    except OSError:
+        return None, "could not be stat'd"
+    if size > _PIN_RESCUE_MAX_BYTES:
+        return None, (
+            f"{size / 1024 / 1024:.1f}MB, over the "
+            f"{_PIN_RESCUE_MAX_BYTES // 1024 // 1024}MB --include ceiling"
+        )
+    return (candidate, normalized, size), None
+
+
+def _cut_to_bytes(content: str, budget: int) -> tuple[str, bool]:
+    """Cut `content` to at most `budget` UTF-8 bytes, marking the cut.
+
+    Returns ``(text, was_cut)``. Unlike `text_budget.truncate_marked`, which
+    bounds the CONTENT and appends its marker on top, this aims to land the
+    whole return value inside the budget: the budget here is `--max-bytes`,
+    which the operator set, so overshooting it quietly would make the number a
+    suggestion. The marker text is `truncate_marked`'s, so a pinned file's cut
+    reads the same as every other marked cut in a Neo prompt.
+
+    **One exception, and it is the caller's to report.** A budget below the
+    marker's own ~51 bytes yields the marker alone and therefore exceeds the
+    budget. The alternatives are worse in both directions: returning "" is a
+    section indistinguishable from an empty file, and a truncated marker is a
+    truncation notice that lies about its own numbers. `pin_included_files`
+    detects the overshoot and hands the caller the real total, so what comes
+    out of this function is never the last word on the ceiling.
+    """
+    raw = content.encode("utf-8")
+    if len(raw) <= budget:
+        return content, False
+
+    keep = max(budget - _PIN_MARKER_RESERVE, 0)
+    head = raw[:keep].decode("utf-8", errors="ignore")
+    marker = MARKER_TEMPLATE.format(
+        dropped=len(content) - len(head), total=len(content)
+    )
+    # The reserve is an estimate of the marker's size; this is the check that
+    # it was big enough. Trimming the head is the safe direction — the marker
+    # is the part that says what happened.
+    while len((head + marker).encode("utf-8")) > budget and head:
+        head = head[:-1]
+        marker = MARKER_TEMPLATE.format(
+            dropped=len(content) - len(head), total=len(content)
+        )
+    return head + marker, True
+
+
+@dataclass
+class PinReport:
+    """What pinning actually did, in the terms the caller has to report.
+
+    Every field exists because a warning built from a cheaper predicate said
+    something untrue. `whole` and `truncated_rels` are separate because a run
+    that cut a file must not be described as delivering it whole; `overshoot`
+    is separate from `truncated_rels` because a cut that honours the ceiling
+    and a ceiling that could not be honoured are different facts with
+    different remedies.
+    """
+    files: list[ContextFile] = field(default_factory=list)
+    truncated_rels: list[str] = field(default_factory=list)
+    #: Named files that could not be opened. Nothing can be shown for them, so
+    #: they are the one case with no entry in the bundle — which is exactly why
+    #: they need their own field. Counting them as "unmatched" would report a
+    #: cause that is not theirs, and leaving them out entirely made
+    #: `--include locked.py` print nothing at all: a named file, silently gone,
+    #: under a guarantee whose whole content is that this does not happen.
+    unreadable_rels: list[str] = field(default_factory=list)
+    #: Total bytes delivered, which is what to compare against `--max-bytes`.
+    total_bytes: int = 0
+    #: True when the ceiling could not seat one marker per named file, so the
+    #: pinned block runs OVER `--max-bytes`. Never silent.
+    overshoot: bool = False
+
+    @property
+    def whole(self) -> int:
+        return len(self.files) - len(self.truncated_rels)
+
+
+def pin_included_files(
+    matched: list[tuple[str, str, int]], max_bytes: int
+) -> PinReport:
+    """Deliver every `--include` match whole, or cut with an explicit marker.
+
+    These files are not candidates. They bypass `MIN_SCORE_THRESHOLD`, the
+    rank ordering, the `--max-files` cap and `MAX_CHUNKS_PER_FILE`, because
+    each of those is a judgement about relevance and the operator has already
+    made that judgement. The one thing that can still cut a pinned file is
+    `--max-bytes`, and that cut is marked in the content and reported.
+
+    When the pins together exceed the ceiling the budget is apportioned
+    max-min fair (`text_budget.apportion`) rather than spent first-come. The
+    difference matters: filling greedily in order gives the last-named file
+    zero bytes and no marker, which is exactly the silent drop #198 is about.
+    Fair shares mean every named file arrives, small ones arrive whole, and
+    only the large ones pay.
+
+    **`--max-bytes` bounds pinned CONTENT, not the pinned block.** Below about
+    one marker per named file — 200 files against a 5,000-byte ceiling — every
+    share is smaller than the notice that has to sit in it, and the block runs
+    over. Dropping named files to make the number come out is the one move
+    that is not available, so the overshoot is reported instead of hidden:
+    `PinReport.overshoot` says it happened and `total_bytes` says by how much.
+    Reporting it is what keeps `--max-bytes` an honest number rather than a
+    claim the code quietly breaks.
+    """
+    if not matched:
+        return PinReport()
+
+    contents: dict[str, str] = {}
+    sizes: dict[str, int] = {}
+    order: list[tuple[str, str]] = []
+    unreadable: list[str] = []
+    for abs_path, rel_path, _size in matched:
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="ignore") as fh:
+                content = fh.read()
+        except OSError:
+            # The one named file with no entry in the bundle: there is nothing
+            # to show and nothing to mark. It is carried out on the report and
+            # named in the warning, because an absence the operator asked for
+            # and is not told about is the defect, not the unreadable file.
+            unreadable.append(rel_path)
+            continue
+        contents[rel_path] = content
+        sizes[rel_path] = len(content.encode("utf-8"))
+        order.append((abs_path, rel_path))
+
+    if not order:
+        return PinReport(unreadable_rels=unreadable)
+
+    total = sum(sizes.values())
+    if total <= max_bytes:
+        allowances = dict(sizes)
+    elif max_bytes >= len(sizes):
+        allowances = apportion(sizes, max_bytes)
+    else:
+        # `--max-bytes` smaller than the number of pinned files. Nonsense
+        # config, but the guarantee still holds: each file arrives carrying a
+        # marker that says none of it fit.
+        allowances = {rel: 0 for rel in sizes}
+
+    report = PinReport(unreadable_rels=unreadable)
+    for abs_path, rel_path in order:
+        text, was_cut = _cut_to_bytes(contents[rel_path], allowances.get(rel_path, 0))
+        if was_cut:
+            report.truncated_rels.append(rel_path)
+        emitted = len(text.encode("utf-8"))
+        report.total_bytes += emitted
+        report.files.append(ContextFile(
+            path=abs_path,
+            rel_path=rel_path,
+            language=infer_language(abs_path),
+            bytes=emitted,
+            content=text,
+            # Above EXPLICIT_PATH_BOOST so the dry-run rank listing shows pins
+            # at the top, where they are in the bundle. It is a display order,
+            # not an input to selection — pins never enter the ranking.
+            score=EXPLICIT_PATH_BOOST + 1.0,
+            pinned=True,
+            truncated=was_cut,
+        ))
+
+    report.overshoot = report.total_bytes > max_bytes
+    return report
+
+
+def _pin_notes(
+    report: PinReport,
+    max_bytes: int,
+    unmatched: list[str],
+    refused: Optional[list[str]] = None,
+) -> None:
+    """Say what pinning did, in terms that match what happened.
+
+    One function for both gather lanes: the two used to carry copies of these
+    strings, and a warning that drifts between lanes is a warning you cannot
+    trust on the lane you are reading.
+    """
+    if report.files:
+        if report.truncated_rels:
+            shape = (
+                f"{report.whole} whole, {len(report.truncated_rels)} cut and marked"
+            )
+        else:
+            shape = "whole"
+        progress.note(
+            f"--include pins {len(report.files)} file(s) {shape} "
+            f"({report.total_bytes:,} bytes), ahead of the scan")
+    if report.truncated_rels:
+        progress.note(
+            f"Warning: --max-bytes={max_bytes:,} forced a cut in "
+            f"{len(report.truncated_rels)} pinned file(s) "
+            f"({', '.join(report.truncated_rels[:3])}) - marked inline")
+    if report.overshoot:
+        progress.note(
+            f"Warning: --max-bytes={max_bytes:,} cannot seat "
+            f"{len(report.files)} pinned file(s) even as truncation markers; "
+            f"the pinned block is {report.total_bytes:,} bytes. Named files "
+            "are never dropped to meet the ceiling - narrow --include or "
+            "raise --max-bytes")
+    if report.unreadable_rels:
+        progress.note(
+            f"Warning: {len(report.unreadable_rels)} --include file(s) could "
+            f"not be read ({', '.join(report.unreadable_rels[:3])}) - they are "
+            "NOT in the context and nothing can be shown for them")
+    if refused:
+        # A refusal we can name gets named. Folding these into "matched no
+        # file - check spelling" told the operator to check the spelling of a
+        # path that was correct, and pointed at .gitignore for a file nothing
+        # ignores. Wrong cause, confidently stated, on the one surface whose
+        # job is to say what happened.
+        progress.note(
+            f"Warning: {len(refused)} --include path(s) NOT admitted: "
+            f"{'; '.join(refused[:3])}")
+    if unmatched:
+        # An include that matched nothing is the highest-value diagnostic on
+        # this path, for the same reason a prompt-named path that matched
+        # nothing is: silence makes it indistinguishable from not asking. The
+        # glob clause is not padding — only an exact path is rescued past the
+        # walker's size limit, so it is a real and distinct cause.
+        progress.note(
+            "Warning: --include pattern(s) matched no file "
+            f"({', '.join(unmatched[:3])}) - check spelling, --exclude and "
+            ".gitignore; a glob, unlike an exact path, is not rescued past "
+            "the walker's 512KB per-file limit")
+
+
 def gather_context(config: GatherConfig) -> list[ContextFile]:
     """Main context gathering pipeline."""
     root = config.root
@@ -833,12 +1257,34 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     parser_cache: dict = {}
 
     # Discover candidates. ONE walk: the corpus the persistent content index
-    # maintains, then this call's flags applied to it.
+    # maintains, then this call's flags applied to it — except `--include`,
+    # which is deliberately NOT among them. Under standing ruling 1 it asserts
+    # inputs rather than narrowing the search, so the scan keeps running over
+    # everything else eligible and the named files are pinned separately.
     eligible = base_paths(root)
-    admitted = filter_candidates(
-        eligible, config.includes, config.excludes, config.exts
-    )
+    admitted = filter_candidates(eligible, [], config.excludes, config.exts)
     candidates = [(e.path, e.rel_path, e.size) for e in admitted]
+
+    # The pin pool is the same corpus minus `--exclude`, but WITHOUT `--exts`.
+    # `--exts` narrows the search and `--include` asserts the inputs, so an
+    # exactly-named file overrides it; `.gitignore` (applied by the walk) and
+    # `--exclude` are not overridden, because G1-inv is a hard invariant and
+    # trading a reported absence for an unreported presence is the worse
+    # failure. Since #209 split the unfiltered corpus out, that distinction is
+    # structural here rather than something the rescue has to reconstruct.
+    pin_pool = [
+        (e.path, e.rel_path, e.size)
+        for e in filter_candidates(eligible, [], config.excludes, None)
+    ]
+
+    # Pins first, so they own their bytes before ranking spends any.
+    include_matches, include_misses, include_refused = resolve_includes(
+        pin_pool, config.includes, root, config.excludes
+    )
+    pin_report = pin_included_files(include_matches, config.max_bytes)
+    pinned = pin_report.files
+    pinned_rels = {f.rel_path for f in pinned}
+    _pin_notes(pin_report, config.max_bytes, include_misses, include_refused)
 
     # Get git context if enabled
     git_recent = set()
@@ -998,15 +1444,40 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     enriched.sort(key=lambda x: x[3], reverse=True)
     scored = enriched
 
-    # Budget: greedily fill up to max_bytes and adaptive max_files
-    selected = []
-    total_bytes = 0
+    # Budget: greedily fill up to max_bytes and adaptive max_files, on top of
+    # the pins. The pins are already in `selected`, so they consume file slots
+    # and bytes the scan would otherwise have had — reported below when that
+    # actually costs the scan something, never silently.
+    selected = list(pinned)
+    total_bytes = sum(f.bytes for f in pinned)
     large_files_warned = []
+    scan_entries_before = len(selected)
+    # Set wherever the byte ceiling REJECTS something, not inferred afterwards
+    # from `total_bytes >= max_bytes`. The two are different: the inner tests
+    # are `total + this_one > max_bytes`, so the ceiling can turn away every
+    # remaining candidate while the running total sits below it. Measured with
+    # a 50-byte pin, a 980-byte candidate and `--max-bytes 1029`: the cap
+    # blocked the only candidate and the run then told the operator no setting
+    # would change it, one byte away from `--max-bytes 1030` changing it.
+    bytes_cap_rejected = False
+    file_cap_rejected = False
 
     for abs_path, rel_path, size, score in scored:
+        # The pinned skip runs BEFORE the cap checks, so a cap can only be
+        # recorded as binding when it turned away a file the scan could
+        # actually have added. With the order reversed, a pin appearing in
+        # `scored` tripped the file cap and the run reported "pinned files
+        # filled the file budget" for a repo where every file was pinned and
+        # no `--max-files` value would have changed anything.
+        if rel_path in pinned_rels:
+            # Already delivered whole. Selecting it again here would emit the
+            # same file twice, once windowed — a duplicate under G1-inv.
+            continue
         if len(selected) >= adaptive_limit:
+            file_cap_rejected = True
             break
         if total_bytes >= config.max_bytes:
+            bytes_cap_rejected = True
             break
 
         try:
@@ -1039,6 +1510,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
 
                     chunk_bytes = len(chunk_content.encode('utf-8'))
                     if total_bytes + chunk_bytes > config.max_bytes:
+                        bytes_cap_rejected = True
                         break
 
                     selected.append(ContextFile(
@@ -1059,6 +1531,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
             else:
                 content_bytes = len(content.encode('utf-8'))
                 if total_bytes + content_bytes > config.max_bytes:
+                    bytes_cap_rejected = True
                     continue
 
                 selected.append(ContextFile(
@@ -1073,6 +1546,43 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
 
         except (OSError, UnicodeDecodeError):
             continue
+
+    if pinned and len(selected) == scan_entries_before:
+        # Ruling 1 is "the named files AND keep scanning", so a scan that added
+        # nothing is worth saying. What it is NOT worth is guessing why.
+        #
+        # A cap only gets named when it actually bound. The first version keyed
+        # solely on "the scan added nothing" and printed both knobs, so a
+        # three-file repo with 135 bytes pinned against a 300,000-byte ceiling
+        # was told its budget was used up — sending the operator to two
+        # settings that would change nothing. That is this repo's own rule
+        # about never blaming a cap for an absence it did not cause, broken
+        # inside the goal whose subject is selection truthfulness.
+        if file_cap_rejected:
+            # The limit that bound is the ADAPTIVE one, and printing it as
+            # `--max-files=25` names a number the operator never typed — worse,
+            # below specificity 10 `calculate_adaptive_limit` returns a fixed
+            # 15/20/25 regardless of `--max-files`, so the knob it names cannot
+            # move the limit it reports. Both numbers, and the relationship.
+            knob = (
+                f"adaptive limit {adaptive_limit}, from --max-files="
+                f"{config.max_files}"
+                if adaptive_limit != config.max_files
+                else f"--max-files={config.max_files}"
+            )
+            progress.note(
+                f"Warning: pinned files filled the file budget ({knob}); "
+                "the scan contributed nothing")
+        elif bytes_cap_rejected:
+            progress.note(
+                f"Warning: pinned files filled the byte budget "
+                f"(--max-bytes={config.max_bytes:,}); the scan contributed "
+                "nothing")
+        else:
+            # No cap bound. The scan simply found nothing else eligible, which
+            # no setting changes — so it gets a bare statement and no remedy.
+            progress.note(
+                "The scan found nothing to add beside the pinned file(s)")
 
     return selected
 
@@ -1178,11 +1688,56 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
             progress.note("Falling back to keyword search")
             return gather_context(config)
 
-        # Pack chunks using MMR for diversity
-        selected_chunks = mmr_pack_chunks(chunks, config.max_bytes, config.max_files)
+        # Pins are a property of `--include`, not of a retrieval strategy. This
+        # lane ignored the flag entirely, so `--semantic --include X` silently
+        # dropped X; a guarantee that a second flag can switch off is not one.
+        #
+        # Guarded on `config.includes` rather than done unconditionally: the
+        # walk is exactly the cost this lane exists to avoid, and a positional
+        # `iter_paths(...)` argument is evaluated whether or not the flag was
+        # passed. Measured on m365dotnet that is seconds of `os.walk` added to
+        # every semantic invocation, for a pin list that is always empty.
+        if config.includes:
+            # The SAME pin pool the keyword lane builds: exclude- and
+            # gitignore-filtered, `--exts`-unfiltered. Passing `config.exts`
+            # here made the two lanes disagree — `--exts py --include '*.txt'`
+            # pinned on the keyword path and reported "matched no file" on
+            # this one. A guarantee that depends on which retrieval strategy
+            # you asked for is the same defect as one a second flag switches
+            # off, which is why this lane pins at all.
+            include_matches, include_misses, include_refused = resolve_includes(
+                [
+                    (e.path, e.rel_path, e.size)
+                    for e in filter_candidates(
+                        base_paths(root), [], config.excludes, None
+                    )
+                ],
+                config.includes, root, config.excludes,
+            )
+            pin_report = pin_included_files(include_matches, config.max_bytes)
+            _pin_notes(
+                pin_report, config.max_bytes, include_misses, include_refused
+            )
+        else:
+            pin_report = PinReport()
+
+        pinned = pin_report.files
+        pinned_bytes = pin_report.total_bytes
+        pinned_rels = {f.rel_path for f in pinned}
+
+        # Pack chunks using MMR for diversity, into what the pins left.
+        # Pin-owned files are dropped BEFORE packing, not after: filtering the
+        # packed result spends budget on chunks that are then discarded, so the
+        # run under-fills its own ceiling and the metrics line stops agreeing
+        # with what was sent.
+        selected_chunks = mmr_pack_chunks(
+            [c for c in chunks if c.file_path not in pinned_rels],
+            max(config.max_bytes - pinned_bytes, 0),
+            max(config.max_files - len(pinned), 0),
+        )
 
         # Convert to ContextFile format
-        context_files = []
+        context_files = list(pinned)
         for chunk in selected_chunks:
             abs_path = Path(root) / chunk.file_path
             chunk_bytes = len(chunk.content.encode('utf-8'))

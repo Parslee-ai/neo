@@ -480,7 +480,12 @@ def parse_args():
     # value overrides both.
     p.add_argument("--max-files", type=int, default=None,
                    help="Cap on files: context gathering (default 30) or, with --index, the index build (default 100)")
-    p.add_argument("--include", action="append", default=[], help="Allowlist glob patterns (repeatable)")
+    p.add_argument("--include", action="append", default=[],
+                   help="Guarantee these files (repeatable): each match is sent whole, ahead of "
+                        "and in addition to the normal scan, cut only if --max-bytes forces it "
+                        "and then marked. An EXACT path is guaranteed even past --exts and the "
+                        "512KB scan limit; a glob is a search and gets neither. Needs the scan, "
+                        "so --no-scan voids it")
     p.add_argument("--exclude", action="append", default=[], help="Blocklist glob patterns (repeatable)")
     p.add_argument("--exts", metavar="CSV", help="Restrict to file extensions (comma-separated)")
     p.add_argument("--diff-since", metavar="REV", help="Prioritize files changed since git rev or duration")
@@ -824,16 +829,52 @@ def _emit_dry_run_terminal_event() -> None:
     ))
 
 
+def _gathered_summary(gathered) -> str:
+    """The one-line gather report: entries, distinct files, bytes.
+
+    `gathered` is CHUNK-level. A file over 15KB contributes up to
+    `MAX_CHUNKS_PER_FILE` entries, so `len(gathered)` overcounts files by up to
+    2x — and the line used to call that number "files". On the run in #197 it
+    read `Gathered 4 files` for four windows of TWO files, on a request that
+    had named four; two of the named files never arrived. It agreed with the
+    request by arithmetic coincidence while the truth was half the files,
+    partially, and the operator read it as full coverage.
+
+    Both numbers, always, even when they agree: the file count answers "what
+    did Neo see", the chunk count answers "in how many pieces". A format that
+    collapses to one number when they happen to match teaches the reader that
+    one number is the whole story on exactly the runs where it is.
+    """
+    total_bytes = sum(gf.bytes for gf in gathered)
+    files = len({gf.rel_path for gf in gathered})
+    chunks = len(gathered)
+    return (
+        f"Gathered {chunks} chunk{'' if chunks == 1 else 's'} "
+        f"from {files} file{'' if files == 1 else 's'} "
+        f"({total_bytes:,} bytes)"
+    )
+
+
 def _print_selected_files(gathered) -> None:
-    """Report the gatherer's choice: which files, which lines, what score.
+    """Report the gatherer's choice: which entries, which lines, what score.
 
     Kept even though the assembled prompt is printed in full below it. The
     prompt shows the file CONTENT that survived; this shows the ranking that
     produced it, including the score — the number an operator needs when the
     right file is missing and they want to know whether it lost or was never
     eligible.
+
+    "entries", not "files": one file can appear twice as two windows, and the
+    header saying otherwise was the same overcount as the progress line (#197)
+    on a surface people read as the authoritative list.
     """
-    print("\n=== DRY RUN: files selected, in rank order ===\n", file=sys.stderr)
+    files = len({gf.rel_path for gf in gathered})
+    print(
+        f"\n=== DRY RUN: {len(gathered)} context "
+        f"entr{'y' if len(gathered) == 1 else 'ies'} from {files} "
+        f"file{'' if files == 1 else 's'}, in rank order ===\n",
+        file=sys.stderr,
+    )
     # Whether the ranking above came out of a cold build, an incremental
     # update or a warm read is the difference between a 60-second call and a
     # 2-second one, and it is invisible from the file list. Printed inside the
@@ -851,9 +892,15 @@ def _print_selected_files(gathered) -> None:
         print(file=sys.stderr)
     for gf in gathered:
         lines_info = f" (lines {gf.start}-{gf.end})" if gf.start else ""
+        tags = []
+        if getattr(gf, 'pinned', False):
+            tags.append("--include")
+        if getattr(gf, 'truncated', False):
+            tags.append("TRUNCATED by --max-bytes, marked inline")
+        suffix = f" [{'; '.join(tags)}]" if tags else ""
         print(
             f"  {gf.rel_path}{lines_info} - {gf.bytes} bytes "
-            f"(score: {gf.score:.2f})",
+            f"(score: {gf.score:.2f}){suffix}",
             file=sys.stderr,
         )
 
@@ -1226,6 +1273,17 @@ def main():
         # the dry-run report below still has to say something truthful.
         gathered = []
 
+        # `--no-scan` skips the gatherer, and the gatherer is what honours
+        # `--include`. Two flags that each mean something reasonable combine
+        # into a named file silently absent — the exact shape #198 is about,
+        # arrived at from the other direction. Said out loud rather than left
+        # for the operator to infer from an empty context.
+        if args.no_scan and args.include:
+            progress.note(
+                f"Warning: --no-scan disables the scan that delivers "
+                f"--include, so {len(args.include)} named pattern(s) will NOT "
+                "be in the context; drop --no-scan or pass the files inline")
+
         # Gather context from working directory unless --no-scan
         if not args.no_scan:
             from neo.context_gatherer import gather_context, gather_context_semantic, GatherConfig
@@ -1255,14 +1313,13 @@ def main():
                 ContextFile(
                     path=gf.path,
                     content=gf.content,
-                    line_range=(gf.start, gf.end) if gf.start else None
+                    line_range=(gf.start, gf.end) if gf.start else None,
+                    pinned=getattr(gf, 'pinned', False),
                 )
                 for gf in gathered
             ]
 
-            # Print summary to stderr
-            total_bytes = sum(gf.bytes for gf in gathered)
-            progress.note(f"Gathered {len(gathered)} files ({total_bytes:,} bytes)")
+            progress.note(_gathered_summary(gathered))
             progress.note("Invoking LLM inference...")
 
             if args.dry_run:

@@ -1082,8 +1082,16 @@ class NeoEngine:
         self._log_action("retrieve_context", neo_input.prompt[:60])
         self._begin_phase(PHASE_CONTEXT, self._voice("phase_context"))
         enriched_context = self._retrieve_context(neo_input)
-        file_count = len(neo_input.context_files) + len(
-            enriched_context.get("additional_files", []) or []
+        # Distinct PATHS. `context_files` is chunk-level, so a file selected
+        # as two windows counted as two files in the `file_count` field on the
+        # phase event — #197's overcount on the surface a HOST reads, which
+        # both plugin adapters consume and no operator sees to doubt.
+        file_count = len(
+            {f.path for f in neo_input.context_files}
+            | {
+                getattr(f, "path", f)
+                for f in (enriched_context.get("additional_files", []) or [])
+            }
         )
         self._end_phase(
             PHASE_CONTEXT,
@@ -2379,20 +2387,45 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         """
         from dataclasses import replace
 
-        shown = files[:_MAX_CONTEXT_FILES]
+        # `--include` pins are never dropped by the file cap. Dropping one is
+        # the same silent absence as truncating one, and the flag exists to
+        # assert presence. The scan's files fill whatever slots are left, in
+        # rank order; the loop preserves the incoming order rather than
+        # hoisting pins, because that order is the bundle's own.
+        remaining_slots = _MAX_CONTEXT_FILES - sum(
+            1 for f in files if getattr(f, 'pinned', False)
+        )
+        shown: list = []
+        for f in files:
+            if getattr(f, 'pinned', False):
+                shown.append(f)
+            elif remaining_slots > 0:
+                shown.append(f)
+                remaining_slots -= 1
+
         sections: list[str] = []
         visible: list = []
         sent_chars = 0
-        truncated_count = 0
+        # Distinct PATHS, like the file count beside it in the same sentence.
+        # A per-entry counter said "18 files truncated" in a banner that had
+        # just correctly said 12 files were shown — the conflation this method
+        # now fixes in its first clause, left standing in its third, where
+        # fixing the first is what made it read as a contradiction.
+        truncated_paths: set = set()
 
         for f in shown:
             original = f.content or ''
             lowered = f.path.lower()
-            limit = (
-                _IMPORTANT_FILE_CHARS
-                if any(pat in lowered for pat in _IMPORTANT_FILE_PATTERNS)
-                else _CONTEXT_FILE_CHARS
-            )
+            if getattr(f, 'pinned', False):
+                # No cap. The gatherer already bounded this file by
+                # `--max-bytes` and marked the cut if it made one; a second cut
+                # here would drop that marker and report its own smaller loss
+                # as the whole of it.
+                limit = len(original)
+            elif any(pat in lowered for pat in _IMPORTANT_FILE_PATTERNS):
+                limit = _IMPORTANT_FILE_CHARS
+            else:
+                limit = _CONTEXT_FILE_CHARS
             # `visible` carries the cut content WITHOUT the marker: it feeds
             # code_smells, which reports line numbers, and the marker is our
             # prose rather than the file's.
@@ -2411,17 +2444,38 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             visible.append(replace(f, content=content) if len(original) > limit else f)
 
             if len(original) > limit:
-                truncated_count += 1
+                truncated_paths.add(f.path)
             sections.append(
                 f"\n--- {f.path} ---\n{truncate_marked(original, limit)}"
             )
 
         total_chars = sum(len(f.content or '') for f in files)
-        file_part = (
-            f"{len(shown)} of {len(files)} files"
-            if len(shown) < len(files)
-            else f"{len(files)} file{'' if len(files) == 1 else 's'}"
-        )
+        # Distinct PATHS, not entries. The gatherer hands this list one entry
+        # per window, so a file selected as two chunks arrived here as two
+        # entries and the banner called it two files — #197's defect surviving
+        # on the surface the MODEL reads, which is the one that matters most.
+        # The chunk count is still stated when it differs, because "3 files"
+        # and "5 chunks from 3 files" answer different questions.
+        shown_files = len({f.path for f in shown})
+        total_files = len({f.path for f in files})
+        if len(files) == total_files:
+            file_part = (
+                f"{shown_files} of {total_files} files"
+                if shown_files < total_files
+                else f"{total_files} file{'' if total_files == 1 else 's'}"
+            )
+        else:
+            chunk_part = (
+                f"{len(shown)} of {len(files)} chunks"
+                if len(shown) < len(files)
+                else f"{len(shown)} chunk{'' if len(shown) == 1 else 's'}"
+            )
+            from_part = (
+                f"{shown_files} of {total_files} files"
+                if shown_files < total_files
+                else f"{shown_files} file{'' if shown_files == 1 else 's'}"
+            )
+            file_part = f"{chunk_part} from {from_part}"
         # "chars", not "bytes": `len()` on a str counts code points, and the
         # old banner said bytes while summing exactly this.
         size_part = (
@@ -2430,9 +2484,11 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             else f"{sent_chars} chars"
         )
         note = ""
-        if truncated_count:
-            noun = "file" if truncated_count == 1 else "files"
-            note = f"; {truncated_count} {noun} truncated, marked inline"
+        if truncated_paths:
+            noun = "file" if len(truncated_paths) == 1 else "files"
+            note = (
+                f"; {len(truncated_paths)} {noun} truncated, marked inline"
+            )
         banner = f"\nREPOSITORY CONTEXT ({file_part}, {size_part}{note}):"
 
         return sections, banner, visible

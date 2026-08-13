@@ -167,6 +167,12 @@ class ContextFile:
     path: str
     content: str
     line_range: Optional[tuple[int, int]] = None
+    #: The operator named this file with `--include`. The renderer's per-file
+    #: character cap does not apply to it (standing ruling 1: the named file,
+    #: whole). Its only ceiling is `--max-bytes`, already enforced — and
+    #: marked — by the gatherer, so re-cutting here would nest one cut inside
+    #: another and slice the inner marker off.
+    pinned: bool = False
 
 
 @dataclass

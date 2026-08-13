@@ -9,7 +9,8 @@ per language against the generated fixture repos in `tests/fixtures/`:
 
 - **G1-inv** zero selected files that `git check-ignore` excludes; zero
   duplicate copies.
-- **G2-inv** a prompt-named file is present, whole or explicitly marked.
+- **G2-inv** a prompt-named file is present, and an `--include` file is
+  present whole (or explicitly marked when `--max-bytes` forces a cut).
 - **G3-inv** no silent caps — every truncation is marked and the reported
   counts match what was actually sent.
 
@@ -62,7 +63,7 @@ def repo(request, fixture_repos) -> FixtureRepo:
     return fixture_repos[request.param]
 
 
-def _gather(fx: FixtureRepo):
+def _gather(fx: FixtureRepo, includes: list[str] | None = None):
     """Gather with the same config `cli.main` builds for a plain invocation.
 
     Deliberately not a reduced or tuned config: an invariant asserted under
@@ -73,7 +74,7 @@ def _gather(fx: FixtureRepo):
             root=str(fx.root),
             prompt=fx.prompt,
             exts=None,
-            includes=[],
+            includes=list(includes or []),
             excludes=[],
             max_files=30,
             use_git=True,
@@ -88,6 +89,7 @@ def _as_engine_files(gathered) -> list[ContextFile]:
             path=g.path,
             content=g.content,
             line_range=(g.start, g.end) if g.start else None,
+            pinned=g.pinned,
         )
         for g in gathered
     ]
@@ -164,6 +166,75 @@ class TestNamedFileGuarantee:
         )
         on_disk = (repo.root / repo.target_rel).read_text(encoding="utf-8")
         assert (target.content or "") == on_disk
+
+
+@_PARAM
+class TestIncludedFileGuarantee:
+    """G2-inv, `--include` half: 100% named-file presence, whole.
+
+    The prompt-named half above is a scoring pin — the file wins the ranking
+    and is then delivered like any winner, which is why the fixture target
+    still arrives cut at the renderer. `--include` is a stronger claim
+    (standing ruling 1): the operator asserted the input, so the file bypasses
+    scoring, the file cap and the chunk cap, and the renderer's per-file
+    character cap does not apply to it either. Only `--max-bytes` may cut it,
+    and that cut is marked.
+
+    Asserted per language for the same reason everything else here is: a
+    guarantee verified on Python alone stayed green through the 8.5 months C#
+    was missing entirely.
+    """
+
+    def test_the_included_file_is_present(self, repo):
+        gathered = _gather(repo, includes=[repo.target_rel])
+
+        assert repo.target_rel in [g.rel_path for g in gathered]
+
+    def test_the_included_file_is_pinned_whole_and_uncut(self, repo):
+        gathered = _gather(repo, includes=[repo.target_rel])
+        entries = [g for g in gathered if g.rel_path == repo.target_rel]
+
+        assert len(entries) == 1, f"{repo.target_rel} arrived in {len(entries)} pieces"
+        target = entries[0]
+        assert target.pinned is True
+        assert target.truncated is False
+        assert target.start is None and target.end is None
+        on_disk = (repo.root / repo.target_rel).read_text(encoding="utf-8")
+        assert (target.content or "") == on_disk
+
+    def test_the_scan_still_runs_alongside_the_pin(self, repo):
+        """Ruling 1 is a conjunction. `--include` used to narrow the walk, so
+        naming one file meant nothing else could be selected."""
+        gathered = _gather(repo, includes=[repo.target_rel])
+        others = [g.rel_path for g in gathered if g.rel_path != repo.target_rel]
+
+        assert others, f"{repo.language}: the scan contributed nothing"
+
+    def test_the_renderer_sends_the_included_file_whole(self, repo):
+        """The end of the pipeline, which is where the guarantee is spent.
+
+        The same file WITHOUT `--include` is cut here — that is what
+        `TestTruncationIsAlwaysMarked` pins — so this is the assertion that
+        distinguishes an included file from a merely well-ranked one.
+        """
+        gathered = _gather(repo, includes=[repo.target_rel])
+        files = _as_engine_files(gathered)
+        sections, _banner, visible = NeoEngine._render_context_files(files)
+
+        target = next(
+            f for f in files if Path(f.path).name == Path(repo.target_rel).name
+        )
+        assert len(target.content or "") > _limit_for(target.path), (
+            "fixture stopped exercising the renderer cap"
+        )
+        section = next(
+            s for s in sections if Path(repo.target_rel).name in s.splitlines()[1]
+        )
+        assert "[truncated:" not in section
+        shown = next(
+            v for v in visible if Path(v.path).name == Path(repo.target_rel).name
+        )
+        assert shown.content == target.content
 
 
 @_PARAM
@@ -293,13 +364,20 @@ class TestTruncationIsAlwaysMarked:
         )
 
     def test_the_banner_counts_the_truncated_files(self, repo):
+        """FILES, counted as distinct paths.
+
+        This assertion used to re-implement a per-ENTRY count, so it codified
+        the conflation it was named after rather than catching it: two windows
+        of one cut file were reported as two files truncated, in a banner whose
+        other clause had already said one file.
+        """
         gathered = _gather(repo)
         files = _as_engine_files(gathered)
         _sections, banner, _visible = NeoEngine._render_context_files(files)
 
-        cut = sum(
-            1 for f in files if len(f.content or "") > _limit_for(f.path)
-        )
+        cut = len({
+            f.path for f in files if len(f.content or "") > _limit_for(f.path)
+        })
         noun = "file" if cut == 1 else "files"
         assert f"{cut} {noun} truncated, marked inline" in banner, banner
 
