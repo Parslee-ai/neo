@@ -1,0 +1,37 @@
+id,shape,run,wall_seconds,max_rss_bytes,entries,distinct_files
+P1,file-named,1,8.43,1455669248,1,1
+P1,file-named,2,8.30,1453998080,1,1
+P1,file-named,3,8.40,1457913856,1,1
+P2,file-named,1,8.85,1451884544,30,30
+P2,file-named,2,9.17,1454735360,30,30
+P2,file-named,3,8.89,1450917888,30,30
+P3,concept-only,1,7.73,1451327488,30,30
+P3,concept-only,2,9.38,1447362560,30,30
+P3,concept-only,3,8.66,1451294720,30,30
+P4,concept-only,1,8.46,1447968768,30,30
+P4,concept-only,2,8.28,1447804928,30,30
+P4,concept-only,3,8.19,1448738816,30,30
+P5,mixed,1,7.25,1451098112,30,30
+P5,mixed,2,7.28,1448411136,30,30
+P5,mixed,3,7.94,1452425216,30,30
+P6,symptom,1,7.27,1451458560,30,30
+P6,symptom,2,23.81,1448394752,30,30
+P6,symptom,3,54.16,1448394752,30,30
+
+=== M2 aggregates ===
+id  shape           median_s   min_s   max_s  peak_RSS_MiB
+P1  file-named          8.40    8.30    8.43        1390.4
+P2  file-named          8.89    8.85    9.17        1387.3
+P3  concept-only        8.66    7.73    9.38        1384.1
+P4  concept-only        8.28    8.19    8.46        1381.6
+P5  mixed               7.28    7.25    7.94        1385.1
+P6  symptom            23.81    7.27   54.16        1384.2
+
+BATTERY median wall = 8.41s (n=18, min 7.25, max 54.16)
+BATTERY peak ru_maxrss = 1457913856 B = 1390.4 MiB = 1.46 GB
+vs M2 targets (<=5s / <=500MB): 1.68x time, 2.92x memory
+
+selected: 151 entries | 151 sum-of-per-prompt-distinct | 125 BATTERY UNION distinct
+repeat entries: 26 battery-wide (entries - union) | 0 within-prompt (entries - per-prompt-distinct)
+files selected by >1 prompt: 22 (accounting for 26 excess selections)
+union written to evidence/m2_g9_clean/union.files (feed this to the G1 check)
