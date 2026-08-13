@@ -18,10 +18,10 @@ $neo_worktree/evidence/run_goal9.sh          # M1 x3, M2, per-stage profile
 
 Goals 6, 7 and 8 each ran a branch arm against a `main` arm, because each was
 changing the ranker and had to show it had not regressed. **This goal changes no
-runtime behaviour.** It deletes prose, rewrites four help/doc strings and adds a
-guard test; `git diff origin/main -- src/` touches three lines of user-facing text
-and one comment. A two-arm A/B would have spent two hours proving that identical
-code performs identically.
+runtime behaviour.** It rewrites help and doc strings and adds a guard test;
+`git diff origin/main -- src/` touches three user-facing strings and one comment,
+none of which any code path reads as data. A two-arm A/B would have spent two hours
+proving that identical code performs identically.
 
 The comparison that means something at the end of the climb is against the **Goal 1
 trailhead**, and that is what this document reports. The goal-over-goal check —
@@ -32,12 +32,16 @@ every M1 cell reproduces Goal 8's branch arm exactly.
 
 | repo | HEAD at measurement | working tree |
 |---|---|---|
-| neo | `5bbee46` (the corpus Goals 1 and 8 measured; the *ranker* is `80a8cfc`) | 4 modified/untracked, unrelated in-flight work |
+| neo | `5bbee46` (the corpus Goal 8 measured; the *ranker* is `80a8cfc`) | 4 modified/untracked, unrelated in-flight work |
 | aieweb | `26fff07e` | 1 modified |
 | m365dotnet | `61dc4a17` | 1 modified |
 
-Same three flagship HEADs as Goal 1 and Goal 8, so this sits on the same corpus as
-the rest of the plan.
+Same three flagship HEADs as **Goal 8**, so the goal-over-goal comparison below is
+on one corpus. Goal 1 is a partial match, and the difference is worth naming rather
+than glossing: aieweb and m365dotnet are at Goal 1's HEADs, but the neo corpus was
+`77251df` at Goal 1 and is `5bbee46` here. (`5bbee46` also appears in this document
+as the revision that pins the trailhead *instrument*; the two uses are unrelated and
+the coincidence is easy to misread.)
 
 ### CPU contention, and why the battery was run three times
 
@@ -49,9 +53,14 @@ committed. The spread is the point:
 
 | battery | 1-min load at start | median wall | peak `ru_maxrss` | entries / union |
 |---|---|---|---|---|
-| run 1 (contended) | ~20 | 9.89 s | 1390.4 MiB | 151 / 125 |
+| run 1 (contended) | ~20 ᵉ | 9.89 s | 1390.4 MiB | 151 / 125 |
 | run 2 (heavily contended) | 25.48 | 18.59 s | 1390.5 MiB | 151 / 125 |
 | **run 3 (quiet)** | **8.40** | **8.41 s** | **1390.4 MiB** | **151 / 125** |
+
+ᵉ Estimated, and marked as such: run 1 was launched inside `evidence/run_goal9.sh`
+before contention was suspected, so no load probe bracketed it. Runs 2 and 3 carry
+measured values. All of these are recorded in `evidence/g9_conditions.txt` — an
+argument that rests on a number belongs in the same commit as the number.
 
 **Run 3 is the reading.** Contention is one-sided — it can only make a call slower,
 never faster — so under a shared box the *minimum* is the better estimator of the
@@ -114,7 +123,8 @@ reads *m365dotnet MRR ≥ 0.6*; on `5bbee46:tools/rank_eval.py` m365dotnet went
 
 Read the two tables as answering two different questions. The trailhead table says
 **the climb worked**. The final table says **Goals 5–9 did not spend the win** —
-0.712 / 0.728 / 0.669, unchanged since Goal 6 introduced the instrument.
+0.712 / 0.728 / 0.669, unchanged since Goal 6, the first goal to report on this
+instrument. (`rank_mine_eval.py` itself shipped in #194, at Goal 2.)
 
 ### The second half of M1: no flagship regressed goal-over-goal
 
@@ -145,9 +155,18 @@ contended runs are committed as `evidence/g9_m2_contended.txt` and
 | | Goal 1 trailhead | Goal 8 | **Goal 9** | target |
 |---|---|---|---|---|
 | battery median wall | 10.54 s | 8.97 s | **8.41 s** | ≤ 5 s |
-| battery peak `ru_maxrss` | 1.43 GB | 1390.5 MiB | **1390.4 MiB** | ≤ 500 MB |
+| battery peak `ru_maxrss` | 1368.0 MiB | 1390.5 MiB | **1390.4 MiB** | ≤ 500 MB |
 | entries / union distinct | — | 151 / 125 | **151 / 125** | — |
 | within-prompt repeat entries (#197) | — ‡ | 0 | **0** | 0 |
+
+**Read the RSS row as a small regression, not a win.** All three figures are in MiB
+on purpose: the trailhead's 1,434,402,816 bytes is 1368.0 MiB *and* 1.43 GB, and
+mixing the two units across a row makes 1368.0 → 1390.4 look like an improvement of
+40-something when memory in fact **rose 22.4 MiB (+1.6%)** over the climb.
+`docs/eval-baselines-2026-08.md` warns about exactly this MB/MiB trap and this
+document nearly walked into it. The rise is not attributable to any one goal — it is
+inside the run-to-run spread of a 1.39 GB FactStore load — but it is a rise, and M2's
+memory target was missed by 2.9× at the trailhead and is missed by 2.9× now.
 
 ‡ Not measured at the trailhead; the battery did not yet report the two file columns
 separately. The number this row usually gets quoted against is **45**, which is Goal
@@ -160,14 +179,20 @@ separately. The number this row usually gets quoted against is **45**, which is 
 | P2 | file-named | 9.49 | **8.89** | 1387.5 | 1387.3 |
 | P3 | concept-only | 7.90 | **8.66** | 1384.5 | 1384.1 |
 | P4 | concept-only | 9.02 | **8.28** | 1384.6 | 1381.6 |
-| P5 | mixed | 8.92 | **7.28** | 1385.0 | 1385.1 |
+| P5 | mixed | 8.92 | **7.28** | 1385.2 | 1385.1 |
 | P6 | symptom | 9.14 | 23.81 ᵖ | 1385.2 | 1384.2 |
 
 ᵖ P6's three runs were 7.27 / 23.81 / 54.16 s — monotonically escalating, with the
 1-minute load average rising from 8.40 to 18.36 across the battery as another
 session started work. Its first run is the in-family reading; the median is not.
-Five of six prompts are **faster** than Goal 8 and the battery median is 6% below
-it, which is the M2 requirement for this goal: **retirement does not re-add cost.**
+**Four of six prompts are faster than Goal 8** — P1, P2, P4 and P5. P3 is slower
+(8.66 against 7.90) under median-vs-median and under min-vs-min alike, and P6 is
+slower on any statistic that does not cherry-pick its first run. The honest summary
+is the battery median, 6% below Goal 8's, which is the M2 requirement for this goal:
+**retirement does not re-add cost.** (An earlier draft of this table said "five of
+six", which is only reachable by scoring P6 on its first run while scoring every
+other prompt on its median — a mixed rule, and the sort of arithmetic this plan has
+spent nine goals removing from its own reports.)
 
 The RSS column is the control: six prompts, six readings, every one within 3 MiB of
 Goal 8's, and unchanged across a 2.2× wall-clock spread between batteries.
@@ -213,10 +238,13 @@ agree with. (Goal 7's equivalent lived in `/tmp` and could not be re-run by anyo
 reading its numbers; this one is committed beside them.)
 
 Run five times across a load range of 6.1 to 20; the reading below is the
-lowest-load run, for the same one-sided reason the battery quotes its quiet run.
-The five WALL TOTALs were 6.47 / 7.09 / 7.12 / 9.05 / 35.52 s while peak RSS held at
-1447 MB in **all five** — the memory figure is load-independent and the time figure
-is not.
+lowest-**wall** run, for the same one-sided reason the battery quotes its quiet run.
+(Lowest wall, not lowest load: the 6.11-load run came in at 7.09 s. Load average is a
+trailing one-minute mean and a poor proxy for what the scheduler did during a 6-second
+process; the wall itself is the measurement.)
+The five WALL TOTALs were 6.47 / 7.09 / 7.12 / 9.05 / 35.52 s while peak RSS read
+1448 / 1447 / 1447 / 1447 / 1447 MB — a 1 MB spread across a 5.5× spread in wall
+clock. The memory figure is load-independent and the time figure is not.
 
 ```
 T imports                                    0.96s             <- 1.24s at Goal 7
@@ -265,7 +293,7 @@ git check-ignore --stdin < $neo_worktree/evidence/m2_g9/union.files
 
 ## Structural proof — the lane is gone, not just unused
 
-New this goal: `tests/test_lane_retirement.py` (16 tests, `-m invariants`).
+New this goal: `tests/test_lane_retirement.py` (15 tests, `-m invariants`).
 
 | claim | how it is proved |
 |---|---|
@@ -273,13 +301,19 @@ New this goal: `tests/test_lane_retirement.py` (16 tests, `-m invariants`).
 | one gather path | `gather_context` defined once; no sibling `gather_*` at module level; `cli.py` calls that name and no other |
 | `--semantic` never routes | AST scan: `cli.py` contains no `if`/`IfExp` whose test reads `.semantic` |
 | zero references to deleted lane functions | text scan of `src/`, `.claude-plugin/`, `plugins/`, `README.md`, `QUICKSTART.md`, `INSTALL.md`, `AGENTS.md`, `docs/**` for `gather_context_semantic`, `mmr_pack_chunks`, `log_context_metrics` |
-| the docs do not teach the old model | four named retired claims appear in no shipped source or doc |
+| the docs do not teach the old model | three named retired claims appear in no shipped source or doc |
 
 Every one of the retired claims was live text in this repository at the start of this
 goal, and each is verified to fail against `origin/main` — a guard that would have
-passed before the change it guards is not a guard.
+passed before the change it guards is not a guard. **This was enforced the hard
+way**: a fourth claim ("run `neo --index` first to enable") was written from
+imagination, and `git log --all -S` found it in exactly one commit — the one that
+added the guard. It was removed rather than kept as decoration. The three that remain
+cover two distinct sites, since the first two were the same README line.
 
-**Two exemptions, both named in the test's docstring.** Dated measurement records
+**Three references to a deleted lane function remain under `docs/` and are exempt on
+purpose** — one in the Goal 8 record and two in this file. **Exemptions are named in
+the test's docstring.** Dated measurement records
 under `docs/` (`goal<N>-*-measurements-<date>.md`, including this file) are evidence
 of what was true on the day they were produced: the Goal 8 record compares an arm
 whose code *did* contain `gather_context_semantic` against one that did not, and

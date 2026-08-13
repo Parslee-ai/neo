@@ -1,0 +1,46 @@
+# Goal 9 — measurement conditions, recorded at run time.
+#
+# Load averages are observations, not artifacts a script emitted: `uptime` was
+# read immediately before and after each battery. They are here because the
+# measurement doc's "run 3 is the reading" argument rests on them, and an
+# argument resting on a number that lives in no committed file is an assertion.
+
+## M2 batteries (tools/m2_battery.sh, m365dotnet, 6 prompts x 3 timed runs)
+
+battery              1-min load at start   1-min load at end   median wall   peak MiB
+run 1 (contended)    ~20 (see note)        --                  9.89 s        1390.4
+run 2 (contended)    25.48                 15.12               18.59 s       1390.5
+run 3 (quiet)        8.40                  18.36               8.41 s        1390.4
+
+Note on run 1: the battery was launched inside evidence/run_goal9.sh without a
+load probe around it -- the probe was added for runs 2 and 3 once contention was
+suspected. "~20" is inferred from `uptime` readings either side of the window
+(25.48 at 10:11 and load averages of 23.96/20.01/18.40 observed at 09:24), so it
+is an estimate and is written as one. Runs 2 and 3 carry measured values.
+
+Competing load in runs 1 and 2: a peer agent session running repeated
+tools/rank_mine_eval.py sweeps out of the Goal 8 worktree (PIDs 29801, 63178,
+93876). That session cleared the machine before run 3.
+
+Selected file set was 151 entries / 125 distinct in ALL THREE runs, and
+evidence/m2_g9/union.files is byte-identical to evidence/m2_g9_clean/union.files.
+That invariance across a 2.2x wall-clock spread is what licenses attributing the
+spread to the machine.
+
+## Per-stage profile (evidence/g9_stage_profile.py, m365dotnet)
+
+run                       1-min load   WALL      peak RSS
+g9_profile (first)        ~20          9.05 s    1448 MB
+g9_profile_clean          19.45        35.52 s   1447 MB
+g9_profile_try1           11.46        7.12 s    1447 MB
+g9_profile_try2 (READING) 7.96         6.47 s    1447 MB
+g9_profile_try3           6.11         7.09 s    1447 MB
+
+The reading is the lowest-WALL run, not the lowest-load one: load average is a
+trailing one-minute mean and a poor proxy for what the scheduler did during a
+six-second process. Peak RSS spans 1 MB across the five.
+
+## Machine
+
+Apple M4 Max, 16 cores, 64 GB, macOS 26.5.2, Python 3.13.7.
+Shared developer laptop with several agent sessions active -- not an isolated box.

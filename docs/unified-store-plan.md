@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 **Owner:** Keenan Keeling (dispatching via goalpool; Kai shepherds)
-**Status:** **Complete — all ten goals landed 2026-08-13.** See [Completion ledger](#completion-ledger-2026-08-13).
+**Status:** **Goals 1-8 and 10 merged; Goal 9 (this ledger) is open as a draft PR and v0.46.0 is uncut.** See [Completion ledger](#completion-ledger-2026-08-13).
 **Origin:** 2026-08-11 forensic review of Neo file selection (issues #158/#159/#176/#186/#193–#199) + the 2026-08-10 Keenan/Matt sync.
 
 ## Intent
@@ -70,10 +70,16 @@ Already done inline (2026-08-11): #192 (eval harness), #186 (gitignore implement
 
 ## Completion ledger (2026-08-13)
 
-**Written at Goal 9, the plan's own closing goal.** 2026-08-11 → 2026-08-13: ten
-goals, thirteen merged PRs plus one governance PR, six issues closed (#195, #196,
-#197, #198, #199, #210). This section is the climb's ledger: what shipped, what the
-numbers did, and what is deliberately left open.
+**Written at Goal 9, the plan's own closing goal, while Goal 9 itself is still an
+open draft PR.** Nine of the ten goals are merged; this one and the v0.46.0 release
+are not, and the tense below is deliberate — a plan that declares itself complete
+before its last PR merges is the same category of claim as an index that prints
+"Built index" and exits 0.
+
+2026-08-11 → 2026-08-13: ten goals, thirteen merged PRs plus one governance PR,
+seven issues closed (#193, #195, #196, #197, #198, #199, #210). This section is the
+climb's ledger: what shipped, what the numbers did, and what is deliberately left
+open.
 
 ### Per-goal PRs
 
@@ -87,11 +93,13 @@ numbers did, and what is deliberately left open.
 | **6. Persistent content index** | [#209](https://github.com/Parslee-ai/neo/pull/209) | closes #195 — BM25 moves into the on-disk store |
 | **7. Auto-freshness** | [#212](https://github.com/Parslee-ai/neo/pull/212) | closes #210 — the eligibility walk persists; `--index` becomes optional |
 | **8. One front door** | [#214](https://github.com/Parslee-ai/neo/pull/214) | one pipeline, four stages; the `cli.py` gather fork and the second gather function deleted |
-| **9. Lane retirement** | *this PR* | the two-lane vocabulary retired from code and docs; `tests/test_lane_retirement.py` guards it; release v0.46.0 |
+| **9. Lane retirement** | *this PR — open, draft* | the two-lane vocabulary retired from code and docs; `tests/test_lane_retirement.py` guards it. **v0.46.0 is cut after it merges, not in it** |
 | **10. Release gate** | [#202](https://github.com/Parslee-ai/neo/pull/202) | G5-inv — per-language LLM round trip gates the release, invariant battery gates every PR |
 
 Governance PR [#203](https://github.com/Parslee-ai/neo/pull/203) added the draft-flow
-ruling mid-climb. Goals 1, 3–8 and 10 used it.
+ruling mid-climb, merging 2026-08-12 12:48Z. **Goals 3–8 used it, and so does this
+one.** Goal 1 (#201, 02:57Z) and Goal 10 (#202, 12:02Z) merged before the ruling
+existed, and Goal 2 is its named in-flight exception.
 
 ### Final metrics vs the trailhead
 
@@ -103,7 +111,7 @@ commit). Full method, conditions and per-prompt tables:
 was retired by #194, which re-ran it on both arms before retiring it; that re-run is
 the like-for-like trailhead comparison, on the same 209 / 221 / 173 mined cases:
 
-| repo | MRR trailhead | MRR final | R@10 trailhead | R@10 final |
+| repo | MRR trailhead | MRR after #194 | R@10 trailhead | R@10 after #194 |
 |---|---|---|---|---|
 | neo | 0.136 | **0.714** | 0.212 | **0.751** |
 | aieweb | 0.180 | **0.759** | 0.244 | **0.774** |
@@ -122,13 +130,16 @@ arm in every cell. No flagship regressed at any goal.
 | | trailhead | final | target | verdict |
 |---|---|---|---|---|
 | battery median wall | 10.54 s | **8.41 s** | ≤ 5 s | **not met including the memory system; met excluding it** (3.04 s of a 6.47 s profiled call) |
-| battery peak `ru_maxrss` | 1.43 GB | **1.46 GB** | ≤ 500 MB | **not met** — 1.39 GB of it is the FactStore (#211) |
+| battery peak `ru_maxrss` | 1.43 GB | **1.46 GB** | ≤ 500 MB | **not met, and it rose** (+22.4 MiB) — Goal 7 attributes 1.26 GB of the peak to the FactStore (#211) |
 | eligibility walk, warm | 4.6–6.9 s | **0.12 s** | — | the walk itself is 38–58× cheaper |
 | file selection, warm, total | — | **0.37 s** | — | walk + content refresh + content scores + catalog boost |
 
-**M3 — freshness cost** was met at Goal 7 and is unchanged here: 0.84 s for 10 files
-edited and 0.75 s for 10 files added, against a ≤ 5 s target, with the cold build
-bounded and reported.
+**M3 — freshness cost** was met at Goal 7: 0.84 s for 10 files edited and 0.75 s for
+10 files added, against a ≤ 5 s target, with the cold build bounded and reported.
+**Goal 9 did not re-measure it** — `evidence/run_goal9.sh` runs M1, M2 and the
+profile only — so that is Goal 7's reading carried forward, not a fresh one. Nothing
+in this goal touches the freshness path, and the profile's 0.12 s eligibility walk
+and 0.08 s content-index refresh are consistent with it.
 
 **Guard invariants**, all green at the final base: G1-inv 0 gitignored and 0
 duplicates of 125 selected files; G2-inv and G3-inv pinned by the invariant battery;
@@ -141,8 +152,9 @@ Two of the three north stars closed. **M1 closed decisively** — the thing the 
 existed to fix. **M2 closed on the half the plan owns**: file selection is 0.37 s of
 a warm call, the walk went from ~5 s to 0.12 s, and the unified store's own cost is
 under the 5 s target with room. It did **not** close on the absolute number, because
-the FactStore history boost and the engine's fact retrieval are 3.43 s and 1.39 GB
-of every invocation and this plan never touched the memory system. That is issue
+the FactStore history boost and the engine's fact retrieval are 3.43 s of every
+invocation, and Goal 7 attributes 1.26 GB of the 1.46 GB peak to them; this plan
+never touched the memory system. That is issue
 #211, scoped out on purpose at the trailhead and still open.
 
 The plan's most durable output may not be a metric. Goals 5, 8 and 9 each ended with
@@ -155,8 +167,9 @@ outside and had exited 0.
 
 | # | What | Why it is out of scope |
 |---|---|---|
-| [#211](https://github.com/Parslee-ai/neo/issues/211) | FactStore history boost loads 1.26 GB / ~3.4 s into every invocation | Named as out of scope in the plan from Goal 1. It is the whole remaining gap to M2's absolute targets, and it is a memory-system problem, not a retrieval one. **The natural successor plan.** |
+| [#211](https://github.com/Parslee-ai/neo/issues/211) | FactStore history boost loads 1.26 GB into every invocation — 2.9 s when the issue was filed, 3.43 s at Goal 9's profile | Named as out of scope in the plan from Goal 1. It is the whole remaining gap to M2's absolute targets, and it is a memory-system problem, not a retrieval one. **The natural successor plan.** |
 | [#213](https://github.com/Parslee-ai/neo/issues/213) | `neo --index` builds a catalog of 100% test files on any `src/` + `tests/` repo | Found at Goal 8 while measuring stage 4. It makes the embedding catalog useless on a normal layout, which is why stage 4 is inert on all three flagships and why the concept-win the plan hoped for could not be measured. |
+| [#217](https://github.com/Parslee-ai/neo/issues/217) | `neo --update` is unreachable standalone (it is read only inside the `--index` branch), never picks up NEW files, and prints the catalog's total chunk count after a budget-truncated refresh | Found at Goal 9 while making the docs truthful. All three are behaviour changes and this goal carries a deletion-only bias, so Goal 9 corrected the documentation to describe what the code does and filed the code half. The third defect is the same "printed success either way" class the plan removed from the index *build* path at #177, surviving one function over in the *refresh* path. |
 | *(no issue yet)* | **Pins can consume the entire byte budget.** A prompt naming a 442 KB file spends 299,959 of `--max-bytes`'s 300,000 default on the pin and leaves 41 bytes for the scan, delivering 1 file where pre-#214 main delivered 22. | Reads against standing ruling 1 — *guarantee the named files **and** keep scanning*. Introduced by #214, found by a fresh verifier in that goal's own committed evidence after merge. A fix (`PIN_BUDGET_SHARE`, capping the pin block at half the budget while the scan still has candidates) exists on a branch with mutation-verified tests; the Goal 8 author is opening a follow-up PR against post-#214 main. **Not a Goal 9 regression** — Goal 8's branch arm and this base produce identical file sets. |
 
 ### Rulings, kept

@@ -107,7 +107,7 @@ def parse_args():
     global_parser.add_argument('--regenerate-embeddings', action='store_true', help='Regenerate all embeddings with current model (safe, with automatic backup)')
     global_parser.add_argument('--index', action='store_true', help='Optional cache-warmer: build the embedding catalog for this repo. File selection works without it (the walk and the keyword index refresh themselves on every call); once built, the catalog re-ranks every call with no flag')
     global_parser.add_argument('--languages', metavar='CSV', help='Languages to index (e.g., python,csharp,typescript)')
-    global_parser.add_argument('--update', action='store_true', help='Re-embed only the files that changed since the last --index build')
+    global_parser.add_argument('--update', action='store_true', help="Re-embed already-catalogued files whose contents changed. Use WITH --index ('neo --index --update'); this flag is only read inside that branch. New files are not picked up — the staleness check walks the snapshot's own hashes — and the refresh stops at 5s/100 chunks, so a partial refresh still reports the full chunk total")
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')

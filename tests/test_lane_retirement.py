@@ -40,6 +40,17 @@ that did not, and editing that sentence to satisfy a grep would make the record
 lie about the experiment. **`tests/`** is exempt from guard 1 for the same
 reason in miniature: a test that asserts the absence of a symbol must be
 allowed to spell it.
+
+**Known limit of the scope, stated rather than papered over.**
+`SHIPPED_DOC_ROOTS` is an ALLOW-list, so anything not enumerated is unguarded
+by default. `CHANGELOG.md` is the live example: it holds a verbatim retired
+claim at its `0.36.0` entry, and it is deliberately out of scope for the same
+reason the measurement records are -- a changelog entry records what a release
+actually printed, and rewriting it would falsify the release. But a
+deny-list would be the stronger shape, because the failure mode of an
+allow-list is silence about a file nobody remembered to add, and the failure
+mode of a deny-list is a test that fails until someone justifies the
+exemption. Inverting it is the obvious next improvement to this file.
 """
 
 import ast
@@ -65,18 +76,24 @@ DELETED_LANE_FUNCTIONS = (
     "log_context_metrics",
 )
 
-#: Exact strings that assert the retired mental model. Every one of these was
-#: live text in this repository at the start of Goal 9. They are matched
-#: case-insensitively as substrings, so a rewording that keeps the claim keeps
-#: failing.
+#: Exact strings that assert the retired mental model. **Every entry here must
+#: be text that was actually live in this repository**, or the guard is
+#: decorative — it fails nothing, and it advertises coverage it does not have.
+#: A fourth entry ("run `neo --index` first to enable") was written from
+#: imagination and removed on review: `git log --all -S` found it in exactly
+#: one commit, the one that added the guard. Before adding a claim here, prove
+#: it exists: `git log --all -S'<claim>' --oneline`.
+#:
+#: Three claims, two sites — the first two were the same README line
+#: (`README.md:660` on `origin/main`), the third was the first-run tip in
+#: `context_gatherer.py`. Matched case-insensitively as substrings, so a
+#: rewording that keeps the claim keeps failing.
 RETIRED_CLAIMS = (
     # `--semantic` as a mode you switch into, rather than a weight hint.
     "use the semantic index for file selection",
     # The catalog as a precondition of selection working at all.
     "requires `.neo/index.json`",
     "enable semantic file selection",
-    # `--index` as a step you must run before Neo is useful.
-    "run `neo --index` first to enable",
 )
 
 #: Where a claim reaches a human or an agent. Directories are walked for
@@ -267,13 +284,33 @@ class TestTheDocsDoNotTeachTheOldModel:
         )
 
     def test_the_cli_help_calls_index_optional(self):
-        """The flag's own help text is the doc most users actually read."""
-        help_text = (SRC / "cli.py").read_text(encoding="utf-8")
-        index_help = next(
-            line for line in help_text.splitlines() if "'--index'" in line
-        )
+        """The flag's own help text is the doc most users actually read.
 
-        assert "ptional" in index_help, (
-            "`--index`'s help must say it is optional. It was 'Build semantic "
-            "index for current directory', which reads as a setup step."
+        Asserts the CONTRACT, not a stem. An earlier version tested
+        `"ptional" in index_help`, which passes on "not optional", on
+        "optionally required" and on any inflection of the word — it proves
+        the seven letters are present, not that the sentence says what it
+        needs to. It also selected its line with a bare `next()`, so a change
+        of quoting style raised `StopIteration` instead of failing legibly.
+        """
+        help_text = (SRC / "cli.py").read_text(encoding="utf-8")
+        candidates = [
+            line for line in help_text.splitlines()
+            if "'--index'" in line or '"--index"' in line
+        ]
+
+        assert candidates, "no `--index` argument declaration found in cli.py"
+        index_help = candidates[0].lower()
+
+        assert "optional cache-warmer" in index_help, (
+            "`--index`'s help must name it a cache-warmer. It read 'Build "
+            "semantic index for current directory', which is a setup step."
+        )
+        assert "works without it" in index_help, (
+            "`--index`'s help must say selection works with no catalog. "
+            "Calling it optional without saying what still works leaves the "
+            "reader to assume the answer is 'less'."
+        )
+        assert "semantic index" not in index_help, (
+            "the retired phrasing is back in `--index`'s help"
         )

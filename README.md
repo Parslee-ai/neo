@@ -617,8 +617,9 @@ neo --cwd /path/to/project "optimize this function"
 # keyword index refresh themselves on every call.
 neo --index
 
-# Re-embed only the files that changed since the last --index build
-neo --update
+# Re-embed catalogued files whose contents changed. Must be passed WITH --index;
+# new files are not picked up, so a repo that grew needs a full build.
+neo --index --update
 
 # Preview the assembled context without making an LLM call
 neo --dry-run "your query"
@@ -1138,7 +1139,7 @@ Two further signals ride on the ranking stages: **tree-sitter symbol overlap** (
 
 **What `--index` is, and is not.** Stages 1–3 need nothing built: the eligibility walk and the keyword index are cached in the repo's `.neo/` and brought up to date inline on every invocation, so removing `--index` from a fresh-clone workflow changes first-call latency and nothing else. `--index` builds the **embedding catalog** that stage 4 reads — tree-sitter chunks embedding `symbols + imports + first ~600 chars of body`, over FAISS, at `.neo/index.json`. Once it exists it is consulted on every run with no flag; `--semantic` only reads it deeper (3×) and raises its weight to `CONTENT_WEIGHT`. Without a catalog, stage 4 contributes nothing and a one-line tip fires.
 
-The catalog build apportions its budget rather than truncating whatever globbed first: files are grouped by language and given a share of `--max-files` proportional to how much of the repo they are, with a floor of one slot per language, and the `MAX_CHUNKS_PER_REPO` cut round-robins across files so every indexed file keeps a chunk (per-file cap 2). Non-source paths (`.worktrees`, `node_modules`, `.claude`, virtualenvs, plus anything the repo's own `.gitignore` names) are excluded, and byte-identical duplicates are indexed once. When a cap bites, `neo --index` says so — a capped build no longer looks the same as a complete one. See [tree-sitter setup](docs/tree-sitter-setup.md#operational-notes).
+The catalog build apportions its budget rather than truncating whatever globbed first: files are grouped by language and given a share of `--max-files` proportional to how much of the repo they are, with a floor of one slot per language, and the `MAX_CHUNKS_PER_REPO` cut is apportioned across files in proportion to what each holds, with a floor. (It was round-robin once — one chunk each before any file gets a second — and that was replaced because equal shares are not fair shares: a 9 KB utility came out fully represented while the modules the repo is built on did not.) Non-source paths (`.worktrees`, `node_modules`, `.claude`, virtualenvs, plus anything the repo's own `.gitignore` names) are excluded, and byte-identical duplicates are indexed once. When a cap bites, `neo --index` says so — a capped build no longer looks the same as a complete one. See [tree-sitter setup](docs/tree-sitter-setup.md#operational-notes).
 
 
 ### Learning Feedback Loop
