@@ -739,7 +739,7 @@ def _report_dry_run(args, calls) -> None:
     the first had.
     """
     if args.json:
-        print(json.dumps({
+        payload = {
             "dry_run": True,
             "calls": calls,
             "note": (
@@ -747,10 +747,33 @@ def _report_dry_run(args, calls) -> None:
                 "adapter restructures them (Anthropic hoists system, Google "
                 "remaps roles, Ollama flattens, CAR adds intent_json)"
             ),
-        }, indent=2))
+        }
+        # `--json` implies `--quiet`, so the stderr note the content index
+        # emits is suppressed on exactly the path a machine consumer reads.
+        # It is a fact about what the run cost and it belongs in the report.
+        report = _content_index_report()
+        if report is not None:
+            payload["content_index"] = report
+        print(json.dumps(payload, indent=2))
         _emit_dry_run_terminal_event()
     else:
         print(render(calls), file=sys.stderr)
+
+
+def _content_index_report():
+    """This process's content-index freshness report, or None.
+
+    None means the index never ran -- `--no-scan`, or a gather that found no
+    eligible file at all. That is a real distinction and it is reported as an
+    absent key rather than as an empty one, which would read as "the index ran
+    and did nothing".
+    """
+    try:
+        from neo.index.content_index import last_report
+    except ImportError:  # pragma: no cover - the module ships with neo
+        return None
+    report = last_report()
+    return report.to_dict() if report is not None else None
 
 
 def _emit_dry_run_terminal_event() -> None:
@@ -790,6 +813,14 @@ def _print_selected_files(gathered) -> None:
     eligible.
     """
     print("\n=== DRY RUN: files selected, in rank order ===\n", file=sys.stderr)
+    # Whether the ranking above came out of a cold build, an incremental
+    # update or a warm read is the difference between a 60-second call and a
+    # 2-second one, and it is invisible from the file list. Printed inside the
+    # block rather than left to the progress note so it cannot drift away from
+    # the selection it describes.
+    report = _content_index_report()
+    if report is not None:
+        print(f"  [{report['summary']}]\n", file=sys.stderr)
     for gf in gathered:
         lines_info = f" (lines {gf.start}-{gf.end})" if gf.start else ""
         print(
