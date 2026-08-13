@@ -1003,6 +1003,27 @@
   on the same terms `--include` uses. The boost STAYS on the ranking: a file can
   only be pinned if the walk found it, so the boost covers the candidates the
   pin pool never held (an `--exts`-narrowed list).
+  **The pin block cannot spend the whole ceiling** (`PIN_BUDGET_SHARE` = 0.5).
+  Ruling 1 is "the named files AND keep scanning", and funding pins to the last
+  byte satisfies the first clause by deleting the second. Measured on the M2
+  battery after #214 merged: the prompt naming
+  `src/Parslee.M365.Api/Program.cs` (442,867 bytes) pinned it, spent 299,959 of
+  the 300,000-byte default, and delivered **one file** — the whole context was
+  that file — where pre-#214 main delivered 22 and the fix delivers 30. The
+  reserve binds only when pins would take more than half; with nothing else
+  eligible it would fund nothing, so it does not apply and the pin arrives
+  whole. The held-back cut is marked and announced, which the ruling permits
+  ("whole, or with an explicit marker").
+  **Each budget cap is charged for what IT removed.** `dropped_by_file_cap` is
+  counted before the byte cap cuts and `dropped_by_byte_cap` after, and both are
+  reported when both bind. Deriving the file cap's verdict from the full
+  candidate list made the run print `pinned files filled the file budget
+  (--max-files=30)` with 29 of 30 slots free and the BYTE ceiling holding the
+  count at one — raising the named knob provably changed nothing, which is this
+  repo's own rule about never blaming a cap for an absence it did not cause,
+  broken inside the goal whose subject is selection truthfulness. In the
+  scan-delivered-nothing branch the byte cap is tested FIRST, because it is
+  applied second and therefore holds the margin.
   **Delivery is one entry per file, read whole from disk.** Chunking survives
   only as a RANKING internal — it chooses WHICH region of an over-budget file
   arrives, never how many entries a file contributes. `--max-bytes` is
