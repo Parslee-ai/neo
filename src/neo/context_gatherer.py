@@ -160,6 +160,12 @@ SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT
 #: the keyword stage never scored at all.
 SEMANTIC_HINT_DEPTH = 3
 
+#: Largest share of `--max-bytes` the pin block may take while the scan still
+#: has candidates of its own. Ruling 1 is "the named files AND keep scanning";
+#: an unbounded pin block satisfies the first clause by deleting the second.
+#: See the call site in `gather_context` for the measurement that forced it.
+PIN_BUDGET_SHARE = 0.5
+
 #: Floor on a scan file's share of `--max-bytes`. Below this a file arrives as
 #: little more than its own truncation marker, which costs a delivery slot and
 #: answers nothing — so the file count is reduced to what the ceiling can
@@ -1388,27 +1394,30 @@ def _budget_notes(
     config: GatherConfig,
     adaptive_limit: int,
     *,
-    file_cap_rejected: bool,
-    bytes_cap_rejected: bool,
-    dropped: int,
+    dropped_by_file_cap: int,
+    dropped_by_byte_cap: int,
 ) -> None:
-    """Name the cap that actually reduced the selection, and only that one.
+    """Name each cap that reduced the selection, charged for what IT removed.
 
     G3-inv: no silent caps. The scan used to stop mid-loop and say nothing —
     the operator saw twelve files and no indication that a thirteenth had lost
     to a ceiling rather than to the ranking. Those are different facts with
     different remedies and they looked identical.
 
-    The file cap is reported before the byte cap because it is applied first
-    and is therefore the one that bound: with 40 candidates, 25 slots and a
-    ceiling that could fund 30, it is `--max-files` that turned away the other
-    15 and raising `--max-bytes` changes nothing. Reporting both would send the
-    operator to a knob that cannot move the number, which is this repo's own
-    rule about never blaming a cap for an absence it did not cause.
+    **Both caps can bind at once and then both are named, with their own
+    counts.** The first version took one boolean per cap, derived the file
+    cap's from the full candidate list before the byte cap had cut anything,
+    and reported the file cap alone whenever both were true. Reproduced: 41
+    candidates, 3 delivered, "38 lower-ranked file(s) not delivered: the file
+    budget was reached" — where the file cap accounted for 16 and the byte cap
+    for 22, and raising `--max-files` moved nothing. A count attributed to the
+    wrong knob is worse than no count, because the operator acts on it.
+
+    The two are charged in application order: the file cap sees every
+    candidate, the byte cap sees only what survived it. So the numbers sum to
+    the real loss and neither is double-counted.
     """
-    if not dropped:
-        return
-    if file_cap_rejected:
+    if dropped_by_file_cap:
         # The limit that bound is the ADAPTIVE one, and printing it as
         # `--max-files=25` names a number the operator never typed — worse,
         # below specificity 10 `calculate_adaptive_limit` returns a fixed
@@ -1421,11 +1430,11 @@ def _budget_notes(
             else f"--max-files={config.max_files}"
         )
         progress.note(
-            f"{dropped} lower-ranked file(s) not delivered: the file budget "
-            f"({knob}) was reached")
-    elif bytes_cap_rejected:
+            f"{dropped_by_file_cap} lower-ranked file(s) not delivered: the "
+            f"file budget ({knob}) was reached")
+    if dropped_by_byte_cap:
         progress.note(
-            f"{dropped} lower-ranked file(s) not delivered: "
+            f"{dropped_by_byte_cap} lower-ranked file(s) not delivered: "
             f"--max-bytes={config.max_bytes:,} cannot fund them above "
             f"{MIN_FILE_SHARE_BYTES} bytes each")
 
@@ -1533,10 +1542,39 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
             pin_origins[entry[1]] = origin
             pin_entries.append(entry)
 
-    pin_report = pin_included_files(pin_entries, config.max_bytes, pin_origins)
+    # **The pin block cannot spend the whole ceiling while anything else is
+    # eligible.** Standing ruling 1 has two clauses — the named files, AND the
+    # scan keeps running — and funding pins to the last byte honours the first
+    # by deleting the second. Measured on the M2 battery: the prompt naming
+    # `src/Parslee.M365.Api/Program.cs` (442,867 bytes) pinned it, spent 299,959
+    # of the 300,000-byte default, left 41 bytes, and delivered **one file**
+    # where main delivered 22. The ruling permits a marked cut ("whole, or with
+    # an explicit marker"); it does not permit the scan contributing nothing
+    # because one named file was large.
+    #
+    # Half, and symmetric, because neither side has a claim to more of the
+    # other's budget than that: "the files you named" and "everything else
+    # useful" are the two things the caller asked for. It binds only when pins
+    # would otherwise take more than half, which on every prompt in the M2
+    # battery except P1 is never — pins are typically a few KB against 300,000.
+    # With nothing else eligible the reserve would fund nothing, so the pins
+    # take the whole ceiling and arrive whole.
+    scan_pool_exists = any(rel not in pin_origins for _a, rel, _s in candidates)
+    pin_budget = (
+        max(int(config.max_bytes * PIN_BUDGET_SHARE), 1)
+        if scan_pool_exists and pin_entries
+        else config.max_bytes
+    )
+    pin_report = pin_included_files(pin_entries, pin_budget, pin_origins)
     pinned = pin_report.files
     pinned_rels = {f.rel_path for f in pinned}
-    _pin_notes(pin_report, config.max_bytes, include_misses, include_refused)
+    _pin_notes(pin_report, pin_budget, include_misses, include_refused)
+    if pin_budget != config.max_bytes and pin_report.truncated_rels:
+        progress.note(
+            f"The pinned block is held to {pin_budget:,} bytes "
+            f"({PIN_BUDGET_SHARE:.0%} of --max-bytes={config.max_bytes:,}) so "
+            "the scan still has a budget to run in; raise --max-bytes to give "
+            "both more room")
 
     if explicit_paths and not explicit_matches:
         # A named path that matched nothing is the single highest-value
@@ -1728,8 +1766,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # have changed anything.
     eligible_scan = [c for c in scored if c[1] not in pinned_rels]
     scan_slots = max(adaptive_limit - len(selected), 0)
-    file_cap_rejected = len(eligible_scan) > scan_slots
-    scan_candidates = eligible_scan[:scan_slots]
+    after_file_cap = eligible_scan[:scan_slots]
 
     # The byte ceiling reduces the file COUNT rather than truncating the tail
     # of the ranking mid-loop, so what it costs is one number the operator can
@@ -1737,9 +1774,20 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # nothing but the file's own truncation marker.
     remaining_bytes = max(config.max_bytes - pinned_bytes, 0)
     affordable = remaining_bytes // MIN_FILE_SHARE_BYTES
-    bytes_cap_rejected = len(scan_candidates) > affordable
-    if bytes_cap_rejected:
-        scan_candidates = scan_candidates[:affordable]
+    scan_candidates = after_file_cap[:affordable]
+
+    # **Each cap is charged for what IT removed, and the two are counted
+    # separately.** The first version set `file_cap_rejected` from the full
+    # candidate list and then let the byte cap cut further, so whenever both
+    # bound the file cap was named and the byte cap was never mentioned —
+    # reproduced live at `--max-files=30`, where the message read "pinned files
+    # filled the file budget (--max-files=30)" for a run with 29 of 30 slots
+    # free and the BYTE ceiling holding the count at one. Raising the knob the
+    # run named provably changed nothing, which is this repo's own rule about
+    # never blaming a cap for an absence it did not cause, broken inside the
+    # goal whose subject is selection truthfulness.
+    dropped_by_file_cap = len(eligible_scan) - len(after_file_cap)
+    dropped_by_byte_cap = len(after_file_cap) - len(scan_candidates)
 
     # Apportion on the walk's own size, not on a pre-pass that reads every
     # candidate: the walk already stat'd them, and reading files the ceiling
@@ -1798,9 +1846,8 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         _budget_notes(
             config,
             adaptive_limit,
-            file_cap_rejected=file_cap_rejected,
-            bytes_cap_rejected=bytes_cap_rejected,
-            dropped=len(eligible_scan) - len(scan_candidates),
+            dropped_by_file_cap=dropped_by_file_cap,
+            dropped_by_byte_cap=dropped_by_byte_cap,
         )
 
     if scan_delivered_nothing:
@@ -1814,7 +1861,17 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         # settings that would change nothing. That is this repo's own rule
         # about never blaming a cap for an absence it did not cause, broken
         # inside the goal whose subject is selection truthfulness.
-        if file_cap_rejected:
+        # Which cap to name is decided by which one REMOVED candidates, in the
+        # same accounting `_budget_notes` uses — and the BYTE cap is tested
+        # first here, because it is applied second and is therefore the one
+        # holding the margin when both bound. The reverse order named
+        # `--max-files=30` on a run with 29 slots free.
+        if dropped_by_byte_cap:
+            progress.note(
+                f"Warning: pinned files filled the byte budget "
+                f"(--max-bytes={config.max_bytes:,}); the scan contributed "
+                "nothing")
+        elif dropped_by_file_cap:
             # The limit that bound is the ADAPTIVE one, and printing it as
             # `--max-files=25` names a number the operator never typed — worse,
             # below specificity 10 `calculate_adaptive_limit` returns a fixed
@@ -1829,11 +1886,6 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
             progress.note(
                 f"Warning: pinned files filled the file budget ({knob}); "
                 "the scan contributed nothing")
-        elif bytes_cap_rejected:
-            progress.note(
-                f"Warning: pinned files filled the byte budget "
-                f"(--max-bytes={config.max_bytes:,}); the scan contributed "
-                "nothing")
         else:
             # No cap bound. The scan simply found nothing else eligible, which
             # no setting changes — so it gets a bare statement and no remedy.

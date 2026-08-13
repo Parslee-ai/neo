@@ -198,6 +198,41 @@ P1 and P5 are slower and P2, P3, P4, P6 faster; every one of those differences i
 smaller than the spread within a single prompt's own three runs. Read the battery
 median, not a row.
 
+### Correction (2026-08-13, post-merge): P1 delivered ONE file, and this doc did not say so
+
+The table above reports P1's wall-clock and RSS and nothing else, and the
+selection table below reports only aggregates. Both concealed the single largest
+behavioural change on the battery, which a fresh non-author verifier found in
+this branch's own committed artifact:
+
+| | pre-#214 main | #214 as merged | with `PIN_BUDGET_SHARE` |
+|---|---|---|---|
+| P1 entries / distinct files | 30 / 22 | **1 / 1** | 30 / 30 |
+| P1 context bytes | 240,525 | 299,959 | 284,406 |
+
+P1 names `src/Parslee.M365.Api/Program.cs` (442,867 bytes). Stage 1 pinned it,
+the pin took 299,959 of the 300,000-byte default ceiling, `remaining_bytes` fell
+to 41, and the scan contributed **nothing** — the entire context was one file.
+The aggregate "sum of per-prompt distinct files 135 → 151" nets a −21 on P1
+against gains elsewhere, and "entries == distinct files on all six prompts" is
+true for P1 only as `1 == 1`.
+
+Two things were wrong and both are fixed in the follow-up:
+
+1. **Ruling 1 has two clauses.** "The named files AND keep scanning" was
+   satisfied by deleting the second. `PIN_BUDGET_SHARE` holds the pin block to
+   half of `--max-bytes` while the scan still has candidates of its own; the cut
+   is marked and announced, which the ruling explicitly permits.
+2. **The warning named the wrong knob.** The run printed `pinned files filled
+   the file budget (--max-files=30)` with 29 of 30 slots free — the byte ceiling
+   was the binder, and raising `--max-files` would have changed nothing.
+
+**Consequence for the M2 medians above:** the branch's P1 did roughly 1/30th of
+main's delivery work and was still the slowest branch prompt (10.50 s vs
+9.37 s), so the battery median comparison is confounded. The confound runs
+against the branch, so "within noise" survives — but P1 is not like-for-like and
+the median should not be read as one.
+
 ### Selection, on the same battery
 
 | | main | branch |
