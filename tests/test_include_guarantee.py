@@ -401,14 +401,44 @@ class TestTheReportMatchesWhatHappened:
         `--max-files`, so the warning named a knob that could not move the
         limit it was reporting. Both numbers now, and the relationship.
         """
-        for i in range(20):
-            (tmp_path / f"f{i}.py").write_text(f"V{i} = {i}\n", encoding="utf-8")
+        for i in range(15):
+            (tmp_path / f"pin{i}.py").write_text(f"V{i} = {i}\n", encoding="utf-8")
+        # Scorable and NOT pinned, so the cap has something real to turn away.
+        # Files the scan would never have ranked cannot demonstrate a cap: the
+        # run then has nothing to add for a reason no setting changes, which
+        # is the other branch.
+        for i in range(5):
+            (tmp_path / f"fix{i}.py").write_text(
+                f"# fix the fix path {i}\nFIX{i} = {i}\n", encoding="utf-8"
+            )
 
-        _gather(tmp_path, includes=["*.py"], max_files=500, prompt="fix")
+        # Exactly the adaptive limit is pinned, so the file budget is full and
+        # the five candidates below it are turned away by the cap.
+        _gather(
+            tmp_path,
+            includes=[f"pin{i}.py" for i in range(15)],
+            max_files=500,
+            prompt="fix",
+        )
         err = capsys.readouterr().err
 
         assert "adaptive limit 15, from --max-files=500" in err
         assert "--max-files=15" not in err
+        assert "found nothing to add" not in err
+
+    def test_an_all_pinned_repo_blames_no_file_cap(self, tmp_path, capsys):
+        """Every file pinned, `--max-files 100`: the scan had no candidate to
+        turn away, so no cap bound. The old predicate inferred from
+        `len(selected) >= adaptive_limit` after the loop and the break ran
+        before the pinned skip, so a pin counted as a candidate rejected."""
+        for i in range(16):
+            (tmp_path / f"f{i}.py").write_text(f"V{i} = {i}\n", encoding="utf-8")
+
+        _gather(tmp_path, includes=["*.py"], max_files=100)
+        err = capsys.readouterr().err
+
+        assert "found nothing to add" in err
+        assert "file budget" not in err and "byte budget" not in err
 
     def test_an_unreadable_named_file_is_reported(self, repo, capsys):
         """The one named file with no entry in the bundle. Saying nothing made
@@ -593,6 +623,81 @@ class TestTheLiteralPathRescue:
         )
         assert "artefact.bin" in rels
 
+    def test_a_symlinked_ancestor_cannot_reach_outside_the_repo(self, tmp_path):
+        """The escape both containment guards were written to prevent.
+
+        `os.walk` never descends a symlinked directory, so a file reachable
+        only through one is not in the walk's world at all — and unlike the
+        lexical `../` form, a symlinked ancestor leaves the repository without
+        the path ever saying so. The leaf-only symlink check admitted
+        `linked/secret.py` through `repo/linked -> /outside`, which is a read
+        of a file outside the repository through a user flag.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.py").write_text('TOKEN = "not-in-this-repo"\n', encoding="utf-8")
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (root / "linked").symlink_to(outside, target_is_directory=True)
+
+        rels = _rels(_gather(root, includes=["linked/secret.py"]))
+        assert "linked/secret.py" not in rels
+        assert not any("secret" in r for r in rels)
+
+    def test_a_refusal_names_its_own_cause(self, tmp_path, capsys):
+        """A cause we can name never joins "check spelling"."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.py").write_text("TOKEN = 1\n", encoding="utf-8")
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (root / "linked").symlink_to(outside, target_is_directory=True)
+
+        _gather(root, includes=["linked/secret.py"])
+        err = capsys.readouterr().err
+
+        assert "NOT admitted" in err
+        assert "symlinked directory linked/" in err
+        assert "check spelling" not in err
+
+    def test_the_size_ceiling_reports_itself(self, tmp_path, capsys, monkeypatch):
+        """G3-inv: no silent caps. This one surfaced for a round as "matched
+        no file - check spelling", which is three wrong causes and a fourth
+        that says an exact path IS rescued past a size limit."""
+        from neo import context_gatherer as cg
+
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (tmp_path / "artefact.bin").write_text("x" * 4096, encoding="utf-8")
+        monkeypatch.setattr(cg, "_PIN_RESCUE_MAX_BYTES", 1024)
+
+        rels = _rels(_gather(tmp_path, includes=["artefact.bin"], exts=["py"]))
+        err = capsys.readouterr().err
+
+        assert "artefact.bin" not in rels
+        assert "NOT admitted" in err and "--include ceiling" in err
+        assert "check spelling" not in err
+
+    def test_an_absolute_path_inside_the_root_is_pinned(self, repo):
+        """The form a traceback, an IDE "copy path" and Neo's own output emit.
+        `matches_explicit_path` already handles it for a path named in the
+        prompt; the flag that promises a guarantee should not be stricter."""
+        target = repo / "notes" / "zzz_placeholder.py"
+
+        rels = _rels(_gather(repo, includes=[str(target)]))
+        assert rels.count("notes/zzz_placeholder.py") == 1
+
+    def test_a_gitignored_file_refusal_is_named_too(self, tmp_path, capsys):
+        (tmp_path / ".gitignore").write_text("secret.py\n", encoding="utf-8")
+        (tmp_path / "secret.py").write_text("TOKEN = 1\n", encoding="utf-8")
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+
+        _gather(tmp_path, includes=["secret.py"])
+        err = capsys.readouterr().err
+
+        assert "NOT admitted" in err and ".gitignore" in err
+
     def test_a_glob_gets_no_rescue_and_the_warning_says_so(self, big_repo, capsys):
         """Expanding a glob means walking, which is the cost the rescue avoids.
         The limit is real, so the diagnostic names it instead of listing four
@@ -640,12 +745,13 @@ class TestCutToBytes:
 
 class TestResolveIncludes:
     def test_a_pattern_that_matches_nothing_is_reported(self, repo):
-        matched, missed = resolve_includes(
+        matched, missed, refused = resolve_includes(
             [("/r/src/app/pool.py", "src/app/pool.py", 10)], ["does/not/exist.py"]
         )
 
         assert matched == []
         assert missed == ["does/not/exist.py"]
+        assert refused == []
 
     def test_the_miss_reaches_stderr(self, repo, capsys):
         _gather(repo, includes=["does/not/exist.py"])
@@ -655,10 +761,10 @@ class TestResolveIncludes:
 
     def test_two_patterns_matching_one_file_pin_it_once(self):
         candidates = [("/r/a.py", "a.py", 1), ("/r/b.py", "b.py", 1)]
-        matched, missed = resolve_includes(candidates, ["a.py", "*.py"])
+        matched, missed, refused = resolve_includes(candidates, ["a.py", "*.py"])
 
         assert [rel for _abs, rel, _size in matched] == ["a.py", "b.py"]
-        assert missed == []
+        assert missed == [] and refused == []
 
 
 class TestThePromptRendererHonoursThePin:
