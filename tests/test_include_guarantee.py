@@ -27,7 +27,6 @@ import pytest
 
 from neo import cli
 from neo.context_gatherer import (
-    MAX_CHUNKS_PER_FILE,
     ContextFile as GatheredFile,
     GatherConfig,
     _cut_to_bytes,
@@ -36,13 +35,15 @@ from neo.context_gatherer import (
 )
 from neo.engine import _MAX_CONTEXT_FILES, NeoEngine
 from neo.models import ContextFile
+from neo.context_gatherer import MIN_FILE_SHARE_BYTES
 from neo.text_budget import MARKER_PREFIX
 
 PROMPT = "Fix the connection pool timeout when the database is busy"
 
-# Past `gather_context`'s 15,000-character chunking threshold, so an unpinned
-# copy of this file is guaranteed to arrive as windows. That is what makes the
-# "pinned files bypass the chunk cap" assertions non-vacuous.
+# Large enough that an unpinned copy cannot fit a share of a ceiling set to its
+# own size, so it arrives as a marked excerpt with a line range. That is what
+# makes the "a pin is delivered whole" assertions non-vacuous: the control and
+# the pinned run use the SAME ceiling and differ only in the flag.
 _BULK = "\n".join(
     f"    # database pool connection timeout retry line {i}" for i in range(400)
 )
@@ -180,24 +181,40 @@ class TestIncludedFilesAreGuaranteed:
         assert others, f"the scan contributed nothing beside the pin: {rels}"
         assert "src/app/pool.py" in others
 
-    def test_an_included_file_is_not_windowed(self, repo):
+    def test_an_included_file_is_not_excerpted(self, repo):
         """The cap that actually bit in #198: ~400 lines of any file, whatever
-        its size, with nothing in the output saying so."""
-        control = _gather(repo)
-        control_pool = [g for g in control if g.rel_path == "src/app/pool.py"]
-        assert control_pool and control_pool[0].start is not None, (
-            "fixture stopped exercising the chunk cap"
-        )
-        assert len(control_pool) <= MAX_CHUNKS_PER_FILE
+        its size, with nothing in the output saying so.
 
-        gathered = _gather(repo, includes=["src/app/pool.py"])
+        Both arms run at the SAME ceiling — the pool file's own size — and
+        differ only in `--include`. That is what makes the control fair: an
+        unpinned file shares that ceiling with the other three candidates, so
+        it cannot fit and arrives as a marked excerpt with a line range; the
+        pin has the ceiling to itself and arrives byte-identical to disk.
+
+        A control at a generous ceiling would pass for the wrong reason. Since
+        delivery became whole-file, an unpinned file is windowed only when the
+        budget forces it, so "nothing was windowed" is the DEFAULT rather than
+        evidence the guarantee did anything.
+        """
+        source = (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
+        ceiling = len(source.encode("utf-8"))
+
+        control = _gather(repo, max_bytes=ceiling)
+        control_pool = [g for g in control if g.rel_path == "src/app/pool.py"]
+        assert len(control_pool) == 1, "one file is one entry, pinned or not"
+        assert control_pool[0].start is not None, (
+            "fixture stopped exercising the budget-forced excerpt"
+        )
+        assert control_pool[0].truncated is True
+        assert MARKER_PREFIX in (control_pool[0].content or "")
+
+        gathered = _gather(repo, includes=["src/app/pool.py"], max_bytes=ceiling)
         pinned = [g for g in gathered if g.rel_path == "src/app/pool.py"]
 
         assert len(pinned) == 1, "a pinned file was still split into windows"
         assert pinned[0].start is None and pinned[0].end is None
-        assert pinned[0].content == (
-            (repo / "src" / "app" / "pool.py").read_text(encoding="utf-8")
-        )
+        assert pinned[0].truncated is False
+        assert pinned[0].content == source
 
     def test_a_pinned_file_is_not_also_selected_as_a_window(self, repo):
         """Delivering it whole AND ranking it would emit one file twice, which
@@ -304,14 +321,16 @@ class TestTheReportMatchesWhatHappened:
         _gather(repo, includes=["src/app/pool.py"], max_bytes=4_000)
         err = capsys.readouterr().err
 
-        assert "pins 1 file(s) 0 whole, 1 cut and marked" in err
+        assert "Pinned 1 file(s) 0 whole, 1 cut and marked" in err
+        assert "from --include" in err
         assert "file(s) whole (" not in err
 
     def test_an_uncut_pin_is_described_as_whole(self, repo, capsys):
         _gather(repo, includes=["src/app/config.py"])
         err = capsys.readouterr().err
 
-        assert "pins 1 file(s) whole" in err
+        assert "Pinned 1 file(s) whole" in err
+        assert "1 from --include" in err
 
     def test_a_ceiling_that_cannot_seat_the_markers_says_so(self, repo, capsys):
         """The ceiling bounds pinned CONTENT. Below one marker per named file
@@ -364,33 +383,34 @@ class TestTheReportMatchesWhatHappened:
 
         assert "contributed nothing" not in err
 
-    def test_a_byte_cap_that_turns_candidates_away_is_named(self, tmp_path, capsys):
-        """One byte below the boundary, where the old predicate went silent.
+    def test_a_byte_cap_that_reduces_the_file_count_is_named(self, tmp_path, capsys):
+        """The byte ceiling now costs FILES, and says how many.
 
-        The inner tests are `total + this_one > max_bytes`, so the ceiling can
-        reject every remaining candidate while the running total sits below it.
-        `total_bytes >= max_bytes` is False there, and the run told the
-        operator no setting would change the outcome — one byte away from
-        `--max-bytes + 1` changing it. The existing byte-cap test sets the
-        ceiling exactly equal to the pin size and lands on the `>=` boundary,
-        which is why it never saw this.
+        It used to stop the fill loop mid-ranking and say nothing: the operator
+        saw six files and no indication that a seventh had lost to a ceiling
+        rather than to the ranking. Those are different facts with different
+        remedies and they looked identical.
+
+        No pin here, deliberately. The pinned-file warning covers the case
+        where pins consumed the budget; this covers the ordinary run, which is
+        the one that used to be silent.
         """
-        (tmp_path / "pin.py").write_text("PIN = 1\n", encoding="utf-8")
-        (tmp_path / "pool.py").write_text(
-            "def connection_pool_timeout():\n"
-            + "    # database pool connection timeout\n" * 25,
-            encoding="utf-8",
-        )
-        pin_bytes = len((tmp_path / "pin.py").read_bytes())
-        pool_bytes = len((tmp_path / "pool.py").read_bytes())
-        ceiling = pin_bytes + pool_bytes - 1
+        for i in range(6):
+            (tmp_path / f"pool_{i}.py").write_text(
+                f"def connection_pool_timeout_{i}():\n"
+                + f"    # database pool connection timeout retry {i}\n" * 5,
+                encoding="utf-8",
+            )
+        # Funds two files at the `MIN_FILE_SHARE_BYTES` floor and no more.
+        ceiling = MIN_FILE_SHARE_BYTES * 2 + 100
 
-        gathered = _gather(tmp_path, includes=["pin.py"], max_bytes=ceiling)
+        gathered = _gather(tmp_path, max_bytes=ceiling)
         err = capsys.readouterr().err
 
-        assert len(gathered) == 1, "fixture stopped exercising the byte cap"
-        assert "byte budget" in err and f"--max-bytes={ceiling:,}" in err
-        assert "found nothing to add" not in err
+        assert len(gathered) == 2, "fixture stopped exercising the byte cap"
+        assert "4 lower-ranked file(s) not delivered" in err
+        assert f"--max-bytes={ceiling:,}" in err
+        assert "file budget" not in err
 
     def test_the_file_cap_warning_names_the_limit_that_actually_bound(
         self, tmp_path, capsys

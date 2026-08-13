@@ -1,0 +1,16 @@
+
+repo         subset      arm       n    MRR    R@1    R@3   R@10   H@10
+neo          all         main     50  0.712  0.307  0.502  0.708  0.980
+neo          all         branch   50  0.712  0.307  0.502  0.708  0.980
+neo          concept     main     49  0.721  0.314  0.513  0.717  0.980
+neo          concept     branch   49  0.721  0.314  0.513  0.717  0.980
+neo          file-named  main      1  0.250  0.000  0.000  0.250  1.000
+neo          file-named  branch    1  0.250  0.000  0.000  0.250  1.000
+aieweb       all         main     50  0.728  0.487  0.654  0.778  0.880
+aieweb       all         branch   50  0.728  0.487  0.654  0.778  0.880
+aieweb       concept     main     50  0.728  0.487  0.654  0.778  0.880
+aieweb       concept     branch   50  0.728  0.487  0.654  0.778  0.880
+m365dotnet   all         main     50  0.669  0.312  0.497  0.771  0.860
+m365dotnet   all         branch   50  0.669  0.312  0.497  0.771  0.860
+m365dotnet   concept     main     50  0.669  0.312  0.497  0.771  0.860
+m365dotnet   concept     branch   50  0.669  0.312  0.497  0.771  0.860

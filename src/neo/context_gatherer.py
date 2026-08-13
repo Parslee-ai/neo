@@ -11,11 +11,9 @@ Approximates Claude Code/Codex ergonomics with:
 """
 
 import fnmatch
-import json
 import os
 import re
 import subprocess
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -112,9 +110,12 @@ class ContextFile:
     #: cap and `MAX_CHUNKS_PER_FILE`, and the prompt renderer does not apply
     #: its per-file character cap to it. See `pin_included_files`.
     pinned: bool = False
-    #: True when the `--max-bytes` ceiling forced a cut in a pinned file. The
-    #: content then carries `text_budget`'s marker; this field is what lets
-    #: the CLI report the cut without re-parsing the text.
+    #: True when the `--max-bytes` ceiling forced a cut in this file — pinned
+    #: or scanned. The content then carries `text_budget`'s marker; this field
+    #: is what lets the CLI report the cut without re-parsing the text. It
+    #: covers scan files too since delivery became whole-file: an over-budget
+    #: file arrives as one marked excerpt rather than as unmarked windows,
+    #: so the cut has a place to be reported from.
     truncated: bool = False
 
 
@@ -130,6 +131,42 @@ class GatherConfig:
     max_files: int = 30
     diff_since: Optional[str] = None
     use_git: bool = True
+    #: `--semantic`. A HINT that biases stage 4 of the front door, not a fork
+    #: to a second pipeline. The semantic catalog is consulted on every
+    #: invocation when it exists; this raises how deep it is read and how much
+    #: its verdict weighs. See `gather_context`.
+    semantic: bool = False
+
+
+# --- Stage 4: the semantic supplement ---------------------------------------
+#
+# The embedding catalog re-ranks and supplements the keyword result; it is
+# never a separate lane the caller has to choose. These two constants are the
+# whole of what `--semantic` does.
+#
+# `SEMANTIC_WEIGHT` is the multiplier on a chunk's cosine when the flag is
+# absent — 1.0, the weight the boost has always carried, so an unflagged run
+# ranks exactly as it did. `SEMANTIC_HINT_WEIGHT` is CONTENT_WEIGHT, which is
+# the point: with the hint the embedding verdict weighs the same as the BM25
+# verdict, so a concept-shaped query can be answered by meaning rather than by
+# shared vocabulary. Below CONTENT_WEIGHT the flag would be decorative; above
+# it, it would be the old fork wearing a smaller word.
+SEMANTIC_WEIGHT = 1.0
+SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT
+
+#: Multiplier on how many catalog chunks stage 4 reads under the hint. Depth
+#: and weight are separate knobs because they fix different misses: weight
+#: moves a file the catalog already surfaced, depth is what surfaces a file
+#: the keyword stage never scored at all.
+SEMANTIC_HINT_DEPTH = 3
+
+#: Floor on a scan file's share of `--max-bytes`. Below this a file arrives as
+#: little more than its own truncation marker, which costs a delivery slot and
+#: answers nothing — so the file count is reduced to what the ceiling can
+#: actually seat, and the reduction is REPORTED rather than absorbed. Only
+#: binds on a hand-set, very small `--max-bytes`: at the 100,000 default it
+#: permits 195 files against an adaptive limit of at most 30.
+MIN_FILE_SHARE_BYTES = 512
 
 
 #: Per-file ceiling for prompt assembly. A file larger than this is not
@@ -674,17 +711,39 @@ def _fit_to_budget(
     return low, high + 1
 
 
-def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
-    """If a ProjectIndex exists for ``root``, return per-file relevance boosts.
+def _project_index_boost(
+    root: str,
+    prompt: str,
+    k: int,
+    *,
+    weight: float = SEMANTIC_WEIGHT,
+    hinted: bool = False,
+) -> dict[str, float]:
+    """Stage 4 of the front door: the semantic supplement, when it exists.
 
-    The index stores semantic embeddings of code chunks (functions, classes)
-    extracted by tree-sitter. Calling ``retrieve(prompt, k)`` returns the
-    top-k most semantically-relevant chunks; we project those back to file
-    paths and give each file a boost proportional to its best chunk's
-    similarity. Files surfaced by multiple chunk hits accumulate.
+    The catalog stores embeddings of code chunks (functions, classes) extracted
+    by tree-sitter. ``retrieve(prompt, k)`` returns the top-k most
+    semantically-relevant chunks; those project back to file paths and each
+    file takes a boost proportional to its best chunk's similarity, scaled by
+    `weight`.
 
-    Falls through silently when the index doesn't exist or fails to load —
-    gather_context still works on the existing filename heuristics.
+    This is a RE-RANK AND SUPPLEMENT, never a lane: the caller unions in files
+    the keyword stage never scored and adds the boost to those it did, so the
+    embedding verdict can move a file up or surface one from nothing, and can
+    never remove a file the keyword stage found. That asymmetry is deliberate —
+    a catalog is a snapshot taken at `--index` time, and letting a stale
+    snapshot suppress a live BM25 hit would make freshness a correctness
+    problem rather than a quality one.
+
+    `hinted` says `--semantic` was passed, and changes exactly two things: the
+    weight the caller supplies, and what is said when there is no catalog to
+    read. Without the flag a missing catalog is a one-line tip; with it, the
+    caller asked for this stage by name and gets told plainly that it did not
+    run, because silence there is indistinguishable from "the catalog was
+    consulted and had nothing to say".
+
+    Falls through silently on any other failure — the front door still ranks on
+    the pinned paths and the keyword index.
     """
     try:
         from neo.index.project_index import ProjectIndex
@@ -694,7 +753,12 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
             # First-run hint: surface the most impactful smart-gather upgrade
             # the user can opt into. Cheap, silent on subsequent runs (we only
             # print when the snapshot file is genuinely missing, not just empty).
-            if not index.snapshot_path.exists():
+            if hinted:
+                progress.note(
+                    "--semantic asked for the embedding catalog and there is "
+                    f"none at {index.snapshot_path} - ranking on the keyword "
+                    "index alone; run 'neo --index' to build it")
+            elif not index.snapshot_path.exists():
                 progress.note("Tip: run 'neo --index' to enable semantic file selection")
             return {}
         chunks = index.retrieve(prompt, k=k)
@@ -713,11 +777,13 @@ def _project_index_boost(root: str, prompt: str, k: int) -> dict[str, float]:
             sim = max(0.0, sim)
             if is_test_path(rel) and not prompt_is_test:
                 sim *= TEST_PENALTY
-            # 1.0 cosine = +1.0 boost (dominant signal); test demotion above.
+            # A 1.0 cosine is worth `weight`; test demotion applied above.
             prev = boost.get(rel, 0.0)
-            boost[rel] = max(prev, sim)
+            boost[rel] = max(prev, sim * weight)
         if boost:
-            progress.note(f"ProjectIndex boost: {len(boost)} files matched semantically")
+            progress.note(
+                f"Semantic re-rank: {len(boost)} file(s) matched the catalog "
+                f"(weight {weight:g}{', --semantic' if hinted else ''})")
         return boost
     except Exception:  # missing index, faiss unavailable, etc.
         # Quiet — index is opt-in, must-not-break path.
@@ -826,6 +892,43 @@ def _symbol_score(
 # realistic sizes, all ASCII. The reserve is checked against the marker that
 # actually gets emitted, so a template change cannot silently break the bound.
 _PIN_MARKER_RESERVE = 96
+
+
+def resolve_explicit_paths(
+    candidates: list[tuple[str, str, int]], explicit: set[str]
+) -> list[tuple[str, str, int]]:
+    """Stage 1 of the front door: the files the prompt spelled out, as pins.
+
+    `EXPLICIT_PATH_BOOST` made a named path rank first and stopped there, which
+    left the guarantee resting on arithmetic. +10.0 clears every organic signal
+    combined, so the file did reach the top of the ranking — and then met the
+    same delivery machinery as everything below it: it could be windowed into
+    a fragment, and on a prompt naming more files than the adaptive limit
+    admits, the last-named ones fell off the end. "Ranked first" and "present"
+    are different claims, and only the second is what a caller who typed a path
+    is asking for.
+
+    So a named path is now pinned, on the same terms `--include` is: delivered
+    whole, ahead of the scan, bypassing `MIN_SCORE_THRESHOLD`, the rank cut and
+    the file cap, with `--max-bytes` the only thing that may still cut it and
+    that cut marked and reported. The boost stays where it is, because pinning
+    is not retrospective: a file can be pinned only if the walk found it, and
+    the boost is what the RANKING does with a named path in every other
+    respect.
+
+    Matching is `matches_explicit_path`'s and nothing else — anchored on a path
+    boundary, tested in both directions so an absolute path from a traceback
+    hits the repo-relative candidate. `extract_explicit_paths` is deliberately
+    loose (any dotted token), and the narrowing is precisely that a candidate
+    the walk admitted has to match it: "e.g." names no file, so it costs
+    nothing. Ordered by path, so the byte ceiling is spent deterministically.
+    """
+    if not explicit:
+        return []
+    return sorted(
+        (c for c in candidates if matches_explicit_path(c[1], explicit)),
+        key=lambda c: c[1],
+    )
 
 
 def resolve_includes(
@@ -1016,7 +1119,9 @@ def _rescue_exact_include(
     return (candidate, normalized, size), None
 
 
-def _cut_to_bytes(content: str, budget: int) -> tuple[str, bool]:
+def _cut_to_bytes(
+    content: str, budget: int, *, whole: Optional[str] = None
+) -> tuple[str, bool]:
     """Cut `content` to at most `budget` UTF-8 bytes, marking the cut.
 
     Returns ``(text, was_cut)``. Unlike `text_budget.truncate_marked`, which
@@ -1026,6 +1131,18 @@ def _cut_to_bytes(content: str, budget: int) -> tuple[str, bool]:
     suggestion. The marker text is `truncate_marked`'s, so a pinned file's cut
     reads the same as every other marked cut in a Neo prompt.
 
+    **`whole` is what the marker's numbers are measured against**, and it is
+    the guard against this repo's documented nested-cut footgun. `content` is
+    normally the entire file and `whole` is left None. When the caller has
+    ALREADY reduced the file — the budgeted excerpt in `gather_context`, which
+    hands over one region of an over-budget file — the marker must report the
+    loss against the file, not against the region. Passing the region alone
+    made a 4 KB excerpt of an 86 KB file announce that it had dropped nothing:
+    a marker whose presence is the only signal a cut happened, stating the
+    smaller of two losses as the whole of it. Supplying `whole` also means the
+    marker is emitted even when the excerpt fits the budget, because the cut
+    that matters already happened upstream.
+
     **One exception, and it is the caller's to report.** A budget below the
     marker's own ~51 bytes yields the marker alone and therefore exceeds the
     budget. The alternatives are worse in both directions: returning "" is a
@@ -1034,14 +1151,15 @@ def _cut_to_bytes(content: str, budget: int) -> tuple[str, bool]:
     detects the overshoot and hands the caller the real total, so what comes
     out of this function is never the last word on the ceiling.
     """
+    source = whole if whole is not None else content
     raw = content.encode("utf-8")
-    if len(raw) <= budget:
+    if whole is None and len(raw) <= budget:
         return content, False
 
     keep = max(budget - _PIN_MARKER_RESERVE, 0)
-    head = raw[:keep].decode("utf-8", errors="ignore")
+    head = raw[:keep].decode("utf-8", errors="ignore") if len(raw) > keep else content
     marker = MARKER_TEMPLATE.format(
-        dropped=len(content) - len(head), total=len(content)
+        dropped=len(source) - len(head), total=len(source)
     )
     # The reserve is an estimate of the marker's size; this is the check that
     # it was big enough. Trimming the head is the safe direction — the marker
@@ -1049,7 +1167,7 @@ def _cut_to_bytes(content: str, budget: int) -> tuple[str, bool]:
     while len((head + marker).encode("utf-8")) > budget and head:
         head = head[:-1]
         marker = MARKER_TEMPLATE.format(
-            dropped=len(content) - len(head), total=len(content)
+            dropped=len(source) - len(head), total=len(source)
         )
     return head + marker, True
 
@@ -1079,14 +1197,24 @@ class PinReport:
     #: True when the ceiling could not seat one marker per named file, so the
     #: pinned block runs OVER `--max-bytes`. Never silent.
     overshoot: bool = False
+    #: rel_path -> which stage asked for it: "prompt" (stage 1) or "--include"
+    #: (stage 2). Two stages now feed one pin block, and a warning that names
+    #: the wrong one sends the operator to a flag they did not pass. Carried
+    #: rather than recomputed so the report cannot disagree with the bundle.
+    origins: dict = field(default_factory=dict)
 
     @property
     def whole(self) -> int:
         return len(self.files) - len(self.truncated_rels)
 
+    def count_from(self, origin: str) -> int:
+        return sum(1 for f in self.files if self.origins.get(f.rel_path) == origin)
+
 
 def pin_included_files(
-    matched: list[tuple[str, str, int]], max_bytes: int
+    matched: list[tuple[str, str, int]],
+    max_bytes: int,
+    origins: Optional[dict] = None,
 ) -> PinReport:
     """Deliver every `--include` match whole, or cut with an explicit marker.
 
@@ -1112,8 +1240,9 @@ def pin_included_files(
     Reporting it is what keeps `--max-bytes` an honest number rather than a
     claim the code quietly breaks.
     """
+    origins = dict(origins or {})
     if not matched:
-        return PinReport()
+        return PinReport(origins=origins)
 
     contents: dict[str, str] = {}
     sizes: dict[str, int] = {}
@@ -1135,7 +1264,7 @@ def pin_included_files(
         order.append((abs_path, rel_path))
 
     if not order:
-        return PinReport(unreadable_rels=unreadable)
+        return PinReport(unreadable_rels=unreadable, origins=origins)
 
     total = sum(sizes.values())
     if total <= max_bytes:
@@ -1148,7 +1277,7 @@ def pin_included_files(
         # marker that says none of it fit.
         allowances = {rel: 0 for rel in sizes}
 
-    report = PinReport(unreadable_rels=unreadable)
+    report = PinReport(unreadable_rels=unreadable, origins=origins)
     for abs_path, rel_path in order:
         text, was_cut = _cut_to_bytes(contents[rel_path], allowances.get(rel_path, 0))
         if was_cut:
@@ -1181,9 +1310,14 @@ def _pin_notes(
 ) -> None:
     """Say what pinning did, in terms that match what happened.
 
-    One function for both gather lanes: the two used to carry copies of these
-    strings, and a warning that drifts between lanes is a warning you cannot
-    trust on the lane you are reading.
+    One function for the whole pin block. Two stages feed it — paths the
+    prompt named (stage 1) and `--include` patterns (stage 2) — and the source
+    split is stated rather than collapsed, because the remedy differs: a
+    surprise pin from a path mentioned in passing is fixed by rewording the
+    prompt, and one from a glob is fixed by narrowing the flag. A single
+    "--include pins 4 files" line for a run that passed no `--include` at all
+    names a flag the operator never typed, which is this repo's own rule about
+    never blaming the wrong knob.
     """
     if report.files:
         if report.truncated_rels:
@@ -1192,9 +1326,18 @@ def _pin_notes(
             )
         else:
             shape = "whole"
+        from_prompt = report.count_from("prompt")
+        from_include = report.count_from("--include")
+        split = ", ".join(
+            part for part in (
+                f"{from_prompt} named in the prompt" if from_prompt else "",
+                f"{from_include} from --include" if from_include else "",
+            ) if part
+        )
         progress.note(
-            f"--include pins {len(report.files)} file(s) {shape} "
-            f"({report.total_bytes:,} bytes), ahead of the scan")
+            f"Pinned {len(report.files)} file(s) {shape} "
+            f"({report.total_bytes:,} bytes), ahead of the scan"
+            + (f" - {split}" if split else ""))
     if report.truncated_rels:
         progress.note(
             f"Warning: --max-bytes={max_bytes:,} forced a cut in "
@@ -1234,8 +1377,85 @@ def _pin_notes(
             "the walker's 512KB per-file limit")
 
 
+def _budget_notes(
+    config: GatherConfig,
+    adaptive_limit: int,
+    *,
+    file_cap_rejected: bool,
+    bytes_cap_rejected: bool,
+    dropped: int,
+) -> None:
+    """Name the cap that actually reduced the selection, and only that one.
+
+    G3-inv: no silent caps. The scan used to stop mid-loop and say nothing —
+    the operator saw twelve files and no indication that a thirteenth had lost
+    to a ceiling rather than to the ranking. Those are different facts with
+    different remedies and they looked identical.
+
+    The file cap is reported before the byte cap because it is applied first
+    and is therefore the one that bound: with 40 candidates, 25 slots and a
+    ceiling that could fund 30, it is `--max-files` that turned away the other
+    15 and raising `--max-bytes` changes nothing. Reporting both would send the
+    operator to a knob that cannot move the number, which is this repo's own
+    rule about never blaming a cap for an absence it did not cause.
+    """
+    if not dropped:
+        return
+    if file_cap_rejected:
+        # The limit that bound is the ADAPTIVE one, and printing it as
+        # `--max-files=25` names a number the operator never typed — worse,
+        # below specificity 10 `calculate_adaptive_limit` returns a fixed
+        # 15/20/25 regardless of `--max-files`, so the knob it names cannot
+        # move the limit it reports. Both numbers, and the relationship.
+        knob = (
+            f"adaptive limit {adaptive_limit}, from --max-files="
+            f"{config.max_files}"
+            if adaptive_limit != config.max_files
+            else f"--max-files={config.max_files}"
+        )
+        progress.note(
+            f"{dropped} lower-ranked file(s) not delivered: the file budget "
+            f"({knob}) was reached")
+    elif bytes_cap_rejected:
+        progress.note(
+            f"{dropped} lower-ranked file(s) not delivered: "
+            f"--max-bytes={config.max_bytes:,} cannot fund them above "
+            f"{MIN_FILE_SHARE_BYTES} bytes each")
+
+
 def gather_context(config: GatherConfig) -> list[ContextFile]:
-    """Main context gathering pipeline."""
+    """The retrieval front door: one pipeline, four stages, in priority order.
+
+    Every invocation goes through here. There is no second lane and no flag
+    that routes around it — `--semantic` is a hint that biases stage 4, not a
+    fork to a different pipeline, because a retrieval strategy the caller has
+    to choose in advance is a question only the code can answer.
+
+    1. **Paths the prompt named** — pinned (`resolve_explicit_paths`).
+    2. **`--include` patterns** — pinned, per standing ruling 1, and the scan
+       keeps running alongside (`resolve_includes`).
+    3. **Keyword** — BM25 over file CONTENT, from the persistent index.
+    4. **Semantic** — the embedding catalog, as a re-rank and supplement of
+       stage 3 whenever it exists, never a substitute for it.
+
+    Stages 1 and 2 assert presence; 3 and 4 rank what is left. That ordering is
+    the whole design: an assertion cannot lose to a score, so a file the caller
+    named is delivered before the ranking spends a byte, and the ranking then
+    fills what remains. Everything below stage 2 is a judgement about
+    relevance, and the caller has already made that judgement for the pins.
+
+    **Delivery is one entry per file, read whole from disk.** A file used to
+    be able to arrive as two windows, which cost two of the file cap's slots,
+    made `len(gathered)` disagree with the number of files (#197), and let one
+    large file crowd out two small ones. Chunking survives as a RANKING
+    internal only: it now decides which region of an over-budget file survives,
+    never how many entries a file contributes. `--max-bytes` is apportioned
+    max-min fair (`text_budget.apportion`) across the selection instead of
+    being spent greedily in rank order, so a file's size no longer decides how
+    many OTHER files reach the model — small files arrive whole, large ones pay,
+    and the count of distinct files delivered stops depending on their sizes.
+    Every cut that budget forces is marked in the content and reported.
+    """
     root = config.root
     prompt_tokens = extract_prompt_tokens(config.prompt)
 
@@ -1243,10 +1463,18 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     adaptive_limit = calculate_adaptive_limit(config.prompt, config.max_files)
     progress.note(f"Adaptive limit: {adaptive_limit} files (based on prompt specificity)")
 
-    # ProjectIndex semantic boost (uses pre-built tree-sitter + FAISS index
-    # if present in .neo/). Computed once up front — boosts apply to
-    # candidates' final scores below.
-    pi_boost = _project_index_boost(root, config.prompt, k=adaptive_limit * 2)
+    # Stage 4, computed once up front — the boosts apply to candidates' final
+    # scores below and union in files the keyword stage never scored. Depth and
+    # weight both rise under `--semantic`; with the flag absent this is the
+    # same +1.0-per-perfect-cosine supplement it has always been, so an
+    # unflagged run ranks exactly as it did.
+    pi_boost = _project_index_boost(
+        root,
+        config.prompt,
+        k=adaptive_limit * 2 * (SEMANTIC_HINT_DEPTH if config.semantic else 1),
+        weight=SEMANTIC_HINT_WEIGHT if config.semantic else SEMANTIC_WEIGHT,
+        hinted=config.semantic,
+    )
 
     # EPISODE-history boost from FactStore (the W2.B3 feedback loop):
     # past Neo runs persist file paths as ``file:*`` tags on EPISODE
@@ -1277,14 +1505,43 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         for e in filter_candidates(eligible, [], config.excludes, None)
     ]
 
-    # Pins first, so they own their bytes before ranking spends any.
+    # Stages 1 and 2, in that order, sharing one pin block and therefore one
+    # byte apportionment. The order is the priority order and it is spent
+    # order: `pin_included_files` funds max-min fair, so the two stages cannot
+    # starve each other, but a duplicate must resolve to the earlier stage or
+    # the same file would be delivered twice.
+    explicit_paths = extract_explicit_paths(config.prompt)
+    explicit_matches = resolve_explicit_paths(pin_pool, explicit_paths)
     include_matches, include_misses, include_refused = resolve_includes(
         pin_pool, config.includes, root, config.excludes
     )
-    pin_report = pin_included_files(include_matches, config.max_bytes)
+
+    pin_entries: list[tuple[str, str, int]] = []
+    pin_origins: dict[str, str] = {}
+    for entry, origin in (
+        *((e, "prompt") for e in explicit_matches),
+        *((e, "--include") for e in include_matches),
+    ):
+        if entry[1] not in pin_origins:
+            pin_origins[entry[1]] = origin
+            pin_entries.append(entry)
+
+    pin_report = pin_included_files(pin_entries, config.max_bytes, pin_origins)
     pinned = pin_report.files
     pinned_rels = {f.rel_path for f in pinned}
     _pin_notes(pin_report, config.max_bytes, include_misses, include_refused)
+
+    if explicit_paths and not explicit_matches:
+        # A named path that matched nothing is the single highest-value
+        # diagnostic here, and staying silent makes it indistinguishable from
+        # "no path mentioned". Causes: a typo, a path outside the scan root, or
+        # one excluded by .gitignore/--exclude. It is NOT `--exts`: the pin
+        # pool is deliberately ext-unfiltered, so a named `.txt` under
+        # `--exts py` is pinned rather than lost.
+        progress.note(
+            "Warning: prompt names a path but no scanned file matched "
+            f"({', '.join(sorted(explicit_paths)[:3])}) - check spelling, "
+            "--exclude and .gitignore")
 
     # Get git context if enabled
     git_recent = set()
@@ -1293,15 +1550,6 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
 
     # Entry point filenames to boost
     entry_points = {'main', 'app', 'server', 'index', 'login', 'auth', '__init__'}
-
-    # A path the prompt named outright must be in the bundle. Without this it
-    # competed on generic filename overlap and lost: asked to fix a function in
-    # `src/neo/subcommands.py`, neo ranked that file 163rd of 296 — below its own
-    # test file — because filename hits cap at 3 and an 86KB file takes a large
-    # size penalty. It never reached the context, so the model correctly refused
-    # to write a patch for code it had not seen, and the suggestion was recorded
-    # with no diff text and could never be verified or learned from.
-    explicit_paths = extract_explicit_paths(config.prompt)
 
     # Computed once here. The ProjectIndex boost path calls the same pure
     # function on the same argument rather than receiving this value, so the
@@ -1332,9 +1580,14 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     if relevance:
         progress.note(f"Content relevance: {len(relevance)} files match the prompt")
 
-    # Score all candidates
+    # Score all candidates. `EXPLICIT_PATH_BOOST` stays on the RANKING even
+    # though stage 1 now pins the same files: a named path can only be pinned
+    # if the walk found it, and the boost is what the ranking does with one
+    # that it did not — a `--exts`-narrowed candidate list, a path spelled in a
+    # way `matches_explicit_path` reads but the pin pool never held. Deleting
+    # it would make the two disagree in exactly the cases where the pin is
+    # unavailable, which is when the boost is the only thing left.
     scored = []
-    explicit_hits = 0
     for abs_path, rel_path, size in candidates:
         score = score_candidate(
             rel_path, size, prompt_tokens, git_recent, entry_points,
@@ -1343,21 +1596,8 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         )
         if matches_explicit_path(rel_path, explicit_paths):
             score += EXPLICIT_PATH_BOOST
-            explicit_hits += 1
         if score > 0:
             scored.append((abs_path, rel_path, size, score))
-    if explicit_hits:
-        progress.note(
-            f"Prompt names {explicit_hits} file(s) explicitly - pinned to context")
-    elif explicit_paths:
-        # A named path that matched nothing is the single highest-value
-        # diagnostic here, and staying silent makes it indistinguishable from
-        # "no path mentioned". Causes: a typo, a path outside the scan root, or
-        # one filtered out by --exclude/--exts.
-        progress.note(
-            "Warning: prompt names a path but no scanned file matched "
-            f"({', '.join(sorted(explicit_paths)[:3])}) - check spelling, "
-            "--exclude and --exts")
 
     # Sort by score descending
     scored.sort(key=lambda x: x[3], reverse=True)
@@ -1390,15 +1630,16 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
             progress.note(f"Filtered {filtered_count} low-relevance files (score < {MIN_SCORE_THRESHOLD})")
         scored = scored_filtered
 
-    # Re-rank pass: union in ProjectIndex semantic hits, then layer
-    # tree-sitter symbol relevance on the top filename-scored candidates.
-    # The two boosts are additive on top of the existing score.
+    # Stage 4 lands here: the semantic hits are unioned in, then tree-sitter
+    # symbol relevance is layered on the top candidates. Both are additive on
+    # top of the keyword score — a re-rank and a supplement, never a
+    # replacement, so the catalog can lift a file or surface one from nothing
+    # and can never remove one the keyword stage found.
     #
-    # ProjectIndex boost dominates when present (+1.0 for a perfect
-    # cosine hit) because it's the strongest signal: it knows the file
-    # actually contains code semantically related to the prompt. Tree-
-    # sitter symbol overlap (+1.2 max) is a fallback when no index
-    # exists, or a tiebreaker when both signals fire.
+    # Weight is `SEMANTIC_WEIGHT` per perfect cosine, or `SEMANTIC_HINT_WEIGHT`
+    # under `--semantic`, where it equals `CONTENT_WEIGHT` and the two verdicts
+    # carry the same authority. Tree-sitter symbol overlap (+1.2 max) is a
+    # fallback when no catalog exists, and a tiebreaker when both signals fire.
     scored_by_path = {r: (a, s, sc) for (a, r, s, sc) in scored}
 
     # Union in any ProjectIndex or history hits not already in the
@@ -1444,110 +1685,118 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     enriched.sort(key=lambda x: x[3], reverse=True)
     scored = enriched
 
-    # Budget: greedily fill up to max_bytes and adaptive max_files, on top of
-    # the pins. The pins are already in `selected`, so they consume file slots
-    # and bytes the scan would otherwise have had — reported below when that
-    # actually costs the scan something, never silently.
+    # ------------------------------------------------------------------
+    # Delivery: one entry per file, whole from disk, budget apportioned.
+    #
+    # The scan used to fill greedily in rank order and stop at the first file
+    # that would not fit, windowing anything over 15,000 characters into up to
+    # two entries on the way. Both halves of that are gone.
+    #
+    # Greedy order made a file's SIZE decide how many OTHER files reached the
+    # model: one 90 KB module ahead of the queue could spend most of a 100,000
+    # byte ceiling and leave nothing for the rest of the ranking. Max-min fair
+    # apportionment funds every file in the selection instead — small files in
+    # full, and the surplus they do not use redistributed to the ones that can
+    # — so the count of distinct files delivered stops depending on their
+    # sizes, which is the property `--max-files` is supposed to control.
+    #
+    # Windowing produced two entries for one file, and that is what made
+    # `len(gathered)` and "files" two different numbers (#197). It cost two
+    # slots of the file cap for one file's worth of coverage. Chunk selection
+    # survives, but as a RANKING internal: it now chooses WHICH region of an
+    # over-budget file is delivered, and never how many entries a file gets.
+    # A file that fits its share arrives whole — the common case, and the
+    # contract; one that does not arrives as a single excerpt centred on the
+    # region that earned it its rank, marked with the loss measured against
+    # the whole file.
     selected = list(pinned)
-    total_bytes = sum(f.bytes for f in pinned)
-    large_files_warned = []
+    pinned_bytes = sum(f.bytes for f in pinned)
     scan_entries_before = len(selected)
-    # Set wherever the byte ceiling REJECTS something, not inferred afterwards
-    # from `total_bytes >= max_bytes`. The two are different: the inner tests
-    # are `total + this_one > max_bytes`, so the ceiling can turn away every
-    # remaining candidate while the running total sits below it. Measured with
-    # a 50-byte pin, a 980-byte candidate and `--max-bytes 1029`: the cap
-    # blocked the only candidate and the run then told the operator no setting
-    # would change it, one byte away from `--max-bytes 1030` changing it.
-    bytes_cap_rejected = False
-    file_cap_rejected = False
 
-    for abs_path, rel_path, size, score in scored:
-        # The pinned skip runs BEFORE the cap checks, so a cap can only be
-        # recorded as binding when it turned away a file the scan could
-        # actually have added. With the order reversed, a pin appearing in
-        # `scored` tripped the file cap and the run reported "pinned files
-        # filled the file budget" for a repo where every file was pinned and
-        # no `--max-files` value would have changed anything.
-        if rel_path in pinned_rels:
-            # Already delivered whole. Selecting it again here would emit the
-            # same file twice, once windowed — a duplicate under G1-inv.
-            continue
-        if len(selected) >= adaptive_limit:
-            file_cap_rejected = True
-            break
-        if total_bytes >= config.max_bytes:
-            bytes_cap_rejected = True
-            break
+    # The pinned skip runs BEFORE the cap arithmetic, so a cap can only be
+    # recorded as binding when it turned away a file the scan could actually
+    # have added. With the order reversed, a pin appearing in `scored` tripped
+    # the file cap and the run reported "pinned files filled the file budget"
+    # for a repo where every file was pinned and no `--max-files` value would
+    # have changed anything.
+    eligible_scan = [c for c in scored if c[1] not in pinned_rels]
+    scan_slots = max(adaptive_limit - len(selected), 0)
+    file_cap_rejected = len(eligible_scan) > scan_slots
+    scan_candidates = eligible_scan[:scan_slots]
 
+    # The byte ceiling reduces the file COUNT rather than truncating the tail
+    # of the ranking mid-loop, so what it costs is one number the operator can
+    # act on. `MIN_FILE_SHARE_BYTES` is the floor below which a share buys
+    # nothing but the file's own truncation marker.
+    remaining_bytes = max(config.max_bytes - pinned_bytes, 0)
+    affordable = remaining_bytes // MIN_FILE_SHARE_BYTES
+    bytes_cap_rejected = len(scan_candidates) > affordable
+    if bytes_cap_rejected:
+        scan_candidates = scan_candidates[:affordable]
+
+    # Apportion on the walk's own size, not on a pre-pass that reads every
+    # candidate: the walk already stat'd them, and reading files the ceiling
+    # cannot fund is the cost this stage exists to avoid. A zero-byte file is
+    # floored at 1 because `apportion` drops non-positive sections.
+    sizes = {rel: max(size, 1) for _abs, rel, size, _sc in scan_candidates}
+    allowances = apportion(sizes, remaining_bytes) if sizes else {}
+
+    total_bytes = pinned_bytes
+    for abs_path, rel_path, size, score in scan_candidates:
         try:
             with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
-
-            lang = infer_language(abs_path)
-
-            # For large files, select chunks
-            if len(content) > 15_000:
-                # Warn about god objects
-                size_kb = len(content) / 1024
-                if size_kb > 50:
-                    if rel_path not in large_files_warned:
-                        progress.note(f"Warning: {rel_path} is {size_kb:.0f}KB - consider refactoring into smaller modules")
-                        large_files_warned.append(rel_path)
-
-                chunks = select_chunks(content, prompt_tokens)
-                # Cap chunks per file. Without this a 90KB engine.py with
-                # 5 keyword windows consumes 5 slots of the adaptive_limit
-                # budget, starving other distinct files. 2 chunks keeps
-                # the highest-relevance windows for a large file without
-                # letting it dominate the prompt context.
-                chunks = chunks[:MAX_CHUNKS_PER_FILE]
-                for chunk_content, start, end in chunks:
-                    # Prepend warning for large files
-                    if size_kb > 50:
-                        warning_header = f"# WARNING: This file is {size_kb:.0f}KB - consider refactoring into smaller modules\n\n"
-                        chunk_content = warning_header + chunk_content
-
-                    chunk_bytes = len(chunk_content.encode('utf-8'))
-                    if total_bytes + chunk_bytes > config.max_bytes:
-                        bytes_cap_rejected = True
-                        break
-
-                    selected.append(ContextFile(
-                        path=abs_path,
-                        rel_path=rel_path,
-                        language=lang,
-                        bytes=chunk_bytes,
-                        start=start,
-                        end=end,
-                        content=chunk_content,
-                        score=score
-                    ))
-                    total_bytes += chunk_bytes
-                    # Recheck the file-cap mid-chunk-loop so a single
-                    # large file can't push selected past adaptive_limit.
-                    if len(selected) >= adaptive_limit:
-                        break
-            else:
-                content_bytes = len(content.encode('utf-8'))
-                if total_bytes + content_bytes > config.max_bytes:
-                    bytes_cap_rejected = True
-                    continue
-
-                selected.append(ContextFile(
-                    path=abs_path,
-                    rel_path=rel_path,
-                    language=lang,
-                    bytes=content_bytes,
-                    content=content,
-                    score=score
-                ))
-                total_bytes += content_bytes
-
         except (OSError, UnicodeDecodeError):
             continue
 
-    if pinned and len(selected) == scan_entries_before:
+        share = allowances.get(rel_path, 0)
+        start = end = None
+        if len(content.encode('utf-8')) <= share:
+            text, was_cut = content, False
+        else:
+            # One region, chosen by the same ranking that chose the file, and
+            # fitted to the share. `select_chunks` is asked for its windows and
+            # only the strongest is taken — the per-file chunk cap no longer
+            # reaches delivery, so which of its entries is "second" no longer
+            # means anything.
+            region, start, end = select_chunks(
+                content, prompt_tokens, max_chunk_bytes=max(share, 1)
+            )[0]
+            # `whole=content` so the marker reports the loss against the FILE.
+            # Measured against the region it would announce that a 4 KB
+            # excerpt of an 86 KB file had dropped nothing.
+            text, was_cut = _cut_to_bytes(region, share, whole=content)
+
+        emitted = len(text.encode('utf-8'))
+        total_bytes += emitted
+        selected.append(ContextFile(
+            path=abs_path,
+            rel_path=rel_path,
+            language=infer_language(abs_path),
+            bytes=emitted,
+            start=start,
+            end=end,
+            content=text,
+            score=score,
+            truncated=was_cut,
+        ))
+
+    scan_delivered_nothing = pinned and len(selected) == scan_entries_before
+    if not scan_delivered_nothing:
+        # Mutually exclusive with the block below, which is the same fact told
+        # from the pins' side. Emitting both restates one cap twice in two
+        # wordings, and a reader who has to reconcile two sentences about one
+        # number learns to skim past the surface whose whole job is to be
+        # believed.
+        _budget_notes(
+            config,
+            adaptive_limit,
+            file_cap_rejected=file_cap_rejected,
+            bytes_cap_rejected=bytes_cap_rejected,
+            dropped=len(eligible_scan) - len(scan_candidates),
+        )
+
+    if scan_delivered_nothing:
         # Ruling 1 is "the named files AND keep scanning", so a scan that added
         # nothing is worth saying. What it is NOT worth is guessing why.
         #
@@ -1585,232 +1834,3 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
                 "The scan found nothing to add beside the pinned file(s)")
 
     return selected
-
-
-def mmr_pack_chunks(chunks: list, max_bytes: int, max_files: int, lambda_param: float = 0.7) -> list:
-    """
-    Pack chunks using Maximal Marginal Relevance for file diversity.
-
-    MMR balances relevance (similarity score) and diversity (different files).
-    lambda_param: 1.0 = pure relevance, 0.0 = pure diversity
-
-    Args:
-        chunks: List of CodeChunk objects with similarity scores
-        max_bytes: Maximum total bytes
-        max_files: Maximum number of files
-        lambda_param: Balance between relevance (1.0) and diversity (0.0)
-
-    Returns:
-        List of selected chunks meeting budget constraints
-    """
-    if not chunks:
-        return []
-
-    selected = []
-    selected_files = set()
-    total_bytes = 0
-    remaining = list(chunks)
-
-    # First chunk: highest similarity
-    first = remaining.pop(0)
-    selected.append(first)
-    selected_files.add(first.file_path)
-    total_bytes += len(first.content.encode('utf-8'))
-
-    # Iteratively select chunks with MMR
-    while remaining and len(selected_files) < max_files and total_bytes < max_bytes:
-        best_score = -1
-        best_idx = -1
-
-        for i, chunk in enumerate(remaining):
-            chunk_bytes = len(chunk.content.encode('utf-8'))
-            if total_bytes + chunk_bytes > max_bytes:
-                continue
-
-            # Relevance: similarity to query
-            relevance = chunk.similarity or 0.0
-
-            # Diversity: bonus for new files
-            diversity = 1.0 if chunk.file_path not in selected_files else 0.0
-
-            # MMR score
-            mmr_score = lambda_param * relevance + (1 - lambda_param) * diversity
-
-            if mmr_score > best_score:
-                best_score = mmr_score
-                best_idx = i
-
-        if best_idx == -1:
-            break
-
-        # Select best chunk
-        chunk = remaining.pop(best_idx)
-        selected.append(chunk)
-        selected_files.add(chunk.file_path)
-        total_bytes += len(chunk.content.encode('utf-8'))
-
-    return selected
-
-
-def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
-    """
-    Gather context using semantic search via ProjectIndex.
-
-    Falls back to keyword search if no index exists.
-
-    Args:
-        config: GatherConfig with prompt, root, and budget constraints
-
-    Returns:
-        List of ContextFile objects
-    """
-    root = config.root
-    index_path = Path(root) / ".neo" / "index.json"
-
-    # Check if index exists
-    if not index_path.exists():
-        progress.note(f"No semantic index found at {index_path}")
-        progress.note("Falling back to keyword search. Run 'neo index' to build semantic index.")
-        return gather_context(config)
-
-    # Load ProjectIndex
-    try:
-        from neo.index.project_index import ProjectIndex
-
-        start_time = time.time()
-        index = ProjectIndex(root)
-
-        # Retrieve top 100 chunks
-        chunks = index.retrieve(config.prompt, k=100)
-
-        if not chunks:
-            progress.note("No chunks found in semantic index")
-            progress.note("Falling back to keyword search")
-            return gather_context(config)
-
-        # Pins are a property of `--include`, not of a retrieval strategy. This
-        # lane ignored the flag entirely, so `--semantic --include X` silently
-        # dropped X; a guarantee that a second flag can switch off is not one.
-        #
-        # Guarded on `config.includes` rather than done unconditionally: the
-        # walk is exactly the cost this lane exists to avoid, and a positional
-        # `iter_paths(...)` argument is evaluated whether or not the flag was
-        # passed. Measured on m365dotnet that is seconds of `os.walk` added to
-        # every semantic invocation, for a pin list that is always empty.
-        if config.includes:
-            # The SAME pin pool the keyword lane builds: exclude- and
-            # gitignore-filtered, `--exts`-unfiltered. Passing `config.exts`
-            # here made the two lanes disagree — `--exts py --include '*.txt'`
-            # pinned on the keyword path and reported "matched no file" on
-            # this one. A guarantee that depends on which retrieval strategy
-            # you asked for is the same defect as one a second flag switches
-            # off, which is why this lane pins at all.
-            include_matches, include_misses, include_refused = resolve_includes(
-                [
-                    (e.path, e.rel_path, e.size)
-                    for e in filter_candidates(
-                        base_paths(root), [], config.excludes, None
-                    )
-                ],
-                config.includes, root, config.excludes,
-            )
-            pin_report = pin_included_files(include_matches, config.max_bytes)
-            _pin_notes(
-                pin_report, config.max_bytes, include_misses, include_refused
-            )
-        else:
-            pin_report = PinReport()
-
-        pinned = pin_report.files
-        pinned_bytes = pin_report.total_bytes
-        pinned_rels = {f.rel_path for f in pinned}
-
-        # Pack chunks using MMR for diversity, into what the pins left.
-        # Pin-owned files are dropped BEFORE packing, not after: filtering the
-        # packed result spends budget on chunks that are then discarded, so the
-        # run under-fills its own ceiling and the metrics line stops agreeing
-        # with what was sent.
-        selected_chunks = mmr_pack_chunks(
-            [c for c in chunks if c.file_path not in pinned_rels],
-            max(config.max_bytes - pinned_bytes, 0),
-            max(config.max_files - len(pinned), 0),
-        )
-
-        # Convert to ContextFile format
-        context_files = list(pinned)
-        for chunk in selected_chunks:
-            abs_path = Path(root) / chunk.file_path
-            chunk_bytes = len(chunk.content.encode('utf-8'))
-
-            context_files.append(ContextFile(
-                path=str(abs_path),
-                rel_path=chunk.file_path,
-                language=infer_language(chunk.file_path),
-                bytes=chunk_bytes,
-                start=chunk.start_line,
-                end=chunk.end_line,
-                content=chunk.content,
-                score=chunk.similarity or 0.0
-            ))
-
-        elapsed = time.time() - start_time
-
-        # Log metrics
-        log_context_metrics(
-            method="semantic",
-            elapsed_ms=elapsed * 1000,
-            chunks_retrieved=len(chunks),
-            chunks_selected=len(selected_chunks),
-            files_selected=len(set(cf.rel_path for cf in context_files)),
-            total_bytes=sum(cf.bytes for cf in context_files),
-            root=root
-        )
-
-        progress.note(f"Semantic search: {len(selected_chunks)} chunks from {len(set(cf.rel_path for cf in context_files))} files in {elapsed*1000:.0f}ms")
-
-        return context_files
-
-    except ImportError as e:
-        progress.note(f"Failed to load ProjectIndex: {e}")
-        progress.note("Falling back to keyword search")
-        return gather_context(config)
-    except Exception as e:
-        progress.note(f"Semantic search error: {e}")
-        progress.note("Falling back to keyword search")
-        return gather_context(config)
-
-
-def log_context_metrics(method: str, elapsed_ms: float, chunks_retrieved: int,
-                        chunks_selected: int, files_selected: int, total_bytes: int,
-                        root: str):
-    """
-    Log context gathering metrics to .neo/context_metrics.jsonl
-
-    Args:
-        method: "semantic" or "keyword"
-        elapsed_ms: Time taken in milliseconds
-        chunks_retrieved: Total chunks retrieved (before packing)
-        chunks_selected: Chunks selected (after packing)
-        files_selected: Number of unique files
-        total_bytes: Total bytes in selected context
-        root: Repository root
-    """
-    try:
-        metrics_path = Path(root) / ".neo" / "context_metrics.jsonl"
-        metrics_path.parent.mkdir(parents=True, exist_ok=True)
-
-        metric = {
-            "timestamp": time.time(),
-            "method": method,
-            "elapsed_ms": round(elapsed_ms, 2),
-            "chunks_retrieved": chunks_retrieved,
-            "chunks_selected": chunks_selected,
-            "files_selected": files_selected,
-            "total_bytes": total_bytes
-        }
-
-        with open(metrics_path, 'a') as f:
-            f.write(json.dumps(metric) + '\n')
-    except Exception as e:
-        # Don't fail on metrics logging errors
-        progress.note(f"Warning: Failed to log metrics: {e}")

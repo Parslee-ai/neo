@@ -65,3 +65,10 @@ specs/
 .neo/
 exemplars/
 *.log
+# Goal 8 measurement scratch: the arm launchers embed absolute paths from the
+# machine that produced them, and the per-run `/usr/bin/time -l` dumps are raw
+# instrument output. The scored JSON and the aggregates are committed; these
+# are not.
+evidence/bin/
+evidence/m2_main/
+evidence/m2_branch/

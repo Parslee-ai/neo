@@ -1,0 +1,1410 @@
+{
+  "cases": 50,
+  "recall": {
+    "R@1": 0.307,
+    "R@3": 0.502,
+    "R@10": 0.708
+  },
+  "hit_rate": {
+    "H@1": 0.58,
+    "H@3": 0.78,
+    "H@10": 0.98
+  },
+  "MRR": 0.712,
+  "failed_cases": 0,
+  "git_recency": false,
+  "contaminated_cases": null,
+  "repo_dirty": null,
+  "repo": "/Users/theleafnode/Documents/_projects/Parslee-AI/neo",
+  "tree": "/Users/theleafnode/Documents/_projects/Parslee-AI/neo/.worktrees/g_msr9uzf2_114f50-main-baseline",
+  "skip_recent": 50,
+  "repo_head": "5bbee46747c8",
+  "tree_head": "d5adcbc4e848",
+  "semantic": false,
+  "per_case": [
+    {
+      "query": "fix(learning): make the durable-promotion path actually reachable",
+      "truth": [
+        "src/neo/engine.py"
+      ],
+      "ranked": [
+        "CLAUDE.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/memory/store.py",
+        "README.md",
+        "src/neo/engine.py",
+        "CHANGELOG.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/memory/evaluation.py",
+        "src/neo/memory/outcomes.py",
+        "docs/solutions/orchestrator-communication.md",
+        "src/neo/subcommands.py",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "CONTRIBUTING.md",
+        "src/neo/memory/episodes.py",
+        ".claude-plugin/commands/neo-pattern.md",
+        "src/neo/adapters.py",
+        "docs/solutions/async-observer.md"
+      ]
+    },
+    {
+      "query": "fix(learning): stop minting promotable candidates that can never be verified",
+      "truth": [
+        "src/neo/engine.py",
+        "src/neo/memory/outcomes.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "CLAUDE.md",
+        "CHANGELOG.md",
+        "README.md",
+        "docs/solutions/async-observer.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/engine.py",
+        "src/neo/memory/evaluation.py",
+        "src/neo/models.py",
+        "docs/solutions/evidence-learning-episodes.md",
+        "AGENTS.md",
+        "docs/solutions/orchestrator-communication.md",
+        "docs/solutions/operating-modes.md",
+        "src/neo/subcommands.py",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        "src/neo/memory/outcomes.py",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "src/neo/memory/transcript.py",
+        "docs/unified-store-plan.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md"
+      ]
+    },
+    {
+      "query": "feat(memory): reap dead synthesis watermarks in prune --all",
+      "truth": [
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "src/neo/memory/observer.py",
+        "src/neo/subcommands.py",
+        "tests/test_memory_prune.py",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        "docs/solutions/transcript-ingestion.md",
+        "AGENTS.md",
+        "tests/test_observer.py",
+        "src/neo/persistent_reasoning.py",
+        "docs/solutions/async-observer.md",
+        "tests/test_fact_store.py",
+        "README.md",
+        "docs/solutions/conversation-mined-issues.md",
+        "docs/architecture/prompt-enhancement.md",
+        "CHANGELOG.md"
+      ]
+    },
+    {
+      "query": "fix(memory): reap dead synthesis watermarks for every project",
+      "truth": [
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "src/neo/memory/store.py",
+        "CLAUDE.md",
+        "src/neo/subcommands.py",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/solutions/async-observer.md",
+        "docs/architecture/prompt-enhancement.md",
+        "tests/test_memory_prune.py",
+        "CHANGELOG.md",
+        "AGENTS.md",
+        "tests/test_observer.py",
+        "README.md",
+        "src/neo/memory/transcript.py",
+        "tests/test_fact_store.py",
+        "docs/solutions/conversation-mined-issues.md",
+        "docs/unified-store-plan.md",
+        "src/neo/context_gatherer.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "docs/solutions/orchestrator-communication.md"
+      ]
+    },
+    {
+      "query": "refactor(memory)!: delete REVIEW->PATTERN synthesis",
+      "truth": [
+        "src/neo/memory/issues.py",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/store.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/generalize.py",
+        "docs/solutions/async-observer.md",
+        "src/neo/memory/models.py",
+        "CLAUDE.md",
+        "src/neo/memory/transcript.py",
+        "src/neo/memory/observer.py",
+        "README.md",
+        "src/neo/engine.py",
+        "CHANGELOG.md",
+        "src/neo/models.py",
+        "src/neo/memory/outcomes.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "CONTRIBUTING.md",
+        "src/neo/memory/migration.py"
+      ]
+    },
+    {
+      "query": "fix(memory): same-id double sweep, synthesis self-consumption, decay scope, CAR error diagnosability",
+      "truth": [
+        "src/neo/adapters.py",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/transcript.py",
+        "CLAUDE.md",
+        "src/neo/memory/store.py",
+        "src/neo/a2ui.py",
+        "src/neo/memory/models.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "CHANGELOG.md",
+        "docs/solutions/async-observer.md",
+        "README.md",
+        "src/neo/subcommands.py",
+        "docs/solutions/conversation-mined-issues.md",
+        "src/neo/memory/issues.py",
+        "src/neo/engine.py",
+        "src/neo/memory/outcomes.py",
+        "AGENTS.md",
+        "src/neo/memory/constraints.py"
+      ]
+    },
+    {
+      "query": "fix(memory): retraction teardown must not delete healthy globals or block re-learning (#145)",
+      "truth": [
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "tests/test_reconcile_teardown_aging.py",
+        "src/neo/memory/store.py",
+        "docs/solutions/async-observer.md",
+        "src/neo/memory/observer.py",
+        "src/neo/engine.py",
+        "src/neo/memory/episodes.py",
+        "docs/unified-store-plan.md",
+        "CLAUDE.md",
+        "src/neo/memory/outcomes.py",
+        "README.md",
+        "src/neo/adapters.py",
+        "src/neo/algorithm_design.py",
+        "src/neo/memory/transcript.py",
+        "src/neo/structured_parser.py",
+        "src/neo/memory/issues.py",
+        "docs/solutions/memory-audit.md",
+        "src/neo/memory/evaluation.py",
+        "src/neo/memory/constraints.py",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "src/neo/cli.py"
+      ]
+    },
+    {
+      "query": "fix(memory): discriminating suggestion fingerprint for common edit shapes (#144)",
+      "truth": [
+        "src/neo/engine.py"
+      ],
+      "ranked": [
+        "CLAUDE.md",
+        "tests/test_suggestion_fingerprint_shapes.py",
+        "src/neo/memory/episodes.py",
+        "src/neo/engine.py",
+        "src/neo/memory/issues.py",
+        "tests/test_engine_reasoning.py",
+        "src/neo/memory/outcomes.py",
+        "src/neo/subcommands.py",
+        "tests/test_fact_store.py",
+        "README.md",
+        "tests/test_subcommands.py",
+        "src/neo/memory/store.py",
+        "docs/project-memory.md",
+        "docs/architecture/prompt-enhancement.md",
+        "src/neo/architecture_metrics.py",
+        "CHANGELOG.md",
+        "docs/solutions/rule-file-sync.md",
+        "docs/solutions/transcript-ingestion.md",
+        "construct/README.md"
+      ]
+    },
+    {
+      "query": "fix(memory): overlap-only citation must not grant prune-immunity (#143)",
+      "truth": [
+        "src/neo/engine.py",
+        "src/neo/memory/episodes.py"
+      ],
+      "ranked": [
+        "src/neo/subcommands.py",
+        "src/neo/cli.py",
+        "src/neo/memory/episodes.py",
+        "CLAUDE.md",
+        "src/neo/engine.py",
+        "tests/test_overlap_no_immunity.py",
+        "README.md",
+        "src/neo/memory/outcomes.py",
+        "tests/test_learning_episodes.py",
+        "tests/test_outcomes.py",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "src/neo/memory/store.py",
+        "docs/solutions/orchestrator-communication.md",
+        "docs/solutions/transcript-ingestion.md",
+        "tests/test_subcommands.py",
+        "docs/solutions/evidence-learning-episodes.md",
+        "CONTRIBUTING.md"
+      ]
+    },
+    {
+      "query": "fix(memory): cap per-project attempt-outcome EPISODE facts (#142)",
+      "truth": [
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "src/neo/engine.py",
+        "README.md",
+        "src/neo/memory/transcript.py",
+        "src/neo/memory/evaluation.py",
+        "src/neo/memory/episodes.py",
+        "src/neo/memory/models.py",
+        "CLAUDE.md",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/outcomes.py",
+        "src/neo/subcommands.py",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/memory/explain.py",
+        "src/neo/memory/issues.py",
+        "AGENTS.md",
+        "src/neo/reasoning_effort.py",
+        "docs/solutions/evidence-learning-completion-audit.md"
+      ]
+    },
+    {
+      "query": "feat(config): default static model gpt-5.5 \u2192 gpt-5.6",
+      "truth": [
+        "src/neo/config.py",
+        "src/neo/reasoning_effort.py"
+      ],
+      "ranked": [
+        "src/neo/config.py",
+        "README.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/adapters.py",
+        "tools/ab_controlled.py",
+        "CONTRIBUTING.md",
+        "QUICKSTART.md",
+        "CHANGELOG.md",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/engine.py",
+        "tools/ab_reasoning.py",
+        "src/neo/reasoning_effort.py",
+        "tests/test_config_keychain.py",
+        "tests/test_car_first.py",
+        "src/neo/models.py",
+        "src/neo/subcommands.py",
+        "src/neo/cli.py"
+      ]
+    },
+    {
+      "query": "feat(cli): error_trace bias + shared failure vocabulary for task-type classification",
+      "truth": [
+        "src/neo/cli.py",
+        "src/neo/execution_context.py",
+        "src/neo/models.py"
+      ],
+      "ranked": [
+        "src/neo/models.py",
+        "CONTRIBUTING.md",
+        "tests/test_task_type_classifier.py",
+        "CLAUDE.md",
+        "src/neo/persistent_reasoning.py",
+        "src/neo/multi_agent.py",
+        "src/neo/memory/outcomes.py",
+        "README.md",
+        "src/neo/engine.py",
+        "src/neo/adapters.py",
+        "docs/solutions/orchestrator-communication.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/cli.py",
+        "docs/solutions/conversation-mined-issues.md",
+        "tests/test_orchestrator_events.py",
+        "docs/tree-sitter-setup.md",
+        "tests/test_car_adapter.py",
+        "docs/solutions/transcript-ingestion.md"
+      ]
+    },
+    {
+      "query": "fix(cli): classify task_type from the prompt so the default CLI can learn",
+      "truth": [
+        "src/neo/cli.py",
+        "src/neo/engine.py",
+        "src/neo/models.py"
+      ],
+      "ranked": [
+        "src/neo/models.py",
+        "src/neo/adapters.py",
+        "src/neo/cli.py",
+        "README.md",
+        "CLAUDE.md",
+        "docs/architecture/prompt-enhancement.md",
+        "docs/solutions/orchestrator-communication.md",
+        "src/neo/persistent_reasoning.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "docs/solutions/operating-modes.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "src/neo/subcommands.py",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        "docs/solutions/async-observer.md",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/episodes.py",
+        "CONTRIBUTING.md",
+        "INSTALL.md",
+        "CHANGELOG.md"
+      ]
+    },
+    {
+      "query": "fix(memory): make episode\u2192durable promotion reachable \u2014 subject-only + fingerprint + path-agnostic global key",
+      "truth": [
+        "src/neo/engine.py",
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "CLAUDE.md",
+        "src/neo/memory/evaluation.py",
+        "src/neo/memory/episodes.py",
+        "src/neo/engine.py",
+        "src/neo/memory/explain.py",
+        "README.md",
+        "src/neo/subcommands.py",
+        "src/neo/memory/outcomes.py",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/memory/transcript.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/architecture_metrics.py",
+        "src/neo/memory/observer.py",
+        "CHANGELOG.md",
+        "tests/test_fact_store.py",
+        "src/neo/cli.py"
+      ]
+    },
+    {
+      "query": "feat(memory): neo memory learning-stats \u2014 interactive-path learning pulse",
+      "truth": [
+        "src/neo/cli.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/subcommands.py",
+        "src/neo/cli.py",
+        "CLAUDE.md",
+        "src/neo/memory/store.py",
+        "src/neo/memory/evaluation.py",
+        "src/neo/persistent_reasoning.py",
+        "src/neo/memory/episodes.py",
+        "src/neo/memory/memimport.py",
+        "README.md",
+        "src/neo/engine.py",
+        "src/neo/prompt/cli.py",
+        "tests/test_subcommands.py",
+        "src/neo/memory/explain.py",
+        "docs/architecture/prompt-enhancement.md"
+      ]
+    },
+    {
+      "query": "feat(memory): neo memory citation-stats readout",
+      "truth": [
+        "src/neo/cli.py",
+        "src/neo/engine.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/subcommands.py",
+        "src/neo/cli.py",
+        "src/neo/memory/memimport.py",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CLAUDE.md",
+        "src/neo/persistent_reasoning.py",
+        "tests/test_subcommands.py",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "src/neo/memory/transcript.py",
+        "src/neo/memory/metrics.py",
+        "src/neo/memory/store.py",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/memory/episodes.py",
+        "docs/architecture/prompt-enhancement.md",
+        "src/neo/engine.py"
+      ]
+    },
+    {
+      "query": "fix(memory): generalize signature-dedup to all scopes + cold-start chain",
+      "truth": [
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        "README.md",
+        "docs/solutions/async-observer.md",
+        "AGENTS.md",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/eval-baselines-2026-08.md",
+        "src/neo/memory/generalize.py",
+        "tests/test_fact_store.py",
+        "src/neo/memory/outcomes.py",
+        "docs/unified-store-plan.md",
+        "src/neo/memory/observer.py",
+        "CHANGELOG.md",
+        "src/neo/memory/query_routing.py",
+        "src/neo/memory/transcript.py",
+        "src/neo/persistent_reasoning.py",
+        "tests/test_transcript.py",
+        "src/neo/context_gatherer.py"
+      ]
+    },
+    {
+      "query": "fix(memory): a project's retraction must not feed global promotion",
+      "truth": [
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "docs/solutions/transcript-ingestion.md",
+        "tests/test_reconcile_teardown_aging.py",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/community.py",
+        "src/neo/subcommands.py",
+        "CLAUDE.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "docs/solutions/memory-audit.md",
+        "src/neo/cli.py",
+        "src/neo/context_gatherer.py",
+        "README.md",
+        "src/neo/persistent_reasoning.py",
+        "src/neo/memory/evaluation.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/memory/episodes.py",
+        "src/neo/memory/constraints.py"
+      ]
+    },
+    {
+      "query": "fix(memory): structural hardening + citation detection for evidence-learning",
+      "truth": [
+        "src/neo/engine.py",
+        "src/neo/memory/context.py",
+        "src/neo/memory/models.py",
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "src/neo/engine.py",
+        "README.md",
+        "src/neo/memory/evaluation.py",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/subcommands.py",
+        "src/neo/memory/episodes.py",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "CLAUDE.md",
+        "src/neo/cli.py",
+        "src/neo/memory/issues.py",
+        "src/neo/memory/explain.py",
+        "CHANGELOG.md",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/solutions/operating-modes.md",
+        "src/neo/memory/store.py",
+        "docs/architecture/prompt-enhancement.md",
+        "docs/solutions/async-observer.md",
+        "docs/unified-store-plan.md"
+      ]
+    },
+    {
+      "query": "fix(memory): strip dead embeddings from tombstones; consolidate invalidation (#141)",
+      "truth": [
+        "src/neo/memory/store.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "CLAUDE.md",
+        "src/neo/persistent_reasoning.py",
+        "docs/eval-baselines-2026-08.md",
+        "src/neo/subcommands.py",
+        "docs/solutions/async-observer.md",
+        "README.md",
+        "tests/test_fact_store.py",
+        "AGENTS.md",
+        "src/neo/cli.py",
+        "construct/README.md",
+        "CHANGELOG.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "src/neo/memory/observer.py",
+        "tests/test_memory_prune.py",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/memory/explain.py",
+        "src/neo/algorithm_design.py",
+        "src/neo/memory/issues.py",
+        "docs/solutions/transcript-ingestion.md"
+      ]
+    },
+    {
+      "query": "feat: diversity A/B/A finding + relax multi-agent gate to \u22651 capable model (#137)",
+      "truth": [
+        "src/neo/config.py",
+        "src/neo/reasoning_mode.py",
+        "tools/ab_controlled.py",
+        "tools/ab_reasoning.py"
+      ],
+      "ranked": [
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/panel.py",
+        "tools/ab_controlled.py",
+        "src/neo/multi_agent.py",
+        "src/neo/reasoning_mode.py",
+        "src/neo/engine.py",
+        "tools/ab_reasoning.py",
+        "CONTRIBUTING.md",
+        "src/neo/models.py",
+        "README.md",
+        "CLAUDE.md",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/solutions/orchestrator-communication.md",
+        "tests/test_reasoning_mode.py",
+        "docs/solutions/async-observer.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "tests/test_multi_agent.py",
+        "docs/solutions/conversation-mined-issues.md",
+        "tests/test_engine_reasoning.py",
+        "src/neo/code_smells.py",
+        "CHANGELOG.md",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        "docs/LOAD_PROGRAM.md"
+      ]
+    },
+    {
+      "query": "docs: correct observer 'single global' model + document replay-feedback (#136)",
+      "truth": [
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "CLAUDE.md",
+        "docs/solutions/async-observer.md",
+        "README.md",
+        "src/neo/cli.py",
+        "src/neo/subcommands.py",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/eval-baselines-2026-08.md",
+        "src/neo/memory/store.py",
+        "CHANGELOG.md",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/outcomes.py",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/a2ui.py",
+        "src/neo/persistent_reasoning.py",
+        "CONSTRUCT.md",
+        "docs/solutions/orchestrator-communication.md"
+      ]
+    },
+    {
+      "query": "feat: persist learned reasoning-model param-compat cache (#133) (#134)",
+      "truth": [
+        "src/neo/adapters.py"
+      ],
+      "ranked": [
+        "src/neo/adapters.py",
+        "src/neo/persistent_reasoning.py",
+        "src/neo/memory/store.py",
+        "CLAUDE.md",
+        "src/neo/engine.py",
+        "CONTRIBUTING.md",
+        "tests/test_model_param_compat.py",
+        "src/neo/memory/memimport.py",
+        "README.md",
+        "src/neo/subcommands.py",
+        "src/neo/cli.py",
+        "tests/test_reasoning_model_params.py",
+        "docs/solutions/evidence-learning-episodes.md",
+        "docs/linus-patterns.md",
+        "construct/README.md",
+        "src/neo/context_gatherer.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "CHANGELOG.md",
+        "docs/solutions/conversation-mined-issues.md"
+      ]
+    },
+    {
+      "query": "fix: recover from reasoning-model param rejections across LM adapters (#132)",
+      "truth": [
+        "src/neo/adapters.py"
+      ],
+      "ranked": [
+        "src/neo/adapters.py",
+        "CLAUDE.md",
+        "tests/test_reasoning_model_params.py",
+        "README.md",
+        "src/neo/subcommands.py",
+        "src/neo/models.py",
+        "src/neo/multi_agent.py",
+        "src/neo/engine.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/stdin_wrapper.py",
+        "CONTRIBUTING.md",
+        "src/neo/parsers.py",
+        "src/neo/cli.py",
+        "src/neo/context_gatherer.py",
+        "docs/solutions/orchestrator-communication.md",
+        "src/neo/persistent_reasoning.py",
+        "tools/ab_reasoning.py",
+        "src/neo/memory/outcomes.py"
+      ]
+    },
+    {
+      "query": "feat: deliberation memory-provenance + diversity-count gate fix (tiered-reasoning follow-ups) (#130)",
+      "truth": [
+        "src/neo/engine.py",
+        "src/neo/panel.py",
+        "tools/ab_reasoning.py"
+      ],
+      "ranked": [
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/multi_agent.py",
+        "src/neo/reasoning_mode.py",
+        "src/neo/engine.py",
+        "CONTRIBUTING.md",
+        "src/neo/memory/store.py",
+        "src/neo/panel.py",
+        "src/neo/memory/episodes.py",
+        "src/neo/persistent_reasoning.py",
+        "src/neo/context_gatherer.py",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "CLAUDE.md",
+        "src/neo/cli.py",
+        "src/neo/memory/issues.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/outcomes.py",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "README.md"
+      ]
+    },
+    {
+      "query": "fix: harden neo inference (stdin hang + CAR call deadline + large-context FFI timeout) (#127)",
+      "truth": [
+        "src/neo/adapters.py",
+        "src/neo/cli.py"
+      ],
+      "ranked": [
+        "src/neo/adapters.py",
+        "src/neo/cli.py",
+        "README.md",
+        "src/neo/car_host.py",
+        "src/neo/context_gatherer.py",
+        "CHANGELOG.md",
+        "CLAUDE.md",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/a2ui.py",
+        "src/neo/stdin_wrapper.py",
+        "src/neo/engine.py",
+        "tests/test_cli_stdin.py",
+        "src/neo/memory/metrics.py",
+        "docs/solutions/orchestrator-communication.md",
+        "src/neo/memory/models.py",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/transcript.py",
+        "docs/solutions/goal-aware-execution-envelope.md"
+      ]
+    },
+    {
+      "query": "feat: learn from merged GitHub PRs + review threads (0.33.0) (#126)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/transcript.py"
+      ],
+      "ranked": [
+        "src/neo/memory/transcript.py",
+        "CONTRIBUTING.md",
+        "docs/unified-store-plan.md",
+        "CLAUDE.md",
+        "README.md",
+        "src/neo/adapters.py",
+        "tests/test_transcript.py",
+        "docs/solutions/async-observer.md",
+        "src/neo/memory/scope.py",
+        "src/neo/persistent_reasoning.py",
+        ".claude/commands/pr-review.md",
+        ".claude/commands/gh-review-assess.md",
+        ".claude/commands/ship-release.md",
+        "construct/README.md",
+        ".agents/skills/source-command-ship-release/SKILL.md",
+        "src/neo/context_gatherer.py",
+        "src/neo/memory/outcomes.py"
+      ]
+    },
+    {
+      "query": "fix: auto-reap orphaned observers + single-instance lock (0.32.0) (#125)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "CLAUDE.md",
+        "src/neo/memory/store.py",
+        "tests/test_observer.py",
+        "docs/solutions/async-observer.md",
+        "CHANGELOG.md",
+        "README.md",
+        "src/neo/memory/outcomes.py",
+        "docs/unified-store-plan.md",
+        "docs/solutions/rule-file-sync.md",
+        "docs/architecture/prompt-enhancement.md",
+        "docs/solutions/orchestrator-communication.md",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/adapters.py",
+        "src/neo/algorithm_design.py",
+        "docs/tree-sitter-setup.md",
+        "src/neo/subcommands.py",
+        "docs/eval-baselines-2026-08.md"
+      ]
+    },
+    {
+      "query": "feat: per-project progress heartbeat in global observer sweep (0.31.1) (#124)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "CLAUDE.md",
+        "src/neo/memory/scope.py",
+        "docs/solutions/transcript-ingestion.md",
+        "README.md",
+        "src/neo/cli.py",
+        "docs/solutions/async-observer.md",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "src/neo/a2ui.py",
+        "src/neo/subcommands.py",
+        "tests/test_observer.py",
+        "docs/eval-baselines-2026-08.md",
+        "docs/solutions/orchestrator-communication.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/memory/store.py",
+        "src/neo/context_gatherer.py",
+        "AGENTS.md",
+        "pyproject.toml",
+        "src/neo/memory/transcript.py"
+      ]
+    },
+    {
+      "query": "feat: single global auto-started observer sweeping all projects (0.31.0) (#123)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/cli.py",
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "docs/solutions/async-observer.md",
+        "CLAUDE.md",
+        "docs/solutions/transcript-ingestion.md",
+        "README.md",
+        "src/neo/subcommands.py",
+        "docs/architecture/prompt-enhancement.md",
+        "CHANGELOG.md",
+        "tests/test_observer.py",
+        "CONTRIBUTING.md",
+        "src/neo/prompt/scanner.py",
+        "src/neo/cli.py",
+        "src/neo/a2ui.py",
+        "docs/solutions/orchestrator-communication.md",
+        "src/neo/memory/store.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "docs/unified-store-plan.md",
+        "AGENTS.md"
+      ]
+    },
+    {
+      "query": "feat: cross-platform observer orphan detection (Windows support) (0.30.0) (#122)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "docs/solutions/async-observer.md",
+        "CONTRIBUTING.md",
+        "pyproject.toml",
+        "docs/eval-baselines-2026-08.md",
+        "CHANGELOG.md",
+        "CLAUDE.md",
+        "tests/test_observer.py",
+        "README.md",
+        "src/neo/cli.py",
+        "docs/tree-sitter-setup.md",
+        "src/neo/architecture_metrics.py",
+        "docs/LOAD_PROGRAM.md",
+        "src/neo/a2ui.py",
+        "INSTALL.md",
+        "src/neo/memory/store.py",
+        "src/neo/subcommands.py",
+        "docs/solutions/memory-audit.md",
+        "docs/solutions/transcript-ingestion.md"
+      ]
+    },
+    {
+      "query": "feat: neo memory observer status flags orphaned observers (0.29.0) (#121)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/observer.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "CLAUDE.md",
+        "docs/solutions/async-observer.md",
+        "CHANGELOG.md",
+        "src/neo/cli.py",
+        "CONTRIBUTING.md",
+        "tests/test_observer.py",
+        "docs/eval-baselines-2026-08.md",
+        "src/neo/subcommands.py",
+        "README.md",
+        "src/neo/a2ui.py",
+        "src/neo/adapters.py",
+        "pyproject.toml",
+        "src/neo/memory/store.py",
+        "src/neo/memory/episodes.py",
+        "tests/test_a2ui.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/issues.py"
+      ]
+    },
+    {
+      "query": "chore: raise [car] floor to car-runtime>=0.27.0,<1.0 (0.28.1) (#120)",
+      "truth": [
+        "src/neo/__init__.py"
+      ],
+      "ranked": [
+        "pyproject.toml",
+        "src/neo/adapters.py",
+        "CLAUDE.md",
+        "src/neo/memory/observer.py",
+        "README.md",
+        "docs/eval-baselines-2026-08.md",
+        "tools/ab_reasoning.py",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "docs/solutions/transcript-ingestion.md",
+        "tests/test_observer.py",
+        "src/neo/memory/transcript.py",
+        "docs/solutions/async-observer.md",
+        "src/neo/car_discovery.py",
+        "src/neo/car_inference.py"
+      ]
+    },
+    {
+      "query": "fix: observer enforces car-runtime >=0.18.0 floor; revisit CarAdapter #52 hint (0.28.0) (#119)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "src/neo/memory/observer.py",
+        "src/neo/adapters.py",
+        "README.md",
+        "CLAUDE.md",
+        "docs/solutions/async-observer.md",
+        "CHANGELOG.md",
+        "AGENTS.md",
+        "pyproject.toml",
+        "docs/solutions/transcript-ingestion.md",
+        "docs/eval-baselines-2026-08.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/subcommands.py",
+        "src/neo/memory/issues.py",
+        "tests/test_observer.py",
+        "src/neo/car_inference.py",
+        "tests/test_car_adapter.py",
+        "tools/ab_reasoning.py",
+        "CONTRIBUTING.md",
+        "src/neo/cli.py"
+      ]
+    },
+    {
+      "query": "feat: neo memory import \u2014 ingest peer-tool memory into neo's store (0.27.0) (#118)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/cli.py",
+        "src/neo/memory/memimport.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/memory/transcript.py",
+        "src/neo/memory/observer.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/memimport.py",
+        "docs/solutions/memory-audit.md",
+        "src/neo/memory/store.py",
+        "CONTRIBUTING.md",
+        "src/neo/subcommands.py",
+        "CLAUDE.md",
+        "README.md",
+        "src/neo/memory/issues.py",
+        "src/neo/memory/models.py",
+        "src/neo/memory/constraints.py",
+        "src/neo/memory/rulesync.py",
+        "src/neo/cli.py",
+        "src/neo/memory/claude_memory.py"
+      ]
+    },
+    {
+      "query": "feat: neo memory audit \u2014 read-only hygiene inspection of AI-tool memory files (0.26.0) (#117)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/cli.py",
+        "src/neo/memory/memaudit.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/memory/memaudit.py",
+        "docs/solutions/memory-audit.md",
+        "src/neo/subcommands.py",
+        "src/neo/cli.py",
+        "README.md",
+        "docs/solutions/transcript-ingestion.md",
+        "CLAUDE.md",
+        "src/neo/memory/rulesync.py",
+        "CONTRIBUTING.md",
+        "src/neo/memory/transcript.py",
+        "docs/eval-baselines-2026-08.md",
+        "src/neo/engine.py",
+        "src/neo/memory/outcomes.py",
+        "src/neo/persistent_reasoning.py",
+        "CHANGELOG.md",
+        "AGENTS.md",
+        "src/neo/memory/memimport.py",
+        "src/neo/memory/issues.py",
+        "src/neo/context_gatherer.py"
+      ]
+    },
+    {
+      "query": "feat: neo memory rules \u2014 flag drift between AGENTS.md / CLAUDE.md / GEMINI.md (0.25.0) (#116)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/cli.py",
+        "src/neo/memory/rulesync.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "CLAUDE.md",
+        "AGENTS.md",
+        "docs/solutions/rule-file-sync.md",
+        "src/neo/memory/rulesync.py",
+        "CONTRIBUTING.md",
+        "README.md",
+        "docs/solutions/conversation-mined-issues.md",
+        "docs/solutions/async-observer.md",
+        "docs/solutions/orchestrator-communication.md",
+        "docs/solutions/memory-audit.md",
+        "CHANGELOG.md",
+        "src/neo/memory/issues.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/cli.py",
+        "src/neo/memory/claude_memory.py",
+        "src/neo/subcommands.py",
+        "src/neo/memory/observer.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/constraints.py",
+        "docs/LOAD_PROGRAM.md",
+        ".agents/skills/source-command-prepare-release/SKILL.md",
+        "docs/tree-sitter-setup.md"
+      ]
+    },
+    {
+      "query": "feat: neo memory issues --suggest-rules (0.24.0) (#115)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/cli.py",
+        "src/neo/memory/issues.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "docs/solutions/conversation-mined-issues.md",
+        "src/neo/memory/issues.py",
+        "src/neo/subcommands.py",
+        "docs/solutions/rule-file-sync.md",
+        "src/neo/memory/rulesync.py",
+        "src/neo/prompt/enhancer.py",
+        "CONTRIBUTING.md",
+        "src/neo/cli.py",
+        "README.md",
+        "CLAUDE.md",
+        "docs/architecture/prompt-enhancement.md",
+        "src/neo/prompt/cli.py",
+        "tests/test_issues.py",
+        "src/neo/prompt/__init__.py",
+        "src/neo/memory/outcomes.py",
+        "AGENTS.md",
+        "src/neo/engine.py"
+      ]
+    },
+    {
+      "query": "feat: neo memory issues \u2014 surface recurring frictions mined from transcripts (#113)",
+      "truth": [
+        "src/neo/cli.py",
+        "src/neo/math_utils.py",
+        "src/neo/memory/issues.py",
+        "src/neo/memory/store.py",
+        "src/neo/subcommands.py"
+      ],
+      "ranked": [
+        "src/neo/memory/issues.py",
+        "docs/solutions/conversation-mined-issues.md",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/transcript.py",
+        "src/neo/cli.py",
+        "CONTRIBUTING.md",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/subcommands.py",
+        "README.md",
+        "CLAUDE.md",
+        "tests/test_issues.py",
+        "src/neo/memory/episodes.py",
+        "src/neo/memory/rulesync.py",
+        "AGENTS.md",
+        "src/neo/engine.py",
+        "src/neo/a2ui.py",
+        "src/neo/memory/outcomes.py",
+        "docs/architecture/prompt-enhancement.md"
+      ]
+    },
+    {
+      "query": "fix: dedupe outcome reinforcement per fact to stop suggestion fan-out over-counting (0.22.4) (#112)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/store.py",
+        "src/neo/memory/transcript.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "src/neo/memory/transcript.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/outcomes.py",
+        "CHANGELOG.md",
+        "src/neo/subcommands.py",
+        "src/neo/engine.py",
+        "docs/LOAD_PROGRAM.md",
+        "CLAUDE.md",
+        "src/neo/models.py",
+        "README.md",
+        "src/neo/memory/episodes.py",
+        "src/neo/persistent_reasoning.py",
+        "docs/eval-baselines-2026-08.md",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "docs/solutions/async-observer.md",
+        "src/neo/memory/observer.py"
+      ]
+    },
+    {
+      "query": "fix: serialize save() with a cross-process file lock to close the torn-write window (0.22.3) (#111)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "src/neo/memory/observer.py",
+        "CLAUDE.md",
+        "src/neo/memory/outcomes.py",
+        "src/neo/context_gatherer.py",
+        "src/neo/construct.py",
+        "CHANGELOG.md",
+        "src/neo/subcommands.py",
+        "src/neo/adapters.py",
+        "docs/solutions/async-observer.md",
+        "docs/eval-baselines-2026-08.md",
+        "src/neo/architecture_metrics.py",
+        "src/neo/prompt/knowledge_base.py",
+        "src/neo/prompt/evolution.py",
+        "src/neo/engine.py",
+        "docs/solutions/orchestrator-communication.md",
+        "src/neo/persistent_reasoning.py"
+      ]
+    },
+    {
+      "query": "fix: field-reconcile same-id facts on merge-save so concurrent reinforcements aren't lost (0.22.2) (#110)",
+      "truth": [
+        "src/neo/__init__.py",
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "src/neo/memory/store.py",
+        "src/neo/memory/outcomes.py",
+        "CLAUDE.md",
+        "CHANGELOG.md",
+        "src/neo/persistent_reasoning.py",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/constraints.py",
+        "src/neo/context_gatherer.py",
+        "src/neo/engine.py",
+        "src/neo/memory/transcript.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/memory/episodes.py",
+        "src/neo/adapters.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/architecture_metrics.py",
+        "docs/solutions/memory-audit.md",
+        "src/neo/memory/scope.py",
+        "docs/solutions/async-observer.md"
+      ]
+    },
+    {
+      "query": "feat: mine weak acceptance signals from transcripts via a durable ledger (#106)",
+      "truth": [
+        "src/neo/memory/outcomes.py",
+        "src/neo/memory/store.py",
+        "src/neo/memory/transcript.py"
+      ],
+      "ranked": [
+        "src/neo/memory/transcript.py",
+        "src/neo/memory/outcomes.py",
+        "CLAUDE.md",
+        "docs/solutions/conversation-mined-issues.md",
+        "CONTRIBUTING.md",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/observer.py",
+        "CHANGELOG.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "src/neo/persistent_reasoning.py",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        "docs/solutions/evidence-learning-evaluation.md",
+        "README.md",
+        "src/neo/architecture_metrics.py",
+        "tests/test_outcomes.py",
+        "docs/solutions/async-observer.md",
+        "tests/test_pending_session_retention.py",
+        "tests/test_fact_store.py",
+        "docs/architecture/prompt-enhancement.md",
+        "src/neo/models.py"
+      ]
+    },
+    {
+      "query": "fix: detect outcomes for review/analysis suggestions (close the feedback loop) (#104)",
+      "truth": [
+        "src/neo/memory/outcomes.py"
+      ],
+      "ranked": [
+        "src/neo/memory/outcomes.py",
+        "CLAUDE.md",
+        "src/neo/subcommands.py",
+        "src/neo/memory/store.py",
+        "src/neo/engine.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md",
+        "src/neo/memory/evaluation.py",
+        "src/neo/cli.py",
+        "README.md",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "src/neo/persistent_reasoning.py",
+        "docs/solutions/orchestrator-communication.md",
+        ".claude/commands/gh-review-assess.md",
+        "docs/solutions/async-observer.md",
+        "tests/test_outcomes.py",
+        "AGENTS.md",
+        "docs/architecture/prompt-enhancement.md"
+      ]
+    },
+    {
+      "query": "fix: purge cold eviction-orphan tombstones on cold start (#102)",
+      "truth": [
+        "src/neo/memory/context.py",
+        "src/neo/memory/store.py"
+      ],
+      "ranked": [
+        "CLAUDE.md",
+        "tests/test_fact_store.py",
+        "construct/caching/cache-aside.md",
+        "src/neo/memory/store.py",
+        "construct/caching/write-through.md",
+        "docs/unified-store-plan.md",
+        "CHANGELOG.md",
+        "docs/eval-baselines-2026-08.md",
+        "docs/solutions/transcript-ingestion.md",
+        "AGENTS.md",
+        "src/neo/memory/observer.py",
+        "README.md",
+        "docs/solutions/async-observer.md",
+        "src/neo/memory/context.py",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "construct/README.md",
+        "CONTRIBUTING.md",
+        "docs/architecture/prompt-enhancement.md"
+      ]
+    },
+    {
+      "query": "feat: CAR-first inference with graceful fallback to static provider (#100)",
+      "truth": [
+        "src/neo/adapters.py",
+        "src/neo/car_host.py",
+        "src/neo/cli.py",
+        "src/neo/config.py",
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "CONTRIBUTING.md",
+        "README.md",
+        "docs/solutions/orchestrator-communication.md",
+        "src/neo/adapters.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "CLAUDE.md",
+        "tests/test_car_first.py",
+        "CHANGELOG.md",
+        "src/neo/engine.py",
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/persistent_reasoning.py",
+        "docs/solutions/operating-modes.md",
+        "src/neo/config.py",
+        "docs/solutions/evidence-learning-completion-audit.md",
+        "src/neo/models.py",
+        "src/neo/subcommands.py",
+        "docs/solutions/conversation-mined-issues.md",
+        "docs/solutions/rule-file-sync.md",
+        "src/neo/car_tool_schema.py",
+        "docs/solutions/goal-aware-execution-envelope.md"
+      ]
+    },
+    {
+      "query": "feat: add Codex source adapter (project-scoped transcript learning) (#99)",
+      "truth": [
+        "src/neo/memory/transcript.py"
+      ],
+      "ranked": [
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/transcript.py",
+        "README.md",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        "docs/solutions/conversation-mined-issues.md",
+        "docs/solutions/async-observer.md",
+        "src/neo/subcommands.py",
+        "src/neo/memory/observer.py",
+        "CHANGELOG.md",
+        "docs/solutions/memory-audit.md",
+        "docs/solutions/evidence-learning-episodes.md",
+        "tests/test_transcript.py",
+        ".agents/skills/source-command-prepare-release/SKILL.md",
+        "src/neo/memory/issues.py",
+        "src/neo/cli.py",
+        "AGENTS.md",
+        "docs/solutions/goal-aware-execution-envelope.md",
+        ".claude/commands/prepare-release.md",
+        "docs/solutions/operating-modes.md",
+        "docs/solutions/orchestrator-communication.md"
+      ]
+    },
+    {
+      "query": "feat: multi-source transcript learning + CAR adapter (#98)",
+      "truth": [
+        "src/neo/memory/transcript.py"
+      ],
+      "ranked": [
+        "docs/solutions/transcript-ingestion.md",
+        "README.md",
+        "CONTRIBUTING.md",
+        "docs/solutions/conversation-mined-issues.md",
+        "CLAUDE.md",
+        "docs/solutions/async-observer.md",
+        "src/neo/memory/transcript.py",
+        "src/neo/memory/observer.py",
+        "CHANGELOG.md",
+        "src/neo/subcommands.py",
+        "src/neo/memory/issues.py",
+        "AGENTS.md",
+        "tools/ab_reasoning.py",
+        "docs/solutions/tiered-reasoning-multi-agent.md",
+        "src/neo/cli.py",
+        "docs/solutions/memory-audit.md"
+      ]
+    },
+    {
+      "query": "feat: learn from Claude Code transcripts (observer transcript ingestion) (#97)",
+      "truth": [
+        "src/neo/memory/observer.py",
+        "src/neo/memory/store.py",
+        "src/neo/memory/transcript.py"
+      ],
+      "ranked": [
+        "docs/solutions/transcript-ingestion.md",
+        "src/neo/memory/observer.py",
+        "src/neo/memory/transcript.py",
+        "docs/solutions/conversation-mined-issues.md",
+        "CLAUDE.md",
+        "README.md",
+        "CONTRIBUTING.md",
+        "src/neo/cli.py",
+        "docs/solutions/async-observer.md",
+        "src/neo/memory/issues.py",
+        "src/neo/adapters.py",
+        "CHANGELOG.md",
+        "tests/test_observer.py",
+        "src/neo/prompt/scanner.py",
+        "tests/test_transcript.py",
+        "src/neo/algorithm_design.py",
+        "src/neo/subcommands.py",
+        "docs/solutions/memory-audit.md"
+      ]
+    },
+    {
+      "query": "chore: align car-runtime version refs to 0.18.0 floor and cap major (#96)",
+      "truth": [
+        "src/neo/memory/observer.py"
+      ],
+      "ranked": [
+        "pyproject.toml",
+        "src/neo/memory/observer.py",
+        "CLAUDE.md",
+        "README.md",
+        "src/neo/adapters.py",
+        "src/neo/memory/episodes.py",
+        "docs/solutions/async-observer.md",
+        "src/neo/engine.py",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "src/neo/car_discovery.py",
+        "src/neo/subcommands.py",
+        "src/neo/memory/outcomes.py",
+        "src/neo/memory/store.py",
+        "tools/sync_version.py",
+        "tools/rank_eval.py",
+        "docs/tree-sitter-setup.md",
+        "docs/mistakes.md",
+        "src/neo/memory/transcript.py",
+        "tests/test_observer.py"
+      ]
+    }
+  ]
+}
