@@ -1,0 +1,70 @@
+# Goal 9 per-stage profile — all five runs, one real 'neo --dry-run' each on m365dotnet.
+# The stage timers only; each run's full assembled-prompt dump is reproducible via
+#   evidence/g9_stage_profile.py <repo>   and is not committed (155 KB apiece).
+# Contention is one-sided, so the LOWEST-load run is the reading: try2 below.
+
+=== first_contended (evidence/g9_profile.txt) ===
+T imports                                    1.51s
+T eligibility walk                           0.13s  (1 call)
+T content index refresh                      0.18s  (1 call)
+T content index scores                       0.15s  (1 call)
+T project index boost                        0.09s  (1 call)
+T fact store history boost                   2.42s  (1 call)
+T fact store retrieve                        1.83s  (1 call)
+T GATHER TOTAL                               3.99s  (1 call)
+T WALL TOTAL                                 9.05s   peak rss = 1448 MB
+T   selection only (GATHER minus history boost)   1.57s
+T   wall excluding the memory system         4.80s
+
+=== second_heavily_contended (evidence/g9_profile_clean.txt) ===
+T imports                                    7.19s
+T eligibility walk                           0.67s  (1 call)
+T content index refresh                      0.28s  (1 call)
+T content index scores                       0.36s  (1 call)
+T project index boost                        0.69s  (1 call)
+T fact store history boost                  11.17s  (1 call)
+T fact store retrieve                        8.11s  (1 call)
+T GATHER TOTAL                              16.82s  (1 call)
+T WALL TOTAL                                35.52s   peak rss = 1447 MB
+T   selection only (GATHER minus history boost)   5.64s
+T   wall excluding the memory system        16.23s
+
+=== load_11.46 (evidence/g9_profile_try1.txt) ===
+T imports                                    1.09s
+T eligibility walk                           0.12s  (1 call)
+T content index refresh                      0.09s  (1 call)
+T content index scores                       0.12s  (1 call)
+T project index boost                        0.09s  (1 call)
+T fact store history boost                   2.09s  (1 call)
+T fact store retrieve                        1.51s  (1 call)
+T GATHER TOTAL                               3.36s  (1 call)
+T WALL TOTAL                                 7.12s   peak rss = 1447 MB
+T   selection only (GATHER minus history boost)   1.27s
+T   wall excluding the memory system         3.52s
+
+=== load_7.96_READING (evidence/g9_profile_try2.txt) ===
+T imports                                    0.96s
+T eligibility walk                           0.12s  (1 call)
+T content index refresh                      0.08s  (1 call)
+T content index scores                       0.09s  (1 call)
+T project index boost                        0.08s  (1 call)
+T fact store history boost                   1.94s  (1 call)
+T fact store retrieve                        1.49s  (1 call)
+T GATHER TOTAL                               3.08s  (1 call)
+T WALL TOTAL                                 6.47s   peak rss = 1447 MB
+T   selection only (GATHER minus history boost)   1.14s
+T   wall excluding the memory system         3.04s
+
+=== load_6.11 (evidence/g9_profile_try3.txt) ===
+T imports                                    1.14s
+T eligibility walk                           0.15s  (1 call)
+T content index refresh                      0.10s  (1 call)
+T content index scores                       0.10s  (1 call)
+T project index boost                        0.13s  (1 call)
+T fact store history boost                   2.03s  (1 call)
+T fact store retrieve                        1.51s  (1 call)
+T GATHER TOTAL                               3.27s  (1 call)
+T WALL TOTAL                                 7.09s   peak rss = 1447 MB
+T   selection only (GATHER minus history boost)   1.23s
+T   wall excluding the memory system         3.55s
+

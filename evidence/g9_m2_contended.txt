@@ -1,0 +1,37 @@
+id,shape,run,wall_seconds,max_rss_bytes,entries,distinct_files
+P1,file-named,1,14.34,1457913856,1,1
+P1,file-named,2,24.22,1456996352,1,1
+P1,file-named,3,27.55,1454112768,1,1
+P2,file-named,1,10.20,1454587904,30,30
+P2,file-named,2,12.01,1454800896,30,30
+P2,file-named,3,13.90,1450950656,30,30
+P3,concept-only,1,9.54,1451622400,30,30
+P3,concept-only,2,11.04,1447608320,30,30
+P3,concept-only,3,9.95,1451163648,30,30
+P4,concept-only,1,9.84,1447919616,30,30
+P4,concept-only,2,9.36,1447657472,30,30
+P4,concept-only,3,8.62,1447772160,30,30
+P5,mixed,1,9.32,1449394176,30,30
+P5,mixed,2,11.04,1448280064,30,30
+P5,mixed,3,8.73,1452294144,30,30
+P6,symptom,1,9.15,1451327488,30,30
+P6,symptom,2,9.30,1449394176,30,30
+P6,symptom,3,9.18,1450328064,30,30
+
+=== M2 aggregates ===
+id  shape           median_s   min_s   max_s  peak_RSS_MiB
+P1  file-named         24.22   14.34   27.55        1390.4
+P2  file-named         12.01   10.20   13.90        1387.4
+P3  concept-only        9.95    9.54   11.04        1384.4
+P4  concept-only        9.36    8.62    9.84        1380.8
+P5  mixed               9.32    8.73   11.04        1385.0
+P6  symptom             9.18    9.15    9.30        1384.1
+
+BATTERY median wall = 9.89s (n=18, min 8.62, max 27.55)
+BATTERY peak ru_maxrss = 1457913856 B = 1390.4 MiB = 1.46 GB
+vs M2 targets (<=5s / <=500MB): 1.98x time, 2.92x memory
+
+selected: 151 entries | 151 sum-of-per-prompt-distinct | 125 BATTERY UNION distinct
+repeat entries: 26 battery-wide (entries - union) | 0 within-prompt (entries - per-prompt-distinct)
+files selected by >1 prompt: 22 (accounting for 26 excess selections)
+union written to /Users/theleafnode/Documents/_projects/Parslee-AI/neo/.worktrees/g_msrhuemt_78c44a-unified-store-goal-9/evidence/m2_g9/union.files (feed this to the G1 check)
