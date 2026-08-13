@@ -866,6 +866,17 @@ def resolve_includes(
     `a[1].py` is an exact path, and classifying it as a glob on its punctuation
     would tell the operator something false about their own filename.
 
+    **The honest limit, stated because it is a silent one.** The rescue is
+    attempted only when a pattern matched NOTHING, so a glob that matched some
+    files never reaches it — and a glob whose pattern also covers a file over
+    the walker's 512 KB ceiling delivers the smaller files and drops the large
+    one with no signal at all. `--include '*.py'` beside a 700 KB `huge.py`
+    pins the small ones and never mentions it, where `--include huge.py` pins
+    it whole. Closing that needs the walk to report which paths its size
+    ceiling skipped, which is `neo.eligibility`'s to give and this goal is
+    scoped out of. The guarantee is therefore over EXACT PATHS; a glob is a
+    search, and naming the file is what asserts it.
+
     Order follows the pattern order the operator gave, then path order within
     a pattern, because that is the order the byte ceiling is spent in.
     """
@@ -1678,8 +1689,20 @@ def gather_context_semantic(config: GatherConfig) -> list[ContextFile]:
         # passed. Measured on m365dotnet that is seconds of `os.walk` added to
         # every semantic invocation, for a pin list that is always empty.
         if config.includes:
+            # The SAME pin pool the keyword lane builds: exclude- and
+            # gitignore-filtered, `--exts`-unfiltered. Passing `config.exts`
+            # here made the two lanes disagree — `--exts py --include '*.txt'`
+            # pinned on the keyword path and reported "matched no file" on
+            # this one. A guarantee that depends on which retrieval strategy
+            # you asked for is the same defect as one a second flag switches
+            # off, which is why this lane pins at all.
             include_matches, include_misses, include_refused = resolve_includes(
-                iter_paths(root, [], config.excludes, config.exts),
+                [
+                    (e.path, e.rel_path, e.size)
+                    for e in filter_candidates(
+                        base_paths(root), [], config.excludes, None
+                    )
+                ],
                 config.includes, root, config.excludes,
             )
             pin_report = pin_included_files(include_matches, config.max_bytes)

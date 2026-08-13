@@ -481,9 +481,11 @@ def parse_args():
     p.add_argument("--max-files", type=int, default=None,
                    help="Cap on files: context gathering (default 30) or, with --index, the index build (default 100)")
     p.add_argument("--include", action="append", default=[],
-                   help="Guarantee these files (glob, repeatable): each match is sent whole, "
-                        "ahead of and in addition to the normal scan, cut only if --max-bytes "
-                        "forces it and then marked")
+                   help="Guarantee these files (repeatable): each match is sent whole, ahead of "
+                        "and in addition to the normal scan, cut only if --max-bytes forces it "
+                        "and then marked. An EXACT path is guaranteed even past --exts and the "
+                        "512KB scan limit; a glob is a search and gets neither. Needs the scan, "
+                        "so --no-scan voids it")
     p.add_argument("--exclude", action="append", default=[], help="Blocklist glob patterns (repeatable)")
     p.add_argument("--exts", metavar="CSV", help="Restrict to file extensions (comma-separated)")
     p.add_argument("--diff-since", metavar="REV", help="Prioritize files changed since git rev or duration")
@@ -1242,6 +1244,17 @@ def main():
         # Bound before the branch: `--no-scan` skips the gatherer entirely and
         # the dry-run report below still has to say something truthful.
         gathered = []
+
+        # `--no-scan` skips the gatherer, and the gatherer is what honours
+        # `--include`. Two flags that each mean something reasonable combine
+        # into a named file silently absent — the exact shape #198 is about,
+        # arrived at from the other direction. Said out loud rather than left
+        # for the operator to infer from an empty context.
+        if args.no_scan and args.include:
+            progress.note(
+                f"Warning: --no-scan disables the scan that delivers "
+                f"--include, so {len(args.include)} named pattern(s) will NOT "
+                "be in the context; drop --no-scan or pass the files inline")
 
         # Gather context from working directory unless --no-scan
         if not args.no_scan:

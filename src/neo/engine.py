@@ -1082,8 +1082,16 @@ class NeoEngine:
         self._log_action("retrieve_context", neo_input.prompt[:60])
         self._begin_phase(PHASE_CONTEXT, self._voice("phase_context"))
         enriched_context = self._retrieve_context(neo_input)
-        file_count = len(neo_input.context_files) + len(
-            enriched_context.get("additional_files", []) or []
+        # Distinct PATHS. `context_files` is chunk-level, so a file selected
+        # as two windows counted as two files in the `file_count` field on the
+        # phase event — #197's overcount on the surface a HOST reads, which
+        # both plugin adapters consume and no operator sees to doubt.
+        file_count = len(
+            {f.path for f in neo_input.context_files}
+            | {
+                getattr(f, "path", f)
+                for f in (enriched_context.get("additional_files", []) or [])
+            }
         )
         self._end_phase(
             PHASE_CONTEXT,

@@ -804,6 +804,62 @@ class TestThePromptRendererHonoursThePin:
         assert [s.split(" ")[1] for s in sections] == ["a.py", "b.py", "c.py"]
 
 
+class TestBothLanesPinTheSameFiles:
+    """`gather_context_semantic` had no test of any kind, which is how it kept
+    an ext-filtered pin pool through the merge that unfiltered the other one.
+
+    The lane falls back to `gather_context` without an index, so these assert
+    on `resolve_includes` against each lane's pool rather than end to end —
+    what diverged was the pool, not the pinning.
+    """
+
+    def _pools(self, root, exts):
+        from neo.context_gatherer import base_paths, filter_candidates
+
+        eligible = base_paths(str(root))
+        keyword = filter_candidates(eligible, [], [], None)
+        return [(e.path, e.rel_path, e.size) for e in keyword]
+
+    def test_a_glob_include_overrides_exts(self, tmp_path):
+        """The behaviour #209's split made structural. An accidental revert to
+        an ext-filtered pin pool passes every other test in this file, because
+        every other `--exts` case is an exact path and the rescue covers it."""
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (tmp_path / "notes.txt").write_text("connection pool notes\n", encoding="utf-8")
+
+        rels = _rels(_gather(tmp_path, includes=["*.txt"], exts=["py"]))
+        assert "notes.txt" in rels
+
+    def test_the_pin_pool_is_a_subset_of_what_the_walk_admitted(self, repo):
+        """The pin pool is deliberately looser than the candidate list, so the
+        thing to pin is that it is still bounded BY THE WALK — an unfiltered
+        pool must not become a second answer to what exists."""
+        from neo.context_gatherer import base_paths, filter_candidates
+
+        eligible = base_paths(str(repo))
+        pool = filter_candidates(eligible, [], [], None)
+
+        assert {e.rel_path for e in pool} <= {e.rel_path for e in eligible}
+
+    def test_the_semantic_lane_pins_what_the_keyword_lane_pins(self, tmp_path):
+        from neo.context_gatherer import base_paths, filter_candidates, resolve_includes
+
+        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
+        (tmp_path / "notes.txt").write_text("connection pool notes\n", encoding="utf-8")
+
+        eligible = base_paths(str(tmp_path))
+        pool = [
+            (e.path, e.rel_path, e.size)
+            for e in filter_candidates(eligible, [], [], None)
+        ]
+        matched, missed, _refused = resolve_includes(
+            pool, ["*.txt"], str(tmp_path), []
+        )
+
+        assert [rel for _abs, rel, _size in matched] == ["notes.txt"]
+        assert missed == []
+
+
 class TestTheBannerTheModelReadsCountsFiles:
     """#197 on the surface that matters most.
 
