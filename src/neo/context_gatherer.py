@@ -159,8 +159,17 @@ def base_paths(root: str) -> list[eligibility.EligiblePath]:
     walk, the ignore rules and the gitignore matcher live in
     `neo.eligibility`, shared with the project index — there is no second copy
     here to drift.
+
+    The walk itself runs through `index.walk_cache`, which remembers each
+    directory's ignore verdicts and re-lists only the directories whose
+    contents moved. That is a cost change and never a result change: the cache
+    is keyed on a hash of the effective ignore patterns and on each directory's
+    mtime, and every failure mode degrades to the full walk.
     """
-    return eligibility.walk_paths(root, max_file_bytes=MAX_FILE_BYTES).paths
+    from neo.index.walk_cache import cached_walk
+
+    policy = eligibility.WalkPolicy(max_file_bytes=MAX_FILE_BYTES)
+    return cached_walk(root, policy).paths
 
 
 def filter_candidates(
