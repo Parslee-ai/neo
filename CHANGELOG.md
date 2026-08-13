@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.46.0] - 2026-08-13
+
+The unified store release, and the close of the ten-goal climb that built it. Neo used to retrieve down two independent lanes that walked the repository separately, disagreed about what was eligible, and answered to two different front doors — so a fix applied to one was silently absent from the other. There is now **one walker, one persistent content index, and one retrieval front door**. The largest flagship repository moved from **MRR 0.051 to 0.738** and recall@10 from **0.097 to 0.883** across the climb; the eligibility walk itself went from 4.6–6.9 s to **0.12 s** warm, and file selection is now 0.37 s of a warm call.
+
+This release cuts nothing new. It is the retirement: the two-lane vocabulary is gone from the code, the tests and every document a user reads, and `tests/test_lane_retirement.py` fails if it returns.
+
+### Changed
+
+- **`neo --index` is documented as what it is — an optional cache-warmer.** Auto-freshness has been the default reality since the eligibility walk began persisting itself, so the docs, the CLI help and the plugin surfaces no longer describe an index you must remember to build.
+- **`--semantic` is documented as a weight hint**, not a lane selector. It stopped selecting a pipeline when the second front door was deleted; the documentation now says so rather than describing a fork that no longer exists.
+- The two-lane mental model is removed from README, QUICKSTART, the CLI help text and the `.claude-plugin/` agent and command docs. Dated evidence and measurement records keep their historical references on purpose — they are the record of what was measured, not instructions to a user.
+
+### Removed
+
+- Every remaining reference to the deleted lane functions across `src/`, the plugin manifests and user-facing docs. The structural proof is re-run as a test: one eligibility implementation, one gather path, zero references to the retired functions.
+
+### Documentation
+
+- [`docs/unified-store-plan.md`](docs/unified-store-plan.md) gains its **completion ledger** — the per-goal PR table, the final M1/M2 readings side by side with the Goal 1 trailhead baselines, an honest reading of which targets closed and which did not, and the exits left open on purpose.
+- **Two of the three north stars closed.** M1 closed decisively. M2 closed on the half this plan owns — file selection — and did **not** close on the absolute number, because the FactStore history boost accounts for 3.43 s and 1.26 GB of every invocation. That is [#211](https://github.com/Parslee-ai/neo/issues/211), scoped out from the trailhead and still open; it is the natural successor plan. [#213](https://github.com/Parslee-ai/neo/issues/213) and [#217](https://github.com/Parslee-ai/neo/issues/217) are the other recorded exits.
+
 ## [0.45.0] - 2026-08-12
 
 Neo picked the files it showed the model without ever opening them, and the tool built for checking that never showed you the answer. This release closes both. File selection now ranks on content, which moves retrieval quality on the largest flagship repository from **MRR 0.051 to 0.738** and recall@10 from 0.097 to 0.883 — a change of kind, not of degree. `--dry-run` now prints the messages Neo actually hands the adapter, having previously exited before the engine was built, and before that could bill you for a full multi-agent panel under a flag whose entire promise is that it makes no call. Ruby and PHP get the graph edges they have never had. And the release itself now runs one real LLM round trip per language, so a language cannot silently stop working for eight months again.

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 **Owner:** Keenan Keeling (dispatching via goalpool; Kai shepherds)
-**Status:** **Goals 1-8 and 10 merged; Goal 9 (this ledger) is open as a draft PR and v0.46.0 is uncut.** See [Completion ledger](#completion-ledger-2026-08-13).
+**Status:** **All ten goals merged ([#216](https://github.com/Parslee-ai/neo/pull/216) closed the climb, 2026-08-13 17:01Z); v0.46.0 is the closing release.** See [Completion ledger](#completion-ledger-2026-08-13).
 **Origin:** 2026-08-11 forensic review of Neo file selection (issues #158/#159/#176/#186/#193–#199) + the 2026-08-10 Keenan/Matt sync.
 
 ## Intent
@@ -70,11 +70,12 @@ Already done inline (2026-08-11): #192 (eval harness), #186 (gitignore implement
 
 ## Completion ledger (2026-08-13)
 
-**Written at Goal 9, the plan's own closing goal, while Goal 9 itself is still an
-open draft PR.** Nine of the ten goals are merged; this one and the v0.46.0 release
-are not, and the tense below is deliberate — a plan that declares itself complete
-before its last PR merges is the same category of claim as an index that prints
-"Built index" and exits 0.
+**Written at Goal 9, the plan's own closing goal, while Goal 9 was still an open
+draft PR — and updated here, in the v0.46.0 release PR, once it merged.** That
+ordering was deliberate: a plan that declares itself complete before its last PR
+merges is the same category of claim as an index that prints "Built index" and
+exits 0. All ten goals are now merged ([#216](https://github.com/Parslee-ai/neo/pull/216),
+2026-08-13 17:01Z) and this release is the last step.
 
 2026-08-11 → 2026-08-13: ten goals, thirteen merged PRs plus one governance PR,
 seven issues closed (#193, #195, #196, #197, #198, #199, #210). This section is the
@@ -93,7 +94,7 @@ open.
 | **6. Persistent content index** | [#209](https://github.com/Parslee-ai/neo/pull/209) | closes #195 — BM25 moves into the on-disk store |
 | **7. Auto-freshness** | [#212](https://github.com/Parslee-ai/neo/pull/212) | closes #210 — the eligibility walk persists; `--index` becomes optional |
 | **8. One front door** | [#214](https://github.com/Parslee-ai/neo/pull/214) | one pipeline, four stages; the `cli.py` gather fork and the second gather function deleted |
-| **9. Lane retirement** | *this PR — open, draft* | the two-lane vocabulary retired from code and docs; `tests/test_lane_retirement.py` guards it. **v0.46.0 is cut after it merges, not in it** |
+| **9. Lane retirement** | [#216](https://github.com/Parslee-ai/neo/pull/216) | the two-lane vocabulary retired from code and docs; `tests/test_lane_retirement.py` guards it. **v0.46.0 is cut after it merged, not in it** |
 | **10. Release gate** | [#202](https://github.com/Parslee-ai/neo/pull/202) | G5-inv — per-language LLM round trip gates the release, invariant battery gates every PR |
 
 Governance PR [#203](https://github.com/Parslee-ai/neo/pull/203) added the draft-flow
