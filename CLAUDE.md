@@ -723,8 +723,8 @@
   The #208 walk is **kept on disk too**, in the same `.neo/`, because once the
   content index stopped rebuilding it became the largest single item in a warm
   call: 4.64 s on m365dotnet to re-derive that 9,348 files are eligible, on every
-  invocation, in a repository that had not changed (#210). Warm walk now 0.2 s;
-  the canonical M2 battery went 15.63 s → **9.47 s** median with byte-identical
+  invocation, in a repository that had not changed (#210). Warm walk now 0.16 s;
+  the canonical M2 battery went 15.63 s → **8.57 s** median with byte-identical
   selection on all six prompts and byte-identical `rank_mine_eval` on all three
   flagships.
   - **The cost is the pattern matching, not the filesystem, and that decides the
