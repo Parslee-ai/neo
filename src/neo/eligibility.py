@@ -347,10 +347,18 @@ class EligiblePath:
     `rel_path` is repository-relative and always POSIX-separated, so a
     downstream comparison against a `.gitignore` pattern, a git path or
     another `rel_path` needs no per-platform normalization.
+
+    `mtime_ns` rides along because the walk already stats every file it
+    admits, so carrying the modification time costs one attribute read rather
+    than a second stat. It is what lets the persistent content index decide
+    which files to hash without reading the repository's every byte on every
+    invocation. Defaulted, so a caller constructing one by hand — a test, a
+    synthetic candidate — is not forced to invent a timestamp.
     """
     path: str
     rel_path: str
     size: int
+    mtime_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -465,14 +473,18 @@ def walk(root: str, policy: Optional[WalkPolicy] = None) -> WalkResult:
                 if ext not in policy.exts:
                     continue
             try:
-                size = os.path.getsize(abs_path)
+                # One `stat`, two facts. `os.path.getsize` is a `stat` that
+                # throws the rest of the struct away, and the modification
+                # time it discards is what an incremental index needs.
+                info = os.stat(abs_path)
             except OSError:
                 # Vanished between the walk and the stat, or unreadable.
                 continue
+            size = info.st_size
             if policy.max_file_bytes is not None and size > policy.max_file_bytes:
                 continue
 
-            paths.append(EligiblePath(abs_path, rel_path, size))
+            paths.append(EligiblePath(abs_path, rel_path, size, info.st_mtime_ns))
 
     paths.sort(key=lambda entry: entry.rel_path)
     return WalkResult(paths, excluded_dirs=excluded_dirs, excluded_files=excluded_files)

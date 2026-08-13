@@ -595,33 +595,21 @@ class TestTheLiteralPathRescue:
 
         assert "notes/zzz_placeholder.py" in _rels(gathered)
 
-    def test_a_file_past_the_rescue_ceiling_is_not_read(self, tmp_path, monkeypatch):
+    def test_a_file_past_the_rescue_ceiling_is_not_read(self, big_repo, monkeypatch):
         """The walk bounds every candidate at 512KB, so the pin read was
         bounded for free; the rescue lifts that and needs its own bound, or
-        `--include` on a multi-gigabyte artefact reads it all into memory."""
+        `--include` on a multi-gigabyte artefact reads it all into memory.
+
+        Exercised on a file OVER the walker's limit, which is the only way in
+        to the rescue now that `--exts` is overridden structurally rather than
+        by re-statting.
+        """
         from neo import context_gatherer as cg
 
-        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
-        (tmp_path / "artefact.bin").write_text("xxxxx\n", encoding="utf-8")
-        # `--exts py` keeps the artefact out of the walk, so admitting it can
-        # only come through the rescue — which is the path under test.
-        monkeypatch.setattr(cg, "_PIN_RESCUE_MAX_BYTES", 1)
+        monkeypatch.setattr(cg, "_PIN_RESCUE_MAX_BYTES", 600_000)
 
-        rels = _rels(
-            _gather(tmp_path, includes=["artefact.bin"], exts=["py"])
-        )
-        assert "artefact.bin" not in rels
-
-    def test_a_file_inside_the_rescue_ceiling_is_read(self, tmp_path):
-        """Guards the guard: with the ceiling never binding, the test above
-        would pass on a rescue that had stopped working entirely."""
-        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
-        (tmp_path / "artefact.bin").write_text("xxxxx\n", encoding="utf-8")
-
-        rels = _rels(
-            _gather(tmp_path, includes=["artefact.bin"], exts=["py"])
-        )
-        assert "artefact.bin" in rels
+        assert (big_repo / "src" / "huge.py").stat().st_size > 600_000
+        assert "src/huge.py" not in _rels(_gather(big_repo, includes=["src/huge.py"]))
 
     def test_a_symlinked_ancestor_cannot_reach_outside_the_repo(self, tmp_path):
         """The escape both containment guards were written to prevent.
@@ -662,20 +650,18 @@ class TestTheLiteralPathRescue:
         assert "symlinked directory linked/" in err
         assert "check spelling" not in err
 
-    def test_the_size_ceiling_reports_itself(self, tmp_path, capsys, monkeypatch):
+    def test_the_size_ceiling_reports_itself(self, big_repo, capsys, monkeypatch):
         """G3-inv: no silent caps. This one surfaced for a round as "matched
         no file - check spelling", which is three wrong causes and a fourth
         that says an exact path IS rescued past a size limit."""
         from neo import context_gatherer as cg
 
-        (tmp_path / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
-        (tmp_path / "artefact.bin").write_text("x" * 4096, encoding="utf-8")
-        monkeypatch.setattr(cg, "_PIN_RESCUE_MAX_BYTES", 1024)
+        monkeypatch.setattr(cg, "_PIN_RESCUE_MAX_BYTES", 600_000)
 
-        rels = _rels(_gather(tmp_path, includes=["artefact.bin"], exts=["py"]))
+        rels = _rels(_gather(big_repo, includes=["src/huge.py"]))
         err = capsys.readouterr().err
 
-        assert "artefact.bin" not in rels
+        assert "src/huge.py" not in rels
         assert "NOT admitted" in err and "--include ceiling" in err
         assert "check spelling" not in err
 

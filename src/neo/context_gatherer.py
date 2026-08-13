@@ -140,26 +140,81 @@ class GatherConfig:
 MAX_FILE_BYTES = 512_000
 
 
-def iter_paths(root: str, includes: list[str], excludes: list[str], exts: Optional[list[str]]) -> list[tuple[str, str, int]]:
-    """Walk `root` via the shared eligibility module, then apply `--include`.
+def base_paths(root: str) -> list[eligibility.EligiblePath]:
+    """The repository's indexable corpus: the shared walk, no per-call flags.
 
-    The walk, the ignore rules and the gitignore matcher all live in
-    `neo.eligibility` and are shared with the project index — there is no
-    second copy here to drift. What stays is the gatherer's own policy: the
-    512 KB ceiling, and `--include`, whose `fnmatch` dialect is a user-facing
-    CLI contract rather than a gitignore rule and is therefore applied after
-    eligibility rather than folded into it.
+    Split out from `iter_paths` because the persistent content index and one
+    invocation's candidate list are answers to different questions. The index
+    is a property of the REPOSITORY — it must survive a call that passed
+    `--exts py` without being pruned to Python and rebuilt on the next call
+    that did not. A call's candidates are a property of THAT CALL.
+
+    So the walk happens once, unfiltered by anything the caller typed, and
+    `--exts` / `--exclude` / `--include` are applied afterwards to the result.
+    That also keeps the two in lockstep by construction: a candidate is always
+    a subset of what was indexed, so a per-call flag can only ever narrow the
+    answer, never smuggle in a file the walker did not admit.
+
+    What stays here is the gatherer's own policy: the 512 KB ceiling. The
+    walk, the ignore rules and the gitignore matcher live in
+    `neo.eligibility`, shared with the project index — there is no second copy
+    here to drift.
     """
-    result = eligibility.walk_paths(
-        root,
-        extra_ignores=excludes,
-        exts=exts or None,
-        max_file_bytes=MAX_FILE_BYTES,
-    )
+    return eligibility.walk_paths(root, max_file_bytes=MAX_FILE_BYTES).paths
+
+
+def filter_candidates(
+    paths: list[eligibility.EligiblePath],
+    includes: list[str],
+    excludes: list[str],
+    exts: Optional[list[str]],
+) -> list[eligibility.EligiblePath]:
+    """Narrow the corpus to what this invocation's flags admit.
+
+    `--exclude` is evaluated with `eligibility.should_ignore`, the same
+    gitignore dialect the walk applies to its own patterns, so moving the
+    evaluation out of the walk did not change what a pattern means. `--include`
+    keeps its `fnmatch` dialect, which is a user-facing CLI contract rather
+    than a gitignore rule and was already applied after eligibility.
+
+    Two things this cannot reproduce, both cost rather than correctness, and
+    stated in full because the first draft of this note understated the second:
+
+    - The walk PRUNES an excluded directory instead of testing every file
+      beneath it, so a `--exclude` naming a directory no longer saves the cost
+      of descending into it. It still excludes every file under it —
+      `should_ignore` matches a non-final path component — and the directories
+      that make pruning matter (`node_modules`, `.worktrees`, build output)
+      are in the shared default list, which the walk still prunes.
+    - A file this function drops is still INDEXED: the content index is
+      refreshed from the unfiltered walk, so an `--exts py` run reads,
+      tokenizes and stores the whole repository. That is the deliberate trade —
+      the index is a property of the repository, and pruning it to one call's
+      flags would make the next call rebuild — but it means `--exclude` does
+      not stop a file being read, only being ranked and delivered.
+    """
+    ext_set = eligibility.normalize_exts(exts) if exts else None
+    out: list[eligibility.EligiblePath] = []
+    for entry in paths:
+        if excludes and eligibility.should_ignore(entry.rel_path, list(excludes)):
+            continue
+        if ext_set is not None:
+            ext = os.path.splitext(entry.rel_path)[1].lstrip('.').lower()
+            if ext not in ext_set:
+                continue
+        if includes and not any(
+            fnmatch.fnmatch(entry.rel_path, g) for g in includes
+        ):
+            continue
+        out.append(entry)
+    return out
+
+
+def iter_paths(root: str, includes: list[str], excludes: list[str], exts: Optional[list[str]]) -> list[tuple[str, str, int]]:
+    """`(abs_path, rel_path, size)` for everything this call admits."""
     return [
         (entry.path, entry.rel_path, entry.size)
-        for entry in result.paths
-        if not includes or any(fnmatch.fnmatch(entry.rel_path, g) for g in includes)
+        for entry in filter_candidates(base_paths(root), includes, excludes, exts)
     ]
 
 
@@ -1181,15 +1236,30 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
 
     parser_cache: dict = {}
 
-    # Discover candidates. `--include` is deliberately NOT passed to the walk:
-    # under standing ruling 1 it asserts inputs rather than narrowing the
-    # search, so the scan keeps running over everything eligible and the named
-    # files are pinned separately below.
-    candidates = iter_paths(root, [], config.excludes, config.exts)
+    # Discover candidates. ONE walk: the corpus the persistent content index
+    # maintains, then this call's flags applied to it — except `--include`,
+    # which is deliberately NOT among them. Under standing ruling 1 it asserts
+    # inputs rather than narrowing the search, so the scan keeps running over
+    # everything else eligible and the named files are pinned separately.
+    eligible = base_paths(root)
+    admitted = filter_candidates(eligible, [], config.excludes, config.exts)
+    candidates = [(e.path, e.rel_path, e.size) for e in admitted]
+
+    # The pin pool is the same corpus minus `--exclude`, but WITHOUT `--exts`.
+    # `--exts` narrows the search and `--include` asserts the inputs, so an
+    # exactly-named file overrides it; `.gitignore` (applied by the walk) and
+    # `--exclude` are not overridden, because G1-inv is a hard invariant and
+    # trading a reported absence for an unreported presence is the worse
+    # failure. Since #209 split the unfiltered corpus out, that distinction is
+    # structural here rather than something the rescue has to reconstruct.
+    pin_pool = [
+        (e.path, e.rel_path, e.size)
+        for e in filter_candidates(eligible, [], config.excludes, None)
+    ]
 
     # Pins first, so they own their bytes before ranking spends any.
     include_matches, include_misses, include_refused = resolve_includes(
-        candidates, config.includes, root, config.excludes
+        pin_pool, config.includes, root, config.excludes
     )
     pin_report = pin_included_files(include_matches, config.max_bytes)
     pinned = pin_report.files
@@ -1221,13 +1291,24 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # rot starting.
     demote_tests = not prompt_targets_tests(config.prompt)
 
-    # Read the files. This is the change: selection used to happen on the path
-    # string and the byte count alone, with content first opened afterwards to
-    # chunk whatever had already been chosen.
-    from neo.file_retrieval import build_index, normalize
+    # Content relevance. Selection used to happen on the path string and the
+    # byte count alone, with content first opened afterwards to chunk whatever
+    # had already been chosen; #194 made it BM25 over file content, and this
+    # is where that stopped being re-derived from scratch on every call. The
+    # index lives in the repository's `.neo/`, is brought level with the walk
+    # above, and re-reads only what moved.
+    from neo.file_retrieval import normalize
+    from neo.index.content_index import ContentIndex
 
-    file_index = build_index(candidates)
-    relevance = normalize(file_index.scores(config.prompt)) if file_index else {}
+    relevance: dict[str, float] = {}
+    if eligible:
+        with ContentIndex(root) as content_index:
+            content_index.refresh(eligible)
+            relevance = normalize(
+                content_index.scores(
+                    config.prompt, [entry.rel_path for entry in admitted]
+                )
+            )
     if relevance:
         progress.note(f"Content relevance: {len(relevance)} files match the prompt")
 

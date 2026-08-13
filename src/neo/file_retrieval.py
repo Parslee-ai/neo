@@ -172,11 +172,22 @@ def _read(path: str, limit: int = MAX_INDEXED_CHARS) -> str:
 
 
 class FileIndex:
-    """BM25 over candidate file content, built once per gather.
+    """BM25 over candidate file content, built in memory for one gather.
 
-    Rebuilt per invocation rather than cached. The gatherer already reads every
-    file it selects, and a cache keyed on content would need invalidation that
-    a one-shot CLI cannot amortize. Measure before adding one.
+    **No longer the gatherer's normal path.** This class rebuilt the whole
+    corpus on every invocation, which was the honest first cut and then became
+    the dominant cost of a Neo call: ~60 s wall and ~1.8 GB peak RSS on
+    m365dotnet's 4,272 files, all of it re-deriving something the previous
+    call had already derived (#195). `neo.index.content_index` persists the
+    same postings in the repository's `.neo/` and re-reads only what changed.
+
+    It stays because the persistent store can be unavailable — a read-only
+    checkout, a full disk, a peer process holding the write lock — and a slow
+    correct ranking is a better answer than an empty one, which a caller
+    cannot tell apart from "your prompt matches nothing". `ContentIndex`
+    falls back to this and says so. It is also the reference implementation
+    the parity test scores against, which is why the document construction
+    lives in one expression that both paths use.
     """
 
     __slots__ = ("paths", "_bm25")

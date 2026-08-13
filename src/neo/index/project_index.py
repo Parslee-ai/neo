@@ -29,6 +29,7 @@ from typing import Optional, List, Dict, Tuple, Any
 import numpy as np
 
 from neo.eligibility import file_content_hash
+from neo.index import freshness
 from neo.index.language_parser import TreeSitterParser
 
 # Import FAISS for fast similarity search
@@ -724,6 +725,17 @@ class ProjectIndex:
         """
         Check if index is stale (files have changed).
 
+        The comparison itself lives in `index.freshness`, shared with the
+        persistent content index next door. Two on-disk indexes answering
+        "what changed since I last looked?" with two implementations is how
+        they end up disagreeing about it; the storage stays separate because
+        they hold different artifacts, the verdict does not.
+
+        This catalog persists hashes only — no size, no mtime — so the shared
+        comparison has no cheap pre-filter to apply here and hashes every
+        tracked file, exactly as this method always did. Claiming a stamp it
+        never recorded would make a changed file look unchanged.
+
         Returns:
             (is_stale, staleness_ratio, changed_files)
         """
@@ -735,20 +747,29 @@ class ProjectIndex:
         if current_commit != self.snapshot.commit_hash:
             logger.info(f"Commit changed: {self.snapshot.commit_hash[:7]} -> {current_commit[:7]}")
 
-        # Check file hashes
-        changed_files = []
-        for rel_path, old_hash in self.snapshot.file_hashes.items():
-            file_path = self.repo_root / rel_path
-            if not file_path.exists():
-                changed_files.append(rel_path)
-                continue
-
-            new_hash = self._compute_file_hash(file_path)
-            if new_hash != old_hash:
-                changed_files.append(rel_path)
+        tracked = self.snapshot.file_hashes
+        current = [
+            freshness.Candidate(
+                abs_path=str(self.repo_root / rel_path),
+                rel_path=rel_path,
+                size=freshness.UNRECORDED,
+                mtime_ns=freshness.UNRECORDED,
+            )
+            for rel_path in tracked
+            if (self.repo_root / rel_path).exists()
+        ]
+        moved, gone = freshness.stale_paths(
+            freshness.stamps_from_hashes(tracked),
+            current,
+            self._compute_file_hash,
+        )
+        # Reported in the order the snapshot tracks them, so two calls on an
+        # unchanged tree cannot disagree about the list.
+        stale = set(moved) | set(gone)
+        changed_files = [rel_path for rel_path in tracked if rel_path in stale]
 
         # Calculate staleness ratio
-        total_files = len(self.snapshot.file_hashes)
+        total_files = len(tracked)
         staleness_ratio = len(changed_files) / total_files if total_files > 0 else 0.0
         is_stale = staleness_ratio > STALENESS_THRESHOLD
 
@@ -1010,7 +1031,7 @@ class ProjectIndex:
 
         logger.info(f"Built FAISS index with {self.faiss_index.ntotal} vectors (dim={dim})")
 
-    def _compute_file_hash(self, file_path: Path) -> str:
+    def _compute_file_hash(self, file_path) -> str:
         """SHA-256 of file contents, via the shared dedup primitive.
 
         Kept as a method because it is the seam `_select_files` hashes
