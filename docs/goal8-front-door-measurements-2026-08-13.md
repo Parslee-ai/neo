@@ -20,6 +20,34 @@ export neo_worktree=$platform_root/neo/.worktrees/g_msr9uzf2_114f50-unified-stor
 export main_tree=$platform_root/neo/.worktrees/g_msr9uzf2_114f50-main-baseline
 ```
 
+## Measurement conditions, disclosed
+
+The repositories under test are separate from the source trees under test: `--repo`
+says where cases are mined and files are read, `--tree` says which ranker executes.
+Both arms of every comparison share `--repo`, so anything below is inherited equally
+and cannot produce a delta — but it does bound what the ABSOLUTE numbers describe.
+
+| repo | HEAD at measurement | working tree |
+|---|---|---|
+| neo | `5bbee46` (behind `origin/main` = `d5adcbc`) | 1 modified + 1 staged file, unrelated in-flight work, timestamped 20 h before the first run and unchanged throughout |
+| aieweb | `26fff07e` | clean |
+| m365dotnet | `61dc4a17` | clean |
+
+The two flagship HEADs are the ones Goal 1's baseline doc records, so these figures
+sit on the same corpus as the rest of the plan. The neo checkout is *not* at the
+commit whose ranker the `main` arm runs — `repo_head` and `tree_head` are stamped
+separately in every JSON for exactly this reason, and the neo table below reads "the
+d5adcbc ranker against the 5bbee46 corpus", both arms alike.
+
+Unlike Goal 6's m365dotnet run, no tree moved mid-sweep: the neo modifications
+predate the first arm by 20 hours and both flagships were clean.
+
+The stage-4 experiment further required building `.neo/index.json` in the neo
+checkout. It was **removed after measurement**, restoring the directory to the
+`content_index.sqlite3` + `walk_cache.json` it held before — leaving a tests-only
+catalog in place would have re-ranked every subsequent real invocation in that repo,
+on both `main` and this branch, for as long as #213 is open.
+
 ---
 
 ## Headline
