@@ -86,7 +86,7 @@ numbers did, and what is deliberately left open.
 | **5. One walker** | [#208](https://github.com/Parslee-ai/neo/pull/208) | `neo/eligibility.py` — one walk for gatherer, index and arch scan; G4-inv structural + differential proof |
 | **6. Persistent content index** | [#209](https://github.com/Parslee-ai/neo/pull/209) | closes #195 — BM25 moves into the on-disk store |
 | **7. Auto-freshness** | [#212](https://github.com/Parslee-ai/neo/pull/212) | closes #210 — the eligibility walk persists; `--index` becomes optional |
-| **8. One front door** | [#214](https://github.com/Parslee-ai/neo/pull/214) | one pipeline, four stages; the `cli.py` gather fork and `gather_context_semantic` deleted |
+| **8. One front door** | [#214](https://github.com/Parslee-ai/neo/pull/214) | one pipeline, four stages; the `cli.py` gather fork and the second gather function deleted |
 | **9. Lane retirement** | *this PR* | the two-lane vocabulary retired from code and docs; `tests/test_lane_retirement.py` guards it; release v0.46.0 |
 | **10. Release gate** | [#202](https://github.com/Parslee-ai/neo/pull/202) | G5-inv — per-language LLM round trip gates the release, invariant battery gates every PR |
 
