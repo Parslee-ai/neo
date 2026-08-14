@@ -36,6 +36,46 @@ MIN_EMBEDDING_SUCCESS_RATE = 0.8  # Require 80% success to prevent mass data cor
 VALID_EMBEDDING_DIMENSIONS = {384, 768, 1536}  # BGE-small, Jina-v2, OpenAI
 
 
+def _describe_contribution_gap(facts: list) -> str:
+    """Name the contribution gate(s) that actually hold these facts back.
+
+    Every caller has already established that none of `facts` is
+    contributable, so at least one gate is short and the result is never
+    empty. Only the short ones are named: quoting "need 0.8 confidence + 3
+    successes" at a fact sitting at 1.00 confidence points the operator at a
+    threshold no amount of learning would change, when the successes counter
+    is the only thing that has stalled.
+    """
+    from neo.memory.store import (
+        CONTRIBUTION_MIN_CONFIDENCE,
+        CONTRIBUTION_MIN_SUCCESSES,
+    )
+
+    conf_short = [f for f in facts
+                  if f.metadata.confidence < CONTRIBUTION_MIN_CONFIDENCE]
+    succ_short = [f for f in facts
+                  if f.metadata.success_count < CONTRIBUTION_MIN_SUCCESSES]
+
+    parts = []
+    if conf_short:
+        best = max(f.metadata.confidence for f in conf_short)
+        parts.append(
+            f"{len(conf_short)} short on confidence "
+            f"(best {best:.2f} of {CONTRIBUTION_MIN_CONFIDENCE})"
+        )
+    if succ_short:
+        best = max(f.metadata.success_count for f in succ_short)
+        parts.append(
+            f"{len(succ_short)} short on successes "
+            f"(best {best} of {CONTRIBUTION_MIN_SUCCESSES})"
+        )
+    if not parts:
+        # Unreachable via the status banner, but a caller that passes an
+        # already-contributable fact should not get a dangling clause.
+        return "no gate short"
+    return "; ".join(parts)
+
+
 def show_version(codebase_root: Optional[str] = None):
     """Show Neo's current state and journey progress."""
     from neo.config import NeoConfig
@@ -134,18 +174,24 @@ def show_version(codebase_root: Optional[str] = None):
             print(f"\n\u2728 {len(contributable)} pattern(s) ready to share with the community")
             print("   Run: neo contribute")
         else:
-            # Show progress toward contribution
-            valid = [f for f in entries if getattr(f, 'is_valid', True)]
-            near = [f for f in valid
-                    if hasattr(f, 'metadata')
-                    and f.metadata.confidence >= 0.6
+            # Show progress toward contribution. Report only the gate that is
+            # actually short: naming a threshold a fact already clears sends the
+            # operator to a knob that would change nothing.
+            valid = [f for f in entries
+                     if getattr(f, 'is_valid', True) and hasattr(f, 'metadata')]
+            candidates = [f for f in valid if memory.is_contribution_candidate(f)]
+            near = [f for f in candidates
+                    if f.metadata.confidence >= 0.6
                     and f.metadata.success_count >= 1]
             if near:
-                print(f"\n\u26a1 {len(near)} pattern(s) approaching contribution (need 0.8 confidence + 3 successes)")
+                print(f"\n\u26a1 {len(near)} pattern(s) approaching contribution: "
+                      f"{_describe_contribution_gap(near)}")
+            elif candidates:
+                print(f"\n\u26a1 {len(candidates)} pattern(s), none yet contributable: "
+                      f"{_describe_contribution_gap(candidates)}")
             elif valid:
-                best_conf = max((f.metadata.confidence for f in valid if hasattr(f, 'metadata')), default=0)
-                best_succ = max((f.metadata.success_count for f in valid if hasattr(f, 'metadata')), default=0)
-                print(f"\n\u26a1 {len(valid)} pattern(s), none yet contributable (best: {best_conf:.0%} confidence, {best_succ} successes — need 0.8 + 3)")
+                print(f"\n\u26a1 {len(valid)} pattern(s), none eligible to contribute "
+                      "(all are constraints, or came from the seed/community feeds)")
             else:
                 print("\n\u26a1 No patterns yet. Use neo to build patterns — validated ones can be shared via: neo contribute")
     print()
@@ -154,7 +200,11 @@ def show_version(codebase_root: Optional[str] = None):
 def handle_contribute(args):
     """Export high-quality patterns and open a GitHub PR draft."""
     from neo.config import NeoConfig
-    from neo.memory.store import FactStore
+    from neo.memory.store import (
+        CONTRIBUTION_MIN_CONFIDENCE,
+        CONTRIBUTION_MIN_SUCCESSES,
+        FactStore,
+    )
 
     codebase_root = getattr(args, 'cwd', None) or os.getcwd()
     config = NeoConfig.load()
@@ -163,7 +213,14 @@ def handle_contribute(args):
     contributable = memory.find_contributable()
     if not contributable:
         print("No patterns ready to contribute yet.")
-        print("Patterns qualify when they reach high confidence (>0.8) with 3+ successes.")
+        print(
+            f"Patterns qualify at {CONTRIBUTION_MIN_CONFIDENCE} confidence "
+            f"with {CONTRIBUTION_MIN_SUCCESSES}+ successes."
+        )
+        candidates = [f for f in memory.entries
+                      if memory.is_contribution_candidate(f)]
+        if candidates:
+            print(_describe_contribution_gap(candidates))
         return
 
     print(f"Found {len(contributable)} pattern(s) ready to contribute:\n")

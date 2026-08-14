@@ -30,6 +30,10 @@ def test_show_version_does_not_eager_initialize_fact_store(capsys):
         def find_contributable(self):
             return []
 
+        @staticmethod
+        def is_contribution_candidate(fact):
+            return True
+
     with patch.object(NeoConfig, "load", return_value=NeoConfig()), \
          patch("neo.memory.store.FactStore", FakeFactStore), \
          patch("neo.car_discovery.discover_car", side_effect=RuntimeError("skip car")):
@@ -37,6 +41,39 @@ def test_show_version_does_not_eager_initialize_fact_store(capsys):
 
     assert calls["eager_init"] is False
     assert "neo " in capsys.readouterr().out
+
+
+def test_contribution_gap_names_only_the_gate_that_binds():
+    """A fact already at full confidence must not be told to raise confidence.
+
+    The status banner used to print a fixed "need 0.8 confidence + 3
+    successes" for every stalled fact, which points the operator at a
+    threshold that is already cleared — the same defect this repo bans for
+    file-selection caps ("never blame a cap for an absence it did not
+    cause").
+    """
+    from neo.memory.models import Fact, FactMetadata, FactKind, FactScope
+    from neo.subcommands import _describe_contribution_gap
+
+    def fact(confidence, successes):
+        return Fact(
+            subject="s", body="b", kind=FactKind.PATTERN, scope=FactScope.PROJECT,
+            metadata=FactMetadata(confidence=confidence, success_count=successes),
+        )
+
+    successes_only = _describe_contribution_gap([fact(1.0, 2), fact(1.0, 1)])
+    assert "confidence" not in successes_only
+    assert "2 short on successes (best 2 of 3)" == successes_only
+
+    confidence_only = _describe_contribution_gap([fact(0.7, 5)])
+    assert "success" not in confidence_only
+    assert "1 short on confidence (best 0.70 of 0.8)" == confidence_only
+
+    both = _describe_contribution_gap([fact(0.7, 5), fact(1.0, 1)])
+    assert "short on confidence" in both and "short on successes" in both
+
+    # Never emits a dangling clause for a fact that clears both gates.
+    assert _describe_contribution_gap([fact(1.0, 9)]) == "no gate short"
 
 
 def test_citation_stats_aggregates_per_signal(capsys):

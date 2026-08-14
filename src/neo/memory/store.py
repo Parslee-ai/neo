@@ -58,6 +58,16 @@ EMBEDDING_CACHE_MAX_SIZE = 500
 MAX_TEXT_LENGTH = 32000
 SUPERSESSION_THRESHOLD = 0.85  # Cosine similarity threshold for supersession
 
+# Community contribution gates. Single-sourced because the status banner has to
+# report which of them is short, and a banner that quotes its own copy of the
+# numbers will eventually quote the wrong ones.
+CONTRIBUTION_MIN_CONFIDENCE = 0.8
+CONTRIBUTION_MIN_SUCCESSES = 3
+# Provenance that permanently disqualifies a fact from being contributed.
+CONTRIBUTION_EXCLUDED_TAGS = frozenset(
+    {"seed", "community", "constraint", "history", "git-commit"}
+)
+
 # How strong each outcome is as evidence, for deciding which one an episode
 # reports as its final_outcome when a single invocation produced several.
 # Same VALUES as the priority map in `OutcomeTracker._dedup_outcomes` (asserted
@@ -92,6 +102,26 @@ DEMOTION_CONFIDENCE_PENALTY = 0.1  # Confidence reduction per demotion
 DEMOTION_CONFIDENCE_FLOOR = 0.1    # Never demote below this
 PROTECTION_HIT_RATE = 0.3      # Success/access ratio for protection boost
 PROTECTION_BOOST = 0.05        # Confidence boost for consistently helpful facts
+
+# Ceiling on what the protection boost alone may buy, as a function of the
+# EVIDENCE behind a fact. `demote_unhelpful_facts` runs on every cold start, so
+# an unbounded `confidence + PROTECTION_BOOST` makes confidence a function of
+# how often the process restarted rather than of how often the fact was right.
+# Measured on a live store: of 6,613 valid facts the 93 with any success at all
+# averaged 0.968 confidence and 57 sat at exactly 1.00, several of them
+# throwaway drill prompts with a single success against 43 accesses. Verified
+# outcomes may still carry a fact above this line — only the restart-driven
+# ratchet is bounded.
+PROTECTION_CEILING_BASE = 0.6        # Confidence one success alone can justify...
+PROTECTION_CEILING_PER_SUCCESS = 0.1  # ...plus this per additional success
+PROTECTION_CEILING_MAX = 0.9         # Protection alone never certifies a fact
+
+# Confidence gained when an ALREADY-durable pattern is independently re-accepted.
+# Deliberately smaller than the +0.2 a linked suggestion earns: that one fact is
+# being re-verified, not newly established, and the mint cap
+# (`min(0.75, ...)`) means this is the only way a repeatedly-proven pattern ever
+# reaches the contribution bar.
+REACCEPTANCE_BOOST = 0.05
 
 # Independent outcome limits (second layer — outcomes.py caps at 5/session)
 MAX_INDEPENDENT_FACTS = 50     # Cap per project to prevent bloat from active repos
@@ -1205,7 +1235,16 @@ class FactStore:
                     if deterministic_failure:
                         candidate.status = "rejected_by_verification"
                     else:
-                        candidate.status = "supported_once"
+                        # "durable" is terminal and must not be walked back.
+                        # `detect_implicit_feedback` calls this method a SECOND
+                        # time right after a successful promotion (to record the
+                        # mutation), and an unconditional assignment here reset
+                        # the status the promotion had just written — leaving
+                        # every promoted candidate reading "supported_once"
+                        # beside a populated promoted_fact_id, and
+                        # `learning-stats` under-reporting durable promotions.
+                        if candidate.status != "durable":
+                            candidate.status = "supported_once"
                         # Invariant: promoted_fact_id is written ONLY by the
                         # promotion path (_promote_repeatedly_supported_candidate).
                         # Setting it here to the outcome's mutation-target fact_id
@@ -1310,6 +1349,44 @@ class FactStore:
         if not base:
             return ""
         return f"{base}{FactStore._SIG_SEP}{fingerprint}"
+
+    def _find_valid_fact_by_signature(
+        self, target_signature: str, scope: Optional[FactScope] = None
+    ) -> Optional[Fact]:
+        """The live fact already minted for an episode correlation signature.
+
+        Matches the FROZEN ``canonical_signature`` only, never a recomputed
+        one — that field is written exclusively by the two promotion paths, so
+        a hit means "this exact lesson has already been promoted" and can
+        never collide with the separate pre-write dedup signature (which adds
+        kind+scope and the body, and is never stored on the fact).
+        """
+        if not target_signature:
+            return None
+        for fact in self._facts:
+            if not fact.is_valid:
+                continue
+            if scope is not None and fact.scope != scope:
+                continue
+            if fact.canonical_signature == target_signature:
+                return fact
+        return None
+
+    def find_durable_fact_for_candidate(self, candidate_subject: str) -> Optional[Fact]:
+        """The durable PROJECT fact this candidate's lesson was promoted to.
+
+        This is what re-links a suggestion to the knowledge it came from. The
+        engine stopped minting a fact per suggestion when episodes replaced
+        immediate fact-writing, which left ``suggestion_fact_ids`` empty on
+        every run and silently killed every downstream reinforcement path. A
+        candidate whose lesson is ALREADY durable has a legitimate fact to
+        point at, and pointing at it is what lets a re-acceptance count.
+        """
+        if not candidate_subject:
+            return None
+        return self._find_valid_fact_by_signature(
+            self._episode_signature(candidate_subject), scope=FactScope.PROJECT
+        )
 
     @staticmethod
     def _global_signature(subject: str) -> str:
@@ -1645,6 +1722,46 @@ class FactStore:
                     )
                     return None
 
+            # Already promoted: reinforce the fact we have rather than mint a
+            # near-twin. `add_fact`'s pre-write dedup can't catch this — its
+            # signature includes the BODY, which is one episode's run-varying
+            # LM prose, so a third acceptance worded differently writes a
+            # SECOND durable fact for the same lesson. `collapse_duplicate_
+            # signature_facts` heals that afterwards, but it keeps the richest
+            # by supporting-episode count, which is the NEW fact at its freshly
+            # capped mint confidence — discarding whatever the original had
+            # earned. Reinforcing in place keeps the accumulated evidence and
+            # is what lets a repeatedly re-verified pattern climb past the mint
+            # ceiling at all.
+            existing_fact = self._find_valid_fact_by_signature(
+                target_signature, scope=FactScope.PROJECT
+            )
+            if existing_fact is not None:
+                existing_fact.supporting_episode_ids = list(dict.fromkeys(
+                    existing_fact.supporting_episode_ids + supporting_ids
+                ))
+                existing_fact.metadata.success_count = max(
+                    existing_fact.metadata.success_count,
+                    len(existing_fact.supporting_episode_ids),
+                )
+                existing_fact.metadata.confidence = min(
+                    1.0, existing_fact.metadata.confidence + REACCEPTANCE_BOOST
+                )
+                update_effectiveness(existing_fact, outcome="better")
+                existing_fact.metadata.last_accessed = time.time()
+                self.save()
+                logger.info(
+                    "Reinforced already-promoted pattern %s "
+                    "(success_count=%d, confidence=%.2f)",
+                    existing_fact.id,
+                    existing_fact.metadata.success_count,
+                    existing_fact.metadata.confidence,
+                )
+                self._mark_candidates_promoted(
+                    episode_store, supporting_ids, target_signature, existing_fact.id
+                )
+                return existing_fact
+
             fact = self.add_fact(
                 # Strip the [fp:<hash>] correlation qualifier from the stored
                 # subject — it's a key ingredient, not user-facing text. The
@@ -1676,23 +1793,40 @@ class FactStore:
             fact.canonical_signature = target_signature  # frozen for rollback-resolve
             self.save()
 
-            for episode_id in supporting_ids:
-                episode = episode_store.load(episode_id)
-                if episode is None:
-                    continue
-                changed = False
-                for candidate in episode.memory_candidates:
-                    signature = self._episode_signature(candidate.subject)
-                    if signature == target_signature:
-                        candidate.status = "durable"
-                        candidate.promoted_fact_id = fact.id
-                        changed = True
-                if changed:
-                    episode_store.save(episode)
+            self._mark_candidates_promoted(
+                episode_store, supporting_ids, target_signature, fact.id
+            )
             return fact
         except Exception as exc:
             logger.warning("Episode candidate promotion failed: %s", exc)
             return None
+
+    def _mark_candidates_promoted(
+        self,
+        episode_store,
+        supporting_ids: list[str],
+        target_signature: str,
+        fact_id: str,
+    ) -> None:
+        """Point every supporting candidate at the fact carrying their lesson.
+
+        Shared by the first promotion and by reinforcement of an
+        already-promoted signature, so a re-verified candidate records the
+        same `promoted_fact_id` as the episodes that minted it. Without that,
+        a later contradiction could not resolve back to the right fact.
+        """
+        for episode_id in supporting_ids:
+            episode = episode_store.load(episode_id)
+            if episode is None:
+                continue
+            changed = False
+            for candidate in episode.memory_candidates:
+                if self._episode_signature(candidate.subject) == target_signature:
+                    candidate.status = "durable"
+                    candidate.promoted_fact_id = fact_id
+                    changed = True
+            if changed:
+                episode_store.save(episode)
 
     def _cross_project_evidence(self, target_signature: str, episodes_root: "Path"):
         """Collect (supporting, project_ids, episode_ids) for one canonical
@@ -2465,28 +2599,41 @@ class FactStore:
         """Backward-compatible access to all facts."""
         return self._facts
 
-    def find_contributable(self, min_confidence: float = 0.8,
-                           min_successes: int = 3) -> list[Fact]:
+    @staticmethod
+    def is_contribution_candidate(fact: Fact) -> bool:
+        """Whether a fact could ever be contributed, ignoring the quality gates.
+
+        Kind and provenance are permanent disqualifiers: a constraint is
+        project-specific and a seed/community fact came FROM the feed. The
+        confidence/success thresholds are the only part a fact can grow out
+        of, so they are asked separately — callers reporting *why* a fact is
+        not contributable must not name a gate that no amount of learning
+        would clear.
+        """
+        if not fact.is_valid:
+            return False
+        if fact.kind == FactKind.CONSTRAINT:
+            return False
+        if CONTRIBUTION_EXCLUDED_TAGS & set(fact.tags):
+            return False
+        return True
+
+    def find_contributable(
+        self,
+        min_confidence: float = CONTRIBUTION_MIN_CONFIDENCE,
+        min_successes: int = CONTRIBUTION_MIN_SUCCESSES,
+    ) -> list[Fact]:
         """Find high-quality facts worth contributing to the community feed.
 
         Criteria: high confidence, real success validation, not already
         from seed/community feeds, not constraints (project-specific).
         """
-        auto_tags = {"seed", "community", "constraint", "history", "git-commit"}
-        results = []
-        for f in self._facts:
-            if not f.is_valid:
-                continue
-            if f.kind == FactKind.CONSTRAINT:
-                continue
-            if f.metadata.confidence < min_confidence:
-                continue
-            if f.metadata.success_count < min_successes:
-                continue
-            if auto_tags & set(f.tags):
-                continue
-            results.append(f)
-        return results
+        return [
+            f for f in self._facts
+            if self.is_contribution_candidate(f)
+            and f.metadata.confidence >= min_confidence
+            and f.metadata.success_count >= min_successes
+        ]
 
     # ------------------------------------------------------------------ #
     # Scope capacity enforcement
@@ -2897,7 +3044,10 @@ class FactStore:
         - access_count 5-9, success 0: reduce confidence by 0.1 (floor 0.1)
         - access_count >= 10, success 0: mark invalid (actively unhelpful)
 
-        Facts with hit rate > 30% get a small confidence boost (protection).
+        Facts with hit rate > 30% get a small confidence boost (protection),
+        bounded by an evidence-derived ceiling — this runs on every cold start,
+        so an unbounded boost would compound per process start rather than per
+        verified success.
 
         Returns the total number of facts affected (demoted + pruned + boosted).
         """
@@ -2934,9 +3084,20 @@ class FactStore:
                     )
                     affected += 1
             elif success > 0 and (success / access) >= PROTECTION_HIT_RATE:
-                # Protect consistently helpful facts
-                new_conf = min(1.0, fact.metadata.confidence + PROTECTION_BOOST)
-                if new_conf != fact.metadata.confidence:
+                # Protect consistently helpful facts, but only up to what the
+                # evidence supports. This runs on every cold start, so an
+                # unbounded boost compounds per PROCESS START — a fact with one
+                # success reached 1.00 confidence purely by being loaded often
+                # enough, and the store is full of them. The ceiling makes the
+                # boost converge on a value justified by success_count instead.
+                ceiling = min(
+                    PROTECTION_CEILING_MAX,
+                    PROTECTION_CEILING_BASE + PROTECTION_CEILING_PER_SUCCESS * success,
+                )
+                new_conf = min(1.0, ceiling, fact.metadata.confidence + PROTECTION_BOOST)
+                # Strictly greater: a fact already above its ceiling was carried
+                # there by verified outcomes, which protection must never undo.
+                if new_conf > fact.metadata.confidence:
                     fact.metadata.confidence = new_conf
                     affected += 1
 
