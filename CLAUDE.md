@@ -502,6 +502,21 @@
   and the way to undo it is one `failures.extend(performance_notes)` —
   `test_no_latency_text_leaks_into_acceptance_failures` exists for exactly that edit,
   since the two obvious tests either side of it stay green when it happens (#183).
+  **The gate came back once already, as a TEST rather than a threshold.**
+  `test_within_budget_run_reports_clean` called `run_learning_evaluation` against
+  the REAL 500ms budget and asserted `performance_within_budget is True` — i.e. it
+  asserted the ambient machine is fast, which is the identical coin-flip one level
+  up. It failed CI at **534.80ms** on a commit measured at ~50ms locally (three runs
+  each on branch and main, pinned `PYTHONPATH`, ≤1ms apart — so not the change under
+  review), with `accepted=True`, `acceptance_failures=[]`, all twelve scenarios
+  passing and every safety rate 0.0. A correctness PR was red for a reason that had
+  nothing to do with correctness, which is the whole defect #183 named. Every OTHER
+  test in that class is deterministic because `_over_budget` forces
+  `latency_ms_max = 0.001`, something no machine can meet; the clean-report case now
+  goes through `_within_budget` (1e6 ms), something no machine can exceed. **Rule:
+  no test in this class may depend on how fast the machine running it is** — pin the
+  budget in whichever direction the case needs, and never mock the clock (a patched
+  timer tests the patch).
 - A2UI memory inspector (`neo.a2ui`): a per-project A2UI v0.9 surface
   (`neo-<project_id8>`) registered with the running `car-server` daemon so any
   conformant renderer (CarHost.app, future webviews) can inspect neo's state

@@ -100,8 +100,24 @@ class TestLatencyIsNotACorrectnessGate:
 
         assert not any("latency" in failure for failure in report.acceptance_failures)
 
+    def _within_budget(self, tmp_path, name):
+        """Run against a budget no machine can exceed.
+
+        Mirrors `_over_budget` in the other direction and for the same reason.
+        Asserting that the AMBIENT machine comes in under the real 500ms budget
+        is the coin-flip this class exists to document: CI measured 534.80ms on
+        a commit that runs at ~50ms locally, with all twelve scenarios passing
+        and every safety rate at zero. That is the same 11x shared-runner
+        spread that moved latency out of `accepted` in the first place —
+        reappearing one level up, as a flaky test that fails a correctness PR
+        for a reason that has nothing to do with correctness.
+        """
+        corpus = load_corpus()
+        corpus["performance_budget"]["latency_ms_max"] = 1_000_000.0
+        return LearningLoopEvaluator(corpus, workspace=tmp_path / name).run()
+
     def test_within_budget_run_reports_clean(self, tmp_path):
-        report = run_learning_evaluation(workspace=tmp_path / "fast")
+        report = self._within_budget(tmp_path, "fast")
 
         assert report.performance_within_budget is True
         assert report.performance_notes == []
