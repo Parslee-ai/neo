@@ -376,6 +376,84 @@
   when no link is found; UNVERIFIED never creates a REVIEW. INDEPENDENT writes a
   REVIEW at confidence 0.2. **Footgun**: if you add a new `OutcomeType`, update
   both `outcomes.py` and `store.detect_implicit_feedback`.
+- **"The linked original fact" means the DURABLE fact the suggestion re-applied,
+  and the link nearly died in silence.** `suggestion_fact_ids` (file_path →
+  fact_id) is the only input to the ACCEPTED reinforcement branch and to
+  `replay_linked_feedback`. It is built by `engine._build_suggestion_fact_ids`
+  from the fact `_store_reasoning` returns — and when episodes replaced
+  immediate fact-writing (`412a174`, 2026-07-18) that function started
+  returning `None` on **every** path (all three `return`s; the legacy branch
+  too). The builder returns `{}` for a `None` fact, so the map was
+  unconditionally empty from that commit on. Nothing raised: the ACCEPTED
+  branch just fell through to the candidate path, `reinforce_legacy_fact`
+  became unreachable, and `neo memory replay-feedback` — documented right here
+  as the repair command for a broken memory loop — became a no-op that reports
+  success. Measured on a live install: 51 sessions through 2026-06-19 carried
+  one link per suggestion, then 9 consecutive sessions from 2026-07-19 carried
+  zero, and **no fact's `success_count` moved again in 90 days** (`learning-stats`
+  reinforcements = 0). Across 6,613 valid facts in every project, **zero have
+  ever reached `success_count >= 3`**, so `find_contributable` has never once
+  returned a fact and `neo contribute` has never been reachable.
+  The fix does NOT restore per-suggestion fact minting — that is the unverified
+  flood `412a174` existed to stop. It resolves the link through the episode
+  candidate instead: `find_durable_fact_for_candidate(subject)` matches the
+  candidate's `_episode_signature` against the FROZEN `canonical_signature`,
+  which is written **only** by the two promotion paths, so a hit means "this
+  exact lesson is already durable" and this suggestion is an application of it.
+  A candidate with no durable fact yet contributes no link — its early
+  acceptances are evidence toward promotion, which the candidate path already
+  owns. **Footgun**: match the frozen field, never a recomputed signature, and
+  never let an empty target match the empty default — every unpromoted fact
+  would answer for every candidate.
+- **A re-accepted durable pattern is reinforced in place, not re-minted.**
+  `_promote_repeatedly_supported_candidate` looks for an existing valid PROJECT
+  fact at the target signature before calling `add_fact`, and on a hit folds in
+  the new supporting episodes, raises `success_count` to the support count and
+  adds `REACCEPTANCE_BOOST` (0.05). `add_fact`'s pre-write dedup cannot catch
+  this: its signature includes the BODY, which is one episode's run-varying LM
+  prose, so a third acceptance worded differently wrote a SECOND durable fact
+  for the same lesson. `collapse_duplicate_signature_facts` heals that after
+  the fact but keeps the richest by supporting-episode count — the NEW fact, at
+  its freshly capped mint confidence — silently discarding whatever the
+  original had earned. This is also the only way past the mint cap: promotion
+  mints at `min(0.75, 0.4 + 0.1·n)`, so without an in-place boost a
+  repeatedly-verified pattern could never reach the 0.8 contribution bar no
+  matter how many acceptances it collected.
+- **`durable` is a terminal candidate status.** `detect_implicit_feedback`
+  calls `_record_attributed_episode_outcome` a SECOND time right after a
+  successful promotion, to record the mutation. That method used to assign the
+  ACCEPTED status unconditionally, so it immediately walked the just-written
+  `durable` back to `supported_once` — leaving every promoted candidate reading
+  `supported_once` beside a populated `promoted_fact_id`, and `learning-stats`
+  under-reporting the one number it exists to report. Promotion is not the only
+  writer of that field, so the guard lives in the status loop, not the caller.
+- **The protection boost is bounded by evidence, because it runs per PROCESS
+  START.** `demote_unhelpful_facts` (cold-start chain) adds `PROTECTION_BOOST`
+  to any fact with `success_count > 0` and hit rate ≥ `PROTECTION_HIT_RATE`.
+  Unbounded, that compounds once per neo invocation, so confidence measured how
+  often the process started rather than how often the fact was right — measured
+  on a live store, the 93 facts with any success at all averaged **0.968**
+  confidence and 57 sat at exactly **1.00**, several of them throwaway drill
+  prompts holding a single success against 40-odd accesses. The boost now stops
+  at `min(PROTECTION_CEILING_MAX, PROTECTION_CEILING_BASE +
+  PROTECTION_CEILING_PER_SUCCESS · success_count)`. Verified outcomes may still
+  carry a fact above that line; the comparison is strictly `>` so protection can
+  never claw back confidence it did not grant. **This is why the contribution
+  banner had it backwards**: confidence was the half satisfied almost
+  accidentally, and successes the half nothing could move.
+- Community contribution gates are single-sourced in `store.py`
+  (`CONTRIBUTION_MIN_CONFIDENCE` / `CONTRIBUTION_MIN_SUCCESSES` /
+  `CONTRIBUTION_EXCLUDED_TAGS`), and eligibility is split in two:
+  `is_contribution_candidate` holds the PERMANENT disqualifiers (kind is
+  CONSTRAINT, or provenance is a seed/community/history feed), while the two
+  numeric thresholds are the only part a fact can grow out of. The split exists
+  so a caller reporting *why* a fact is not contributable can name only the gate
+  that binds — `subcommands._describe_contribution_gap`. The status banner used
+  to print a fixed "need 0.8 confidence + 3 successes" at facts already sitting
+  at 1.00, which is this repo's own rule about never blaming a cap for an
+  absence it did not cause, broken in the one line a user reads most. It also
+  filtered `near` differently from `find_contributable`, so it could advertise
+  facts that were never contributable at all.
 - Retrieval: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f
   + provenance_bonus`. `memory.models.rank_score` is the single source of truth — if you
   change the formula, audit `ContextAssembler._score_facts` too. Cosine is batched via
@@ -424,6 +502,21 @@
   and the way to undo it is one `failures.extend(performance_notes)` —
   `test_no_latency_text_leaks_into_acceptance_failures` exists for exactly that edit,
   since the two obvious tests either side of it stay green when it happens (#183).
+  **The gate came back once already, as a TEST rather than a threshold.**
+  `test_within_budget_run_reports_clean` called `run_learning_evaluation` against
+  the REAL 500ms budget and asserted `performance_within_budget is True` — i.e. it
+  asserted the ambient machine is fast, which is the identical coin-flip one level
+  up. It failed CI at **534.80ms** on a commit measured at ~50ms locally (three runs
+  each on branch and main, pinned `PYTHONPATH`, ≤1ms apart — so not the change under
+  review), with `accepted=True`, `acceptance_failures=[]`, all twelve scenarios
+  passing and every safety rate 0.0. A correctness PR was red for a reason that had
+  nothing to do with correctness, which is the whole defect #183 named. Every OTHER
+  test in that class is deterministic because `_over_budget` forces
+  `latency_ms_max = 0.001`, something no machine can meet; the clean-report case now
+  goes through `_within_budget` (1e6 ms), something no machine can exceed. **Rule:
+  no test in this class may depend on how fast the machine running it is** — pin the
+  budget in whichever direction the case needs, and never mock the clock (a patched
+  timer tests the patch).
 - A2UI memory inspector (`neo.a2ui`): a per-project A2UI v0.9 surface
   (`neo-<project_id8>`) registered with the running `car-server` daemon so any
   conformant renderer (CarHost.app, future webviews) can inspect neo's state

@@ -1112,6 +1112,92 @@ class TestOutcomeLinkage:
             store.detect_implicit_feedback({"prompt": "next"}, [])
         return episode_store
 
+    def test_third_acceptance_reinforces_instead_of_minting_a_twin(self, store):
+        """A re-verified lesson must grow the fact it already has.
+
+        `add_fact`'s pre-write dedup keys on subject+body, and the body is one
+        episode's run-varying LM prose — so a third acceptance worded
+        differently used to write a SECOND durable fact for the same lesson.
+        `collapse_duplicate_signature_facts` heals that afterwards but keeps
+        the richest by supporting-episode count, i.e. the NEW fact at its
+        freshly capped mint confidence, discarding what the original earned.
+        """
+        subject = "algorithm: dedupe a list preserving order [util.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "grow-0", subject, "Reasoning: use a seen set.")
+        self._accept_episode(store, "grow-1", subject, "Reasoning: track membership.")
+
+        promoted = [f for f in store.entries if "episode-derived" in f.tags]
+        assert len(promoted) == 1
+        fact = promoted[0]
+        minted_confidence = fact.metadata.confidence
+        assert fact.metadata.success_count == 2
+
+        self._accept_episode(store, "grow-2", subject, "Reasoning: worded a third way.")
+
+        still = [f for f in store.entries if "episode-derived" in f.tags and f.is_valid]
+        assert len(still) == 1, "a re-acceptance must not mint a near-twin"
+        assert still[0] is fact
+        assert fact.metadata.success_count == 3
+        assert fact.metadata.confidence > minted_confidence, (
+            "re-verification is the only way past the mint cap"
+        )
+
+    def test_promotion_status_is_not_walked_back_by_its_own_bookkeeping(self, store):
+        """`durable` must survive the record call that follows promotion.
+
+        `detect_implicit_feedback` records the mutation by calling
+        `_record_attributed_episode_outcome` a second time, and that method
+        assigns the ACCEPTED status unconditionally — so every promoted
+        candidate read `supported_once` beside a populated `promoted_fact_id`,
+        and `learning-stats` under-counted durable promotions.
+        """
+        from neo.memory.episodes import LearningEpisodeStore
+
+        subject = "algorithm: dedupe a list preserving order [util.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "term-0", subject, "Reasoning: a.")
+        self._accept_episode(store, "term-1", subject, "Reasoning: b.")
+
+        fact = [f for f in store.entries if "episode-derived" in f.tags][0]
+        episode_store = LearningEpisodeStore(store.project_id)
+        for ep_id in ("term-0", "term-1"):
+            candidate = episode_store.load(ep_id).memory_candidates[0]
+            assert candidate.status == "durable", (
+                f"{ep_id} reverted to {candidate.status} after promotion"
+            )
+            assert candidate.promoted_fact_id == fact.id
+
+    def test_reinforced_fact_records_the_new_supporting_episode(self, store):
+        """The third episode's candidate must point at the same fact."""
+        from neo.memory.episodes import LearningEpisodeStore
+
+        subject = "algorithm: dedupe a list preserving order [util.py] [fp:deadbeef1234]"
+        for i in range(3):
+            self._accept_episode(store, f"link-{i}", subject, f"Reasoning: v{i}.")
+
+        fact = [f for f in store.entries
+                if "episode-derived" in f.tags and f.is_valid][0]
+        assert set(fact.supporting_episode_ids) == {"link-0", "link-1", "link-2"}
+
+        episode_store = LearningEpisodeStore(store.project_id)
+        candidate = episode_store.load("link-2").memory_candidates[0]
+        assert candidate.status == "durable"
+        assert candidate.promoted_fact_id == fact.id
+
+    def test_reinforcement_cannot_resurrect_a_rolled_back_lesson(self, store):
+        """The rollback guard runs before the reuse branch, not after."""
+        subject = "algorithm: dedupe a list preserving order [util.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "roll-0", subject, "Reasoning: a.")
+        self._accept_episode(store, "roll-1", subject, "Reasoning: b.")
+
+        fact = [f for f in store.entries if "episode-derived" in f.tags][0]
+        fact.is_valid = False
+        fact.invalidation_reason = "repeated_attributed_contradiction"
+
+        self._accept_episode(store, "roll-2", subject, "Reasoning: c.")
+
+        assert [f for f in store.entries
+                if "episode-derived" in f.tags and f.is_valid] == []
+
     def test_body_drift_with_matching_fingerprint_promotes(self, store):
         """The live-drill regression: two independent accepted episodes of the
         SAME task whose bodies differ (run-varying LM prose) but whose subject +
@@ -3283,3 +3369,155 @@ class TestCrashEvidenceSupersession:
         for stale in ("error_type", "error_message", "traceback"):
             assert stale not in saved.outcome_details, (
                 f"{stale} outlived the crash it described")
+
+
+class TestProtectionCeiling:
+    """The protection boost must track evidence, not process restarts.
+
+    `demote_unhelpful_facts` runs on every cold start. An unbounded
+    `confidence + PROTECTION_BOOST` therefore compounds once per invocation of
+    neo, which is how a live store ended up with 57 facts at exactly 1.00
+    confidence — several of them throwaway drill prompts holding a single
+    success against 40-odd accesses.
+    """
+
+    @staticmethod
+    def _fact(confidence, success, access):
+        return Fact(
+            subject="helpful",
+            body="a fact that has paid off",
+            kind=FactKind.PATTERN,
+            scope=FactScope.PROJECT,
+            metadata=FactMetadata(
+                confidence=confidence,
+                access_count=access,
+                success_count=success,
+                created_at=time.time() - 10 * 86400,
+            ),
+        )
+
+    def test_boost_converges_instead_of_ratcheting_to_one(self, store):
+        """Repeated cold starts must not walk a one-success fact up to 1.00."""
+        fact = self._fact(confidence=0.5, success=2, access=5)
+        store._facts.append(fact)
+
+        for _ in range(50):  # 50 cold starts
+            store.demote_unhelpful_facts(save=False)
+
+        # Ceiling for 2 successes: 0.6 + 2 * 0.1 = 0.8
+        assert fact.metadata.confidence == pytest.approx(0.8)
+
+    def test_ceiling_rises_with_evidence(self, store):
+        """More verified successes justify a higher protected confidence."""
+        low = self._fact(confidence=0.5, success=2, access=5)
+        high = self._fact(confidence=0.5, success=6, access=10)
+        store._facts.extend([low, high])
+
+        for _ in range(50):
+            store.demote_unhelpful_facts(save=False)
+
+        assert low.metadata.confidence == pytest.approx(0.8)
+        assert high.metadata.confidence == pytest.approx(0.9)  # PROTECTION_CEILING_MAX
+        assert high.metadata.confidence > low.metadata.confidence
+
+    def test_never_lowers_a_fact_already_above_its_ceiling(self, store):
+        """Confidence earned by verified outcomes is not clawed back.
+
+        success/access must clear PROTECTION_HIT_RATE so this actually enters
+        the protection branch — at a lower hit rate the fact falls through
+        both branches untouched and the assertion would hold vacuously.
+        """
+        fact = self._fact(confidence=0.95, success=3, access=5)  # hit rate 0.6
+        store._facts.append(fact)
+
+        affected = store.demote_unhelpful_facts(save=False)
+
+        # Ceiling for 3 successes is 0.9, and the fact is already past it.
+        assert fact.metadata.confidence == pytest.approx(0.95)
+        assert affected == 0, "a no-op boost must not be reported as a change"
+
+    def test_boost_still_applies_below_the_ceiling(self, store):
+        """The ceiling bounds the ratchet; it does not disable protection."""
+        fact = self._fact(confidence=0.5, success=2, access=5)
+        store._facts.append(fact)
+
+        assert store.demote_unhelpful_facts(save=False) == 1
+        assert fact.metadata.confidence == pytest.approx(0.55)
+
+
+class TestDurableFactLinkage:
+    """A suggestion applying an already-learned lesson must link to its fact.
+
+    `engine._store_reasoning` stopped minting a fact per suggestion when
+    episodes replaced immediate fact-writing, which left `suggestion_fact_ids`
+    permanently empty and killed every path that reinforces a fact on a
+    verified acceptance.
+    """
+
+    @staticmethod
+    def _durable(store, candidate_subject):
+        """Mint a fact the way `_promote_repeatedly_supported_candidate` does.
+
+        The stored subject is fingerprint-STRIPPED while the frozen signature
+        is computed from the full candidate subject — so lookup cannot work by
+        comparing subjects, only by the frozen signature.
+        """
+        fact = Fact(
+            subject=store._split_fingerprint(candidate_subject)[0].strip(),
+            body="the learned lesson",
+            kind=FactKind.PATTERN,
+            scope=FactScope.PROJECT,
+            metadata=FactMetadata(confidence=0.7, success_count=2),
+            tags=["episode-derived", "durable"],
+        )
+        fact.canonical_signature = store._episode_signature(candidate_subject)
+        store._facts.append(fact)
+        return fact
+
+    def test_finds_the_fact_a_candidate_was_promoted_to(self, store):
+        subject = "bugfix: guard the empty path [a.py] [fp:abc123]"
+        fact = self._durable(store, subject)
+
+        assert fact.subject != subject, "fixture must exercise the stripped subject"
+        assert store.find_durable_fact_for_candidate(subject) is fact
+
+    def test_a_different_diff_shape_is_a_different_lesson(self, store):
+        """Same prompt prefix, different fingerprint — must not link."""
+        self._durable(store, "bugfix: guard the empty path [a.py] [fp:abc123]")
+
+        assert store.find_durable_fact_for_candidate(
+            "bugfix: guard the empty path [a.py] [fp:def456]"
+        ) is None
+
+    def test_no_link_before_the_lesson_is_durable(self, store):
+        """A candidate with no promoted fact contributes no link."""
+        self._durable(store, "bugfix: guard the empty path [a.py] [fp:abc123]")
+
+        assert store.find_durable_fact_for_candidate(
+            "bugfix: something else entirely [z.py] [fp:999999]"
+        ) is None
+        assert store.find_durable_fact_for_candidate("") is None
+
+    def test_tombstoned_fact_is_not_linked(self, store):
+        """A rolled-back lesson must not be re-linked as if still believed."""
+        subject = "bugfix: guard the empty path [a.py] [fp:abc123]"
+        fact = self._durable(store, subject)
+        fact.is_valid = False
+
+        assert store.find_durable_fact_for_candidate(subject) is None
+
+    def test_ignores_facts_carrying_no_frozen_signature(self, store):
+        """canonical_signature is written only by the promotion paths.
+
+        An ordinary fact leaves it "", and an empty target must never match
+        that empty field — every unpromoted fact would answer for every
+        candidate.
+        """
+        ordinary = Fact(
+            subject="unrelated", body="b", kind=FactKind.PATTERN,
+            scope=FactScope.PROJECT, metadata=FactMetadata(confidence=0.7),
+        )
+        store._facts.append(ordinary)
+
+        assert store._find_valid_fact_by_signature("") is None
+        assert store.find_durable_fact_for_candidate("   ") is None

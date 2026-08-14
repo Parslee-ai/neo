@@ -1405,8 +1405,10 @@ class NeoEngine:
             )
         simulation_facts = []
         if self.fact_store is not None and learning_allowed:
-            ids = self._build_suggestion_fact_ids(fact, code_suggestions)
             episode = self.current_learning_episode
+            # After `_store_reasoning`, so the episode already carries this
+            # run's candidates — that is what the linkage is resolved against.
+            ids = self._build_suggestion_fact_ids(fact, code_suggestions, episode)
             candidates = {
                 candidate.suggestion_id: {
                     "candidate_id": candidate.candidate_id,
@@ -3541,20 +3543,71 @@ RULES:
         # Combine template with facts
         return f"{template}\n\n({facts})"
 
-    @staticmethod
     def _build_suggestion_fact_ids(
-        fact, code_suggestions: list[CodeSuggestion]
+        self, fact, code_suggestions: list[CodeSuggestion], episode=None
     ) -> dict[str, str]:
-        """Build file_path -> fact_id mapping for outcome linkage."""
-        if fact is None:
-            logger.debug("_build_suggestion_fact_ids: fact is None, no linkage possible")
-            return {}
+        """Build file_path -> fact_id mapping for outcome linkage.
+
+        This map is how a later git-verified acceptance finds the knowledge its
+        suggestion came from — `detect_implicit_feedback` reinforces the linked
+        fact, and `replay_linked_feedback` (the documented repair command for a
+        broken memory loop) does nothing else.
+
+        `fact` is the suggestion-time fact, and on the FactStore backend there
+        ISN'T one: episodes replaced immediate fact-writing, so `_store_reasoning`
+        returns None on every path. That left this map permanently empty and
+        silently killed both reinforcement paths — measured on a live install,
+        every session from the changeover onward carried zero links, and no
+        fact's success_count moved again.
+
+        The successor link is the episode candidate: when a candidate's lesson
+        has ALREADY been promoted to a durable fact, that fact is exactly what
+        this suggestion is an application of, and an acceptance of it is
+        genuine re-verification. A candidate with no durable fact yet
+        contributes no link — its first acceptances are evidence toward
+        promotion, which the candidate path handles.
+        """
         ids: dict[str, str] = {}
-        for s in code_suggestions:
-            fp = getattr(s, "file_path", "")
-            if fp and fp not in ("/", "N/A"):
-                ids[fp] = fact.id
-        logger.debug(f"_build_suggestion_fact_ids: linked {len(ids)} suggestions to fact {fact.id}")
+
+        def _targets() -> list[str]:
+            return [
+                fp for s in code_suggestions
+                if (fp := getattr(s, "file_path", "")) and fp not in ("/", "N/A")
+            ]
+
+        if fact is not None:
+            # A backend that still mints a fact per suggestion links directly.
+            ids = {fp: fact.id for fp in _targets()}
+            logger.debug(
+                "_build_suggestion_fact_ids: linked %d suggestion(s) to fact %s",
+                len(ids), fact.id,
+            )
+            return ids
+
+        if episode is None or self.fact_store is None:
+            logger.debug(
+                "_build_suggestion_fact_ids: no fact and no episode, no linkage possible"
+            )
+            return ids
+
+        subjects = {
+            candidate.suggestion_id: candidate.subject
+            for candidate in episode.memory_candidates
+        }
+        for suggestion in code_suggestions:
+            file_path = getattr(suggestion, "file_path", "")
+            if not file_path or file_path in ("/", "N/A"):
+                continue
+            subject = subjects.get(getattr(suggestion, "suggestion_id", ""), "")
+            if not subject:
+                continue
+            durable = self.fact_store.find_durable_fact_for_candidate(subject)
+            if durable is not None:
+                ids[file_path] = durable.id
+        logger.debug(
+            "_build_suggestion_fact_ids: linked %d of %d suggestion(s) to durable facts",
+            len(ids), len(code_suggestions),
+        )
         return ids
 
     def _store_reasoning(
