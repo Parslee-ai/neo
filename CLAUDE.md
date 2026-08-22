@@ -1355,9 +1355,49 @@
   response — a peer that sees generic `ProcessingError` assumes its own request
   was malformed and stops retrying. The lock releases in a `finally`, so a
   failed run doesn't leave the engine permanently busy (pinned by a test).
+- **Claude Code components live at the PLUGIN ROOT, never in `.claude-plugin/`.**
+  Claude Code discovers `agents/`, `commands/`, `skills/` and `hooks/` at the
+  plugin root and reads only manifests (`plugin.json`, `marketplace.json`) out
+  of `.claude-plugin/`. Nested there they are silently not loaded: the plugin
+  installs, `claude plugin validate` passes, and nothing fires — `claude plugin
+  details` is the only check that proves a component loaded. This repo shipped
+  the wrong layout, and so did CAR, which is why
+  `test_the_manifest_directory_holds_no_components` fails on any non-manifest
+  entry rather than merely asserting the components exist at the root (a stray
+  copy left behind keeps every other assertion green).
+- **The edit-recording hook (`neo hook record`, `neo/hook.py`)** is a
+  `PostToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit` that appends one
+  line to `~/.neo/sessions/host_events.jsonl`: tool, path, host cwd, and HEAD at
+  edit time. It exists because acceptance is otherwise inferred from a repo-wide
+  git diff on the NEXT invocation, which cannot see an edit that was never
+  followed by another Neo run. Three rules, two of them mutation-pinned:
+  (1) **it never fails** — `run_hook` returns 0 on every path *by construction*,
+  including an unknown action, because a hook exiting non-zero reports an error
+  against a tool call that already succeeded; (2) **it stays cheap** —
+  `import neo.cli` is 0.04s but `neo --version` is 0.36s, and the whole
+  difference is `FactStore` construction, so `cli.main` dispatches to it before
+  argument parsing, the update check and the observer autostart
+  (`test_hook_stays_off_the_slow_path` fails if anything moves above it);
+  (3) **paths, never contents** — `tool_input` carries the text being written.
+  Opt out with `NEO_HOOKS=0`. `HOOK_LEDGER` captures `Path.home()` at import, so
+  it is registered in `conftest.HOME_PATH_CONSTANTS`.
+  **Nothing reads the ledger yet** — `collect_outcomes` still infers from git.
+  That split is deliberate: a ledger is only worth reading once it has history,
+  and history cannot be recorded retroactively. The consumer must be written
+  against a DIRTY tree (see the pending-session entry above for why).
+  **Footgun — the plugin now has a hard CLI version floor.** The plugin updates
+  from this repo; the CLI comes from PyPI. On a `neo` predating the subcommand,
+  `neo hook record` is an argparse error exiting **2**, the one code Claude Code
+  treats specially — the identical defect filed against CAR as
+  Parslee-ai/car#993, reproduced here while writing that issue. Floor documented
+  in README; `hooks.json` deliberately does NOT wrap the command in
+  `|| true`, because that reintroduces the shell dependency (and `2>/dev/null`
+  is invalid in `cmd.exe`) that choosing a subcommand was meant to avoid.
 - **Host adapters must stay in parity.** There are TWO checked-in integration
-  surfaces, and they are easy to miss: `.claude-plugin/` (agent + 6 slash
-  commands) and **`plugins/neo/`** (Codex CLI plugin + 6 skills, manifest at
+  surfaces, and they are easy to miss: the Claude Code plugin (manifests in
+  `.claude-plugin/`; agent, 6 slash commands and the hook at the REPO ROOT —
+  see the layout rule above) and **`plugins/neo/`** (Codex CLI plugin + 6
+  skills, manifest at
   `plugins/neo/.codex-plugin/plugin.json`, registered by
   `.agents/plugins/marketplace.json`). `.agents/skills/` holds RELEASE
   maintenance skills, not the Neo capabilities — looking there and concluding

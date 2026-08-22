@@ -37,6 +37,7 @@ REAL_HOME = Path.home()
 # the real cache on purpose.
 HOME_PATH_CONSTANTS: list[tuple[str, str, str]] = [
     ("neo.memory.outcomes", "SESSIONS_DIR", ".neo/sessions"),
+    ("neo.hook", "HOOK_LEDGER", ".neo/sessions/host_events.jsonl"),
     # transcript does `from ...outcomes import SESSIONS_DIR`, which binds a
     # SECOND name at import time; patching only outcomes leaves this one live.
     ("neo.memory.transcript", "SESSIONS_DIR", ".neo/sessions"),

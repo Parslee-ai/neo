@@ -349,11 +349,19 @@ Neo ships as a **Claude Code plugin** with a specialized agent and six slash com
 /plugin install neo
 ```
 
+`Parslee-ai/neo` also carries its own marketplace manifest, so
+`/plugin marketplace add Parslee-ai/neo` installs the same plugin directly
+without the intermediate repository.
+
 Once installed:
 
 - **Slash commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
 - **Specialized agent**: invoke with `Use the Neo agent to ...` for delegated semantic reasoning
 - **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Codex plugin
+- **Edit-recording hook**: a `PostToolUse` hook records which files Claude Code
+  edited, so Neo can observe whether a suggestion was applied instead of
+  inferring it from a later git diff. It records paths, never file contents, and
+  costs no model context. Opt out with `NEO_HOOKS=0`.
 
 Examples:
 
@@ -366,7 +374,22 @@ Examples:
 
 The plugin wraps the local `neo` CLI, so the binary must be installed first (`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set, or your provider of choice).
 
-Plugin sources live under [`.claude-plugin/`](.claude-plugin/) — `plugin.json` is the manifest, `agents/neo.md` defines the agent, and `commands/*.md` defines each slash command.
+**The plugin requires `neo-reasoner` 0.47.0 or newer.** The plugin updates from
+this repository while the CLI comes from PyPI, so the two can drift. On an older
+CLI the edit-recording hook invokes a subcommand that does not exist, and the
+argument parser exits 2 — the one exit code Claude Code treats as a hook
+failure. Nothing is corrupted, but every edit reports an error. `pip install -U
+neo-reasoner` resolves it.
+
+Plugin sources: [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json) is
+the manifest and [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)
+the marketplace entry. **Components live at the repository root, not inside
+`.claude-plugin/`** — [`agents/neo.md`](agents/neo.md) defines the agent,
+[`commands/*.md`](commands/) each slash command, and
+[`hooks/hooks.json`](hooks/hooks.json) the edit-recording hook. Claude Code
+discovers components at the plugin root and reads only manifests from
+`.claude-plugin/`; nested there they are silently not loaded, which is what
+`tests/test_host_adapter_parity.py` now pins.
 
 
 ## Codex Plugin

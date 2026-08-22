@@ -1,6 +1,6 @@
 ---
 name: neo
-description: Ask Neo for semantic reasoning and code suggestions over explicitly selected context. Use for general questions, code suggestions, or architectural guidance; persistent memory is opt-in for external-provider calls.
+description: Ask Neo for semantic reasoning and code suggestions over explicitly selected context. Use for general questions, code suggestions, or architectural guidance; persistent memory is opt-in for external-provider calls. Skip for questions answerable from the context already selected, factual lookups, and mechanical edits — each run costs 5-30s and an external-provider call.
 ---
 
 # Neo — Semantic Reasoning Helper

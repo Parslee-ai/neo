@@ -1,5 +1,11 @@
 ---
-description: "Ask Neo for semantic reasoning and code suggestions"
+description: >-
+  Ask Neo for semantic reasoning over this codebase — multi-agent analysis
+  with persistent memory. Use when a question spans several files or past
+  decisions, or when you want a second independent opinion before committing
+  to an approach. Skip for questions answerable from the file already open,
+  factual lookups, and mechanical edits; each run costs 5-30s and an LLM
+  call.
 ---
 
 Ask Neo for semantic reasoning and code suggestions.

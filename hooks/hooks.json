@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "neo hook record",
+            "statusMessage": "Neo: recording edit",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
