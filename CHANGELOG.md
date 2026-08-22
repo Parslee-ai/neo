@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.47.0] - 2026-08-22
+
+Two halves of the same loop. [#219](https://github.com/Parslee-ai/neo/pull/219) restored the link that lets a verified acceptance reinforce the fact it re-applied; this release adds the input that never existed — a `PostToolUse` hook that records which files Claude Code actually edited, so acceptance can be **observed** rather than inferred from a repo-wide git diff on some later invocation. And the Claude Code plugin, which had never loaded a single component, now loads.
+
+### Fixed
+
+- **The Claude Code plugin loaded nothing — no agent, no commands, no hooks.** Components were nested inside `.claude-plugin/`, and Claude Code discovers them at the **plugin root**, reading only manifests out of that directory. A fresh install reported `Skills (0) / Agents (0)`. `claude plugin validate` passes a plugin that loads nothing, so the failure was invisible to the obvious check; `claude plugin details` is the one that proves a component loaded. Now `Skills (6) / Agents (1) / Hooks (1)`. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+- **The parity suite had stopped guarding the surface it exists to guard.** `tests/test_host_adapter_parity.py` still resolved the pre-move paths, so 18 of 54 tests failed — including every assertion about the agent contract. A parity suite that cannot open the file it checks is not a guard. `CLAUDE_PLUGIN` meant the manifest directory and the component root at once, which are now different places, and is split accordingly.
+
+  Asserting the components exist at the root is **not** sufficient, and that is the half worth keeping: it proves only that they are *also* there. A stray copy left behind in `.claude-plugin/` keeps every other assertion green while Claude Code loads neither. `test_the_manifest_directory_holds_no_components` fails on any non-manifest entry, mutation-verified by re-nesting a copy. CAR shipped the identical nesting mistake in its own repo — this is a mistake the organisation has now made twice, which is why it is pinned rather than left to review. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+- **`suggestion_fact_ids` had been unconditionally empty since 2026-07-18**, so no fact's `success_count` moved in 90 days and `neo memory replay-feedback` — the documented repair command for a broken memory loop — was a no-op reporting success. Across 6,613 valid facts, zero had ever reached `success_count >= 3`, so `neo contribute` had never once been reachable. Also bounds the protection boost by evidence (it compounded per *process start*, not per verified success: 57 facts sat at exactly 1.00), keeps `durable` a terminal candidate status, and reports only the contribution gate that actually binds. ([#219](https://github.com/Parslee-ai/neo/pull/219))
+
+### Added
+
+- **`neo hook record` — the edit-recording hook.** A `PostToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit` appends one line per edit to `~/.neo/sessions/host_events.jsonl`: the tool, the path, the host's working directory, and HEAD **at the moment of the edit**. Declared by `hooks/hooks.json` at the plugin root; `claude plugin details` reports it as harness-only, with **no model context cost**. Opt out with `NEO_HOOKS=0`.
+
+  Three properties, two of them mutation-pinned. **It never fails** — `run_hook` returns 0 on every path *by construction*, not by catching anticipated errors, because a hook exiting non-zero reports an error against a tool call that already succeeded. **It stays cheap** — it fires on every edit, and while `import neo.cli` costs 0.04s, `neo --version` costs 0.36s, the whole difference being `FactStore` construction; `cli.main` therefore dispatches to the hook before argument parsing, the update check and the observer autostart, and `test_hook_stays_off_the_slow_path` fails if anything moves above it. Measured end to end at **0.06s**. **It records paths, never contents** — `tool_input` carries the text being written.
+
+  **Nothing reads the ledger yet.** `collect_outcomes` still infers acceptance from git. The split is deliberate rather than partial delivery: a ledger is only worth reading once it has history, and history cannot be recorded retroactively, so the recorder must land first regardless of when the consumer does. The consumer has to be written against a **dirty tree** — the last fix in `outcomes.py` passed every test because they all ran on a pristine one, the single state neo is never invoked in, and lost acceptances anyway. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+- **A marketplace manifest in this repository**, so `/plugin marketplace add Parslee-ai/neo` installs the plugin directly, alongside the existing `Parslee-ai/claude-code-plugins` entry. Both resolve to the same plugin.
+
+### Changed
+
+- **Both host surfaces now say when *not* to invoke Neo.** All twelve descriptions — six Claude commands, six Codex skills — restated their own titles: *"Get architectural guidance from Neo on design decisions"* names what the command is and gives a model no basis for choosing it. `claude plugin details` inventories every one as model-invocable, so the description is the whole interface. Each now carries the conditions that warrant Neo **and** the conditions that do not: profile before `neo-optimize`, skip `neo-debug` for a straightforward traceback, `neo-pattern` writes durable memory so a wrong lesson outlives the session.
+
+  The negative half is what keeps cost bounded, since every invocation is 5–30s and an LLM call, and it is the clause most likely to be dropped when someone shortens a line — so `test_both_surfaces_describe_when_to_invoke_and_when_not` pins it across both surfaces, mutation-verified. A companion test parses the frontmatter as YAML rather than pattern-matching it, because that is how the host reads it: a `": "` inside an unquoted plain scalar is a parse error, not a long description, and a `SKILL.md` that fails to parse is indistinguishable from one that is absent. Measured cost of the added text: always-on 246 → 725 tokens. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+### Documentation
+
+- [`docs/solutions/host-hooks-for-outcome-detection.md`](docs/solutions/host-hooks-for-outcome-detection.md) — the measured case for observing acceptance, the payload fields confirmed against a shipped implementation rather than documentation, and the constraints any consumer must respect. It also **corrects an overclaim in its own first draft**: capturing HEAD at edit time does *not* close the shared-revision defect, because two applications of one lesson in a single sitting share a HEAD if no commit intervened — which is exactly the measured 40% case. Better evidence, not a fix.
+
+- **The plugin now has a CLI version floor, and it is documented.** The plugin updates from this repository while the CLI comes from PyPI, so the two drift. On a `neo` predating `hook record`, argparse rejects the argv and exits **2** — the one exit code Claude Code treats as a hook failure. The same defect was filed against CAR as [Parslee-ai/car#993](https://github.com/Parslee-ai/car/issues/993) and then reproduced here while writing that issue up. `hooks.json` deliberately does **not** wrap the command in `|| true`: semantically lossless, since the hook never uses its exit code, but it reintroduces the shell dependency (`2>/dev/null` is invalid in `cmd.exe`) that choosing a subcommand exists to avoid.
+
+- README's plugin section described the layout this release fixed, and CLAUDE.md's parity entry said the same. Both corrected, and CLAUDE.md gains the component-layout rule and the hook subsystem.
+
 ## [0.46.0] - 2026-08-13
 
 The unified store release, and the close of the ten-goal climb that built it. Neo used to retrieve down two independent lanes that walked the repository separately, disagreed about what was eligible, and answered to two different front doors — so a fix applied to one was silently absent from the other. There is now **one walker, one persistent content index, and one retrieval front door**. The largest flagship repository moved from **MRR 0.051 to 0.738** and recall@10 from **0.097 to 0.883** across the climb; the eligibility walk itself went from 4.6–6.9 s to **0.12 s** warm, and file selection is now 0.37 s of a warm call.
