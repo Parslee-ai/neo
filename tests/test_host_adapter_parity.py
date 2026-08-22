@@ -23,6 +23,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parent.parent
 # Claude Code discovers components at the PLUGIN ROOT and reads only manifests
@@ -281,3 +282,46 @@ def test_documented_event_types_exist_in_the_code():
     valid = {member.value for member in NeoEventType}
     for name in documented:
         assert name in valid, name
+
+
+# ------------------------------------------------------------ descriptions
+
+
+def _description(body: str) -> str:
+    """The `description:` a host reads when deciding whether to invoke.
+
+    Parsed as YAML rather than pattern-matched, because that is how the host
+    reads it — and an unquoted plain scalar containing ": " is a parse error,
+    not a long description. One was written during this change and caught here.
+    """
+    return yaml.safe_load(body.split("---")[1])["description"]
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_both_surfaces_describe_when_to_invoke_and_when_not(name):
+    """A description that names no trigger is a component that never fires.
+
+    All six read as restatements of their own title — "Get architectural
+    guidance from Neo on design decisions" tells a model what the command is
+    and gives it no basis for choosing one. `claude plugin details` inventories
+    every one of them as model-invocable, so the trigger is the whole interface.
+
+    The *negative* half is what is pinned here rather than merely encouraged.
+    Each invocation costs 5-30s and an LLM call, so a description that says
+    when to reach for Neo and never when not to buys reach with spend. It is
+    also the half most likely to be dropped when someone shortens a line.
+    """
+    for surface, body in (("codex", _codex_skill(name)), ("claude", _claude_command(name))):
+        description = _description(body)
+        assert "Skip" in description, (
+            f"{surface}:{name} description names no condition NOT to invoke Neo"
+        )
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_every_description_is_readable_by_the_host(name):
+    """Both hosts parse this frontmatter as YAML. A description that raises is
+    indistinguishable from a component that does not exist."""
+    for surface, body in (("codex", _codex_skill(name)), ("claude", _claude_command(name))):
+        description = _description(body)
+        assert isinstance(description, str) and description.strip(), f"{surface}:{name}"
