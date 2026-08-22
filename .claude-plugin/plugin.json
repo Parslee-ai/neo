@@ -8,6 +8,7 @@
   "repository": "https://github.com/Parslee-ai/neo",
   "homepage": "https://github.com/Parslee-ai/neo",
   "license": "Apache-2.0",
+  "hooks": "./hooks/hooks.json",
   "keywords": [
     "reasoning",
     "semantic-search",

@@ -923,6 +923,15 @@ def _print_supplied_files(context_files) -> None:
 
 def main():
     """Main entry point for stdin/stdout interface."""
+    # The host-hook recorder fires on every editor tool call, so it dispatches
+    # before argument parsing, the update check, the observer autostart and any
+    # FactStore construction. `neo --version` costs 0.36s because it builds a
+    # store; this path costs the interpreter start and nothing else.
+    # `test_hook_stays_off_the_slow_path` pins the ordering.
+    if len(sys.argv) > 1 and sys.argv[1] == "hook":
+        from neo.hook import run_hook
+        return run_hook(sys.argv[2:])
+
     # Parse arguments
     args = parse_args()
 
