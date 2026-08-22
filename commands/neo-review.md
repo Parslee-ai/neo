@@ -1,5 +1,9 @@
 ---
-description: "Get Neo's code review with semantic analysis"
+description: >-
+  Get Neo's code review with semantic matching against past findings in
+  memory. Use on a diff or module before merge, especially where earlier
+  mistakes in this codebase are likely to recur. Skip for formatting,
+  lint-catchable issues, and single-line changes.
 ---
 
 Get Neo's code review with semantic analysis.

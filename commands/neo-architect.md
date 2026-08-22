@@ -1,5 +1,10 @@
 ---
-description: "Get architectural guidance from Neo on design decisions"
+description: >-
+  Get Neo's architectural guidance on a design decision. Use when choosing
+  between structural options — boundaries, layering, data flow, build-vs-buy
+  — and the trade-offs depend on how this codebase is actually built. Skip
+  for decisions already made, style preferences, and anything settled by
+  reading one file.
 ---
 
 Get architectural guidance from Neo on design decisions.
