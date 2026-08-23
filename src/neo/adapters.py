@@ -41,6 +41,28 @@ logger = logging.getLogger(__name__)
 
 # Adaptation flags recorded per model.
 _ADAPT_DROP_TEMPERATURE = "drop_temperature"
+
+
+def _sdk_rejects_keyword(exc: TypeError, param: str) -> bool:
+    """True when `exc` is the SDK refusing `param` at the call signature.
+
+    A provider can retire a sampling parameter in two distinct ways, and only
+    one of them is an HTTP error. `anthropic` 1.0.0 removed `temperature` from
+    `Messages.create()` outright, so the call raises a **client-side
+    TypeError** before any request is made — `BadRequestError` handling never
+    sees it, and every Anthropic call failed with
+    `ProcessingError: Messages.create() got an unexpected keyword argument
+    'temperature'`. Caught by the release gate, not by any test.
+
+    Matching is deliberately narrow: CPython's message for this case is
+    `<callable>() got an unexpected keyword argument '<name>'`, so both the
+    phrase and the quoted parameter must be present. A TypeError from inside
+    the SDK for any other reason re-raises untouched, which matters because
+    this runs on the inference path and swallowing a real bug here would
+    silently degrade every call.
+    """
+    message = str(exc)
+    return "unexpected keyword argument" in message and f"'{param}'" in message
 _ADAPT_RENAME_MAX_TOKENS = "rename_max_tokens"
 
 
@@ -181,6 +203,20 @@ def _chat_completion_resilient(client, kwargs: dict, provider: str):
     while True:
         try:
             return client.chat.completions.create(**kwargs)
+        except TypeError as e:
+            # The SDK refusing the keyword at the signature, not the API
+            # refusing it over HTTP. `anthropic` 1.0.0 did exactly this with
+            # `temperature`; the same hole existed here and is closed at the
+            # same time rather than waiting for the openai SDK to do it too.
+            if "temperature" not in kwargs or not _sdk_rejects_keyword(e, "temperature"):
+                raise
+            _PARAM_COMPAT.learn(provider, model, _ADAPT_DROP_TEMPERATURE)
+            kwargs.pop("temperature", None)
+            logger.debug(
+                "%s SDK does not accept `temperature` for model %s; dropped it "
+                "and retrying", provider, model,
+            )
+            continue
         except openai.BadRequestError as e:
             msg = str(e).lower()
             # NOTE: we can't distinguish "temperature is deprecated/unsupported"
@@ -468,6 +504,20 @@ class AnthropicAdapter(LMAdapter):
                 logger.debug(
                     "Anthropic model %s rejected `temperature`; dropped it "
                     "and retrying", self.model,
+                )
+                response = self.client.messages.create(**kwargs)
+            except TypeError as e:
+                # The SDK, not the API: `anthropic` 1.0.0 dropped `temperature`
+                # from the signature, so this raises before any request. Same
+                # remedy, same persistent learning — but it can never be a 400,
+                # so the branch above cannot reach it.
+                if "temperature" not in kwargs or not _sdk_rejects_keyword(e, "temperature"):
+                    raise
+                _PARAM_COMPAT.learn("anthropic", self.model, _ADAPT_DROP_TEMPERATURE)
+                kwargs.pop("temperature", None)
+                logger.debug(
+                    "Anthropic SDK does not accept `temperature` for model %s; "
+                    "dropped it and retrying", self.model,
                 )
                 response = self.client.messages.create(**kwargs)
             self._emit_usage_metric(response)

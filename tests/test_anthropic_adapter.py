@@ -116,3 +116,77 @@ def test_unrelated_400_reraises(_fake_anthropic):
 
     assert adapter.client.messages.create.call_count == 1
     assert not adapters._PARAM_COMPAT.has("anthropic", "claude-opus-4-8", "drop_temperature")
+
+
+# ------------------------------------------------- the SDK dropping the keyword
+
+
+class TestSdkKeywordRemoval:
+    """A provider can retire a sampling parameter in two ways, and only one of
+    them is an HTTP error.
+
+    `anthropic` 1.0.0 removed `temperature` from `Messages.create()` outright,
+    so the call raises a **client-side TypeError** before any request is made.
+    The `BadRequestError` recovery above never saw it, and every Anthropic call
+    failed with `ProcessingError: Messages.create() got an unexpected keyword
+    argument 'temperature'`. `pyproject.toml` declared `anthropic>=0.21.0` with
+    no upper bound, so CI resolved into the major bump on its own.
+
+    It was caught by the release gate — one real LLM round trip per language —
+    and by nothing else in 2769 tests, because every test here mocks the SDK
+    and a mock accepts any keyword.
+    """
+
+    def test_recognises_the_sdk_refusing_a_keyword(self):
+        exc = TypeError("Messages.create() got an unexpected keyword argument 'temperature'")
+        assert adapters._sdk_rejects_keyword(exc, "temperature")
+
+    @pytest.mark.parametrize("message", [
+        "unsupported operand type(s) for +: 'int' and 'str'",
+        "Messages.create() got an unexpected keyword argument 'top_p'",
+        "Messages.create() missing 1 required positional argument: 'model'",
+        "'NoneType' object is not subscriptable",
+    ])
+    def test_unrelated_type_errors_are_not_swallowed(self, message):
+        """This sits on the inference path. Treating an unrelated TypeError as
+        a parameter rejection would silently degrade every call."""
+        assert not adapters._sdk_rejects_keyword(TypeError(message), "temperature")
+
+    def test_drops_temperature_and_retries_on_sdk_type_error(self, _fake_anthropic):
+        """One refusal, one retry without the parameter, a successful answer —
+        the behaviour the release gate demanded."""
+        adapter = _fake_anthropic(model="claude-sonnet-4-5-20250929", api_key="k")
+        adapter.client = MagicMock()
+        adapter.client.messages.create.side_effect = [
+            TypeError("Messages.create() got an unexpected keyword argument 'temperature'"),
+            _ok_response(),
+        ]
+
+        assert adapter.generate([{"role": "user", "content": "hi"}], temperature=0.7) == "ok"
+
+        assert adapter.client.messages.create.call_count == 2
+        assert "temperature" in adapter.client.messages.create.call_args_list[0].kwargs
+        assert "temperature" not in adapter.client.messages.create.call_args_list[1].kwargs
+
+    def test_the_rejection_is_remembered_so_the_next_call_omits_it(self, _fake_anthropic):
+        """Otherwise every call pays a wasted round of argument binding."""
+        adapter = _fake_anthropic(model="claude-sonnet-4-5-20250929", api_key="k")
+        adapter.client = MagicMock()
+        adapter.client.messages.create.side_effect = [
+            TypeError("Messages.create() got an unexpected keyword argument 'temperature'"),
+            _ok_response(),
+            _ok_response(),
+        ]
+        adapter.generate([{"role": "user", "content": "hi"}], temperature=0.7)
+        adapter.generate([{"role": "user", "content": "again"}], temperature=0.7)
+
+        assert "temperature" not in adapter.client.messages.create.call_args_list[-1].kwargs
+
+    def test_an_unrelated_type_error_still_propagates(self, _fake_anthropic):
+        adapter = _fake_anthropic(model="claude-sonnet-4-5-20250929", api_key="k")
+        adapter.client = MagicMock()
+        adapter.client.messages.create.side_effect = TypeError(
+            "'NoneType' object is not subscriptable"
+        )
+        with pytest.raises(TypeError, match="NoneType"):
+            adapter.generate([{"role": "user", "content": "hi"}], temperature=0.7)
