@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.47.1] - 2026-08-23
+
+Every Anthropic call in 0.47.0 fails before it reaches the network. `anthropic` 1.0.0 removed `temperature` from `Messages.create()`, and `pyproject.toml` declared `anthropic>=0.21.0` with no upper bound, so the major bump arrived on its own. 0.47.0 never reached PyPI — the release gate caught this and stopped the publish — but its GitHub release artifacts carry the defect; use 0.47.1.
+
+### Fixed
+
+- **A provider can retire a sampling parameter in two ways, and only one of them is an HTTP error.** `adapters.py` already recovered from the 400 — catch it, drop the param, retry, remember the model. It had no handling for the SDK dropping the keyword from the *signature*, which raises a client-side `TypeError` before any request exists to carry a status code:
+
+  ```
+  ProcessingError: Messages.create() got an unexpected keyword argument 'temperature'
+  ```
+
+  `_sdk_rejects_keyword` closes it, in the Anthropic adapter **and** in the shared OpenAI-family path — the hole was identical, and fixing only the copy that bit would leave a known defect in half of a duplicated rule. Matching is deliberately narrow (CPython's `unexpected keyword argument` phrase *and* the quoted parameter name) because this sits on the inference path, where swallowing an unrelated `TypeError` would silently degrade every call. Verified against the real `anthropic` 1.0.0 rather than a mock.
+
+  `anthropic` is now capped at `<2.0`. The recovery handles a parameter we know to drop; the cap is what stops the next major retiring one we do not. ([#223](https://github.com/Parslee-ai/neo/pull/223))
+
+  **The durable lesson is about the gate, not the parameter.** This was found by `language-roundtrip` — one real LLM round trip per language — and by nothing else in 2,769 tests, because every adapter test mocks the SDK and **a mock accepts any keyword**. A mocked boundary cannot detect the boundary changing shape. It also vindicates the gate's design decision in [`docs/release-gate.md`](docs/release-gate.md): the job **fails rather than skips** when `ANTHROPIC_API_KEY` is absent, because an absent credential is a red gate, not a green one. Had it skipped, 0.47.0 would have shipped to PyPI unable to make a single inference call.
+
 ## [0.47.0] - 2026-08-22
 
 Two halves of the same loop. [#219](https://github.com/Parslee-ai/neo/pull/219) restored the link that lets a verified acceptance reinforce the fact it re-applied; this release adds the input that never existed — a `PostToolUse` hook that records which files Claude Code actually edited, so acceptance can be **observed** rather than inferred from a repo-wide git diff on some later invocation. And the Claude Code plugin, which had never loaded a single component, now loads.
