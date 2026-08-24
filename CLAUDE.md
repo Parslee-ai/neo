@@ -544,6 +544,16 @@
   never see. **Not opt-in**: `maybe_autostart_observer()`
   (called from `cli.main`) auto-registers it whenever `car-server` is reachable;
   opt out with `NEO_OBSERVER_AUTOSTART=0`. No CAR → one-time hint, then silent.
+  **Footgun — that export belongs in `~/.zshenv`, never `~/.zshrc`.** The gate is
+  a plain `os.getenv` (`observer.py`), read by whichever process runs `neo`, and
+  most of those are NOT interactive shells: an editor plugin, a CI step, a git
+  hook, an agent tool call. zsh sources `.zshrc` for interactive shells only, so
+  an export there leaves every programmatic invocation autostarting the observer
+  while the terminal prints `0` and looks correct. Measured directly: with it in
+  `.zshrc`, `zsh -c`, `zsh -lc` and a non-interactive tool call all read empty;
+  only `zsh -ic` read `0`. **Verify without `-i`** — that flag forces the single
+  mode that works, so the obvious check passes for the wrong reason and confirms
+  nothing.
   Projects are discovered from `~/.claude/projects/*` (decoded roots), minus
   **container roots** (`observer._is_container_root`): a decoded root that holds
   another discovered root and is not itself a repo. Claude Code mints a

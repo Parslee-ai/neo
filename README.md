@@ -904,7 +904,17 @@ neo memory observer kick     # force a cycle now (maps to CAR agents_restart)
 
 It **autostarts** whenever `car-server` is reachable — opt out with
 `NEO_OBSERVER_AUTOSTART=0`. With no CAR present it prints a one-time hint and
-stays silent. Requires the `[car]` extra and a running `car-server`
+stays silent.
+
+> **Put that export in `~/.zshenv`, not `~/.zshrc`** (or `~/.bash_profile`'s
+> non-interactive equivalent). The gate is a plain `os.getenv` read by whichever
+> process runs `neo`, and most of them are **not** interactive shells — an editor
+> plugin, a CI step, a git hook, an agent tool call. zsh sources `.zshrc` only for
+> interactive shells, so an export placed there leaves every programmatic
+> invocation autostarting the observer while `echo $NEO_OBSERVER_AUTOSTART` in
+> your terminal cheerfully prints `0`. Verify with `zsh -c 'echo
+> $NEO_OBSERVER_AUTOSTART'` — **without** `-i`, which forces the one mode that
+> works and makes the check pass for the wrong reason. Requires the `[car]` extra and a running `car-server`
 (car-runtime ≥ 0.18.0). Logs land in
 `~/.car/logs/neo-observer.{stdout,stderr}.log`. Tunables:
 `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
@@ -1318,7 +1328,7 @@ export NEO_ALLOW_PLAINTEXT_API_KEY=1              # permit storing api_key in co
 **Background observer**
 
 ```bash
-export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer
+export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer (put in ~/.zshenv, not ~/.zshrc)
 export NEO_OBSERVER_INTERVAL_SECONDS=300          # sweep interval
 export NEO_OBSERVER_COOLDOWN=60                   # per-process cooldown between cycles
 export NEO_OBSERVER_RECYCLE_CYCLES=48             # re-exec after N cycles to bound RSS (0 disables)
