@@ -10,7 +10,11 @@ case for it: `docs/solutions/host-hooks-for-outcome-detection.md`.
 Three rules govern everything in this module.
 
 **It never fails.** `run_hook` returns 0 on every path, by construction — not by
-catching the errors we thought of. A `PostToolUse` hook that exits non-zero
+catching the errors we thought of. That means `BaseException`, and it means the
+failure-reporting path is guarded too. Two things remain outside its reach and
+are stated rather than papered over: a signal that terminates the process
+(SIGKILL), and a library calling `os._exit`. Neither is reachable from this
+module's own code. A `PostToolUse` hook that exits non-zero
 reports an error against a tool call that already succeeded. CAR's equivalent
 hook documents exactly this intent and still has a hole: an unrecognized
 subcommand dies in argument parsing before any fail-open code runs, which wedged
@@ -59,9 +63,31 @@ def _debug(message: str) -> None:
 
     A hook writing to stderr on every edit would be noise in the host's UI, but
     a hook that fails silently forever is undiagnosable.
+
+    Swallows everything, including `BaseException`. This runs *inside* the
+    handler that exists to keep the hook from failing, so a closed or full
+    stderr here would defeat the whole guarantee by way of the code reporting
+    it. Neo found this one in review; no test covered it.
     """
-    if os.environ.get("NEO_HOOK_DEBUG") == "1":
+    if os.environ.get("NEO_HOOK_DEBUG") != "1":
+        return
+    try:
         print(f"[neo hook] {message}", file=sys.stderr)
+    except BaseException:
+        pass
+
+
+def _debug_failure(exc: BaseException) -> None:
+    """Report a swallowed failure, totally.
+
+    Formatting an exception can itself raise — a custom `__str__` is under no
+    obligation to succeed — so the interpolation is guarded too, not just the
+    write.
+    """
+    try:
+        _debug(f"{type(exc).__name__}: {exc}")
+    except BaseException:
+        pass
 
 
 def _head(cwd: str) -> str:
@@ -165,6 +191,18 @@ def run_hook(argv: list) -> int:
         if record is None:
             return 0
         append(record)
-    except Exception as exc:
-        _debug(f"{type(exc).__name__}: {exc}")
+    except BaseException as exc:
+        # `BaseException`, not `Exception`. `KeyboardInterrupt`, `SystemExit`
+        # and `GeneratorExit` bypass an `Exception` handler, and the docstring
+        # above claims this returns 0 on every path BY CONSTRUCTION — a
+        # stronger claim than `except Exception` delivers. Neo caught the gap;
+        # every test in `TestNeverFails` raised an `Exception` subclass, so
+        # none of them could have.
+        #
+        # Swallowing `KeyboardInterrupt` is normally wrong. It is right here:
+        # this process lives ~60ms, does one append, and is spawned by the host
+        # rather than a terminal. The tool call it reports on has ALREADY
+        # succeeded, so exiting non-zero would annotate a successful edit with a
+        # failure — worse than losing one telemetry line.
+        _debug_failure(exc)
     return 0

@@ -1383,7 +1383,15 @@
   followed by another Neo run. Three rules, two of them mutation-pinned:
   (1) **it never fails** — `run_hook` returns 0 on every path *by construction*,
   including an unknown action, because a hook exiting non-zero reports an error
-  against a tool call that already succeeded; (2) **it stays cheap** —
+  against a tool call that already succeeded. That means `except BaseException`,
+  not `except Exception`: `KeyboardInterrupt`/`SystemExit`/`GeneratorExit` walk
+  straight out of the narrower handler, and the failure-REPORTING path is
+  guarded too (a closed stderr, or a custom `__str__` that raises, would defeat
+  the guarantee from inside the code announcing it). Both gaps were found by
+  running `neo` against this module and by no test — every case in
+  `TestNeverFails` raised an `Exception` subclass, so none of them could
+  distinguish the two handlers. Only SIGKILL and a library `os._exit` remain
+  outside its reach, and the docstring says so; (2) **it stays cheap** —
   `import neo.cli` is 0.04s but `neo --version` is 0.36s, and the whole
   difference is `FactStore` construction, so `cli.main` dispatches to it before
   argument parsing, the update check and the observer autostart

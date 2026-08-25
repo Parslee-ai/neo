@@ -210,3 +210,72 @@ def test_the_ledger_is_registered_for_home_isolation():
     from tests.conftest import HOME_PATH_CONSTANTS
 
     assert ("neo.hook", "HOOK_LEDGER", ".neo/sessions/host_events.jsonl") in HOME_PATH_CONSTANTS
+
+
+# ------------------------------------------ escapes an `except Exception` misses
+
+
+class TestBaseExceptionCannotEscape:
+    """The gap Neo found reviewing this module, and the reason it was invisible.
+
+    `TestNeverFails` above is thorough about *inputs* and blind to *exception
+    class*: every case it raises is an `Exception` subclass, so an
+    `except Exception` handler passes all of them while `KeyboardInterrupt`,
+    `SystemExit` and `GeneratorExit` walk straight out. The docstring claimed
+    "returns 0 on every path, by construction" — a stronger claim than the code
+    delivered, and no test could tell the difference.
+    """
+
+    @pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit, GeneratorExit])
+    def test_base_exception_subclasses_are_swallowed(self, exc, monkeypatch, tmp_path):
+        monkeypatch.setattr(hook, "HOOK_LEDGER", tmp_path / "l.jsonl")
+        monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(json.dumps(_payload())))
+        monkeypatch.setattr(hook, "build_record", lambda *a, **k: (_ for _ in ()).throw(exc()))
+        assert hook.run_hook(["record"]) == 0
+
+    def test_a_broken_stderr_in_the_reporting_path_does_not_escape(self, monkeypatch, tmp_path):
+        """The reporting path runs INSIDE the handler that exists to stop the
+        hook failing. A closed stderr there defeats the guarantee by way of the
+        code announcing it."""
+        monkeypatch.setenv("NEO_HOOK_DEBUG", "1")
+        monkeypatch.setattr(hook, "HOOK_LEDGER", tmp_path / "l.jsonl")
+        monkeypatch.setattr(sys, "stdin", __import__("io").StringIO("not json"))
+
+        class _Dead:
+            def write(self, *a):
+                raise ValueError("I/O operation on closed file")
+            def flush(self, *a):
+                raise ValueError("I/O operation on closed file")
+
+        monkeypatch.setattr(sys, "stderr", _Dead())
+        assert hook.run_hook(["record"]) == 0
+
+    def test_an_exception_whose_str_raises_does_not_escape(self, monkeypatch, tmp_path):
+        """Formatting the failure can itself fail — a custom `__str__` is under
+        no obligation to succeed, and it runs inside the guard."""
+        class _Hostile(Exception):
+            def __str__(self):
+                raise RuntimeError("__str__ is hostile")
+
+        monkeypatch.setenv("NEO_HOOK_DEBUG", "1")
+        monkeypatch.setattr(hook, "HOOK_LEDGER", tmp_path / "l.jsonl")
+        monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(json.dumps(_payload())))
+        monkeypatch.setattr(
+            hook, "build_record", lambda *a, **k: (_ for _ in ()).throw(_Hostile())
+        )
+        assert hook.run_hook(["record"]) == 0
+
+    def test_debug_itself_never_raises(self, monkeypatch):
+        """Called directly, not only through `run_hook` — a future caller must
+        inherit the same guarantee."""
+        monkeypatch.setenv("NEO_HOOK_DEBUG", "1")
+
+        class _Dead:
+            def write(self, *a):
+                raise OSError("no space left on device")
+            def flush(self, *a):
+                raise OSError("no space left on device")
+
+        monkeypatch.setattr(sys, "stderr", _Dead())
+        hook._debug("anything")          # must not raise
+        hook._debug_failure(ValueError("x"))
