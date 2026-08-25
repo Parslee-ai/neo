@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.48.0] - 2026-08-25
+
+Two credentials problems and two silent ones. Neo could not reach a model on a machine where CAR already held the key — the two tools use disjoint names for the same entry in the same keychain, so both truthfully reported "no key" while it sat between them. The edit-recording hook promised it returns 0 on every path *by construction* and had two ways out that an `except Exception` cannot catch. And `learning-stats` named a cause it had never checked.
+
+### Fixed
+
+- **A provider key stored by CAR was invisible to Neo.** Neo looks for `neo-reasoner:openai:api_key` (account `openai`); CAR stores at service `car`, key `OPENAI_API_KEY`. Same machine, same keychain, same credential, two namespaces — and each layer accurate about the name it checked and silent about the neighbouring one. `NeoConfig.load()` now falls back to CAR's store via the `car` CLI when an environment variable and Neo's own keychain have both missed.
+
+  Delegating to the CLI rather than reading the keychain directly keeps CAR's naming inside CAR, and it is the only portable route: Neo's `keychain_available()` is literally `platform.system() == "Darwin"`, while CAR's store spans Keychain, Credential Manager and Secret Service. **So this also gives Neo credential storage on Windows and Linux, which it has never had.** Last in the chain and test-pinned there, because it forks a subprocess and must never run when something cheaper has already answered. Both names are tried, since they diverge — CAR calls the Gemini key `GEMINI_API_KEY` while Neo calls the provider `google`. Quiet on every absence; opt out with `NEO_CAR_SECRETS=0`. ([#228](https://github.com/Parslee-ai/neo/pull/228))
+
+- **`run_hook` could exit non-zero two ways, against a documented guarantee that it cannot.** `except Exception` does not catch `KeyboardInterrupt`, `SystemExit` or `GeneratorExit`; and the failure-*reporting* path could itself raise — `_debug` writes to stderr from inside the handler that exists to stop the hook failing, so a closed stderr defeated the guarantee by way of the code announcing it, as could a custom `__str__`. Both closed. Only SIGKILL and a library `os._exit` remain outside reach, and the docstring now says so rather than repeating a claim it cannot keep.
+
+  A `PostToolUse` hook exiting non-zero reports an error against a tool call that **already succeeded**, which is the whole reason for the contract. Swallowing `KeyboardInterrupt` is normally wrong and is right here: the process lives ~60ms, does one append, and is spawned by the host rather than a terminal.
+
+  **Why no test caught it:** `TestNeverFails` is exhaustive about *inputs* — malformed stdin, unknown actions, an unwritable ledger, opt-out — and blind to exception *class*. Every case it raises is an `Exception` subclass, so both handlers pass all of them identically and no assertion could distinguish them. A suite can be complete along the axis it was written for and silent on the one that matters. Found by running `neo` against its own module. ([#227](https://github.com/Parslee-ai/neo/pull/227))
+
+### Added
+
+- **`neo memory learning-stats` now names the promotion gate that actually binds.** It reported `supported_once (1 accept, needs 2)` — a cause it had never checked. A candidate sits there either because it genuinely has one acceptance, or because it has two or more that landed at the same `repository_revision` and the distinct-revision gate held it. Different problems, different remedies, and the label asserted the first. That is this project's own rule about never blaming a cap for an absence it did not cause, broken in the one line an operator reads to decide what is wrong.
+
+  ```
+  promotion gates (why unpromoted patterns are unpromoted):
+    promoted (durable)                             1
+    awaiting a 2nd acceptance                      1
+    blocked: acceptances share a revision          1
+  ```
+
+  It reuses `_supporting_episodes_span_distinct_revisions` rather than restating "two distinct revisions" in its own words — a second copy of a threshold agrees with the first only by coincidence, and the failure mode here is a diagnostic confidently naming the wrong blocker. It also decides an open question: that gate's docstring records the shared-revision case as a known limitation and names the acceptance-carrying sha as the fix, but it runs *downstream* of acceptance, and the measured ledger had zero accepted outcomes — so it may never have fired. `blocked_by_revision_span` turns that into a measurement instead of a guess, before anyone spends an episode schema bump on it. ([#226](https://github.com/Parslee-ai/neo/pull/226))
+
+### Documentation
+
+- **`NEO_OBSERVER_AUTOSTART=0` belongs in `~/.zshenv`, not `~/.zshrc`.** zsh sources `.zshrc` for interactive shells only, and the gate is a plain `os.getenv` read by whichever process runs `neo` — an editor plugin, a CI step, a git hook, an agent tool call, none of them interactive. Placed in `.zshrc` the export is inert for every caller that matters while `echo $NEO_OBSERVER_AUTOSTART` prints `0` in your terminal. Measured in all four shell modes. The docs also say to verify **without** `-i`, because `zsh -lic` forces the single mode where `.zshrc` is read and so passes over a setting that is doing nothing. ([#225](https://github.com/Parslee-ai/neo/pull/225))
+
 ## [0.47.1] - 2026-08-23
 
 Every Anthropic call in 0.47.0 fails before it reaches the network. `anthropic` 1.0.0 removed `temperature` from `Messages.create()`, and `pyproject.toml` declared `anthropic>=0.21.0` with no upper bound, so the major bump arrived on its own. 0.47.0 never reached PyPI — the release gate caught this and stopped the publish — but its GitHub release artifacts carry the defect; use 0.47.1.
