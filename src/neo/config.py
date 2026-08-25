@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
 import tempfile
 from dataclasses import MISSING, dataclass, field, fields
@@ -22,8 +23,85 @@ logger = logging.getLogger(__name__)
 _SECRET_FIELDS = frozenset({"api_key"})
 
 
+#: Provider -> the environment variable that carries its key. Single-sourced:
+#: this was duplicated at both resolution sites, and a third copy was about to
+#: be added for the CAR fallback below.
+PROVIDER_ENV_VAR = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+}
+
+#: What CAR calls the same key, where it differs. CAR names the Gemini key
+#: `GEMINI_API_KEY`; neo calls the provider `google`. Anything absent here uses
+#: `PROVIDER_ENV_VAR`, and both names are tried, so a key stored under either
+#: is found.
+_CAR_KEY_ALIASES = {"google": "GEMINI_API_KEY"}
+
+_CAR_SECRET_SERVICE = "car"
+_CAR_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+
 def _keychain_service(provider: str) -> str:
     return f"{KEYCHAIN_SERVICE_PREFIX}:{provider}:api_key"
+
+
+def _car_key_names(provider: str) -> list:
+    """Names CAR might hold this provider's key under, in preference order."""
+    names = []
+    for name in (_CAR_KEY_ALIASES.get(provider.lower()),
+                 PROVIDER_ENV_VAR.get(provider.lower())):
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def load_api_key_from_car(provider: str) -> Optional[str]:
+    """Read this provider's key from CAR's secret store, if CAR is installed.
+
+    Neo already treats CAR as a first-class backend — `car-runtime` is an
+    extra, `CarAdapter` is a provider, `neo serve` hosts on car-server, and the
+    observer runs under CAR's supervisor. On a machine where CAR holds the
+    credential, neo refusing to look was an oversight rather than a boundary:
+    the two stores use disjoint names for the same key in the same keychain
+    (`car`/`OPENAI_API_KEY` against `neo-reasoner:openai:api_key`), so both
+    tools truthfully reported "no key" while the key sat between them.
+
+    Delegates to the `car` CLI rather than reading the keychain directly. That
+    keeps CAR's naming in CAR, and it is the only portable route: neo's own
+    `keychain_available()` is `platform.system() == "Darwin"`, while CAR's store
+    covers Keychain, Credential Manager and Secret Service. So this also gives
+    neo credential storage on Windows and Linux, which it has none of today.
+
+    Last in the chain by design — it forks a subprocess, so it must never run
+    when an env var or neo's own keychain already answered. Quiet on every
+    failure: no CAR, no entry, a timeout, a broken install. Opt out with
+    `NEO_CAR_SECRETS=0`.
+    """
+    if not provider or os.environ.get("NEO_CAR_SECRETS") == "0":
+        return None
+    car = shutil.which("car")
+    if not car:
+        return None
+    for name in _car_key_names(provider):
+        try:
+            result = subprocess.run(
+                [car, "secrets", "get", "--service", _CAR_SECRET_SERVICE, name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_CAR_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode == 0:
+            # `secrets get` prints the value with a trailing newline; the stored
+            # value itself must not be assumed to carry one either way.
+            key = result.stdout.strip()
+            if key:
+                return key
+    return None
 
 
 def keychain_available() -> bool:
@@ -209,13 +287,7 @@ class NeoConfig:
 
         # API keys. NEO_API_KEY is the explicit generic override; otherwise
         # choose the provider-specific key for the selected provider only.
-        provider_key_env = {
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-            "google": "GOOGLE_API_KEY",
-            "azure": "AZURE_OPENAI_API_KEY",
-        }
-        provider_key = provider_key_env.get(config.provider.lower())
+        provider_key = PROVIDER_ENV_VAR.get(config.provider.lower())
         config.api_key = os.environ.get("NEO_API_KEY")
         if config.api_key is None and provider_key:
             config.api_key = os.environ.get(provider_key)
@@ -287,12 +359,7 @@ class NeoConfig:
             if env_name in os.environ:
                 setattr(config, field_name, getattr(env_config, field_name))
 
-        provider_key_env = {
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-            "google": "GOOGLE_API_KEY",
-            "azure": "AZURE_OPENAI_API_KEY",
-        }.get(config.provider.lower())
+        provider_key_env = PROVIDER_ENV_VAR.get(config.provider.lower())
         if "NEO_API_KEY" in os.environ or (
             provider_key_env is not None and provider_key_env in os.environ
         ):
@@ -304,6 +371,10 @@ class NeoConfig:
 
         if not config.api_key:
             config.api_key = load_api_key_from_keychain(config.provider)
+        if not config.api_key:
+            # Last: CAR's store. Forks a subprocess, so it runs only once
+            # everything cheaper has missed.
+            config.api_key = load_api_key_from_car(config.provider)
 
         return config
 
