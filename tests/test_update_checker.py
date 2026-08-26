@@ -12,6 +12,7 @@ Tests cover:
 
 import builtins
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -190,12 +191,38 @@ class TestAutoInstallIdempotency:
     """Test perform_auto_install skips if already on target version."""
 
     def test_skip_install_when_already_on_target_version(self):
-        """Test that auto_install is skipped when current version matches target."""
+        """Skipped when the target is already installed — but only when the
+        DISK agrees. The in-process read alone is not sufficient evidence."""
         with patch.object(
             update_checker, "_get_current_version", return_value="1.0.0"
+        ), patch.object(
+            update_checker, "_get_installed_version_fresh", return_value="1.0.0"
         ):
             result = perform_auto_install("1.0.0")
             assert result is True
+
+    def test_in_process_version_alone_does_not_short_circuit(self):
+        """If the in-process read says "already there" and the disk disagrees,
+        that is the stale-metadata case — do the upgrade, do not claim success."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            cache_file.write_text("{}")
+            with patch.object(
+                update_checker, "_get_current_version", return_value="1.0.0"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIPX
+            ), patch.object(
+                update_checker, "_already_notified", return_value=False
+            ), patch.object(
+                update_checker, "_get_installed_version_fresh", return_value="0.9.0"
+            ), patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+                result = perform_auto_install("1.0.0")
+
+            assert result is False, "claimed success from the in-process read"
+            assert mock_run.called, "did not attempt the upgrade"
 
     def test_attempts_install_when_versions_differ(self):
         """Test that auto_install runs pip when versions differ (pip-venv path)."""
@@ -208,6 +235,8 @@ class TestAutoInstallIdempotency:
                 update_checker, "_get_cache_file", return_value=cache_file
             ), patch.object(
                 update_checker, "_detect_install_method", return_value=INSTALL_PIP_VENV
+            ), patch.object(
+                update_checker, "_get_installed_version_fresh", return_value="1.0.0"
             ), patch("subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stderr="")
                 result = perform_auto_install("1.0.0")
@@ -560,6 +589,8 @@ class TestPerformUpdate:
                 update_checker, "check_for_updates", return_value="1.0.0"
             ), patch.object(
                 update_checker, "_detect_install_method", return_value=INSTALL_PIP_VENV
+            ), patch.object(
+                update_checker, "_get_installed_version_fresh", return_value="1.0.0"
             ), patch("subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stderr="")
                 result = perform_update()
@@ -743,13 +774,18 @@ class TestInstallMethodDispatch:
                 update_checker, "_get_cache_file", return_value=cache_file
             ), patch.object(
                 update_checker, "_detect_install_method", return_value=INSTALL_PIPX
+            ), patch.object(
+                update_checker, "_get_installed_version_fresh", return_value="0.16.0"
             ), patch("subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stderr="")
                 result = perform_auto_install("0.16.0")
 
             assert result is True
             assert mock_run.called
-            cmd = mock_run.call_args.args[0]
+            # The FIRST subprocess call is the upgrade. Asserting on
+            # `call_args` would read the last call instead, which is the
+            # post-state version probe.
+            cmd = mock_run.call_args_list[0].args[0]
             assert cmd[:2] == ["pipx", "upgrade"]
             assert cmd[2] == "neo-reasoner"
 
@@ -793,3 +829,311 @@ class TestInstallMethodDispatch:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestAutoInstallVerifiesPostState:
+    """A zero exit code is not evidence of an upgrade.
+
+    `pipx upgrade` and `pip install --upgrade` both exit 0 when they upgrade
+    NOTHING. Trusting that produced a false-success loop: ~/.neo/auto_update.log
+    accumulated 126 "Success!" lines for roughly 10 real upgrades, including 49
+    consecutive claims of 0.15.4 and 52 of 0.34.0, while the installed version
+    never moved. perform_auto_install must confirm against the disk.
+    """
+
+    def _run(self, tmpdir, installed_after, method=INSTALL_PIPX):
+        cache_file = Path(tmpdir) / "update_check.json"
+        cache_file.write_text("{}")
+        with patch.object(
+            update_checker, "_get_current_version", return_value="0.46.0"
+        ), patch.object(
+            update_checker, "_get_cache_file", return_value=cache_file
+        ), patch.object(
+            update_checker, "_detect_install_method", return_value=method
+        ), patch.object(
+            update_checker, "_already_notified", return_value=False
+        ), patch.object(
+            update_checker, "_get_installed_version_fresh",
+            return_value=installed_after,
+        ), patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = perform_auto_install("0.48.0")
+        return result, cache_file
+
+    def test_exit_zero_without_version_change_is_not_success(self, capsys):
+        """The regression: pipx exits 0, disk still shows the old version."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, cache_file = self._run(tmpdir, installed_after="0.46.0")
+
+            assert result is False, "claimed success without an observed upgrade"
+            err = capsys.readouterr().err
+            assert "did not take effect" in err
+            assert "✓ Auto-update completed" not in err
+            # Cache is preserved so the next run does not immediately re-attempt
+            # a command we just watched change nothing. Asserted inside the
+            # tmpdir context: outside it the directory is gone and exists() is
+            # False for reasons that have nothing to do with the code.
+            assert cache_file.exists()
+
+    def test_observed_version_change_is_success(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, cache_file = self._run(tmpdir, installed_after="0.48.0")
+
+            assert result is True
+            assert "✓ Auto-update completed: 0.48.0" in capsys.readouterr().err
+            # Cache cleared so the next run re-verifies.
+            assert not cache_file.exists()
+
+    def test_unverifiable_probe_is_not_treated_as_success(self, capsys):
+        """"unknown" means could-not-verify, which is never a success."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self._run(tmpdir, installed_after="unknown")
+
+        assert result is False
+        err = capsys.readouterr().err
+        # A failed PROBE is a different claim from a verified no-op. Saying
+        # "the installed version is still unknown" reports the state of the
+        # probe as if it were the state of the install.
+        assert "Could not verify" in err
+        assert "did not take effect" not in err
+        assert "still unknown" not in err
+
+    def test_upgrade_past_the_cached_target_is_success(self, capsys):
+        """`new_version` is up to an hour stale; pipx installs LATEST.
+
+        A release landing inside that window means the probe legitimately
+        reports something NEWER than the target. Exact equality would call a
+        perfectly good upgrade a failure.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self._run(tmpdir, installed_after="0.49.0")
+
+            assert result is True, "reported a successful upgrade as a failure"
+            assert "✓ Auto-update completed" in capsys.readouterr().err
+
+    def test_pep440_normalization_skew_is_not_a_failure(self, capsys):
+        """PyPI's info.version and the dist-info Version: field can differ in
+        normalization ("0.48" vs "0.48.0") without differing in meaning."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            cache_file.write_text("{}")
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.46.0"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIPX
+            ), patch.object(
+                update_checker, "_already_notified", return_value=False
+            ), patch.object(
+                update_checker, "_get_installed_version_fresh", return_value="0.48"
+            ), patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+                assert perform_auto_install("0.48.0") is True
+
+    def test_verified_noop_throttles_the_next_attempt(self):
+        """Replacing a silent false-success loop with a loud false-alarm loop
+        is not an improvement. A VERIFIED no-op must not be retried on every
+        subsequent invocation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            cache_file.write_text("{}")
+            marked = {}
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.46.0"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIPX
+            ), patch.object(
+                update_checker, "_already_notified",
+                side_effect=lambda v: marked.get(v, False)
+            ), patch.object(
+                update_checker, "_mark_notified",
+                side_effect=lambda v: marked.__setitem__(v, True)
+            ), patch.object(
+                update_checker, "_get_installed_version_fresh", return_value="0.46.0"
+            ), patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+                assert perform_auto_install("0.48.0") is False
+                first_calls = mock_run.call_count
+                assert first_calls > 0
+
+                # Second run: the no-op was verified, so do not re-spend the
+                # upgrade subprocess to re-learn the same answer.
+                assert perform_auto_install("0.48.0") is False
+                assert mock_run.call_count == first_calls, (
+                    "re-ran the upgrade after verifying it changes nothing"
+                )
+
+    def test_failed_probe_does_not_throttle(self):
+        """A failed probe is evidence of nothing. The next run must retry."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            cache_file.write_text("{}")
+            marked = {}
+            with patch.object(
+                update_checker, "_get_current_version", return_value="0.46.0"
+            ), patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIPX
+            ), patch.object(
+                update_checker, "_already_notified",
+                side_effect=lambda v: marked.get(v, False)
+            ), patch.object(
+                update_checker, "_mark_notified",
+                side_effect=lambda v: marked.__setitem__(v, True)
+            ), patch.object(
+                update_checker, "_get_installed_version_fresh", return_value="unknown"
+            ), patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+                assert perform_auto_install("0.48.0") is False
+                first_calls = mock_run.call_count
+                assert perform_auto_install("0.48.0") is False
+                assert mock_run.call_count > first_calls, (
+                    "throttled on an unverifiable probe"
+                )
+
+    def test_pip_venv_path_is_verified_too(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self._run(
+                tmpdir, installed_after="0.46.0", method=INSTALL_PIP_VENV
+            )
+
+        assert result is False
+        assert "pip install --upgrade" in capsys.readouterr().err
+
+
+class TestFreshVersionProbe:
+    """_get_installed_version_fresh must not answer from this process."""
+
+    def test_uses_a_separate_interpreter(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="0.48.0\n", stderr="")
+            assert update_checker._get_installed_version_fresh() == "0.48.0"
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == sys.executable
+        # -E must be present: the installed pipx shim uses it, so a probe
+        # without it can resolve a different dist-info under PYTHONPATH.
+        assert "-E" in cmd
+        assert any("importlib.metadata" in part for part in cmd)
+
+    def test_probe_failure_reports_unknown_not_a_version(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+            assert update_checker._get_installed_version_fresh() == "unknown"
+
+    def test_probe_timeout_reports_unknown(self):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("p", 15)):
+            assert update_checker._get_installed_version_fresh() == "unknown"
+
+
+class TestPerformUpdateVerifiesPostState:
+    """`neo update` is the command a user runs DELIBERATELY when they suspect
+    something is wrong. It was the last place still taking an exit code at its
+    word — the automatic path was hardened and this one was not."""
+
+    def _run(self, tmpdir, installed_after, method=INSTALL_PIP_VENV):
+        cache_file = Path(tmpdir) / "update_check.json"
+        cache_file.write_text("{}")
+        with patch.object(
+            update_checker, "_get_cache_file", return_value=cache_file
+        ), patch.object(
+            update_checker, "_get_current_version", return_value="0.46.0"
+        ), patch.object(
+            update_checker, "check_for_updates", return_value="0.48.0"
+        ), patch.object(
+            update_checker, "_detect_install_method", return_value=method
+        ), patch.object(
+            update_checker, "_get_installed_version_fresh",
+            return_value=installed_after,
+        ), patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = perform_update()
+        return result, cache_file
+
+    def test_noop_is_not_reported_as_success(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, cache_file = self._run(tmpdir, installed_after="0.46.0")
+
+            assert result is False, "claimed success without an observed upgrade"
+            out = capsys.readouterr()
+            assert "✓ Successfully updated" not in out.out
+            assert "did not take effect" in out.err
+            # The cache must NOT be cleared on a non-upgrade: clearing it is a
+            # success side effect.
+            assert cache_file.exists()
+
+    def test_unverifiable_is_distinct_from_failure(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self._run(tmpdir, installed_after="unknown")
+
+            assert result is False
+            err = capsys.readouterr().err
+            assert "could not be verified" in err
+            assert "did not take effect" not in err
+
+    def test_observed_upgrade_still_succeeds(self, capsys):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, cache_file = self._run(tmpdir, installed_after="0.48.0")
+
+            assert result is True
+            assert "✓ Successfully updated" in capsys.readouterr().out
+            assert not cache_file.exists()
+
+
+class TestUpgradeVerificationIsShared:
+    """Both entry points must route through one perform-and-verify.
+
+    Three fixes for one symptom (#81 broken RECORD files, #89 install-method
+    routing, this one) came from cause-specific patches applied to whichever
+    call site was in front of the author. The invariant has to live in one
+    place or a fourth cause finds the un-hardened path.
+    """
+
+    def test_both_entry_points_call_the_shared_verifier(self):
+        seen = []
+
+        def fake(method, target, *, quiet=True):
+            seen.append((method, target, quiet))
+            return update_checker.UpgradeOutcome.UPGRADED, target
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            cache_file.write_text("{}")
+            with patch.object(
+                update_checker, "_get_cache_file", return_value=cache_file
+            ), patch.object(
+                update_checker, "_get_current_version", return_value="0.46.0"
+            ), patch.object(
+                update_checker, "_detect_install_method", return_value=INSTALL_PIPX
+            ), patch.object(
+                update_checker, "_already_notified", return_value=False
+            ), patch.object(
+                update_checker, "check_for_updates", return_value="0.48.0"
+            ), patch.object(
+                update_checker, "_perform_upgrade_and_verify", side_effect=fake
+            ):
+                perform_auto_install("0.48.0")
+                perform_update()
+
+        assert len(seen) == 2, f"an entry point bypassed the verifier: {seen}"
+        # The manual path asks for verbose output and must actually get it.
+        assert seen[0][2] is True
+        assert seen[1][2] is False
+
+    def test_pipx_verbose_flag_is_honoured(self):
+        """`quiet` was accepted and ignored, so `neo update` silently ran quiet."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            update_checker._run_pipx_upgrade(quiet=False)
+        assert "--verbose" in mock_run.call_args[0][0]
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            update_checker._run_pipx_upgrade(quiet=True)
+        assert "--verbose" not in mock_run.call_args[0][0]
