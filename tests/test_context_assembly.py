@@ -367,3 +367,98 @@ class TestRankingPolicyStaysSingleSourced:
             "the ranking formula is being recomputed outside models.py: "
             f"{offenders} -- call rank_score() instead"
         )
+
+
+class TestConstraintOverflowRanking:
+    """When constraints overflow their cap, RELEVANCE decides which survive.
+
+    Scope order is a stable sort, so within a scope the order was whatever the
+    store yielded — effectively creation order. With a prefix cut that stopped
+    at the first fact that did not fit, the injected set was "globals, plus the
+    OLDEST project constraints until the budget fills". Measured on a real
+    store: 2,445 valid constraints against an 8,000-token cap — ~1.4% injected,
+    newest structurally unreachable however well they matched the query.
+    """
+
+    @staticmethod
+    def _big(subject, embedding, scope=FactScope.PROJECT, body_len=400):
+        return _make_fact(
+            kind=FactKind.CONSTRAINT,
+            scope=scope,
+            subject=subject,
+            body="x" * body_len,
+            embedding=embedding,
+        )
+
+    def test_relevant_constraint_survives_overflow_despite_being_last(
+        self, assembler
+    ):
+        """The match is placed LAST, where age-ordering would guarantee it is
+        dropped. It must be injected anyway."""
+        query_vec = np.array([1.0, 0.0], dtype=np.float32)
+        off_topic = np.array([0.0, 1.0], dtype=np.float32)
+
+        facts = [self._big(f"filler-{i}", off_topic) for i in range(30)]
+        facts.append(self._big("the-relevant-one", query_vec))
+
+        result = assembler.assemble(
+            facts, "query", query_embedding=query_vec, max_tokens=600,
+        )
+
+        subjects = [f.subject for f in result.constraints]
+        assert subjects, "constraint layer came back empty"
+        assert "the-relevant-one" in subjects, (
+            f"relevance ignored on overflow; kept {subjects[:5]}"
+        )
+
+    def test_scope_still_outranks_relevance(self, assembler):
+        """Globals are few and deliberately authoritative. Ranking applies
+        WITHIN a scope tier, it does not let a project fact outrank a global."""
+        query_vec = np.array([1.0, 0.0], dtype=np.float32)
+        off_topic = np.array([0.0, 1.0], dtype=np.float32)
+
+        facts = [self._big(f"proj-{i}", query_vec) for i in range(30)]
+        facts.append(self._big("glob", off_topic, scope=FactScope.GLOBAL))
+
+        result = assembler.assemble(
+            facts, "query", query_embedding=query_vec, max_tokens=600,
+        )
+        assert result.constraints[0].scope == FactScope.GLOBAL
+
+    def test_no_embedding_preserves_previous_ordering(self, assembler):
+        """Nothing to rank on means keep scope order — not a silent fallback
+        to some other arrangement."""
+        facts = [self._big(f"c-{i}", None) for i in range(30)]
+        result = assembler.assemble(facts, "query", query_embedding=None, max_tokens=600)
+
+        subjects = [f.subject for f in result.constraints]
+        assert subjects == sorted(subjects, key=lambda s: int(s.split("-")[1]))
+
+    def test_one_oversized_constraint_does_not_empty_the_layer(self, assembler):
+        """A single verbose constraint used to truncate everything behind it:
+        the accumulator stopped at the first fact that did not fit."""
+        query_vec = np.array([1.0, 0.0], dtype=np.float32)
+        huge = self._big("huge-global", query_vec, scope=FactScope.GLOBAL, body_len=20000)
+        small = [self._big(f"small-{i}", query_vec) for i in range(5)]
+
+        result = assembler.assemble(
+            [huge] + small, "query", query_embedding=query_vec, max_tokens=900,
+        )
+
+        subjects = [f.subject for f in result.constraints]
+        assert any(s.startswith("small-") for s in subjects), (
+            f"one oversized fact emptied the layer; kept {subjects}"
+        )
+
+    def test_under_cap_ordering_is_untouched(self, assembler):
+        """Ranking must only engage on overflow. Below the cap, everything is
+        injected and the established scope order is the contract."""
+        query_vec = np.array([1.0, 0.0], dtype=np.float32)
+        off_topic = np.array([0.0, 1.0], dtype=np.float32)
+        a = _make_fact(kind=FactKind.CONSTRAINT, subject="a", body="short", embedding=off_topic)
+        b = _make_fact(kind=FactKind.CONSTRAINT, subject="b", body="short", embedding=query_vec)
+
+        result = assembler.assemble(
+            [a, b], "query", query_embedding=query_vec, max_tokens=12000,
+        )
+        assert [f.subject for f in result.constraints] == ["a", "b"]

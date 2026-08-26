@@ -357,3 +357,128 @@ class TestSelectChunksBudget:
         content = "\n".join(f"line {i} padding" for i in range(2000))
         chunks = select_chunks(content, set())
         assert len(chunks) == 1 and chunks[0][1] == 1
+
+
+class TestRealPathPredicate:
+    """The not-found WARNING fires on the no-match case, so every prose token
+    `_PATH_LIKE` over-captures becomes a bogus "check spelling" for something
+    the user never claimed was a path.
+
+    Observed on a real run: "ASP.NET Core 10" produced
+        Warning: prompt names a path but no scanned file matched (asp.net)
+    """
+
+    @pytest.mark.parametrize("token", [
+        "asp.net",        # "ASP.NET Core 10"
+        "e.g",            # prose
+        "0.42.0",         # a version
+        "vs.the",         # sloppy punctuation
+        "etc.and",
+    ])
+    def test_prose_is_not_warnable(self, token):
+        from neo.context_gatherer import _looks_like_a_real_path
+        assert not _looks_like_a_real_path(token), (
+            f"{token!r} would produce a bogus not-found warning"
+        )
+
+    @pytest.mark.parametrize("token", [
+        "src/neo/context_gatherer.py",
+        "context_gatherer.py",
+        "README.md",
+        "pyproject.toml",
+        "web/src/App.tsx",
+        "Program.cs",
+        "some/dir/without-extension",   # a separator is proof enough
+        "config.yaml",
+        # Genuinely ambiguous, and deliberately resolved as "warn". `js` is a
+        # real extension and a file named node.js is entirely plausible, so
+        # "Node.js" cannot be told from a filename BY VALUE. The alternative is
+        # a denylist of technology names, which never ends and would suppress
+        # warnings for real files. A rare spurious warning about a token that
+        # genuinely looks like a filename is the cheaper error.
+        "node.js",
+    ])
+    def test_genuine_paths_are_warnable(self, token):
+        from neo.context_gatherer import _looks_like_a_real_path
+        assert _looks_like_a_real_path(token), (
+            f"{token!r} is a real path reference and must still warn"
+        )
+
+    def test_extraction_itself_is_unchanged(self):
+        """The predicate gates the WARNING only. The candidate set stays loose
+        so EXPLICIT_PATH_BOOST keeps its reach — a token matching nothing costs
+        nothing there, which is what the regex comment actually promises."""
+        from neo.context_gatherer import extract_explicit_paths
+        found = extract_explicit_paths("we use ASP.NET and src/neo/engine.py")
+        assert "asp.net" in found
+        assert "src/neo/engine.py" in found
+
+
+class TestRelativeScoreFloor:
+    """An absolute floor does not discriminate on long prompts.
+
+    Content relevance accumulates per matching query term, so a long prompt
+    lifts every file's score together. On a real 200-word review prompt the
+    0.2 floor removed 224 of 14,428 files — 99.2% "passed", which is not a
+    filter, and a code-review prompt came back holding design documents.
+    """
+
+    @staticmethod
+    def _apply(scores):
+        """Mirror the production floor: absolute OR relative-to-best."""
+        from neo.context_gatherer import (
+            MIN_SCORE_THRESHOLD, RELATIVE_SCORE_FLOOR,
+        )
+        top = max(scores)
+        floor = max(MIN_SCORE_THRESHOLD, top * RELATIVE_SCORE_FLOOR)
+        return [s for s in scores if s >= floor]
+
+    def test_long_prompt_inflation_is_still_discriminated(self):
+        """Every score inflated 50x. An absolute floor keeps all of them; a
+        relative floor keeps the same SHAPE it kept before inflation."""
+        base = [10.0, 5.0, 1.0, 0.5, 0.25]
+        inflated = [s * 50 for s in base]
+
+        assert len(self._apply(base)) == len(self._apply(inflated)), (
+            "the cut changed meaning when the prompt got longer"
+        )
+
+    def test_weak_tail_is_dropped_relative_to_a_strong_best(self):
+        kept = self._apply([100.0, 90.0, 80.0, 1.0, 0.9])
+        assert 1.0 not in kept and 0.9 not in kept
+        assert 100.0 in kept and 80.0 in kept
+
+    def test_absolute_floor_still_guards_an_all_noise_prompt(self):
+        """When even the best file is noise, "15% of the best" is still noise.
+        The absolute floor is what catches that."""
+        from neo.context_gatherer import MIN_SCORE_THRESHOLD
+        kept = self._apply([0.19, 0.1, 0.05])
+        assert kept == [], f"kept noise below the absolute floor: {kept}"
+        assert MIN_SCORE_THRESHOLD == 0.2
+
+    def test_flat_distribution_keeps_everything(self):
+        """Genuinely equal relevance must not be cut arbitrarily."""
+        assert len(self._apply([5.0, 5.0, 5.0, 5.0])) == 4
+
+    def test_boosted_file_must_not_set_the_bar(self):
+        """EXPLICIT_PATH_BOOST is tuned to exceed any organic score by
+        construction, so a prompt-named file would put the floor above the
+        entire scan — leaving a prompt that names one file holding only that
+        file. The floor is measured against the best ORGANIC hit instead.
+
+        Caught by test_selection_invariants, not by this class: the first cut
+        used max(all scores) and a named file scoring 13.67 produced a floor of
+        2.05, filtering every organically-scored file in the repo.
+        """
+        from neo.context_gatherer import (
+            EXPLICIT_PATH_BOOST, MIN_SCORE_THRESHOLD, RELATIVE_SCORE_FLOOR,
+        )
+        organic = [2.0, 1.5, 0.8]
+        boosted = 2.0 + EXPLICIT_PATH_BOOST
+
+        floor = max(MIN_SCORE_THRESHOLD, max(organic) * RELATIVE_SCORE_FLOOR)
+        kept = [s for s in organic + [boosted] if s >= floor]
+
+        assert len(kept) == 4, (
+            f"the boosted file raised the floor to {floor} and cut the scan"
+        )

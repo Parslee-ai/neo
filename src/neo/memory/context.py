@@ -79,12 +79,39 @@ class ContextAssembler:
         # Reserve at least 1/3 of budget for non-constraint content.
         constraint_cap = max_tokens * 2 // 3
         uncapped_total = sum(f.size_hint() for f in constraints)
-        constraints = self._accumulate_within_budget(constraints, constraint_cap, at_least_one=True)
+        uncapped_count = len(constraints)
+
+        # WHEN CONSTRAINTS OVERFLOW, RELEVANCE DECIDES WHICH SURVIVE.
+        #
+        # Scope order alone is a stable sort, so within a scope the order is
+        # whatever the store yielded — effectively creation order. Combined
+        # with a prefix cut that stops at the first fact that does not fit,
+        # that made the injected set "the globals, plus the OLDEST project
+        # constraints until the budget fills". Measured on a real store: 2,445
+        # valid constraints against an 8,000-token cap, so ~1.4% were injected
+        # and the newest were structurally unreachable no matter how well they
+        # matched the query. The highest-authority memory layer was the only
+        # one not consulting the query, while ordinary facts were ranked by
+        # similarity right below (see _score_facts).
+        #
+        # Scope still leads: globals and org constraints are few and are
+        # deliberately authoritative. Ranking applies WITHIN each scope, and
+        # only matters at all once the layer overflows.
+        if uncapped_total > constraint_cap and len(constraints) > 1:
+            constraints = self._rank_constraints_by_scope_then_relevance(
+                constraints, scope_order, query_embedding,
+            )
+
+        constraints = self._accumulate_within_budget(
+            constraints, constraint_cap, at_least_one=True, skip_oversized=True,
+        )
         constraint_tokens = sum(f.size_hint() for f in constraints)
         if uncapped_total > constraint_cap:
             logger.warning(
-                "Constraints would consume %d tokens (cap %d); truncated to %d tokens",
-                uncapped_total, constraint_cap, constraint_tokens,
+                "Constraints would consume %d tokens (cap %d); kept the %d most "
+                "relevant of %d (%d tokens)",
+                uncapped_total, constraint_cap, len(constraints),
+                uncapped_count, constraint_tokens,
             )
 
         # Rank valid facts by similarity + confidence + recency
@@ -121,24 +148,71 @@ class ContextAssembler:
     @staticmethod
     def _accumulate_within_budget(
         facts: list[Fact], budget: int, *, at_least_one: bool = False,
+        skip_oversized: bool = False,
     ) -> list[Fact]:
         """Accumulate facts until budget is exhausted.
 
         Args:
             at_least_one: If True, always include the first fact even if it
                 exceeds the budget. Only used for valid_facts (primary layer).
+            skip_oversized: If True, a fact that does not fit is SKIPPED and
+                accumulation continues. Default False stops at the first
+                non-fitting fact, which is correct for a relevance-ordered
+                list where everything after it ranks lower anyway.
+
+                Constraints pass True: they are ordered by scope first, so a
+                single large global constraint would otherwise truncate every
+                project constraint behind it regardless of relevance — one
+                verbose fact silently emptying the layer.
         """
         result: list[Fact] = []
         used = 0
         for fact in facts:
             cost = fact.size_hint()
             if used + cost > budget:
+                if skip_oversized:
+                    # Skip THIS fact, keep going. Deliberately does not consume
+                    # budget for something that was not included.
+                    continue
                 if not result and at_least_one:
                     result.append(fact)
                 break
             result.append(fact)
             used += cost
+
+        # The "at least one" guarantee is a floor, not a priority claim. Under
+        # skip_oversized it applies only when nothing fit at all — otherwise a
+        # single oversized fact at the front (a verbose global constraint, say)
+        # would be admitted over every smaller fact behind it and blow the cap
+        # that exists to protect the other layers.
+        if not result and at_least_one and facts:
+            result.append(facts[0])
         return result
+
+    def _rank_constraints_by_scope_then_relevance(
+        self,
+        constraints: list[Fact],
+        scope_order: dict,
+        query_embedding: Optional[np.ndarray],
+    ) -> list[Fact]:
+        """Order constraints by scope tier, then by relevance within the tier.
+
+        With no query embedding there is nothing to rank on, so the incoming
+        scope order is returned untouched — the pre-existing behaviour, not a
+        silent fallback to something else.
+        """
+        if query_embedding is None:
+            return constraints
+
+        scored = self._score_facts(constraints, query_embedding)
+        rank = {id(fact): position for position, (fact, _) in enumerate(scored)}
+        return sorted(
+            constraints,
+            key=lambda f: (
+                scope_order.get(f.scope, 99),
+                rank.get(id(f), len(constraints)),
+            ),
+        )
 
     def _score_facts(
         self,

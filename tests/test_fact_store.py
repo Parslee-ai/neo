@@ -3521,3 +3521,77 @@ class TestDurableFactLinkage:
 
         assert store._find_valid_fact_by_signature("") is None
         assert store.find_durable_fact_for_candidate("   ") is None
+
+
+class TestBuildContextCaching:
+    """One neo request builds this context twice.
+
+    _decide_reasoning_mode -> _compute_memory_signal and _process_combined ->
+    _format_combined_prompt both call build_context, which is why the
+    constraint-overflow warning prints twice per run. Each call re-embeds the
+    query and re-ranks the whole corpus.
+    """
+
+    def test_repeat_call_reuses_the_assembled_context(self, store):
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            first = store.build_context("same query")
+            second = store.build_context("same query")
+
+        assert spy.call_count == 1, "re-assembled an identical context"
+        assert first is second
+
+    def test_different_query_is_not_served_from_cache(self, store):
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("query one")
+            store.build_context("query two")
+
+        assert spy.call_count == 2
+
+    def test_added_fact_invalidates_the_cache(self, store):
+        store.add_fact(subject="first", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+            store.add_fact(subject="second", body="b", kind=FactKind.PATTERN)
+            store.build_context("same query")
+
+        assert spy.call_count == 2, "served a stale context after a new fact"
+
+    def test_invalidated_fact_invalidates_the_cache(self, store):
+        """Supersession flips is_valid in place without changing list length —
+        a plain length check would miss it and serve a retracted fact."""
+        f = store.add_fact(subject="first", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+            f.is_valid = False
+            store.build_context("same query")
+
+        assert spy.call_count == 2, "served a context containing a retracted fact"
+
+    def test_cache_hit_does_not_restamp_access_metadata(self, store):
+        """Counting one request as several retrievals would inflate the
+        recency and access-count signals rank_score reads."""
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        result = store.build_context("same query")
+        if not result.valid_facts:
+            pytest.skip("no valid facts retrieved to observe")
+        counts_before = [f.metadata.access_count for f in result.valid_facts]
+
+        store.build_context("same query")
+        counts_after = [f.metadata.access_count for f in result.valid_facts]
+
+        assert counts_after == counts_before

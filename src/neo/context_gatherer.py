@@ -23,6 +23,27 @@ from neo.text_budget import MARKER_TEMPLATE, apportion
 
 # Constants
 MIN_SCORE_THRESHOLD = 0.2  # Filter files with very low relevance (was 0.3, reduced for broad prompts)
+
+# The absolute floor above is measured against a score that GROWS WITH PROMPT
+# LENGTH: content relevance accumulates per matching query term, so a long
+# prompt lifts every file's score at once. On a 200-word review prompt against
+# this repo the floor removed 224 of 14,428 files — 99.2% "passed", which is
+# not a filter, and the surviving order is then decided by whatever the ranker
+# happened to do. That is how a code-review prompt came back holding design
+# documents. Lowering the constant (0.3 -> 0.2, as the comment above records)
+# treated the symptom and made it worse.
+#
+# So also require a file to score within a fraction of the BEST file for this
+# prompt. That is scale-free: it means the same thing whether the prompt is
+# five words or five hundred. The absolute floor stays as the guard for the
+# case a relative floor cannot see — a prompt where even the top file is
+# irrelevant, where "10% of the best" is still noise.
+# Measured against the best ORGANIC score — a file that merely got
+# EXPLICIT_PATH_BOOST does not set the bar for everything else. That boost is
+# tuned to exceed any organic score by construction (see EXPLICIT_PATH_BOOST),
+# so including it put the floor above the entire scan and left prompts that
+# named a file with nothing but that file.
+RELATIVE_SCORE_FLOOR = 0.15  # keep files scoring >= 15% of the best organic hit
 MAX_CHUNKS_PER_FILE = 2    # Cap chunks per file so one large file doesn't dominate the budget
 MAX_CHUNK_CENTERS = 20     # Best-scoring lines considered as window centers before merging
 MAX_MERGED_WINDOW_LINES = 200   # Ceiling on a merged window so one file can't eat the budget
@@ -349,6 +370,42 @@ EXPLICIT_PATH_BOOST = 10.0
 # Loose: real filtering is "does this match a file we actually found", which no
 # amount of prose punctuation can fake.
 _PATH_LIKE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z][A-Za-z0-9]{0,5}')
+
+
+# Extensions that make a bare dotted token a plausible FILE reference. A token
+# with a "/" needs no such evidence; one without it is only a path if it ends
+# in something a file actually ends in.
+_SOURCE_EXTENSIONS = frozenset("""
+    py pyi ipynb js jsx mjs cjs ts tsx vue svelte rb rs go java kt kts scala
+    c h cc cpp cxx hpp hh cs fs fsx swift m mm php pl pm r jl lua dart ex exs
+    erl hrl clj cljs sh bash zsh fish ps1 psm1 sql graphql proto
+    json yaml yml toml ini cfg conf env lock
+    md markdown rst txt csv tsv xml html htm css scss sass less
+    tf tfvars dockerfile mk cmake gradle sbt bzl bazel
+""".split())
+
+
+def _looks_like_a_real_path(token: str) -> bool:
+    """Is this token actually naming a file, or is it just prose?
+
+    `_PATH_LIKE` is deliberately loose, and its comment says that is safe
+    because "real filtering is 'does this match a file we actually found'".
+    That holds for the EXPLICIT_PATH_BOOST consumer, where a token matching
+    nothing costs nothing. It is false for the not-found WARNING, which fires
+    precisely ON the no-match case: there, every prose token the regex
+    over-captures becomes a bogus "check spelling, --exclude and .gitignore"
+    for something the user never claimed was a path.
+
+    Observed: "ASP.NET Core 10" in a prompt produced
+        Warning: prompt names a path but no scanned file matched (asp.net)
+    Same shape as "Node.js", "e.g.", "0.42.0", "vs.".
+
+    A separator is proof enough. Without one, require a real file extension.
+    """
+    if "/" in token:
+        return True
+    _, _, ext = token.rpartition(".")
+    return ext in _SOURCE_EXTENSIONS
 
 
 def extract_explicit_paths(prompt: str) -> set[str]:
@@ -1576,7 +1633,8 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
             "the scan still has a budget to run in; raise --max-bytes to give "
             "both more room")
 
-    if explicit_paths and not explicit_matches:
+    warnable_paths = {t for t in explicit_paths if _looks_like_a_real_path(t)}
+    if warnable_paths and not explicit_matches:
         # A named path that matched nothing is the single highest-value
         # diagnostic here, and staying silent makes it indistinguishable from
         # "no path mentioned". Causes: a typo, a path outside the scan root, or
@@ -1585,7 +1643,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         # `--exts py` is pinned rather than lost.
         progress.note(
             "Warning: prompt names a path but no scanned file matched "
-            f"({', '.join(sorted(explicit_paths)[:3])}) - check spelling, "
+            f"({', '.join(sorted(warnable_paths)[:3])}) - check spelling, "
             "--exclude and .gitignore")
 
     # Get git context if enabled
@@ -1633,6 +1691,11 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     # it would make the two disagree in exactly the cases where the pin is
     # unavailable, which is when the boost is the only thing left.
     scored = []
+    # Tracked so the relative floor below can be measured against the ORGANIC
+    # score distribution. EXPLICIT_PATH_BOOST is deliberately larger than any
+    # organic score can reach, so letting a prompt-named file set the bar would
+    # put the floor above everything the scan found on its own.
+    top_organic_score = 0.0
     for abs_path, rel_path, size in candidates:
         score = score_candidate(
             rel_path, size, prompt_tokens, git_recent, entry_points,
@@ -1641,15 +1704,22 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
         )
         if matches_explicit_path(rel_path, explicit_paths):
             score += EXPLICIT_PATH_BOOST
+        else:
+            top_organic_score = max(top_organic_score, score)
         if score > 0:
             scored.append((abs_path, rel_path, size, score))
 
     # Sort by score descending
     scored.sort(key=lambda x: x[3], reverse=True)
 
-    # Filter by minimum score threshold
+    # Filter by minimum score threshold — absolute AND relative-to-best.
+    # See RELATIVE_SCORE_FLOOR: the absolute floor alone does not discriminate
+    # on long prompts, because the score scales with the number of query terms.
     scored_before_filter = len(scored)
-    scored_filtered = [(a, r, s, sc) for (a, r, s, sc) in scored if sc >= MIN_SCORE_THRESHOLD]
+    effective_floor = max(
+        MIN_SCORE_THRESHOLD, top_organic_score * RELATIVE_SCORE_FLOOR,
+    )
+    scored_filtered = [(a, r, s, sc) for (a, r, s, sc) in scored if sc >= effective_floor]
 
     # For very broad prompts (<= 5 tokens), boost architectural/entry point files
     if len(prompt_tokens) <= 5:
@@ -1667,12 +1737,15 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
 
     # If no files pass threshold, keep top 10 anyway to avoid empty results
     if not scored_filtered and scored_before_filter > 0:
-        progress.note(f"Warning: All files scored below {MIN_SCORE_THRESHOLD}, using top 10")
+        progress.note(f"Warning: All files scored below {effective_floor:.2f}, using top 10")
         scored = scored[:10]
     else:
         filtered_count = scored_before_filter - len(scored_filtered)
         if filtered_count > 0:
-            progress.note(f"Filtered {filtered_count} low-relevance files (score < {MIN_SCORE_THRESHOLD})")
+            progress.note(
+                f"Filtered {filtered_count} low-relevance files "
+                f"(score < {effective_floor:.2f})"
+            )
         scored = scored_filtered
 
     # Stage 4 lands here: the semantic hits are unioned in, then tree-sitter

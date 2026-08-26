@@ -1,5 +1,7 @@
 """Tests for neo.static_analysis — language dispatch registry."""
 
+import pytest
+
 from neo.models import CodeSuggestion
 from neo.static_analysis import (
     _KNOWN_TOOLS,
@@ -139,3 +141,48 @@ class TestDispatch:
             enable_eslint=True,
         )
         assert len(called_with) == 6
+
+
+class TestCheckersAreBounded:
+    """Every checker shells out to an external tool, and none of these calls
+    was bounded. A wedged pyright or an eslint waiting on a lockfile could hang
+    a neo run indefinitely — in the one phase whose whole job is to make the
+    output trustworthy. Being bounded is also what makes it safe to run these
+    unconditionally instead of dropping them when inference runs long.
+    """
+
+    @pytest.mark.parametrize("checker_name", ["ruff", "pyright", "mypy", "eslint"])
+    def test_checker_passes_a_timeout(self, checker_name, monkeypatch):
+        from neo import static_analysis as sa
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(sa.subprocess, "run", fake_run)
+        checker = getattr(sa, f"run_{checker_name}_check")
+        checker(_suggestion(f"x.{'ts' if checker_name == 'eslint' else 'py'}"))
+
+        assert seen.get("timeout") == sa.STATIC_CHECK_TIMEOUT_SECONDS, (
+            f"{checker_name} ran unbounded"
+        )
+
+    @pytest.mark.parametrize("checker_name", ["ruff", "pyright", "mypy", "eslint"])
+    def test_timeout_is_reported_as_not_run(self, checker_name, monkeypatch):
+        """A timed-out checker contributed no diagnostics. That must not read
+        as "checked and clean" — it is "not checked"."""
+        import subprocess as sp
+        from neo import static_analysis as sa
+
+        def fake_run(cmd, **kwargs):
+            raise sp.TimeoutExpired(cmd, sa.STATIC_CHECK_TIMEOUT_SECONDS)
+
+        monkeypatch.setattr(sa.subprocess, "run", fake_run)
+        checker = getattr(sa, f"run_{checker_name}_check")
+        result = checker(_suggestion(f"x.{'ts' if checker_name == 'eslint' else 'py'}"))
+
+        assert "timed out" in result.summary.lower()
+        assert "not run" in result.summary.lower()
+        assert not result.diagnostics

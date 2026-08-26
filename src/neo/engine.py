@@ -182,7 +182,27 @@ class NeoEngine:
 
     # Constants for magic numbers (Phase 5)
     EARLY_EXIT_CONFIDENCE = 0.8  # Skip static checks if confidence above this
-    STATIC_CHECK_BUFFER = 0.9    # Reserve 10% of budget for static checks
+    # There is deliberately NO time gate on the static checks any more.
+    #
+    # The old gate was `elapsed < time_budget * 0.9`, and the constant behind
+    # it claimed to "reserve 10% of budget for static checks". It reserved
+    # nothing: time_budget never bounds the LM call — it is advisory context
+    # (see enriched_context["time_budget"]) — so the comparison only ever
+    # measured whether the run had already overrun.
+    #
+    # And it always had. TIME_BUDGETS is 30/60/120s drawn from ALGORITHM-problem
+    # percentiles ("Simple problems with N <= 100"); a repo review that walks
+    # 14,428 files and makes a network call takes minutes. So the gate resolved
+    # to "run the checkers only if the entire run finished in 27 seconds",
+    # which for real work is never — and neo told the user "I ran out of time
+    # before the checkers. This code is unverified." on essentially every
+    # substantial run. Verification, the only objective signal in the pipeline,
+    # was dropped precisely on the runs hard enough to need it.
+    #
+    # The checks are bounded work now: every checker subprocess carries
+    # STATIC_CHECK_TIMEOUT_SECONDS (see static_analysis), so the phase cannot
+    # run away. Bounded work does not need a budget guard, and gating it on a
+    # budget that does not describe this workload is what broke it.
     # Below this, a result is worth flagging rather than acting on. Applies to
     # both a single suggestion's confidence and the run's overall confidence;
     # the plugin docs quote the same threshold to users.
@@ -1226,9 +1246,15 @@ class NeoEngine:
         # objective signal (no error-severity diagnostics) to skip the rest of
         # the pipeline. Static checks are cheap enough to always run when the
         # time budget allows.
-        elapsed = time.time() - start_time
         static_checks = []
-        if elapsed < time_budget * self.STATIC_CHECK_BUFFER:
+        # Run the checks whenever there is something to check. Verification is
+        # the last thing to drop, not the first: a slow network call is not a
+        # reason to stop being able to say whether the patch is sound.
+        have_changes = any(
+            getattr(sug, "diff", None) or getattr(sug, "code", None)
+            for sug in code_suggestions
+        )
+        if have_changes:
             self._begin_phase(
                 PHASE_STATIC_CHECKS, self._voice("phase_checks")
             )
@@ -1268,15 +1294,25 @@ class NeoEngine:
         else:
             # Guarded: a zero budget is not reachable through _get_time_budget
             # today, but a *log line* must never be what crashes a run.
-            utilization = (elapsed / time_budget * 100) if time_budget else float("inf")
-            logger.info(f"Skipping static checks (at {utilization:.0f}% budget utilization)")
+            # WARNING, not INFO: the default log level is WARNING, so the only
+            # record that a run went unverified was invisible in normal use.
+            logger.warning(
+                "Skipping static checks (no suggestion carries a change)"
+            )
             # Opened even though nothing runs: a phase that closes without
             # opening leaves a host tracking a close for a phase it never saw
             # start. "Started then skipped" is both true and well-formed.
             self._begin_phase(PHASE_STATIC_CHECKS, self._voice("phase_checks_considering"))
+            # Two different reasons to skip, two different sentences. Saying
+            # "out of time" when there was simply nothing to check reports a
+            # budget problem that did not happen, and hides the real state:
+            # the model proposed no change, so there was nothing to verify.
             self._end_phase(
                 PHASE_STATIC_CHECKS,
-                self._voice("phase_checks_skipped"),
+                self._voice(
+                    "phase_checks_nothing_to_check" if not have_changes
+                    else "phase_checks_skipped"
+                ),
                 status="skipped",
             )
 
@@ -3430,9 +3466,15 @@ RULES:
         if issue_count:
             cautions.append(self._voice("caution_sim_issues", count=issue_count))
         if code_suggestions and not self._checks_that_evaluated(static_checks):
-            # Two different facts with two different remedies: install a linter
-            # versus give the run more time. The phase record already knows
-            # which one happened — don't collapse them here.
+            # Two different facts with two different remedies: install a
+            # linter, versus the model proposed nothing to check. The phase
+            # record already knows which one happened — don't collapse them.
+            #
+            # "Give the run more time" used to be the third case and is gone:
+            # the checkers no longer have a time gate (see the static-check
+            # phase). While that gate existed this line told operators a run
+            # was unverified because it ran out of time, on runs where the real
+            # state was that no diff had been produced at all.
             # Reads evaluated checks, not the raw list: a constraint result
             # that could only report "not checked for <language>" left the list
             # non-empty and swallowed this caution, which is the one line

@@ -854,6 +854,31 @@ class FactStore:
 
         Delegates to ContextAssembler to organize facts into layers.
         """
+        # A single neo request builds this context more than once —
+        # _decide_reasoning_mode -> _compute_memory_signal and
+        # _process_combined -> _format_combined_prompt both call it, which is
+        # why the constraint-overflow warning prints twice per run. Each call
+        # re-embeds the query and re-ranks the whole corpus (19,688 facts on a
+        # real store), so the repeat is pure waste.
+        #
+        # Keyed on a CONTENT fingerprint, not a revision counter: facts are
+        # mutated in place (supersession flips is_valid, retrieval stamps
+        # metadata) in enough places that a counter would silently go stale,
+        # and a stale memory layer is the exact failure this module cannot
+        # afford. len + valid-count catches append, extend, clear, reassign
+        # and supersede; anything it misses is metadata that only perturbs
+        # ranking WITHIN one request, where a stable answer is what we want.
+        fingerprint = (
+            len(self._facts),
+            sum(1 for f in self._facts if f.is_valid),
+            query,
+            k,
+            id(environment) if environment is not None else None,
+        )
+        cached = getattr(self, "_context_cache", None)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+
         query_embedding = self._embed_text(query)
         result = self._assembler.assemble(
             facts=self._facts,
@@ -867,6 +892,11 @@ class FactStore:
         now = time.time()
         for fact in result.valid_facts:
             self._mark_retrieved(fact, now)
+
+        # Cached AFTER the access stamps so a cache hit does not re-stamp:
+        # counting one request as several retrievals would inflate the recency
+        # and access-count signals that rank_score reads.
+        self._context_cache = (fingerprint, result)
 
         self._record_metric(
             "retrieve",

@@ -26,6 +26,15 @@ from neo.models import CodeSuggestion, StaticCheckResult
 # Python - Ruff
 # ============================================================================
 
+# Every checker below shells out to an external tool. None of these calls was
+# bounded, so a wedged `pyright` or an `eslint` waiting on a lockfile could
+# hang a neo run indefinitely — in the one phase whose whole job is to make the
+# output trustworthy. Bounded here so the checks are cheap enough to run
+# UNCONDITIONALLY (see EngineCore's static-check phase); a checker that times
+# out reports that plainly rather than silently contributing no diagnostics.
+STATIC_CHECK_TIMEOUT_SECONDS = 30
+
+
 def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
     """
     Run ruff in check-only mode on the suggested code.
@@ -55,6 +64,7 @@ def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['ruff', 'check', '--output-format=json', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse JSON output
@@ -74,6 +84,11 @@ def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"ruff timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
     except FileNotFoundError:
         summary = "ruff not found - install with: pip install ruff"
     except Exception as e:
@@ -117,6 +132,7 @@ def run_pyright_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['pyright', '--outputjson', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse JSON output
@@ -135,6 +151,11 @@ def run_pyright_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"pyright timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
     except FileNotFoundError:
         summary = "pyright not found - install with: npm install -g pyright"
     except Exception as e:
@@ -178,6 +199,7 @@ def run_mypy_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['mypy', '--no-error-summary', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse output (line format: file:line:col: severity: message)
@@ -196,6 +218,11 @@ def run_mypy_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"mypy timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
     except FileNotFoundError:
         summary = "mypy not found - install with: pip install mypy"
     except Exception as e:
@@ -242,6 +269,7 @@ def run_eslint_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['eslint', '--format=json', '--no-eslintrc', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse JSON output
@@ -262,6 +290,11 @@ def run_eslint_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"eslint timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
     except FileNotFoundError:
         summary = "eslint not found - install with: npm install -g eslint"
     except Exception as e:
@@ -324,6 +357,7 @@ def apply_diff_to_content(unified_diff: str, original_content: str) -> str:
         subprocess.run(
             ['patch', orig_path, diff_path],
             capture_output=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Read patched content

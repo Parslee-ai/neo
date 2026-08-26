@@ -162,3 +162,83 @@ def test_a_real_warning_still_reaches_the_episode_ledger(tmp_path):
     statuses = [v.status for v in engine.current_learning_episode.verification]
     assert "warning" in statuses
     assert metadata["verification_verdict"] == "warning"
+
+
+class TestSkipReasonIsReportedHonestly:
+    """Two different reasons to skip the checkers, two different sentences.
+
+    Saying "out of time" when there was simply nothing to check reports a
+    budget problem that did not happen and hides the real state: the model
+    proposed no change, so there was nothing to verify. Observed on a live run
+    that produced no diff and still announced "I ran out of time before the
+    checkers."
+    """
+
+    def test_both_reasons_have_distinct_voice_lines(self):
+        import yaml
+        from pathlib import Path
+
+        deck = yaml.safe_load(
+            (
+                Path(__file__).parent.parent
+                / "src/neo/config/beats/neo_matrix.yaml"
+            ).read_text()
+        )
+        lines = deck["orchestrator_voice"]["lines"]
+
+        out_of_time = lines["phase_checks_skipped"]
+        nothing = lines["phase_checks_nothing_to_check"]
+
+        assert out_of_time != nothing
+        assert "time" in out_of_time.lower()
+        assert "time" not in nothing.lower(), (
+            "the nothing-to-check message must not blame the clock"
+        )
+
+    def test_the_user_facing_caution_does_not_blame_the_clock(self):
+        """The FINAL caution line is a separate key from the phase summary, and
+        it was the one users actually saw: "I ran out of time before the
+        checkers." It kept saying that on runs where nothing was proposed to
+        check — and now that the checkers have no time gate at all, no run can
+        legitimately blame the clock."""
+        import yaml
+        from pathlib import Path
+
+        deck = yaml.safe_load(
+            (
+                Path(__file__).parent.parent
+                / "src/neo/config/beats/neo_matrix.yaml"
+            ).read_text()
+        )
+        caution = deck["orchestrator_voice"]["lines"]["caution_unverified_skipped"]
+
+        assert "time" not in caution.lower(), (
+            f"caution still blames the clock: {caution!r}"
+        )
+
+    def test_static_checks_have_no_time_gate(self):
+        """Bounded work does not need a budget guard. The old gate resolved to
+        "run the checkers only if the whole run finished in 27 seconds", which
+        for repo-scale work is never."""
+        from pathlib import Path
+
+        src = (Path(__file__).parent.parent / "src/neo/engine.py").read_text()
+        assert "STATIC_CHECK_BUFFER" not in src
+        assert "STATIC_CHECK_RUNAWAY_MULTIPLE" not in src
+
+    def test_engine_selects_the_message_from_have_changes(self):
+        """Pins the branch itself, so a future edit cannot collapse the two
+        reasons back into one sentence without this failing."""
+        import re
+        from pathlib import Path
+
+        src = (
+            Path(__file__).parent.parent / "src/neo/engine.py"
+        ).read_text()
+
+        assert "phase_checks_nothing_to_check" in src
+        branch = re.search(
+            r'phase_checks_nothing_to_check"\s+if\s+not\s+have_changes',
+            src,
+        )
+        assert branch, "skip message is no longer selected by have_changes"
