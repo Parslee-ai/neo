@@ -128,8 +128,92 @@ class ConstraintIngester:
             # Update checksum
             self._checksums[str(file_path)] = current_checksum
 
+        self._retire_orphaned_facts(existing_facts, superseded_facts)
+
         self._save_checksums()
         return new_facts, superseded_facts
+
+    def _retire_orphaned_facts(
+        self, existing_facts: list[Fact], superseded_facts: list[Fact],
+    ) -> None:
+        """Retire constraints whose source file no longer exists.
+
+        Supersession only ever ran INSIDE the loop over files that were found,
+        because `_group_by_file_identity` skips anything failing `exists()`. So
+        a constraint file that was deleted, renamed, or moved out of scope left
+        its facts `is_valid=True` at confidence 1.0 — and CONSTRAINT facts are
+        exempt from recall decay, from `prune_stale_facts`, from
+        `_enforce_scope_limit` and from `demote_unhelpful_facts`. Nothing in
+        the system could ever retire them. That is a monotonic leak with no
+        upper bound, and since constraints are now relevance-ranked those
+        ghosts compete on equal footing with live rules for a capped budget.
+
+        Soft supersession (`is_valid=False`), the same mechanism a CHANGED file
+        already uses — not a delete. A file that comes back is re-ingested on
+        the next run.
+
+        Scoped to facts THIS INGESTER created — tagged `auto-ingested`, with a
+        recorded `source_file`. Those are the ones whose entire justification is
+        that file; a hand-written constraint, or one from any other producer, is
+        not ours to retire.
+
+        Checked against the recorded path itself rather than only against paths
+        resolved from the current root, because the orphans are overwhelmingly
+        from OTHER roots. Measured on a real store: 1,479 of 2,445 valid
+        constraints (60%, ~346k tokens) were sourced from ephemeral agent
+        worktrees under /private/tmp/.../scratchpad/ and from deleted checkouts
+        — every throwaway worktree holding a CLAUDE.md minted ~45 permanent
+        facts. GLOBAL and ORG scoped facts load everywhere, so those ghosts
+        competed with live rules for a capped budget in every project.
+
+        A file that exists but was skipped this run for an unchanged checksum
+        still exists, so it is not an orphan.
+
+        KNOWN HAZARD: an unmounted volume makes its files look deleted, so a
+        run while a network mount is down retires the constraints sourced from
+        it. Bounded and self-healing — this is soft supersession, and the next
+        ingest of that root restores the rules — but it is why this logs at
+        INFO with the paths rather than doing it quietly.
+        """
+        retired = 0
+        missing_paths: set[str] = set()
+        exists_cache: dict[str, bool] = {}
+        for fact in existing_facts:
+            if fact.kind != FactKind.CONSTRAINT or not fact.is_valid:
+                continue
+            if "auto-ingested" not in fact.tags:
+                continue
+            source = fact.metadata.source_file
+            if not source:
+                continue
+            present = exists_cache.get(source)
+            if present is None:
+                present = Path(source).exists()
+                exists_cache[source] = present
+            if present:
+                continue
+            fact.is_valid = False
+            superseded_facts.append(fact)
+            missing_paths.add(source)
+            retired += 1
+
+        if not missing_paths:
+            return
+
+        # Drop the stored checksum for every missing file, or retiring the
+        # facts would be a ONE-WAY door: the file comes back with identical
+        # content, the cached checksum still matches, the unchanged-file
+        # short-circuit skips it, and the rules that were retired are never
+        # re-ingested. Forgetting the checksum makes a returning file look new,
+        # which is exactly what it is to a store that no longer holds it.
+        for path in missing_paths:
+            self._checksums.pop(path, None)
+
+        if retired:
+            logger.info(
+                "Retired %d constraint(s) whose source file no longer exists: %s",
+                retired, ", ".join(sorted(missing_paths)),
+            )
 
     def _group_by_file_identity(
         self,

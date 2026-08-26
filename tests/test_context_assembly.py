@@ -462,3 +462,134 @@ class TestConstraintOverflowRanking:
             [a, b], "query", query_embedding=query_vec, max_tokens=12000,
         )
         assert [f.subject for f in result.constraints] == ["a", "b"]
+
+
+class TestMissingEmbeddingIsNotAClaim:
+    """A fact with no embedding must not be scored as moderately similar to a
+    query it was never compared to.
+
+    The default was 0.5. Under rank_score (sim * confidence + bonuses) an
+    unembedded fact at confidence 0.9 scored 0.45 and outranked a genuinely
+    matching fact at confidence 0.6 whose real similarity was 0.7 (0.42).
+    Absence rendered as a value, and the value won.
+    """
+
+    def test_unembedded_fact_does_not_outrank_a_real_match(self, assembler):
+        """Placed exactly at the decision boundary.
+
+        A real match with cosine ~1.0 wins under the old default too, so a
+        fixture like that proves nothing — an earlier version of this test used
+        one and survived mutation. The defect only shows where the genuine
+        similarity is MODEST: measured, unembedded-at-0.9-confidence scored
+        0.560 against a real 0.7-similarity match at 0.478.
+        """
+        import math
+
+        query = np.array([1.0, 0.0], dtype=np.float32)
+        # Unit vector whose cosine with `query` is exactly 0.7.
+        modest = np.array([0.7, math.sqrt(1 - 0.49)], dtype=np.float32)
+
+        unembedded = _make_fact(
+            subject="unembedded-high-confidence", confidence=0.9, embedding=None,
+        )
+        real_match = _make_fact(
+            subject="real-match", confidence=0.6, embedding=modest,
+        )
+
+        result = assembler.assemble(
+            [unembedded, real_match], "query", query_embedding=query, k=2,
+        )
+        assert result.valid_facts[0].subject == "real-match", (
+            "a fact with no embedding outranked one that actually matched"
+        )
+
+    def test_absent_query_still_ranks_by_confidence(self, assembler):
+        """The OTHER absence, and it wants the opposite answer. A missing query
+        makes similarity uninformative for everyone equally; zeroing it there
+        does not remove a false claim, it deletes confidence from the score and
+        makes a 0.9 fact tie a 0.2 one. Ranking by confidence beats ranking by
+        nothing."""
+        low = _make_fact(confidence=0.2, subject="low", embedding=None)
+        high = _make_fact(confidence=0.9, subject="high", embedding=None)
+
+        result = assembler.assemble(
+            [low, high], "query", query_embedding=None, k=2,
+        )
+        assert result.valid_facts[0].subject == "high"
+
+    def test_constraint_fallback_to_scope_order_is_reported(self, assembler, caplog):
+        """Reverting to scope-then-insertion order IS the age-ordering defect
+        the ranking exists to remove, and it would return silently in exactly
+        the state where memory is already degraded."""
+        import logging
+
+        facts = [
+            _make_fact(
+                kind=FactKind.CONSTRAINT, subject=f"c-{i}",
+                body="x" * 400, embedding=None,
+            )
+            for i in range(30)
+        ]
+        with caplog.at_level(logging.WARNING, logger="neo.memory.context"):
+            assembler.assemble(facts, "query", query_embedding=None, max_tokens=600)
+
+        assert any(
+            "no query embedding" in r.message.lower()
+            or "no query embedding" in r.getMessage().lower()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+
+class TestConstraintSelectionIsObservable:
+    """The constraint layer holds two-thirds of the token budget and was the
+    only one whose selection left no trace.
+
+    `retrieval_scores` carried valid_facts only, so nothing recorded which
+    constraints were injected or why. Ranking them by relevance without that
+    would have been a better selection with an unchanged reporting posture —
+    "age silently decides" replaced by "relevance silently decides".
+    """
+
+    @staticmethod
+    def _big(subject, embedding):
+        return _make_fact(
+            kind=FactKind.CONSTRAINT, subject=subject,
+            body="x" * 400, embedding=embedding,
+        )
+
+    def test_injected_constraints_carry_their_scores(self, assembler):
+        query = np.array([1.0, 0.0], dtype=np.float32)
+        off = np.array([0.0, 1.0], dtype=np.float32)
+        facts = [self._big(f"c-{i}", off) for i in range(30)]
+        facts.append(self._big("relevant", query))
+
+        result = assembler.assemble(
+            facts, "query", query_embedding=query, max_tokens=600,
+        )
+
+        assert result.constraints, "no constraints injected"
+        scored = [c for c in result.constraints if c.id in result.retrieval_scores]
+        assert scored, (
+            "not one injected constraint reports the score it was chosen on"
+        )
+
+    def test_valid_fact_scores_are_not_clobbered(self, assembler):
+        """Constraint scores are merged UNDER valid-fact scores, so the layer
+        consumers already read keeps its meaning."""
+        query = np.array([1.0, 0.0], dtype=np.float32)
+        facts = [self._big(f"c-{i}", query) for i in range(30)]
+        pattern = _make_fact(subject="p", embedding=query)
+        facts.append(pattern)
+
+        result = assembler.assemble(
+            facts, "query", query_embedding=query, max_tokens=600,
+        )
+        for fact in result.valid_facts:
+            assert fact.id in result.retrieval_scores
+
+    def test_no_scores_reported_when_the_layer_did_not_overflow(self, assembler):
+        """Ranking only engages on overflow, so below the cap there is no
+        selection to report and nothing should be invented."""
+        a = _make_fact(kind=FactKind.CONSTRAINT, subject="a", body="short")
+        result = assembler.assemble([a], "query", max_tokens=12000)
+        assert result.constraints

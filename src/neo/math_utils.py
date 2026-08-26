@@ -74,24 +74,48 @@ def batched_cosine(
     embeddings: list[Optional[np.ndarray]],
     query: Optional[np.ndarray],
     *,
-    default: float = 0.5,
+    default: float = 0.0,
+    no_query_default: Optional[float] = None,
 ) -> list[float]:
     """Cosine similarity of one query against many embeddings, one numpy pass.
 
     Rows with None or non-finite embeddings — and the case where ``query`` is
     None or zero-norm — fall back to ``default``. Vectorized: O(n * d) but in
     one matrix-vector product rather than n Python iterations.
+
+    ``default`` is 0.0, meaning NO EVIDENCE OF SIMILARITY. It used to be 0.5,
+    which is not an absence — it is a claim of moderate similarity, and it won
+    arguments it had no business entering: an unembedded fact at confidence
+    0.9 scored 0.45 under ``rank_score`` and outranked a genuinely matching
+    fact at confidence 0.6 whose real similarity was 0.7 (0.42). Every caller
+    that had thought about this already passed 0.0 explicitly; the two that
+    took the default were the retrieval and context-assembly rankers, i.e.
+    exactly the paths where being wrong changes what the model is shown.
+
+    A caller that genuinely wants "unknown, treat as mid" must now say so.
+
+    ``no_query_default`` covers the OTHER case, which the single ``default``
+    used to swallow: no query embedding at all. Those are not the same
+    absence. A row missing an embedding is *this fact* being uncomparable
+    while others are comparable — it must not be credited. A missing QUERY
+    makes similarity uninformative for everyone equally, and zeroing it there
+    does not remove a false claim, it deletes the other ranking terms:
+    ``rank_score`` computes ``sim * confidence + bonuses``, so sim=0 discards
+    confidence entirely and a 0.9-confidence fact ties a 0.2-confidence one.
+    Ranking by confidence beats ranking by nothing. Defaults to ``default``
+    when unset, so callers that pass an explicit ``default`` keep one meaning.
     """
     n = len(embeddings)
     if n == 0:
         return []
+    absent_query = default if no_query_default is None else no_query_default
     if query is None:
-        return [default] * n
+        return [absent_query] * n
 
     q = np.asarray(query, dtype=np.float32)
     q_norm = float(np.linalg.norm(q))
     if q_norm == 0.0 or not np.isfinite(q_norm):
-        return [default] * n
+        return [absent_query] * n
 
     rows: list[np.ndarray] = []
     row_indices: list[int] = []

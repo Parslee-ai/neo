@@ -215,3 +215,141 @@ class TestUnchangedBehaviour:
         new_facts, superseded = _ingester(tmp_path).ingest([])
         assert new_facts == []
         assert superseded == []
+
+
+class TestOrphanedConstraintsAreRetired:
+    """A constraint file that disappears must not leave immortal facts.
+
+    Supersession only ever ran inside the loop over files that were FOUND —
+    `_group_by_file_identity` skips anything failing `exists()` — so a deleted
+    or renamed rule file left its facts `is_valid=True` at confidence 1.0.
+    CONSTRAINT facts are exempt from recall decay, from `prune_stale_facts`,
+    from `_enforce_scope_limit` and from `demote_unhelpful_facts`, so nothing
+    in the system could retire them. Since constraints are now
+    relevance-ranked, those ghosts compete with live rules for a capped budget.
+    """
+
+    def _ingest_then_delete(self, tmp_path, monkeypatch):
+        rules = tmp_path / "CLAUDE.md"
+        rules.write_text(RULES)
+        monkeypatch.chdir(tmp_path)
+
+        ing = _ingester(tmp_path)
+        facts, _ = ing.ingest([])
+        assert facts, "fixture did not ingest anything"
+        assert all(f.is_valid for f in facts)
+
+        rules.unlink()
+        return facts
+
+    def test_facts_from_a_deleted_file_are_superseded(self, tmp_path, monkeypatch):
+        facts = self._ingest_then_delete(tmp_path, monkeypatch)
+
+        ing = _ingester(tmp_path)
+        _new, superseded = ing.ingest(facts)
+
+        assert _valid(facts) == [], (
+            f"{len(_valid(facts))} constraint(s) outlived their source file"
+        )
+        assert len(superseded) == len(facts)
+
+    def test_soft_supersession_not_deletion(self, tmp_path, monkeypatch):
+        """Recoverable: a file that comes back is re-ingested."""
+        facts = self._ingest_then_delete(tmp_path, monkeypatch)
+        ing = _ingester(tmp_path)
+        ing.ingest(facts)
+
+        assert all(f.is_valid is False for f in facts)
+        assert all(f.subject for f in facts), "facts were destroyed, not retired"
+
+        (tmp_path / "CLAUDE.md").write_text(RULES)
+        revived, _ = _ingester(tmp_path).ingest(facts)
+        assert revived, "a returning file was not re-ingested"
+
+    def test_a_present_file_is_never_treated_as_orphaned(self, tmp_path, monkeypatch):
+        """An unchanged file is SKIPPED for its checksum but still exists.
+        Confusing "not processed this run" with "gone" would retire every rule
+        on the second run."""
+        (tmp_path / "CLAUDE.md").write_text(RULES)
+        monkeypatch.chdir(tmp_path)
+
+        ing = _ingester(tmp_path)
+        facts, _ = ing.ingest([])
+
+        _new, superseded = ing.ingest(facts)
+
+        assert superseded == [], "retired constraints whose file still exists"
+        assert _valid(facts) == facts
+
+    def test_foreign_facts_are_left_alone(self, tmp_path, monkeypatch):
+        """Only facts this ingester created are ours to retire."""
+        monkeypatch.chdir(tmp_path)
+        foreign = Fact(
+            subject="hand written",
+            body="not from a rule file",
+            kind=FactKind.CONSTRAINT,
+            scope=FactScope.PROJECT,
+            metadata=FactMetadata(source_file="", confidence=1.0),
+            tags=["constraint"],
+        )
+        _new, superseded = _ingester(tmp_path).ingest([foreign])
+
+        assert foreign.is_valid
+        assert foreign not in superseded
+
+
+class TestOrphansFromOtherRootsAreRetired:
+    """The orphans are overwhelmingly from OTHER roots.
+
+    Measured on a real store: 1,479 of 2,445 valid constraints (60%, ~346k
+    tokens) came from ephemeral agent worktrees under
+    /private/tmp/.../scratchpad/ and from deleted checkouts — every throwaway
+    worktree holding a CLAUDE.md minted ~45 permanent facts. Checking only
+    paths resolved from the CURRENT root would leave every one of them.
+    """
+
+    def test_a_fact_from_a_vanished_foreign_root_is_retired(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        gone = tmp_path / "ephemeral-worktree" / "CLAUDE.md"
+        gone.parent.mkdir()
+        gone.write_text(RULES)
+
+        ghost = Fact(
+            subject="Build",
+            body="Run `make build`.",
+            kind=FactKind.CONSTRAINT,
+            scope=FactScope.GLOBAL,
+            metadata=FactMetadata(source_file=str(gone), confidence=1.0),
+            tags=["constraint", "auto-ingested"],
+        )
+        # Still there: nothing to retire.
+        _new, superseded = _ingester(tmp_path).ingest([ghost])
+        assert ghost.is_valid and ghost not in superseded
+
+        import shutil
+        shutil.rmtree(gone.parent)
+
+        _new, superseded = _ingester(tmp_path).ingest([ghost])
+        assert not ghost.is_valid, (
+            "a constraint from a deleted foreign worktree survived"
+        )
+        assert ghost in superseded
+
+    def test_hand_written_constraints_are_never_retired(self, tmp_path, monkeypatch):
+        """No auto-ingested tag means another producer owns it."""
+        monkeypatch.chdir(tmp_path)
+        manual = Fact(
+            subject="hand written",
+            body="rule",
+            kind=FactKind.CONSTRAINT,
+            scope=FactScope.GLOBAL,
+            metadata=FactMetadata(
+                source_file=str(tmp_path / "never-existed.md"), confidence=1.0,
+            ),
+            tags=["constraint"],
+        )
+        _new, superseded = _ingester(tmp_path).ingest([manual])
+        assert manual.is_valid
+        assert manual not in superseded

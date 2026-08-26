@@ -748,7 +748,13 @@ class FactStore:
                 return []
 
             now = time.time()
-            sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
+            # default=0.0 (this fact is uncomparable while others are not) is
+            # a different absence from no_query_default=0.5 (similarity is
+            # uninformative for everyone, so let confidence decide).
+            sims = batched_cosine(
+                [f.embedding for f in valid_facts], query_embedding,
+                default=0.0, no_query_default=0.5,
+            )
 
             # Hybrid dense + sparse (paper 2603.19935 Memori §3.3). BM25
             # over the same corpus catches keyword matches the dense
