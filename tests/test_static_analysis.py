@@ -186,3 +186,148 @@ class TestCheckersAreBounded:
         assert "timed out" in result.summary.lower()
         assert "not run" in result.summary.lower()
         assert not result.diagnostics
+        # STATUS is what the engine reads — _static_check_status returns it
+        # verbatim and _checks_that_evaluated gates the "unverified" caution
+        # and the early exit on it. Asserting only on the prose let a version
+        # ship where the summary said "treat this check as NOT run" and the
+        # status said "passed".
+        assert result.status == "unavailable", (
+            f"a wedged checker reports {result.status!r} — reads as clean"
+        )
+
+    @pytest.mark.parametrize("checker_name", ["ruff", "pyright", "mypy", "eslint"])
+    def test_timeout_does_not_derive_passed_end_to_end(self, checker_name, monkeypatch):
+        """Through run_static_checks, which is where the status is derived.
+
+        A timeout yields no diagnostics, no "not found" and no "failed:", so
+        the derivation at the end of run_static_checks landed on "passed".
+        """
+        import subprocess as sp
+        from neo import static_analysis as sa
+
+        def fake_run(cmd, **kwargs):
+            raise sp.TimeoutExpired(cmd, sa.STATIC_CHECK_TIMEOUT_SECONDS)
+
+        monkeypatch.setattr(sa.subprocess, "run", fake_run)
+        ext = "ts" if checker_name == "eslint" else "py"
+        sug = CodeSuggestion(
+            file_path=f"x.{ext}",
+            unified_diff="--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b\n",
+            code_block="", description="", confidence=0.0,
+        )
+        results = sa.run_static_checks(
+            [sug],
+            enable_ruff=checker_name == "ruff",
+            enable_pyright=checker_name == "pyright",
+            enable_mypy=checker_name == "mypy",
+            enable_eslint=checker_name == "eslint",
+        )
+        for r in results:
+            assert r.status != "passed", (
+                f"{r.tool_name} timed out and was recorded as passed"
+            )
+
+
+class TestDiffApplicationIsBounded:
+    """apply_diff_to_content shells out to `patch` and sits under every
+    checker."""
+
+    def test_timeout_is_handled_not_escaped(self, monkeypatch):
+        """TimeoutExpired is a SubprocessError, NOT an OSError, so it escaped
+        this function's except tuple entirely — past the fallback, into the
+        calling checker's handler, where it was reported as that checker
+        timing out on a run where the checker never ran."""
+        import subprocess as sp
+        from neo import static_analysis as sa
+
+        monkeypatch.setattr(
+            sa.subprocess, "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(sp.TimeoutExpired(cmd, 30)),
+        )
+        out = sa.apply_diff_to_content(
+            "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", "old\n"
+        )
+        assert out == "new"
+
+    def test_temp_files_are_not_leaked_on_failure(self, monkeypatch):
+        """Cleanup sat after the `return`, so every raising path leaked both
+        temp files — which is now every path that times out."""
+        import glob
+        import os
+        import subprocess as sp
+        import tempfile
+        from neo import static_analysis as sa
+
+        pattern = os.path.join(tempfile.gettempdir(), "tmp*")
+        before = set(glob.glob(pattern))
+        monkeypatch.setattr(
+            sa.subprocess, "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(sp.TimeoutExpired(cmd, 30)),
+        )
+        sa.apply_diff_to_content(
+            "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", "old\n"
+        )
+        assert not (set(glob.glob(pattern)) - before)
+
+    def test_patch_cannot_consume_neos_stdin(self, monkeypatch):
+        """`patch` prompts on a malformed diff and otherwise inherits neo's
+        own stdin — the stdin a host may be feeding the prompt on."""
+        import subprocess as sp
+        from neo import static_analysis as sa
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["stdin"] = kwargs.get("stdin")
+            raise sp.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(sa.subprocess, "run", fake_run)
+        sa.apply_diff_to_content("--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b\n", "a\n")
+
+        assert seen["stdin"] == sp.DEVNULL
+        assert "--batch" in seen["cmd"]
+
+    def test_fallback_does_not_leak_diff_headers_into_content(self, monkeypatch):
+        """The header guard was one-sided: "+++ b/file" was excluded from the
+        added-lines branch but fell through the context branch and was
+        appended verbatim, so the checkers linted a literal "+++ b/file" line
+        and reported it against the user's code."""
+        import subprocess as sp
+        from neo import static_analysis as sa
+
+        monkeypatch.setattr(
+            sa.subprocess, "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(sp.TimeoutExpired(cmd, 30)),
+        )
+        out = sa.apply_diff_to_content(
+            "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n", "ctx\nold\n"
+        )
+        assert "+++" not in out and "---" not in out and "@@" not in out
+        assert out.splitlines() == ["ctx", "new"]
+
+    def test_fallback_preserves_context_indentation(self, monkeypatch):
+        """Context lines carry a leading space in unified diff format.
+        Appending them verbatim shifted every one a column right — in Python
+        that is a syntax change, and the checkers reported indentation errors
+        against code the user never wrote."""
+        import subprocess as sp
+        from neo import static_analysis as sa
+
+        monkeypatch.setattr(
+            sa.subprocess, "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(sp.TimeoutExpired(cmd, 30)),
+        )
+        diff = (
+            "--- a/x.py\n+++ b/x.py\n@@ -1,3 +1,3 @@\n"
+            " def f():\n"
+            "-    return 1\n"
+            "+    return 2\n"
+        )
+        out = sa.apply_diff_to_content(diff, "def f():\n    return 1\n")
+
+        assert out.splitlines() == ["def f():", "    return 2"], out.splitlines()
+        # The reconstructed file must actually parse; that is the whole point
+        # of handing it to a checker.
+        import ast
+        ast.parse(out)

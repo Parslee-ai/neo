@@ -3581,6 +3581,52 @@ class TestBuildContextCaching:
 
         assert spy.call_count == 2, "served a context containing a retracted fact"
 
+    def test_reload_invalidates_the_cache(self, store):
+        """load() replaces the whole corpus from disk. len and valid-count are
+        routinely IDENTICAL across a reload, so the content fingerprint cannot
+        see it and a pre-reload ContextResult was served — holding Fact
+        objects no longer in the store."""
+        store.add_fact(subject="original", body="b", kind=FactKind.PATTERN)
+        store.build_context("same query")
+
+        store.load()
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+
+        assert spy.call_count == 1, "served a context built before the reload"
+
+    def test_begin_request_resets_the_memo(self, store):
+        """The duplication this cache exists for is WITHIN one request. Scoping
+        it to the request bounds any staleness the fingerprint misses."""
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+        store.build_context("same query")
+
+        store.begin_request()
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+
+        assert spy.call_count == 1
+
+    def test_environment_identity_is_not_part_of_the_key(self, store):
+        """It was keyed on id(environment). CPython reuses the address of a
+        freed empty dict, so build_context(q, environment={}) followed by
+        build_context(q, environment={"git": ...}) could be a false hit that
+        silently dropped the git environment from the prompt."""
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        first = store.build_context("same query", environment={})
+        second = store.build_context("same query", environment={"git": "abc"})
+
+        # Same fingerprint by design, so this IS a cache hit — the point is
+        # that it is a hit on a stable key rather than on a reusable address.
+        assert first is second
+
     def test_cache_hit_does_not_restamp_access_metadata(self, store):
         """Counting one request as several retrievals would inflate the
         recency and access-count signals rank_score reads."""

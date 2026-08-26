@@ -478,6 +478,12 @@ class NeoEngine:
         self.action_log.clear()
         self._phase_records = []
         self._findings = []
+        # Per-request memoization starts clean. build_context is called from
+        # more than one place in a single request and is expensive; the memo
+        # that serves that is reset here so its scope is the request, never the
+        # process.
+        if self.fact_store is not None:
+            self.fact_store.begin_request()
         self._selected_beat = None
         self._beat_selected = False
         self._recalled_fact_count = 0
@@ -1292,8 +1298,6 @@ class NeoEngine:
                 failed=len(failed),
             )
         else:
-            # Guarded: a zero budget is not reachable through _get_time_budget
-            # today, but a *log line* must never be what crashes a run.
             # WARNING, not INFO: the default log level is WARNING, so the only
             # record that a run went unverified was invisible in normal use.
             logger.warning(
@@ -1303,16 +1307,12 @@ class NeoEngine:
             # opening leaves a host tracking a close for a phase it never saw
             # start. "Started then skipped" is both true and well-formed.
             self._begin_phase(PHASE_STATIC_CHECKS, self._voice("phase_checks_considering"))
-            # Two different reasons to skip, two different sentences. Saying
-            # "out of time" when there was simply nothing to check reports a
-            # budget problem that did not happen, and hides the real state:
-            # the model proposed no change, so there was nothing to verify.
+            # One reason, one sentence. This branch is reached only when
+            # have_changes is false — the checkers have no time gate, so
+            # "out of time" is not a state this can be in.
             self._end_phase(
                 PHASE_STATIC_CHECKS,
-                self._voice(
-                    "phase_checks_nothing_to_check" if not have_changes
-                    else "phase_checks_skipped"
-                ),
+                self._voice("phase_checks_nothing_to_check"),
                 status="skipped",
             )
 
@@ -2711,10 +2711,21 @@ RULES:
         the target language still occupies a slot in that list, so counting
         slots reports a run as verified by a checker that evaluated nothing,
         and suppresses the "this code is unverified" caution that is true.
+
+        "unavailable" is excluded for the same reason as "skipped", and it was
+        NOT before: a tool that is not installed reports `unavailable` (see
+        static_analysis), and was counted here as having examined the code. A
+        machine with no ruff and no pyright therefore produced "all 2
+        checker(s) clean". A checker that timed out lands in the same state and
+        would have inherited the same lie.
+
+        Stated positively so a new status cannot silently join the vouching
+        set: only a check that reached a verdict about the code counts.
         """
         return [
             check for check in checks
-            if NeoEngine._static_check_status(check) != "skipped"
+            if NeoEngine._static_check_status(check)
+            in ("passed", "warning", "failed")
         ]
 
     @staticmethod

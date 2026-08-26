@@ -186,14 +186,15 @@ class TestSkipReasonIsReportedHonestly:
         )
         lines = deck["orchestrator_voice"]["lines"]
 
-        out_of_time = lines["phase_checks_skipped"]
         nothing = lines["phase_checks_nothing_to_check"]
-
-        assert out_of_time != nothing
-        assert "time" in out_of_time.lower()
         assert "time" not in nothing.lower(), (
             "the nothing-to-check message must not blame the clock"
         )
+        # The out-of-time phrasing is GONE, not merely unused: with no time
+        # gate on the checkers there is no state it could describe, and a
+        # retired sentence sitting in the deck is one grep away from being
+        # wired back up.
+        assert "phase_checks_skipped" not in lines
 
     def test_the_user_facing_caution_does_not_blame_the_clock(self):
         """The FINAL caution line is a separate key from the phase summary, and
@@ -226,10 +227,11 @@ class TestSkipReasonIsReportedHonestly:
         assert "STATIC_CHECK_BUFFER" not in src
         assert "STATIC_CHECK_RUNAWAY_MULTIPLE" not in src
 
-    def test_engine_selects_the_message_from_have_changes(self):
-        """Pins the branch itself, so a future edit cannot collapse the two
-        reasons back into one sentence without this failing."""
-        import re
+    def test_no_dead_ternary_on_the_skip_message(self):
+        """The skip branch is reached only when have_changes is false, so a
+        `if not have_changes` ternary inside it is a branch that cannot be
+        taken. It was there, selecting a message that could never be emitted.
+        """
         from pathlib import Path
 
         src = (
@@ -237,8 +239,6 @@ class TestSkipReasonIsReportedHonestly:
         ).read_text()
 
         assert "phase_checks_nothing_to_check" in src
-        branch = re.search(
-            r'phase_checks_nothing_to_check"\s+if\s+not\s+have_changes',
-            src,
+        assert "phase_checks_skipped" not in src, (
+            "retired voice key is referenced again"
         )
-        assert branch, "skip message is no longer selected by have_changes"

@@ -24,26 +24,44 @@ from neo.text_budget import MARKER_TEMPLATE, apportion
 # Constants
 MIN_SCORE_THRESHOLD = 0.2  # Filter files with very low relevance (was 0.3, reduced for broad prompts)
 
-# The absolute floor above is measured against a score that GROWS WITH PROMPT
-# LENGTH: content relevance accumulates per matching query term, so a long
-# prompt lifts every file's score at once. On a 200-word review prompt against
-# this repo the floor removed 224 of 14,428 files — 99.2% "passed", which is
-# not a filter, and the surviving order is then decided by whatever the ranker
-# happened to do. That is how a code-review prompt came back holding design
-# documents. Lowering the constant (0.3 -> 0.2, as the comment above records)
-# treated the symptom and made it worse.
+# 0.2 is far too low to separate signal from noise, and the reason is NOT that
+# scores scale with prompt length — an earlier version of this comment claimed
+# that and it is false. `content_relevance` arrives already normalized to
+# [0, 1] by the per-query maximum (file_retrieval.normalize), so
+# the weighted content term is capped at CONTENT_WEIGHT for a three-word prompt and for a
+# three-hundred-word one alike.
 #
-# So also require a file to score within a fraction of the BEST file for this
-# prompt. That is scale-free: it means the same thing whether the prompt is
-# five words or five hundred. The absolute floor stays as the guard for the
-# case a relative floor cannot see — a prompt where even the top file is
-# irrelevant, where "10% of the best" is still noise.
+# What actually clears 0.2 without any content signal is the filename
+# tie-breaker, `0.15 * min(hits, 3)` (capped at 0.45), plus the +0.8
+# documentation bonus below. On a long prompt nearly every path in a large repo
+# contains three prompt tokens as substrings, so nearly every file scores
+# 0.2-0.45 on filename alone: measured, 224 of 14,428 filtered, 99.2% "passed",
+# which is not a filter.
+#
+# A file therefore also has to reach a fraction of the BEST ORGANIC score for
+# this prompt. Because the content term is max-normalized, that best is pinned
+# near CONTENT_WEIGHT (3.0) whenever anything matches, which puts the effective
+# floor around 0.5 — deliberately just above the 0.45 tie-breaker ceiling. That
+# coupling is the whole mechanism: if CONTENT_WEIGHT or the 0.45 cap moves,
+# RELATIVE_SCORE_FLOOR has to be re-derived, and this comment is the only place
+# that says so.
+#
+# KNOWN LIMIT: anchored on max(), the least robust statistic available. One
+# outlier organic hit sets the bar for the whole scan. A p90 of the organic
+# distribution would be robust to that and costs one sorted().
 # Measured against the best ORGANIC score — a file that merely got
 # EXPLICIT_PATH_BOOST does not set the bar for everything else. That boost is
 # tuned to exceed any organic score by construction (see EXPLICIT_PATH_BOOST),
 # so including it put the floor above the entire scan and left prompts that
 # named a file with nothing but that file.
 RELATIVE_SCORE_FLOOR = 0.15  # keep files scoring >= 15% of the best organic hit
+
+# A prompt this short cannot express a specific target, so architectural and
+# documentation files are the best available answer. Above it, the prompt names
+# what it wants and documentation has to earn its place on content like
+# anything else. Same threshold the architectural-file top-up uses below, named
+# once so the two cannot drift apart.
+BROAD_PROMPT_TOKENS = 5
 MAX_CHUNKS_PER_FILE = 2    # Cap chunks per file so one large file doesn't dominate the budget
 MAX_CHUNK_CENTERS = 20     # Best-scoring lines considered as window centers before merging
 MAX_MERGED_WINDOW_LINES = 200   # Ceiling on a merged window so one file can't eat the budget
@@ -369,7 +387,14 @@ EXPLICIT_PATH_BOOST = 10.0
 
 # Loose: real filtering is "does this match a file we actually found", which no
 # amount of prose punctuation can fake.
-_PATH_LIKE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z][A-Za-z0-9]{0,5}')
+# The extension bound is 10 characters, not 6. At {0,5} the pattern MATCHED a
+# long extension but TRUNCATED it: "schema.graphql" was extracted as
+# "schema.graphq" and "notes.markdown" as "notes.markdo". A truncated token
+# matches no real file, so the named file silently lost EXPLICIT_PATH_BOOST,
+# and it is not a known extension either, so the not-found warning stayed
+# quiet too — the file the user explicitly named just quietly did not arrive.
+# 10 covers dockerfile/properties/markdown/graphql.
+_PATH_LIKE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z][A-Za-z0-9]{0,9}')
 
 
 # Extensions that make a bare dotted token a plausible FILE reference. A token
@@ -405,7 +430,10 @@ def _looks_like_a_real_path(token: str) -> bool:
     if "/" in token:
         return True
     _, _, ext = token.rpartition(".")
-    return ext in _SOURCE_EXTENSIONS
+    # Lowered here rather than relying on extract_explicit_paths having done
+    # it: this function is public enough to be called directly, and the
+    # coupling was stated nowhere. Unlowered, "README.MD" was not warnable.
+    return ext.lower() in _SOURCE_EXTENSIONS
 
 
 def extract_explicit_paths(prompt: str) -> set[str]:
@@ -560,9 +588,25 @@ def score_candidate(rel_path: str, size: int, prompt_tokens: set[str],
     basename = os.path.basename(rel_path).lower()
 
     # Documentation/architecture bonus (for broad prompts)
+    #
+    # Gated on the prompt actually BEING broad, or on the file carrying some
+    # content signal. The comment always said "for broad prompts"; the code
+    # applied it to every prompt, unconditionally, with no reference to whether
+    # the file matched anything. At +0.8 that is four times MIN_SCORE_THRESHOLD
+    # and above the relative floor, so any path containing "design", "docs/" or
+    # "readme" was admitted on its filename alone — which is why a review
+    # prompt asking about controllers and entities came back holding design
+    # documents and historical audits, with the implementation files it named
+    # crowded out.
+    #
+    # Scaled rather than dropped for specific prompts: a design doc that DOES
+    # match the query is still worth surfacing, just not ahead of the code.
     doc_patterns = ['readme', 'architecture', 'design', 'claude.md', 'contributing', 'docs/']
     if any(pat in name_lower for pat in doc_patterns):
-        score += 0.8  # Strong boost for documentation
+        if len(prompt_tokens) <= BROAD_PROMPT_TOKENS:
+            score += 0.8  # Strong boost for documentation on a broad prompt
+        else:
+            score += 0.8 * content_relevance
 
     # Penalize archive/old documentation
     if 'archive' in name_lower or 'old' in name_lower or 'deprecated' in name_lower:
@@ -1722,7 +1766,7 @@ def gather_context(config: GatherConfig) -> list[ContextFile]:
     scored_filtered = [(a, r, s, sc) for (a, r, s, sc) in scored if sc >= effective_floor]
 
     # For very broad prompts (<= 5 tokens), boost architectural/entry point files
-    if len(prompt_tokens) <= 5:
+    if len(prompt_tokens) <= BROAD_PROMPT_TOKENS:
         arch_patterns = ['README', 'main', 'app', '__init__', 'index', 'setup', 'config']
         arch_files = [(a, r, s, sc) for (a, r, s, sc) in scored
                       if any(pat.lower() in r.lower() for pat in arch_patterns)]

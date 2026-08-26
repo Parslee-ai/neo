@@ -113,7 +113,6 @@ orchestrator_voice:
     phase_checks_none: "No checkers here. Nothing verified this."
     phase_checks_inconclusive: "The checkers ran and could evaluate none of it. Treat this as unverified."
     phase_checks_considering: "Considering the checkers."
-    phase_checks_skipped: "Out of time before I could run them. This is unchecked."
     phase_checks_nothing_to_check: "No change to check. Nothing was verified because nothing was proposed."
 
 # Base expressions per personality stage (fallback when no specific beat matches)

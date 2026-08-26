@@ -474,6 +474,28 @@ class FactStore:
         if self._emit_metrics:
             metrics_record(event, **fields)
 
+    def begin_request(self) -> None:
+        """Reset per-request memoization. Called by the engine at request start.
+
+        The duplication this cache exists for is WITHIN one request: two call
+        sites in a single process() build the same context. A store-lifetime
+        cache is therefore the wrong scope — it outlives every request and
+        every reload, which is what made a stale hit possible at all. Resetting
+        here bounds any staleness to a single request no matter what the
+        fingerprint misses.
+        """
+        self._invalidate_context_cache()
+
+    def _invalidate_context_cache(self) -> None:
+        """Drop the memoized build_context result.
+
+        Called from every mutator whose effect the cache fingerprint cannot
+        see. Named and explicit precisely so "what invalidates this?" is
+        answerable by grep, which is the property a two-integer content
+        fingerprint does not have.
+        """
+        self._context_cache = None
+
     def add_fact(
         self,
         subject: str,
@@ -861,19 +883,26 @@ class FactStore:
         # re-embeds the query and re-ranks the whole corpus (19,688 facts on a
         # real store), so the repeat is pure waste.
         #
-        # Keyed on a CONTENT fingerprint, not a revision counter: facts are
-        # mutated in place (supersession flips is_valid, retrieval stamps
-        # metadata) in enough places that a counter would silently go stale,
-        # and a stale memory layer is the exact failure this module cannot
-        # afford. len + valid-count catches append, extend, clear, reassign
-        # and supersede; anything it misses is metadata that only perturbs
-        # ranking WITHIN one request, where a stable answer is what we want.
+        # Keyed on len + valid-count + query + k, and EXPLICITLY invalidated by
+        # the mutators that a count cannot see. The fingerprint alone is not a
+        # sufficient invalidator and must not be treated as one: it is two
+        # integers over a corpus of ~20,000 facts, and confidence adjustments
+        # and re-embedding both change WHICH facts are injected while leaving
+        # both integers identical. `load()` was the proven hole — it replaces
+        # the whole list from disk, routinely at the same counts.
+        #
+        # `environment` is deliberately NOT part of the key. It was keyed on
+        # `id(environment)`, which is pointer identity: CPython reuses the
+        # address of a freed empty dict, so build_context(q, environment={})
+        # followed by build_context(q, environment={"git": ...}) could be a
+        # false hit that silently dropped the git environment. Callers within a
+        # request pass the same environment; the invalidation below covers the
+        # rest.
         fingerprint = (
             len(self._facts),
             sum(1 for f in self._facts if f.is_valid),
             query,
             k,
-            id(environment) if environment is not None else None,
         )
         cached = getattr(self, "_context_cache", None)
         if cached is not None and cached[0] == fingerprint:
@@ -2950,6 +2979,7 @@ class FactStore:
                 removed_ids.append(f.id)
         purged = len(removed_ids)
         if purged:
+            self._invalidate_context_cache()
             self._facts = kept
             # Record physical deletions so the merge-on-save can't resurrect
             # them from another process's stale copy on disk. Recorded even when
@@ -3137,8 +3167,9 @@ class FactStore:
             logger.info(f"Demote/protect cycle affected {affected} fact(s)")
         return affected
 
-    def load(self) -> None:
+    def load(self) -> None:  # noqa: D401 - see _invalidate_context_cache
         """Load facts from all scoped files and merge."""
+        self._invalidate_context_cache()
         self._facts = []
         # Fresh load = fresh concurrency bookkeeping: forget prior deletions
         # and re-baseline the per-file mtimes we compare against on save.
