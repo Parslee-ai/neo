@@ -931,8 +931,17 @@ def _project_index_boost(
                 f"Semantic re-rank: {len(boost)} file(s) matched the catalog "
                 f"(weight {weight:g}{', --semantic' if hinted else ''})")
         return boost
-    except Exception:  # missing index, faiss unavailable, etc.
-        # Quiet — index is opt-in, must-not-break path.
+    except Exception as e:
+        # NOT the "no index" case — that is handled explicitly above, with its
+        # own note, and returns before reaching here. What lands here is a
+        # catalog that EXISTS and failed: a corrupt snapshot, a faiss import
+        # blowing up, retrieve() raising. Silence is right for a feature the
+        # user never enabled; it is wrong for one they did enable and that is
+        # now quietly contributing nothing to selection.
+        progress.note(
+            f"Warning: semantic re-rank failed ({type(e).__name__}: {e}) - "
+            "the embedding catalog is not contributing to file selection"
+        )
         return {}
 
 
@@ -971,8 +980,17 @@ def _history_boost(root: str, prompt: str, k: int = 10) -> dict[str, float]:
         boost = {p: min(0.5, n * 0.15) for p, n in counts.items()}
         progress.note(f"EPISODE-history boost: {len(boost)} files seen in past similar runs")
         return boost
-    except Exception:
-        # FactStore missing, fact_store init crashed, etc. — never break gather.
+    except ImportError:
+        # No FactStore module at all: a genuine absence, and the feature is
+        # optional. Silent by design.
+        return {}
+    except Exception as e:
+        # The store EXISTS and failed. Never break gather — but do not pretend
+        # the history signal was consulted and found nothing either.
+        progress.note(
+            f"Warning: history boost failed ({type(e).__name__}: {e}) - past "
+            "runs are not contributing to file selection"
+        )
         return {}
 
 

@@ -681,3 +681,44 @@ class TestSystemicParserFailureIsReported:
         assert note.count("tree-sitter parser unavailable") == 1, (
             "reported once per FILE instead of once per gather"
         )
+
+
+class TestRetrievalBoostFailuresAreReported:
+    """A feature the user never enabled may fail silently. One they DID enable
+    and that is now contributing nothing must say so.
+
+    The "no index" case is handled explicitly earlier in _project_index_boost and
+    returns before the except, so what reaches the handler is a catalog that
+    EXISTS and broke — a corrupt snapshot, faiss failing to import, retrieve()
+    raising. Same distinction as an absent tree-sitter parser.
+    """
+
+    def test_semantic_rerank_failure_is_announced(self, capsys, tmp_path):
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        with patch(
+            "neo.index.project_index.ProjectIndex",
+            side_effect=RuntimeError("corrupt snapshot"),
+        ):
+            out = cg._project_index_boost(str(tmp_path), "widget registry", k=5)
+
+        assert out == {}
+        note = capsys.readouterr().err
+        assert "semantic re-rank failed" in note, note
+
+    def test_history_boost_failure_is_announced(self, capsys, tmp_path):
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        with patch(
+            "neo.memory.store.FactStore",
+            side_effect=RuntimeError("store corrupt"),
+        ):
+            out = cg._history_boost(str(tmp_path), "widget registry", k=5)
+
+        assert out == {}
+        note = capsys.readouterr().err
+        assert "history boost failed" in note, note

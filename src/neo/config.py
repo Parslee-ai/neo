@@ -109,6 +109,12 @@ def keychain_available() -> bool:
     return platform.system() == "Darwin"
 
 
+# `security` prompts for keychain unlock when the keychain is locked, and an
+# unattended run has nobody to answer it. Unbounded, that is an indefinite hang
+# during config load — before neo does any work at all.
+KEYCHAIN_TIMEOUT_SECONDS = 10
+
+
 def load_api_key_from_keychain(provider: str) -> Optional[str]:
     """Load a provider API key from macOS Keychain, if available."""
     if not provider or not keychain_available():
@@ -128,8 +134,15 @@ def load_api_key_from_keychain(provider: str) -> Optional[str]:
             check=False,
             capture_output=True,
             text=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
         )
     except OSError:
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Keychain lookup timed out after %ss - the keychain may be locked; "
+            "no API key was read", KEYCHAIN_TIMEOUT_SECONDS,
+        )
         return None
 
     if result.returncode != 0:
@@ -147,6 +160,10 @@ def store_api_key_in_keychain(provider: str, api_key: str) -> None:
     if not keychain_available():
         raise RuntimeError("Durable secret storage is only implemented for macOS Keychain")
 
+    # Bounded, and the TimeoutExpired is deliberately NOT caught: this
+    # function's contract is "the key is stored or you hear about it". A
+    # timeout means we do not know whether it was written, and swallowing that
+    # would report a durable secret that may not exist.
     result = subprocess.run(
         [
             "security",
@@ -162,6 +179,7 @@ def store_api_key_in_keychain(provider: str, api_key: str) -> None:
         check=False,
         capture_output=True,
         text=True,
+        timeout=KEYCHAIN_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
