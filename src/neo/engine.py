@@ -2691,10 +2691,13 @@ RULES:
         )
 
         # Phase 5.5: Static constraint verification (no code execution).
-        if constraints:
-            constraint_result = self._check_constraints_static(suggestions, constraints)
-            if constraint_result is not None:
-                results.append(constraint_result)
+        # Called even with an empty constraint list, because empty has two
+        # meanings — the prompt declared none, or extraction broke — and only
+        # the callee knows which. Guarding here made the failure report
+        # unreachable.
+        constraint_result = self._check_constraints_static(suggestions, constraints)
+        if constraint_result is not None:
+            results.append(constraint_result)
 
         return results
 
@@ -2844,16 +2847,30 @@ RULES:
         Returns typed Constraint objects so callers pass them explicitly to
         downstream checks rather than relying on instance state.
         """
+        self._constraint_extraction_failed = False
         try:
             from neo.constraint_verification import ConstraintVerifier
-        except ImportError:
+        except ImportError as e:
+            self._constraint_extraction_failed = True
+            logger.warning(f"Constraint verification unavailable: {e}")
             return []
 
         verifier = ConstraintVerifier()
         try:
             return verifier.extract_constraints(prompt)
         except Exception as e:
-            logger.debug(f"Constraint extraction failed: {e}")
+            # Record the FAILURE, do not merely return "no constraints".
+            #
+            # This was a double swallow — extract_constraints catches Exception
+            # and returns [] of its own accord, and this caught again at debug
+            # level, which the default WARNING log level hides. An empty list
+            # then meets the `if not constraints` guard in
+            # _check_constraints_static, no constraint check is appended, and
+            # the run reports the code as constraint-clean. Measured: a prompt
+            # yielding 2 constraints yields 0 when the extractor raises, and
+            # nothing anywhere says so.
+            self._constraint_extraction_failed = True
+            logger.warning(f"Constraint extraction failed: {e}")
             return []
 
     def _extract_input_constraints(self, neo_input: NeoInput) -> list:
@@ -3013,7 +3030,27 @@ RULES:
         warning that no code could ever clear (#196). A caution channel with a
         permanent entry teaches operators to skip the channel.
         """
-        if not constraints or not suggestions:
+        if not suggestions:
+            return None
+
+        if not constraints:
+            # "No constraints in the prompt" and "the extractor broke" are
+            # different facts and only one of them means there was nothing to
+            # verify. Reported as `unavailable`, which _checks_that_evaluated
+            # excludes from the set that vouches for an answer, so the run
+            # cannot present itself as constraint-clean on a check that never
+            # ran.
+            if getattr(self, "_constraint_extraction_failed", False):
+                return StaticCheckResult(
+                    tool_name="constraints",
+                    diagnostics=[],
+                    summary=(
+                        "constraint extraction failed - the prompt's "
+                        "constraints were NOT checked"
+                    ),
+                    kind="constraint",
+                    status="unavailable",
+                )
             return None
 
         from neo.constraint_verification import (

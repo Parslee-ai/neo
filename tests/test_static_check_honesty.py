@@ -242,3 +242,66 @@ class TestSkipReasonIsReportedHonestly:
         assert "phase_checks_skipped" not in src, (
             "retired voice key is referenced again"
         )
+
+
+class TestConstraintExtractionFailureIsVisible:
+    """"The prompt declared no constraints" and "the extractor broke" are
+    different facts, and only one of them means there was nothing to verify.
+
+    It was a DOUBLE swallow: extract_constraints catches Exception and returns
+    [] itself, and the caller caught again at logger.debug — invisible at the
+    default WARNING level. The empty list then met the `if constraints:` guard
+    at the call site, no constraint check was appended, and the run presented
+    itself as constraint-clean. Measured: a prompt yielding 2 constraints
+    yields 0 when the extractor raises.
+    """
+
+    @staticmethod
+    def _suggestion():
+        from neo.models import CodeSuggestion
+        return CodeSuggestion(
+            file_path="x.py",
+            unified_diff="--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b\n",
+            code_block="", description="", confidence=0.9,
+        )
+
+    def test_extractor_failure_produces_an_unavailable_check(self, capsys):
+        from unittest.mock import patch
+
+        import neo.constraint_verification as cv
+        from neo.engine import NeoEngine
+
+        class Boom:
+            def extract_constraints(self, *a, **k):
+                raise RuntimeError("extractor blew up")
+
+        engine = NeoEngine.__new__(NeoEngine)
+        with patch.object(cv, "ConstraintVerifier", Boom):
+            constraints = NeoEngine._extract_prompt_constraints(
+                engine, "the result must be non-negative"
+            )
+        assert constraints == []
+
+        result = NeoEngine._check_constraints_static(
+            engine, [self._suggestion()], constraints
+        )
+        assert result is not None, (
+            "a failed extraction left no trace at all"
+        )
+        assert result.status == "unavailable"
+        assert "NOT checked" in result.summary
+        # And it must not count toward "N checker(s) clean".
+        assert NeoEngine._checks_that_evaluated([result]) == []
+
+    def test_a_prompt_with_no_constraints_stays_silent(self):
+        """The other branch. No constraints declared genuinely means there was
+        nothing to verify, and inventing a warning there would train operators
+        to ignore the channel."""
+        from neo.engine import NeoEngine
+
+        engine = NeoEngine.__new__(NeoEngine)
+        NeoEngine._extract_prompt_constraints(engine, "just do the thing")
+
+        assert NeoEngine._check_constraints_static(
+            engine, [self._suggestion()], []
+        ) is None

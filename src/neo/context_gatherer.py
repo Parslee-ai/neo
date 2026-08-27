@@ -11,6 +11,7 @@ Approximates Claude Code/Codex ergonomics with:
 """
 
 import fnmatch
+import logging
 import os
 import re
 import subprocess
@@ -20,6 +21,8 @@ from typing import Optional
 
 from neo import eligibility, progress
 from neo.text_budget import MARKER_TEMPLATE, apportion
+
+logger = logging.getLogger(__name__)
 
 # Constants
 MIN_SCORE_THRESHOLD = 0.2  # Filter files with very low relevance (was 0.3, reduced for broad prompts)
@@ -309,51 +312,80 @@ def iter_paths(root: str, includes: list[str], excludes: list[str], exts: Option
     ]
 
 
+# Four git invocations per gather, none of which was bounded. A lock held by
+# another process, a network-mounted worktree, or a wedged credential helper
+# could hang the whole run before a single file was scored.
+GIT_QUERY_TIMEOUT_SECONDS = 10
+
+
 def get_git_recent_files(root: str, diff_since: Optional[str] = None) -> set[str]:
-    """Get recently modified files from git."""
+    """Recently modified files from git, or an empty set when git says nothing.
+
+    RETURN CODES ARE CHECKED, and this is the point of the function's shape.
+    Only the `rev-parse` probe used to pass `check=True`; the three calls that
+    actually produce data ignored their exit status entirely. A git that exits
+    128 — a corrupt index, `detected dubious ownership`, a held lock — writes
+    its complaint to stderr and NOTHING to stdout, so the parse loops saw no
+    lines and the function returned an empty set. That is byte-identical to
+    "this repo has no recent changes", and the caller cannot tell a healthy
+    quiet repo from a broken one.
+
+    Reproduced: truncate `.git/index`, and `git status --porcelain` exits 128
+    while this returned `set()`.
+
+    The recency signal is no longer only a tie-breaker either. It contributes
+    to `top_organic_score`, so it now helps set the admission floor rather than
+    merely re-ordering what was admitted — a silent zero here changes WHICH
+    files reach the model, not just their order.
+    """
     recent = set()
 
-    try:
-        # Check if we're in a git repo
-        subprocess.run(
-            ['git', 'rev-parse', '--git-dir'],
-            cwd=root,
-            capture_output=True,
-            check=True
-        )
+    def _git(args: list[str]) -> Optional[str]:
+        """Run one git query. None means it failed; "" means it said nothing."""
+        try:
+            result = subprocess.run(
+                ['git', *args],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=GIT_QUERY_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            return None
+        except subprocess.TimeoutExpired:
+            progress.note(
+                f"Warning: `git {args[0]}` timed out after "
+                f"{GIT_QUERY_TIMEOUT_SECONDS}s - git recency is not "
+                "contributing to file selection"
+            )
+            return None
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip().splitlines()
+            progress.note(
+                f"Warning: `git {args[0]}` failed (exit {result.returncode})"
+                + (f": {detail[0]}" if detail else "")
+                + " - git recency is not contributing to file selection"
+            )
+            return None
+        return result.stdout
 
-        # Get unstaged and staged files
-        result = subprocess.run(
-            ['git', 'status', '--porcelain'],
-            cwd=root,
-            capture_output=True,
-            text=True
-        )
-        for line in result.stdout.splitlines():
+    if _git(['rev-parse', '--git-dir']) is None:
+        return recent
+
+    status = _git(['status', '--porcelain'])
+    if status is not None:
+        for line in status.splitlines():
             if len(line) > 3:
                 recent.add(line[3:].strip())
 
-        # Get files changed since ref/duration
-        if diff_since:
-            result = subprocess.run(
-                ['git', 'diff', '--name-only', diff_since],
-                cwd=root,
-                capture_output=True,
-                text=True
-            )
-            recent.update(result.stdout.splitlines())
-        else:
-            # Get last 50 commits
-            result = subprocess.run(
-                ['git', 'log', '-n', '50', '--name-only', '--pretty=format:'],
-                cwd=root,
-                capture_output=True,
-                text=True
-            )
-            recent.update(line for line in result.stdout.splitlines() if line.strip())
-
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+    if diff_since:
+        changed = _git(['diff', '--name-only', diff_since])
+        if changed is not None:
+            recent.update(changed.splitlines())
+    else:
+        log = _git(['log', '-n', '50', '--name-only', '--pretty=format:'])
+        if log is not None:
+            recent.update(line for line in log.splitlines() if line.strip())
 
     return recent
 
@@ -958,13 +990,31 @@ def _symbol_score(
     Returns at most +1.2 (3 symbol hits × 0.4). Failures (unsupported
     language, parse error, OSError) return 0 — falls through to the
     filename score.
+
+    That per-file 0 is deliberate and stays. What does NOT stay is applying the
+    same silence to a SYSTEMIC failure: the bare `except Exception` also caught
+    the parser failing to import or construct, which removes this signal from
+    every file in the repo at once rather than from one awkward file. Those are
+    different events — one is a file this parser cannot read, the other is the
+    signal being absent from the whole run — and only the second is worth
+    saying out loud. Reported once per gather, not once per file.
     """
     try:
         # Lazy-init the parser exactly once per gather call.
         if "parser" not in parser_cache:
-            from neo.index.language_parser import TreeSitterParser
-            parser_cache["parser"] = TreeSitterParser()
+            try:
+                from neo.index.language_parser import TreeSitterParser
+                parser_cache["parser"] = TreeSitterParser()
+            except Exception as e:
+                parser_cache["parser"] = None
+                progress.note(
+                    "Warning: tree-sitter parser unavailable "
+                    f"({type(e).__name__}: {e}) - symbol relevance is not "
+                    "contributing to file selection"
+                )
         parser = parser_cache["parser"]
+        if parser is None:
+            return 0.0
 
         path = Path(abs_path)
         if not parser.supports_extension(path.suffix.lower()):
@@ -996,7 +1046,10 @@ def _symbol_score(
             if any(t in s or s in t for s in symbols):
                 hits += 1
         return 0.4 * min(hits, 3)
-    except Exception:
+    except Exception as e:
+        # Per-file only, by construction: a systemic parser failure is handled
+        # above and short-circuits before reaching here.
+        logger.debug(f"Symbol scoring failed for {abs_path}: {e}")
         return 0.0
 
 

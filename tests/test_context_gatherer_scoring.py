@@ -578,3 +578,106 @@ class TestRelativeFloorAdmissionBoundary:
         ]
         assert len(selected) >= 1
         assert any("widget_registry.py" in p for p in selected)
+
+
+class TestGitFailureIsNotSilence:
+    """An empty recent-files set must mean "git said nothing", never "git
+    broke".
+
+    Only the rev-parse probe passed check=True; the three calls that actually
+    produce data ignored their exit status. A git exiting 128 — corrupt index,
+    detected dubious ownership, a held lock — writes to stderr and nothing to
+    stdout, so the parse loops saw no lines and the function returned an empty
+    set, byte-identical to a clean repo.
+
+    The signal is no longer only a tie-breaker either: recency feeds
+    top_organic_score, so a silent zero changes WHICH files are admitted.
+    """
+
+    def _repo(self, tmp_path):
+        import subprocess
+        subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True)
+        (tmp_path / "a.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "a.py"], cwd=tmp_path, check=True)
+        return tmp_path
+
+    def test_healthy_repo_reports_its_changes(self, tmp_path):
+        from neo.context_gatherer import get_git_recent_files
+        assert "a.py" in get_git_recent_files(str(self._repo(tmp_path)))
+
+    def test_corrupt_index_is_reported_not_swallowed(self, tmp_path, capsys):
+        from neo.context_gatherer import get_git_recent_files
+
+        repo = self._repo(tmp_path)
+        (repo / ".git" / "index").write_bytes(b"garbage")
+
+        result = get_git_recent_files(str(repo))
+        note = capsys.readouterr().err
+
+        assert result == set()
+        assert "git status" in note and "failed" in note, (
+            f"a broken repo looked exactly like a clean one; notes were: {note!r}"
+        )
+
+    def test_every_git_query_is_bounded(self):
+        """Four git invocations per gather, none of which was bounded. A held
+        lock or a wedged credential helper could hang the run before a single
+        file was scored."""
+        import subprocess
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        with patch.object(cg.subprocess, "run", fake_run):
+            cg.get_git_recent_files(".")
+
+        assert seen, "no git query was attempted"
+        assert all(t == cg.GIT_QUERY_TIMEOUT_SECONDS for t in seen), seen
+
+    def test_timeout_is_reported(self, capsys):
+        import subprocess
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        with patch.object(
+            cg.subprocess, "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(cmd, 10)
+            ),
+        ):
+            assert cg.get_git_recent_files(".") == set()
+
+        assert "timed out" in capsys.readouterr().err
+
+
+class TestSystemicParserFailureIsReported:
+    """A file this parser cannot read and the parser being absent are
+    different events. The bare except treated them identically, so a broken
+    tree-sitter removed the symbol signal from every file in the repo in
+    silence."""
+
+    def test_parser_init_failure_is_announced_once(self, capsys):
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        cache = {}
+        with patch(
+            "neo.index.language_parser.TreeSitterParser",
+            side_effect=RuntimeError("no grammars"),
+        ):
+            for _ in range(5):
+                assert cg._symbol_score("x.py", {"widget"}, cache) == 0.0
+
+        note = capsys.readouterr().err
+        assert "tree-sitter parser unavailable" in note
+        assert note.count("tree-sitter parser unavailable") == 1, (
+            "reported once per FILE instead of once per gather"
+        )
