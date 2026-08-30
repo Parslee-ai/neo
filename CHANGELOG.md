@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.50.0] - 2026-08-30
+
+The learning loop had a hard mechanical ceiling, and it was one `if`. Neo credited the facts its reasoning actually used, recorded the credit in the episode ledger, reported it in `learning-stats` — and then threw it away without writing it to disk. `neo contribute` has never been reachable on any install, and this is why.
+
+### Fixed
+
+- **The cited-fact credit never reached a `save()`.** `detect_implicit_feedback` credits two different populations. Linked ORIGINAL facts — a suggestion re-applying a durable fact — move `linked_count`. CITED retrieved facts, credited by `_apply_used_fact_feedback`, do not: they bump `success_count` on the live `Fact` objects and record an episode mutation, and nothing else. The single save was `if linked_count: self.save()`, so a run that credited a cited fact but had no linked original fact never wrote the store and the credit died with the process. That is the **normal** case — `suggestion_fact_ids` is empty unless the candidate already resolves to a durable fact.
+
+  The episode ledger still recorded the mutation, so `learning-stats` reported reinforcements the fact store had never received. The reporter and the data disagreed, and the reporter was the honest one.
+
+  Measured on a live install: **0 of 88 valid GLOBAL facts had ever reached `success_count > 0`**, while 64 carried a non-zero `access_count` — global facts are almost never the linked original, so theirs were the credits always dropped. PROJECT facts topped out at exactly **2**, the value promotion writes from its two supporting episodes, because the credit that would carry one past 2 never survived. Consequently **no fact among 6,613 ever cleared the `success_count >= 3` contribution bar**. `neo contribute` was mechanically unreachable, not merely starved — and restoring the suggestion→fact link, previously recorded as the cause, would not by itself have lifted it.
+
+  Reproduced live before fixing: a drill run credited one fact with `before={'success_count': 0} after={'success_count': 1}` in the ledger while the fact on disk still read 0, immediately after and later.
+
+  **Why no test caught it, and why the obvious test still doesn't.** Two neighbouring paths save for their own reasons and persist the credit as a side effect: the no-link ACCEPTED fallback calls `add_fact`, which saves, and the janitor chain under `if outcomes:` ends in `if changed: self.save()`. So the credit survived whenever either happened to fire, which made the defect load-dependent. The real modern path reaches neither — an ACCEPTED outcome carrying an episode candidate takes the candidate branch and `continue`s past the fallback, and a *first* acceptance promotes nothing. `test_cited_fact_credit_survives_the_process` is written against that path specifically: it sets `candidate_id`, pins the janitor to "changed nothing", stubs promotion to `None`, and **reloads from disk**. All four are load-bearing; two earlier cuts of that test passed against the broken code, once via `add_fact` and once via the janitor. Every other test in `TestRetrievedFactAttribution` asserts the mutated in-memory object and never reloads — which is how a suite thorough about attribution stayed silent about persistence.
+
+- **Two Codex skills claimed memory they had disabled.** Five of the six pass `--no-memory`, documented as *"Disable persistent fact retrieval AND learning for this request"* — a deliberate privacy control, since retrieved facts become provider context. The flag stays. The prose beside it was wrong in two places: `neo/SKILL.md` said the skill "may retrieve established memory", contradicting its own privacy note eleven lines earlier; and `neo-architect/SKILL.md` step 6 instructed the agent to surface "architectural facts Neo retrieved from memory… higher-trust than fresh reasoning", which under `--no-memory` is unexecutable and invites presenting reasoning-only output as informed by past projects. The other four skills documented the flag correctly and are untouched.
+
 ## [0.49.0] - 2026-08-30
 
 A diagnostic that invented a presence, and an extractor that never got to answer. `learning-stats` exists to tell an operator whether the accept-driven loop is running; on a live install it reported a healthy loop that was not running at all. And the transcript miner had been asking reasoning models for lessons in a budget they spend before they speak.
