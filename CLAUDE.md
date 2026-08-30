@@ -520,6 +520,30 @@
   Changes to layer ordering, the 2/3 constraint cap, or the inline `(changed from: X)`
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
+- **Effectiveness evidence** (`docs/effectiveness-evidence-2026-08-30.md`,
+  `tools/rank_baseline_eval.py`). Absolute R@k figures have no comparator and
+  cannot answer "is neo effective". The baseline harness scores four naive
+  rankers over the IDENTICAL candidate set, queries and ground truth
+  `rank_mine_eval.py` used, so only the ranking rule differs.
+  **The load-bearing baseline is `grep`** — prompt-token counts over file
+  CONTENT — because the mining leak (a file holds the commit's terms because
+  that commit put them there) helps any content-reading ranker and does nothing
+  for `size`/`recency`. Comparing only against content-blind baselines would let
+  the leak masquerade as ranker quality. Measured, MRR vs grep: neo 0.778/0.584
+  (1.3×), aieweb 0.729/0.511 (1.4×), m365dotnet 0.536/0.219 (2.4×); **pooled
+  over 150 cases 81 better / 37 worse / 32 tied, sign p = 6.3e-05**. The margin
+  GROWS with repo size (vs random 6× → 32× → 43×) because naive heuristics
+  collapse as the candidate pool grows — `size` runs MRR 0.443 on neo's 99 files
+  and 0.098 on m365dotnet's 2,882. The comparison is **conservative toward neo**:
+  neo is scored on the ~30 files it would actually deliver while every baseline
+  ranks the full set (99 / 480 / 2,882). **Footgun**: `random` must be seeded
+  from `hashlib`, not `hash()` — the latter is salted per process and did not
+  reproduce; and `recency` is mtime-based, so editing this harness (which lives
+  in the repo it measures) moves its own score. Both are floor comparators; the
+  deterministic ones reproduce byte-identically across runs. **What this does
+  NOT show**: answer quality (every number is retrieval), and the learning loop
+  delivering value in practice — on a live install that loop is starved, 2
+  accepted outcomes in 208 episodes and both from drills.
 - Learning-loop benchmark (`memory/evaluation.py`, `benchmarks/learning_loop_v1.json`,
   `neo memory evaluate-learning`). **`accepted` is a correctness verdict and nothing
   else — never gate it on wall-clock time.** Everything it enforces is reproducible on
