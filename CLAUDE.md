@@ -394,6 +394,11 @@
   reinforcements = 0). Across 6,613 valid facts in every project, **zero have
   ever reached `success_count >= 3`**, so `find_contributable` has never once
   returned a fact and `neo contribute` has never been reachable.
+  **That absence had a SECOND, independent cause, and restoring the link alone
+  would not have lifted it** — the cited-credit path reached no `save()` at all,
+  so the one mechanism that can carry a fact past the 2 that promotion writes
+  was discarding its own work. See "A credited fact must reach a SAVE" below;
+  read the two together before concluding the contribution gate is fixed.
   The fix does NOT restore per-suggestion fact minting — that is the unverified
   flood `412a174` existed to stop. It resolves the link through the episode
   candidate instead: `find_durable_fact_for_candidate(subject)` matches the
@@ -405,6 +410,41 @@
   owns. **Footgun**: match the frozen field, never a recomputed signature, and
   never let an empty target match the empty default — every unpromoted fact
   would answer for every candidate.
+- **A credited fact must reach a SAVE, and the cited-credit path had none.**
+  `detect_implicit_feedback` credits two different populations: linked ORIGINAL
+  facts (a suggestion re-applying a durable fact), which move `linked_count`;
+  and CITED retrieved facts, credited by `_apply_used_fact_feedback`, which bump
+  `success_count` on the live Fact objects and record an episode mutation and
+  **nothing else**. The single save was `if linked_count: self.save()`, so a run
+  that credited a cited fact with no linked original fact never wrote the store
+  and the credit died with the process — the normal case, since
+  `suggestion_fact_ids` is empty unless the candidate already resolves to a
+  durable fact. The episode ledger still recorded the mutation, so
+  `learning-stats` reported reinforcements the store never received; the
+  reporter and the data disagreed and the REPORTER was the honest one.
+  Measured live: **0 of 88 valid GLOBAL facts had ever reached
+  `success_count > 0`** while 64 carried a non-zero `access_count` (global facts
+  are almost never the linked original, so theirs were the credits always
+  dropped), and PROJECT facts topped out at exactly **2** — the value promotion
+  writes from its two supporting episodes — so no fact among 6,613 ever cleared
+  the `success_count >= 3` contribution bar and `neo contribute` was
+  mechanically unreachable, not merely starved. Gate is now
+  `if linked_count or touched_fact_ids`.
+  **Footgun — two neighbours save for their own reasons and will mask this.**
+  The no-link ACCEPTED fallback calls `add_fact`, which saves; and the janitor
+  chain under `if outcomes:` ends in `if changed: self.save()`. The credit
+  survived whenever either happened to fire, which is what made the bug
+  load-dependent. The real modern path reaches neither: an ACCEPTED outcome
+  carrying an episode candidate takes the candidate branch and `continue`s past
+  the fallback, and a FIRST acceptance promotes nothing.
+  `test_cited_fact_credit_survives_the_process` therefore sets `candidate_id`,
+  pins the janitor to "changed nothing", stubs promotion to `None`, and RELOADS
+  FROM DISK — all four load-bearing; the first two cuts of that test passed
+  against the broken code, once via `add_fact` and once via the janitor. Every
+  other test in `TestRetrievedFactAttribution` asserts the mutated in-memory
+  object and never reloads, which is how a suite thorough about attribution
+  stayed silent about persistence. **Any new credit path needs its own save,
+  and a test that reads the fact back off disk.**
 - **A re-accepted durable pattern is reinforced in place, not re-minted.**
   `_promote_repeatedly_supported_candidate` looks for an existing valid PROJECT
   fact at the target signature before calling `add_fact`, and on a hit folds in
