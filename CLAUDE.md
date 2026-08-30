@@ -1220,13 +1220,35 @@
   Through the front door the same broken catalog yields 0.705 / 0.708, because
   it is one channel of four. **#213 is now FIXED** — selection ranks source
   before tests (see index invariant 1) and a rebuild of this repo's catalog went
-  from 82% tests / 52 files to **100% source / 94 files**. So
-  `SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT` remains a defensible default and is
-  STILL NOT a tuned one: the re-measurement it was waiting on is now possible
-  but has not been run. Do not quote the −0.007 MRR under the flag as a property
-  of the weight; it is a property of the catalog the measurement used, and that
-  catalog no longer exists. Re-run `tools/rank_mine_eval.py` against a freshly
-  built catalog before trusting any semantic-lane figure.
+  from 82% tests / 52 files to **100% source / 94 files**.
+  **The deferred re-measurement has now been RUN, and it reverses the sign.**
+  `tools/rank_mine_eval.py`, 50 git-mined cases on this repo at `d6ab226`,
+  `--no-git`, clean tree, 0 failed cases, both arms the same commit and the same
+  fresh catalog. `--semantic` against flag-off: MRR **0.778 → 0.841**, R@10
+  0.708 → 0.767, H@1 0.680 → 0.760. Paired by case: **11 better, 2 worse, 37
+  tied, two-sided sign p = 0.022**. The old **−0.007 MRR is superseded** — it
+  was a property of the 100%-test catalog it was measured against, not of the
+  weight, and that catalog no longer exists.
+  **The win is the WEIGHT, not the depth.** `--semantic` moves two things, and
+  they were separated by pinning `SEMANTIC_HINT_WEIGHT = 1.0` while
+  `SEMANTIC_HINT_DEPTH` stayed at 3×: that arm scores MRR 0.769, *below*
+  flag-off's 0.778 (1 better / 3 worse, p = 0.625). Retrieving 3× deeper into
+  the catalog buys nothing on its own; what pays is weighing the catalog as
+  heavily as the keyword index.
+  **The weight is a broad plateau, and 3.0 is kept rather than re-tuned.**
+  Sweep at 50 cases (MRR): 1.0 → 0.769, 2.0 → 0.803, **3.0 → 0.841**, 6.0 →
+  0.853, 9.0 → 0.832 — an inverted U, degrading by 9.0. 6.0 is NOT
+  distinguishable from 3.0 (paired 6 better / 2 worse of 50, p = 0.289), and
+  its R@1 is lower (0.405 vs 0.430). Moving the default to the sweep's argmax
+  would be selecting on the same 50 cases that produced it; the honest reading
+  is that `SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT` now has evidence behind it
+  rather than only a symmetry argument. **Still one repo and 50 cases**, and
+  every caveat in the harness's own docstring applies — absolutes are upper
+  bounds (the corpus has already seen the answer), the mined population is
+  filtered upward, and `_history_boost` stays live. Direction survives those;
+  magnitudes should not be quoted as precise. `aieweb` and `m365dotnet` still
+  have no catalog, so the cross-repo half of this remains unmeasured. Full
+  tables and setup: `docs/semantic-lane-remeasurement-2026-08-30.md`.
   **The renderer's per-file cap is NOT the front door's** and the two are
   deliberately still separate: `engine._render_context_files` keeps its 3,000
   character cut for unpinned files, with its own marker. Collapsing them would
