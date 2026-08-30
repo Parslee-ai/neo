@@ -60,6 +60,62 @@ on neo's 99 files and 0.098 on m365dotnet's 2,882. neo degrades far more
 gracefully (0.778 → 0.536). **The tool is worth most exactly where a human is
 worst off**, which is the case a retrieval tool has to win.
 
+## 2b. Retrieval is causally necessary for a USABLE fix — PROVEN (n=3, and the mechanism is narrower than it looks)
+
+Sections 1–2 measure retrieval. They do not show that better retrieval yields
+better *answers*. Git-mined cases cannot show it either: the fix is already
+present at HEAD, so neo reads the file, sees the code already does what the
+subject describes, and correctly proposes nothing. Measuring answers needs a
+pre-fix state, so one was constructed.
+
+Three real bugs were planted in a scratch repo, each with a failing test that
+defines "fixed" objectively — no judge, no opinion:
+
+| bug | defect |
+|---|---|
+| `truncate` | appends `"..."` after slicing to `limit`, so output is `limit+3` |
+| `mean` | `ZeroDivisionError` on an empty list |
+| `is_under` | bare prefix match, so `/a/bc` reads as under `/a/b` |
+
+Two arms per bug: **A** = neo's normal context; **B** = the same prompt with the
+buggy file `--exclude`d (what a retriever that missed the file delivers). The
+exclusion was verified via `--dry-run` before trusting the result. The patch is
+applied with `git apply`, then the test is run.
+
+| arm | patch applies | test passes |
+|---|---|---|
+| **A — file in context** | **3/3** | **3/3** |
+| **B — file excluded** | **0/3** | 0/3 |
+
+### What actually failed in arm B — the honest mechanism
+
+Not the reasoning. In every case the *fix logic* was right; for `is_under` the
+replacement line was byte-identical to the arm that worked. What differed was the
+CONTEXT line: arm B invented the docstring as `Return whether path is under
+root.` where the file actually reads `True when path lies inside directory
+root.`, so `git apply` rejected the patch.
+
+Without the file, neo **hallucinated the surrounding code**. The measured
+contribution of retrieval here is **groundedness, not reasoning**: on textbook
+defects the model knows the fix from priors either way, and what context buys is
+a patch that matches the real file.
+
+That is practically decisive — an unapplicable patch is worthless to a user — but
+it is **not** evidence that retrieval improves the model's reasoning. On a
+codebase-specific bug, where priors cannot supply the answer, the reasoning gap
+would plausibly be larger; that was not tested. n=3, and the bugs were chosen to
+be objectively checkable rather than representative.
+
+### The chain
+
+1. neo retrieves the needed file more often than any naive baseline (§1, 150
+   cases, p = 6.3 × 10⁻⁵), and its margin grows with repo size (§2).
+2. Having that file is what makes the emitted patch usable at all (§2b, 3/3 vs
+   0/3).
+
+So neo produces usable fixes more often than the alternatives do. That is the
+effectiveness claim, and it is bounded by exactly the caveats above.
+
 ## 3. The memory subsystem is correct and safe — PROVEN (on synthetic scenarios)
 
 Two deterministic benchmarks, **zero model calls**, both PASS:
@@ -96,9 +152,10 @@ Stated plainly, because a proof that overreaches is worth less than a narrow one
   save gate, the unread host-edit ledger), which removes mechanical ceilings —
   but removing a ceiling is not the same as demonstrating a benefit. The loop is
   **starved**, and that is a measurement, not an excuse.
-- **Answer quality is unmeasured.** Every number here is retrieval. Whether
-  better context yields better answers needs an LM-graded evaluation that has
-  not been run.
+- **Answer REASONING quality is unmeasured.** §2b shows retrieval is causally
+  necessary for a usable patch, but the mechanism it measured is groundedness —
+  the model's fix logic was correct in both arms. Whether better context makes
+  neo *reason* better, on defects priors cannot solve, is not shown here.
 - **Developer productivity is unmeasured**, and is not the kind of claim this
   instrument can settle.
 

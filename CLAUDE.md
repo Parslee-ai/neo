@@ -540,9 +540,18 @@
   from `hashlib`, not `hash()` — the latter is salted per process and did not
   reproduce; and `recency` is mtime-based, so editing this harness (which lives
   in the repo it measures) moves its own score. Both are floor comparators; the
-  deterministic ones reproduce byte-identically across runs. **What this does
-  NOT show**: answer quality (every number is retrieval), and the learning loop
-  delivering value in practice — on a live install that loop is starved, 2
+  deterministic ones reproduce byte-identically across runs. **The answer link is
+  measured too**, in a constructed pre-fix repo (git-mined cases cannot show it —
+  the fix is already at HEAD, so neo correctly proposes nothing): three planted
+  bugs, each with a failing test defining "fixed", run with the buggy file in
+  context vs `--exclude`d. **3/3 patches applied and passed with the file, 0/3
+  without.** The mechanism is narrower than it looks and is recorded as such:
+  arm B's fix LOGIC was right (for one bug byte-identical to the passing arm) and
+  the patch was rejected because the surrounding context lines were hallucinated.
+  Retrieval's measured contribution is **groundedness, not reasoning** — on
+  textbook defects priors supply the fix either way. **What this does NOT show**:
+  that context improves reasoning on codebase-specific defects, and the learning
+  loop delivering value in practice — on a live install that loop is starved, 2
   accepted outcomes in 208 episodes and both from drills.
 - Learning-loop benchmark (`memory/evaluation.py`, `benchmarks/learning_loop_v1.json`,
   `neo memory evaluate-learning`). **`accepted` is a correctness verdict and nothing
