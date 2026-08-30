@@ -570,10 +570,22 @@
   without.** The mechanism is narrower than it looks and is recorded as such:
   arm B's fix LOGIC was right (for one bug byte-identical to the passing arm) and
   the patch was rejected because the surrounding context lines were hallucinated.
-  Retrieval's measured contribution is **groundedness, not reasoning** — on
-  textbook defects priors supply the fix either way. **What this does NOT show**:
-  that context improves reasoning on codebase-specific defects, and the learning
-  loop delivering value in practice — on a live install that loop is starved, 2
+  Retrieval's measured contribution there is **groundedness, not reasoning** — on
+  textbook defects priors supply the fix either way. **A second experiment closes
+  that gap**: two conventions defined only in a scratch repo (a `ConfigError`
+  whose `code` kwarg is required, a key rule stripping an `acme::` prefix), with
+  the CONVENTION file excluded in arm B while the file to edit stays in context,
+  so only project knowledge varies. **2/2 pass with the convention visible, 0/2
+  without** — and the failure mode is REFUSAL, not a wrong guess: neo names the
+  file it needs and says the convention "cannot be verified". Instructive
+  contrast with the textbook case, where priors gave it false confidence and it
+  patched against hallucinated context. **Footgun that invalidated the first
+  run**: the tests defining the conventions lived IN the repo and were retrieved
+  at score 2.52, so the no-context arm read the answer out of the answer key and
+  "passed". A benchmark whose answer key is inside the corpus measures nothing —
+  the tests now live outside the repository. **What this does NOT show**: how
+  often real tasks turn on project-specific knowledge (n=2 is an existence proof,
+  not a rate), and the learning loop delivering value in practice — on a live install that loop is starved, 2
   accepted outcomes in 208 episodes and both from drills.
 - Learning-loop benchmark (`memory/evaluation.py`, `benchmarks/learning_loop_v1.json`,
   `neo memory evaluate-learning`). **`accepted` is a correctness verdict and nothing

@@ -116,6 +116,60 @@ be objectively checkable rather than representative.
 So neo produces usable fixes more often than the alternatives do. That is the
 effectiveness claim, and it is bounded by exactly the caveats above.
 
+## 2c. Retrieval enables project-specific REASONING, and the failure mode is refusal — PROVEN (n=2)
+
+§2b left a gap it named itself: its bugs were textbook, so priors supplied the
+fix logic in both arms and retrieval's measured contribution was groundedness.
+This closes that gap with defects whose answer **priors cannot know**, because
+the convention exists only in the repository.
+
+A scratch repo defines two project conventions:
+
+- `app/errors.py` — `ConfigError(message, *, code)` where `code` is REQUIRED and
+  restricted to three values.
+- `app/keys.py` — `normalize_key()` lowercases **and** strips an `acme::` prefix.
+
+Two files ignore them (`loader.py` raises bare `ValueError`; `registry.py` only
+lowercases). The tests that define "fixed" assert the project-specific
+behaviour: `ei.value.code == "missing"`, and that `"ACME::Foo"` resolves to
+`foo`. A generic `ValueError`, or `ConfigError("...")` without the kwarg, fails.
+
+**The arms isolate reasoning from groundedness.** Arm B excludes the
+*convention-defining* file while leaving the file to be edited in context —
+verified: `app/loader.py` is present at score 11.00 in arm B. So neo can reach
+what it must change, and only the project knowledge varies.
+
+| arm | patch | project-convention test |
+|---|---|---|
+| **A — convention visible** | applied 2/2 | **PASS 2/2** |
+| **B — convention withheld** | no patch 2/2 | 0/2 |
+
+### The failure mode is refusal, not hallucination
+
+Arm B did not guess. Its own output:
+
+> "No code change is proposed yet. First inspect `app/errors.py` and at least one
+> existing usage, then replace ValueError with that verified project exception."
+
+and it flagged: *"The exact configuration exception class and established import
+convention cannot be verified."*
+
+It identified the file it needed, declined to invent a convention, and said why.
+That is the correct epistemic behaviour, and it contrasts instructively with
+§2b: on **textbook** defects, priors gave the model false confidence and it
+emitted a confident patch against hallucinated surrounding code; on
+**project-specific** defects it recognised it could not know and stopped.
+
+### A design flaw that had to be fixed first
+
+The first run of this experiment reported arm B **passing** — because
+`test_conv.py` lived in the repo and was retrieved into context at score 2.52.
+It contains `from app.errors import ConfigError` and
+`assert ei.value.code == "missing"`, so the no-context arm was reading the
+answer out of the test rather than reasoning to it. The tests were moved outside
+the repository entirely, where they cannot be retrieved, and the result
+inverted. A benchmark whose answer key is inside the corpus measures nothing.
+
 ## 3. The memory subsystem is correct and safe — PROVEN (on synthetic scenarios)
 
 Two deterministic benchmarks, **zero model calls**, both PASS:
@@ -152,10 +206,12 @@ Stated plainly, because a proof that overreaches is worth less than a narrow one
   save gate, the unread host-edit ledger), which removes mechanical ceilings —
   but removing a ceiling is not the same as demonstrating a benefit. The loop is
   **starved**, and that is a measurement, not an excuse.
-- **Answer REASONING quality is unmeasured.** §2b shows retrieval is causally
-  necessary for a usable patch, but the mechanism it measured is groundedness —
-  the model's fix logic was correct in both arms. Whether better context makes
-  neo *reason* better, on defects priors cannot solve, is not shown here.
+- **Answer reasoning is now measured (§2c) but at n=2.** Retrieval is shown to
+  enable project-specific correctness that priors cannot supply, with refusal —
+  not hallucination — as the failure mode. Two conventions in one scratch repo
+  is an existence proof, not a rate. How often real tasks turn on
+  project-specific knowledge, versus knowledge the model already has, is
+  unmeasured.
 - **Developer productivity is unmeasured**, and is not the kind of claim this
   instrument can settle.
 
