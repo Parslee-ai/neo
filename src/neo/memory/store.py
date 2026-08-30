@@ -2494,9 +2494,33 @@ class FactStore:
                 source_candidate_id=outcome.candidate_id or None,
             )
 
-        if linked_count:
+        # `touched_fact_ids` is load-bearing here, not decoration.
+        # `_apply_used_fact_feedback` credits CITED retrieved facts — a
+        # different population from the linked-original facts that move
+        # `linked_count` — and it bumps `success_count` on the live Fact
+        # objects without touching that counter. Gating the only save on
+        # `linked_count` alone therefore discarded every cited-fact credit
+        # made by a run that had no linked original fact, which is the normal
+        # case: `suggestion_fact_ids` is empty unless the candidate already
+        # resolves to a durable fact. The episode ledger still recorded the
+        # mutation, so `learning-stats` reported reinforcements that the fact
+        # store never received — the reporter and the data disagreed, and the
+        # reporter was the honest one.
+        #
+        # Measured on a live install: of 88 valid GLOBAL facts, ZERO had ever
+        # reached `success_count > 0` while 64 carried a non-zero
+        # `access_count` — global facts are almost never the linked original,
+        # so their credits were the ones always dropped. PROJECT facts topped
+        # out at exactly 2, the value promotion writes, because the credit
+        # that would carry one past 2 never survived the process. That is why
+        # no fact in 6,613 ever reached the `success_count >= 3` contribution
+        # bar and `neo contribute` was unreachable.
+        if linked_count or touched_fact_ids:
             self.save()
-            logger.info(f"Boosted/demoted {linked_count} original fact(s) from outcomes")
+            logger.info(
+                "Boosted/demoted %d original fact(s) and credited %d cited "
+                "fact(s) from outcomes", linked_count, len(touched_fact_ids)
+            )
         if outcomes:
             modified = sum(1 for o in outcomes if o.outcome_type == OutcomeType.MODIFIED)
             regressions = sum(1 for o in outcomes if o.outcome_type == OutcomeType.REGRESSION)
