@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.49.0] - 2026-08-30
+
+A diagnostic that invented a presence, and an extractor that never got to answer. `learning-stats` exists to tell an operator whether the accept-driven loop is running; on a live install it reported a healthy loop that was not running at all. And the transcript miner had been asking reasoning models for lessons in a budget they spend before they speak.
+
+### Fixed
+
+- **`neo memory learning-stats` counted hand-run drill state as learning.** It reported `21 promoted -> interactive loop is ACTIVE` on an install whose real promotion count was **zero**. The reporter walks every directory under `~/.neo/episodes` and counts what it finds, and 50 of the 253 episodes there belonged to `testproj1234` — drill state, with subjects like `pattern: x [a.py]` and `fp:deadbeef`, in files named `crashed.json` rather than the 32-hex ids the engine mints. Its 19 `durable` candidates *were* the promotion figure.
+
+  Cross-checking the ledger against the store is what exposed it, and it is the check worth keeping: of the 7 `promoted_fact_id`s recorded, **6 named facts that exist in no fact file**, and the 7th was an already-retracted `drill_artifact_incorrect_lesson`. Removing the drill directory alone moved accepted outcomes 44 → 2, promotions 21 → 1, rollbacks 4 → 0, demotions 4 → 0.
+
+  A project id with no `facts_project_<id>.json` cannot have received a promotion, because promotion **writes** that file. The ledger walk now counts a project only when its store exists. Two things that had to be right:
+
+  `unscoped` is exempt — it is the id `LearningEpisodeStore` assigns when a run resolves no project, so its episodes are real runs (engine errors land there), and a bare fact-store test would have thrown them away. And the exclusion is **reported, never silent**, including in the empty-ledger branch: a ledger holding nothing but drill state must not read "neo has never run" when the truth is "what is here is junk". This project's rule about never blaming a cap for an absence it did not cause, applied to a diagnostic that was inventing a presence instead.
+
+  **Why no test caught it:** three existing tests build a ledger for a project with no fact store, so the suite had encoded the broken state as the expected one. That state does not occur — `FactStore.initialize` creates the file for a brand-new project before any episode can be recorded (verified directly), and on the live ledger all 11 real project dirs had a store while only the drill dir did not. The tests were modelling drill state; they now create the store the way production does.
+
+- **The transcript lesson extractor asked for 1024 max tokens, and reasoning models spent it before answering.** `TranscriptIngester._lm_json` capped output at a number that predates reasoning models, which consume the budget on reasoning tokens before emitting a visible character. The observer log shows the result: `incomplete_details.reason = max_output_tokens`, **850 of 1024 spent reasoning**, the lessons array cut mid-object, and the whole extraction discarded. Raised to 4096, the adapters' own default — this call site was the outlier, not the target.
+
+  The failure was already loud (`transcript: LM call failed` at WARNING), which is why it is a budget bug rather than a silent one; it just named the symptom and not the cause.
+
 ## [0.48.0] - 2026-08-25
 
 Two credentials problems and two silent ones. Neo could not reach a model on a machine where CAR already held the key — the two tools use disjoint names for the same entry in the same keychain, so both truthfully reported "no key" while it sat between them. The edit-recording hook promised it returns 0 on every path *by construction* and had two ways out that an `except Exception` cannot catch. And `learning-stats` named a cause it had never checked.
