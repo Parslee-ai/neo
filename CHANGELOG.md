@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.51.0] - 2026-08-30
+
+The edit-recording hook has been writing a ledger since it shipped and nothing read it. Now `collect_outcomes` does — and the first thing that falls out is that a suggestion to create a **new file** was never verifiable at all.
+
+### Added
+
+- **`collect_outcomes` reads the host edit ledger.** `neo hook record` appends every host Edit/Write to `~/.neo/sessions/host_events.jsonl`; `_load_host_edit_events` unions those into the git-derived `changed_files`. It ADDS evidence and removes none — git still reports everything committed or dirty.
+
+  **The concrete gap this closes is the untracked new file.** `git diff --name-only HEAD` lists tracked modifications ONLY, so a suggestion to create a new file — which `suggestion_is_verifiable` explicitly admits as legitimate, since proposing one is normal and shows up in `git log` once committed — was invisible to outcome detection until somebody committed it.
+
+  Closing it needed **both** halves, and the first alone is not enough: the ledger surfaces the path, and `_get_file_diff_since` gained a third source (`git diff --no-index` against `os.devnull`, gated on a new `_is_untracked`) so the classifier can see the content it is being asked to verify. With only the union, `_match_to_suggestions` found no diff to compare and returned UNVERIFIED — which by design mutates nothing, i.e. a file reported as changed that no diff could confirm. That was the observed behaviour of the first cut, not a prediction.
+
+  Confirmed end to end on a live run: neo suggested creating `src/validators.py`, the file was created and left untracked, an unrelated file was left dirty, and the next invocation recorded `accepted` for that path — while `git diff --name-only HEAD` never listed it and no commit occurred, so git could not have been the source.
+
+  **Attribution is by `file_path`, never by `cwd` or `head`.** Those name the directory the HOST was launched in, not the repository the edited file belongs to — measured directly: an edit to a scratch repository, made from a Claude Code session rooted in the neo checkout, recorded neo's OWN head. A record is ours when its path resolves inside `codebase_root`, which also stops one machine-wide ledger cross-attributing between projects.
+
+  The read is hoisted out of the per-session loop, for the same reason `_get_working_tree_changes` had to be — retention means many pending sessions, and a per-session re-read puts a linear cost on the request hot path. The rotated `.1` generation is read too: rotation moves the RECENT records there and leaves the active file nearly empty, so reading only the active file would lose exactly the window this exists to protect. A missing, unreadable or malformed ledger yields an empty list, and a malformed LINE is skipped rather than discarding the file — the ledger is append-only, so a torn final write is the expected corruption.
+
+  Every test in `tests/test_host_edit_ledger.py` runs against a **dirty** working tree, because a spotless one is the state neo is never actually invoked in. Both halves are separately mutation-pinned.
+
+### Known limits
+
+- A session that has already aged out at `PENDING_SESSION_TTL_SECONDS` (14 days) is gone before the ledger can help. The ledger makes a longer TTL *useful* — previously a longer window would only have retained records nothing could resolve — but the TTL itself is unchanged here.
+- A new-file acceptance classifies as `feature` → `decision` kind, which is deliberately non-promotable. The acceptance is now detected; it still does not mint a durable pattern.
+
 ## [0.50.0] - 2026-08-30
 
 The learning loop had a hard mechanical ceiling, and it was one `if`. Neo credited the facts its reasoning actually used, recorded the credit in the episode ledger, reported it in `learning-stats` — and then threw it away without writing it to disk. `neo contribute` has never been reachable on any install, and this is why.
