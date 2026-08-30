@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.52.0] - 2026-08-30
+
+Two caps that were not caps. `neo --index` spent its whole file budget on tests before examining a single source file, and `--max-files` — whose help calls it a "Cap on files" — could be exceeded threefold. Both are fixed, and this release also adds the tooling that found them: neo's retrieval is now measured against naive baselines rather than reported as bare absolutes.
+
+### Fixed
+
+- **`neo --index` built a catalog of 100% test files on any `src/` + `tests/` repo** ([#213](https://github.com/Parslee-ai/neo/issues/213)). `ProjectIndex._select_files` ranked shallowest-path-first, and depth is a proxy for centrality that **inverts** on the conventional Python layout: with `src/<pkg>/…` beside `tests/…`, every test sits at depth 2 and every source file at depth 3, so the whole test tree sorted ahead of the whole source tree and `--max-files` was spent before one source file was examined.
+
+  Measured on this repo: 131 Python files at depth 2, and the existing catalog held 52 files of which 43 (82%) were tests. Rebuilt after the fix, same language scope: **94 files, 100% source**. The build reported success either way, and the selection report was truthful that the cap bound — nothing said the files it kept were all tests.
+
+  The sort key is now `(is_test, depth, path)`. Tests are **demoted, not excluded** — they fill the slots source does not need, so a test-only repository still indexes. `is_test_path` is **imported** from `context_gatherer` rather than restated, so its careful cases hold (`testdata/` and `testing/` stay ordinary source; `Foo.Tests/` does not).
+
+  Worth recording: this module already treated "tests outrank the source they test" as a failure mode — `_embed_chunks` embeds a structured summary instead of the raw body for exactly that reason. That mitigation runs at *embedding* time and never got a chance, because selection had spent the budget one stage earlier.
+
+- **`--max-files` was not a cap.** `calculate_adaptive_limit` picks a file budget from prompt specificity and returned its three broad-prompt buckets verbatim, ignoring the caller's ceiling — so `--max-files 5` on a vague prompt delivered **15 files**, three times what was asked.
+
+  | prompt | `--max-files=5` | `=10` | `=30` |
+  |---|---|---|---|
+  | "review this" | **15** | **15** | 15 |
+  | "review this codebase" | **20** | **20** | 20 |
+  | "refactor memory delete synthesis" | **25** | **25** | 25 |
+  | "review ProjectIndex.retrieve() in src/…" | 5 | 10 | 30 |
+
+  Only the *specific* bucket honoured the ceiling, and it does so by construction — it returns `default_max`. The one branch that could not fail was the only one a specific prompt exercised, which is why nothing caught it. Now `min(floor, default_max)`. **No behaviour change at the shipped default** (every bucket is already ≤ 30), and the cap *bounds* the heuristic rather than replacing it: a vague prompt with `--max-files 500` still gets 15. Pinned in the Guard-invariant battery beside the other no-silent-caps checks.
+
+- **A performance test measured process warmup, not the code under test.** `test_consolidation_performance_with_all_boosts` timed the *first* call to `_merge_cluster`, so one-time process costs dominated: cold n=5 reads ~18ms, warm n=5 reads **0.06ms**, and cold n=40 reads 2.8ms — eight times the work in a seventh of the time. A performance assertion whose reading falls as the input grows is measuring startup.
+
+  It flapped for the same reason (18ms against a 100ms bound is 5× headroom, so ordinary full-suite load tripped it, and the bound had already been raised 50ms → 100ms once). Fixed by warming up outside the measurement, giving ~870× headroom while keeping the assertion live — injecting a 150ms slowdown still fails it. Per the rule adopted in #183: no assertion may depend on how fast the machine running it is.
+
+### Added
+
+- **`tools/rank_baseline_eval.py`** — scores four naive rankers (`random`, `recency`, `size`, `filename`, `grep`) over the *identical* candidate set, queries and ground truth that `rank_mine_eval.py` uses, so the ranking rule is the only thing that differs. Absolute R@k figures have no comparator and cannot answer "is this working"; this supplies one.
+
+  The load-bearing baseline is **`grep`** — prompt-token counts over file *content* — because the mining leak (a file holds the commit's terms because that commit put them there) helps any content-reading ranker and does nothing for `size` or `recency`. Comparing only against content-blind baselines would let the leak masquerade as ranker quality.
+
+- **`rank_mine_eval.py --max-files N`** — sweeps the delivery cap, which was unmeasurable until the cap fix above.
+
+### Measured
+
+Recorded in `docs/`, with limits stated rather than left to be rediscovered:
+
+- **Effectiveness** (`effectiveness-evidence-2026-08-30.md`): neo's selection beats the strongest naive baseline on three repos — pooled over 150 cases, **81 better / 37 worse / 32 tied, p = 6.3 × 10⁻⁵** — and the margin grows with repo size (1.3× → 2.4×). Controlled experiments show retrieval is causally necessary both for a patch that *applies* (3/3 vs 0/3) and for project-specific correctness priors cannot supply (2/2 vs 0/2), where the failure mode is **refusal, not hallucination**.
+- **Semantic lane** (`semantic-lane-remeasurement-2026-08-30.md`): pooled across three repos the `--semantic` flag is **null** (18 better / 18 worse, p = 1.000). Its value tracks **catalog coverage**, tested causally by starving neo's own catalog 49.5% → 14.7%, which collapses a significant effect (p = 0.022) to nothing (p = 0.832). The lane is starved, not weak; the lever is the catalog cap, not the weight.
+- **Delivery cap** (`delivery-cap-sweep-2026-08-30.md`): the knee is **~10 files** on repos 29× apart in size. Cap 30 vs cap 10 over 100 cases is 6 better / 2 worse / 92 tied (p = 0.289) while costing **15–50% more context bytes**. The default is deliberately **unchanged** — that evidence is retrieval-only, and R@k cannot see whether the extra files help the model reason.
+
 ## [0.51.0] - 2026-08-30
 
 The edit-recording hook has been writing a ledger since it shipped and nothing read it. Now `collect_outcomes` does — and the first thing that falls out is that a suggestion to create a **new file** was never verifiable at all.
