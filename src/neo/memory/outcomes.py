@@ -640,6 +640,9 @@ class OutcomeTracker:
         # a measured 0.88s of pure `git` forking at 40 pending sessions, on the
         # request hot path, growing linearly.
         working_tree = self._get_working_tree_changes()
+        # Host-recorded edits, loaded once and filtered per session below —
+        # hoisted for the same reason `working_tree` is.
+        host_edits = self._load_host_edit_events()
         # Watermark stamped onto retained records. Backed off a little because
         # `git log --since` is second-granular: anchoring exactly at "now"
         # could skip a commit made in this same second.
@@ -665,6 +668,18 @@ class OutcomeTracker:
             changed_files = self._get_changed_files_since(
                 since, working_tree=working_tree
             )
+            # Union in the host's own record of what it edited. Strictly ADDS
+            # evidence: git already reports anything committed or dirty, and the
+            # ledger additionally covers an edit that was applied and then left
+            # alone with no later Neo run in that repository — the case
+            # `_get_changed_files_since` structurally cannot see, and the one
+            # that ages a real acceptance out at PENDING_SESSION_TTL_SECONDS.
+            # `>=` not `>`: `since` is a session's own timestamp, and an edit
+            # applied in the same clock second as the suggestion is an
+            # acceptance, not a pre-existing change.
+            changed_files |= {
+                path for ts, path in host_edits if ts >= since
+            }
 
             # Retain a REDUCED record holding only what is still outstanding.
             # Keeping the whole session would re-emit an outcome for every
@@ -1126,6 +1141,86 @@ class OutcomeTracker:
 
         return outcomes
 
+    def _load_host_edit_events(self) -> list[tuple[float, str]]:
+        """Edits the HOST recorded, as ``(timestamp, repo-relative path)``.
+
+        The `neo hook record` PostToolUse hook appends one line per
+        Edit/Write/MultiEdit/NotebookEdit to ``~/.neo/sessions/host_events.jsonl``.
+        This is the consumer for it, and it exists because the git-based
+        detector cannot see an edit that was never followed by another Neo run
+        in that repository: a suggestion applied and then left alone ages out at
+        ``PENDING_SESSION_TTL_SECONDS`` and its acceptance is lost. The ledger
+        records the edit at the moment it happens.
+
+        **Attribution is by ``file_path`` and never by ``cwd`` or ``head``.**
+        Those two name the directory the HOST was launched in, which is not the
+        repository the edited file belongs to — measured directly: an edit to a
+        scratch repository made from a Claude Code session rooted in the neo
+        checkout recorded neo's own HEAD. Only the path can say which project an
+        edit belongs to, so a record is ours when its file resolves inside
+        ``codebase_root``.
+
+        Read ONCE per ``collect_outcomes`` and filtered per session in memory,
+        for the same reason ``_get_working_tree_changes`` is hoisted out of that
+        loop: retention means many pending sessions, and re-reading a
+        multi-megabyte ledger per session would put a linear cost on the request
+        hot path.
+
+        Returns an empty list on every failure — a missing, unreadable or
+        malformed ledger must never break outcome detection, which is the same
+        contract the hook that writes it keeps. A single malformed LINE is
+        skipped rather than discarding the file: the ledger is append-only, so a
+        torn final write is the expected corruption and the records before it
+        are still good.
+        """
+        if not self.codebase_root:
+            return []
+        try:
+            from neo.hook import HOOK_LEDGER
+        except Exception:  # pragma: no cover - import guard only
+            return []
+
+        events: list[tuple[float, str]] = []
+        root = Path(self.codebase_root)
+        # The rotated generation is read too. Rotation happens at 8 MB, and it
+        # moves the RECENT records into `.1` while leaving the active file
+        # nearly empty — so reading only the active file would silently lose the
+        # window immediately after a rotation, which is exactly the evidence
+        # this consumer exists to stop losing.
+        for ledger in (HOOK_LEDGER.with_name(HOOK_LEDGER.name + ".1"), HOOK_LEDGER):
+            try:
+                if not ledger.exists():
+                    continue
+                with ledger.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line.startswith("{"):
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(record, dict):
+                            continue
+                        raw = record.get("file_path")
+                        ts = record.get("ts")
+                        if not isinstance(raw, str) or not raw:
+                            continue
+                        if not isinstance(ts, (int, float)):
+                            continue
+                        try:
+                            resolved = Path(raw)
+                            if not resolved.is_absolute():
+                                continue
+                            relative = str(resolved.relative_to(root))
+                        except (ValueError, TypeError, OSError):
+                            continue  # not under this project's root
+                        events.append((float(ts), relative))
+            except OSError as exc:
+                logger.debug("host-edit ledger unreadable (non-fatal): %s", exc)
+                continue
+        return events
+
     def _get_working_tree_changes(self) -> set[str]:
         """Files dirty in the working tree right now.
 
@@ -1289,6 +1384,29 @@ class OutcomeTracker:
 
         return outcomes
 
+    def _is_untracked(self, file_path: str) -> bool:
+        """Is this path present on disk but unknown to git?
+
+        `ls-files --error-unmatch` exits non-zero for a path git does not
+        track. Used only to decide whether the `--no-index` diff is the right
+        source; any failure answers False, so the caller falls back to
+        reporting no diff rather than inventing one.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", file_path],
+                cwd=self.codebase_root,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            )
+            return result.returncode != 0
+        except (subprocess.SubprocessError, FileNotFoundError, OSError,
+                UnicodeDecodeError) as exc:
+            logger.debug("untracked check failed for %s (non-fatal): %s",
+                         file_path, exc)
+            return False
+
     def _get_file_diff_since(self, file_path: str, since_timestamp: float) -> str:
         """Get the actual diff content for a file since a timestamp.
 
@@ -1330,6 +1448,29 @@ class OutcomeTracker:
                     diff += "\n" + result2.stdout.strip()
                 else:
                     diff = result2.stdout.strip()
+
+            # Third source: a file that exists on disk but is UNTRACKED. Neither
+            # query above can see one — `git log -p` needs a commit and
+            # `git diff HEAD` reports tracked modifications only — so a
+            # suggestion to create a NEW file, applied and not yet committed,
+            # produced an empty diff and was classified UNVERIFIED, which
+            # mutates nothing. `suggestion_is_verifiable` explicitly admits a
+            # not-yet-existing path as legitimate, so this is a case the system
+            # invites and then could not verify. `--no-index` exits 1 when the
+            # files differ, which is the normal result here, so a non-zero
+            # return is not an error; only stdout decides.
+            if not diff:
+                target = Path(self.codebase_root) / file_path
+                if target.is_file() and self._is_untracked(file_path):
+                    result3 = subprocess.run(
+                        ["git", "diff", "--no-index", "--", os.devnull, file_path],
+                        cwd=self.codebase_root,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                        timeout=10,
+                    )
+                    if result3.stdout.strip():
+                        diff = result3.stdout.strip()
 
             if not diff:
                 return ""

@@ -1439,10 +1439,37 @@
   (3) **paths, never contents** — `tool_input` carries the text being written.
   Opt out with `NEO_HOOKS=0`. `HOOK_LEDGER` captures `Path.home()` at import, so
   it is registered in `conftest.HOME_PATH_CONSTANTS`.
-  **Nothing reads the ledger yet** — `collect_outcomes` still infers from git.
-  That split is deliberate: a ledger is only worth reading once it has history,
-  and history cannot be recorded retroactively. The consumer must be written
-  against a DIRTY tree (see the pending-session entry above for why).
+  **`collect_outcomes` reads the ledger** (`_load_host_edit_events`), unioning
+  host-recorded edits into the git-derived `changed_files`. It ADDS evidence and
+  removes none: git still reports everything committed or dirty.
+  **Attribution is by `file_path` and never by `cwd` or `head`** — those name the
+  directory the HOST was launched in, not the repository the edited file belongs
+  to. Measured: an edit to a scratch repo, made from a Claude Code session rooted
+  in the neo checkout, recorded neo's OWN head. A record is ours when its path
+  resolves inside `codebase_root`.
+  The read is hoisted OUT of the per-session loop for the same reason
+  `_get_working_tree_changes` was — retention means many pending sessions, and a
+  per-session re-read puts a linear cost on the request hot path
+  (`test_the_ledger_is_read_once_per_call_not_once_per_session`). The rotated
+  `.1` generation is read too: rotation moves the RECENT records there and leaves
+  the active file nearly empty, so reading only the active file would lose
+  exactly the window this exists to protect. A malformed LINE is skipped rather
+  than discarding the file — the ledger is append-only, so a torn final write is
+  the expected corruption.
+  **The concrete gap it closes is the UNTRACKED new file.**
+  `git diff --name-only HEAD` lists tracked modifications ONLY, so a suggestion
+  to create a new file — which `suggestion_is_verifiable` explicitly admits as
+  legitimate — was invisible to detection until someone committed it. Closing
+  that needed BOTH halves: the ledger surfaces the path, and
+  `_get_file_diff_since` gained a third source (`git diff --no-index` against
+  `os.devnull`, gated on `_is_untracked`) so the classifier can actually see the
+  content. With only the first half the outcome was UNVERIFIED, which mutates
+  nothing — a file reported as changed that no diff could confirm. `--no-index`
+  exits 1 when files differ, which is the normal result, so only stdout decides.
+  Both halves are separately mutation-pinned in `tests/test_host_edit_ledger.py`.
+  **Every test in that file runs against a DIRTY tree**, because a spotless
+  working tree is the one state neo is never invoked in — the mistake that let
+  the per-session retention bug ship.
   **Footgun — the plugin now has a hard CLI version floor.** The plugin updates
   from this repo; the CLI comes from PyPI. On a `neo` predating the subcommand,
   `neo hook record` is an argparse error exiting **2**, the one code Claude Code
