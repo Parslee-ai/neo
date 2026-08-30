@@ -775,6 +775,26 @@
      one function later — chunks arrive grouped by file and files by language, so
      the slice kept 1000 C# chunks and dropped every other language, with 37 of
      the 100 selected files contributing nothing.
+     **And the order WITHIN a language is source-before-tests, then depth, then
+     alphabetical** — the test key being the load-bearing one. Depth alone is a
+     centrality proxy that INVERTS on the conventional Python layout: with
+     `src/<pkg>/…` beside `tests/…` every test sits at depth 2 and every source
+     file at depth 3, so the whole test tree sorted ahead of the whole source
+     tree and `--max-files` was spent before one source file was examined.
+     Measured here: 131 Python files at depth 2, and the catalog came out
+     **100% tests** while the build reported success — the cap had genuinely
+     bound and the report was truthful about that, but nothing said the files
+     it kept were all tests (#213). This module already treats "tests outrank
+     the source they test" as a failure mode — `_embed_chunks` embeds a
+     structured summary rather than the raw body precisely because assertion
+     strings carry a query's keywords verbatim — but that mitigation runs at
+     EMBEDDING time and so never got a chance; selection had already spent the
+     budget. Tests are DEMOTED, not excluded: they fill the slots source does
+     not need, so a test-only repo still indexes. `is_test_path` is IMPORTED
+     from `context_gatherer`, never restated — a second copy of that rule would
+     agree with the first only by coincidence, and its careful cases
+     (`testdata/` and `testing/` are ordinary source; `Foo.Tests/` is not) are
+     exactly what a re-implementation loses.
   2. **Exclusion is two layers and `bin`/`build`/`out`/`target`/`dist`/`vendor`
      belong to neither by name.** Both layers, and the walk that applies them,
      live in `neo/eligibility.py` — the ONE eligibility module, consumed by
@@ -1197,12 +1217,16 @@
   `ProjectIndex._select_files` ranks shallowest-path-first, so on `src/<pkg>/…`
   + `tests/…` every test is depth 2 and every source file depth 3 — 105 Python
   files at depth 2 here, first non-test at rank 102, `--max-files` default 100.
-  Not fixed in this goal (the front door consumes the catalog; the index builds
-  it). Through the front door the same broken catalog yields 0.705 / 0.708,
-  because it is one channel of four. So `SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT`
-  is a defensible default, NOT a tuned one — re-measure it against a catalog
-  built after #213 lands, and do not quote the −0.007 MRR under the flag as a
-  property of the weight; it is a property of the catalog's contents.
+  Through the front door the same broken catalog yields 0.705 / 0.708, because
+  it is one channel of four. **#213 is now FIXED** — selection ranks source
+  before tests (see index invariant 1) and a rebuild of this repo's catalog went
+  from 82% tests / 52 files to **100% source / 94 files**. So
+  `SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT` remains a defensible default and is
+  STILL NOT a tuned one: the re-measurement it was waiting on is now possible
+  but has not been run. Do not quote the −0.007 MRR under the flag as a property
+  of the weight; it is a property of the catalog the measurement used, and that
+  catalog no longer exists. Re-run `tools/rank_mine_eval.py` against a freshly
+  built catalog before trusting any semantic-lane figure.
   **The renderer's per-file cap is NOT the front door's** and the two are
   deliberately still separate: `engine._render_context_files` keeps its 3,000
   character cut for unpinned files, with its own marker. Collapsing them would

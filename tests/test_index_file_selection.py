@@ -146,6 +146,102 @@ class TestSelectionAcrossLanguages:
         )
 
 
+class TestTestFilesDoNotCrowdOutSource:
+    """`--max-files` must not be spent on tests before source is examined.
+
+    Depth is a proxy for centrality that INVERTS on the conventional Python
+    layout: with `src/<pkg>/...` beside `tests/...`, every test is at depth 2
+    and every source file at depth 3, so ranking by depth alone put the whole
+    test tree ahead of the whole source tree. Measured on this repo: 131 Python
+    files at depth 2, and the catalog came out 100% tests while the build
+    reported success — the cap had genuinely bound and the report was truthful
+    about that; nothing said the files it kept were all tests. (#213)
+    """
+
+    @pytest.fixture
+    def src_and_tests_repo(self, tmp_path):
+        """The layout that inverts a depth ranking: tests shallower than source."""
+        for i in range(60):
+            _write(tmp_path, f"tests/test_mod{i}.py", f"def test_{i}(): assert {i}\n")
+        for i in range(30):
+            _write(tmp_path, f"src/pkg/mod{i}.py", f"def fn{i}(): return {i}\n")
+        return tmp_path
+
+    def test_source_is_indexed_even_though_tests_sort_shallower(
+        self, src_and_tests_repo
+    ):
+        index = ProjectIndex(str(src_and_tests_repo))
+        selected, _ = index._select_files(["**/*.py"], 30)
+        chosen = [str(Path(p).relative_to(src_and_tests_repo)) for p, _ in selected]
+
+        # Establish the premise rather than assuming it: in this fixture the
+        # tests really ARE shallower than the source, so a depth-only ranking
+        # would have taken all 30 slots from `tests/`.
+        all_files = list(src_and_tests_repo.rglob("*.py"))
+        depths = {
+            "tests": {len(p.relative_to(src_and_tests_repo).parts)
+                      for p in all_files if "tests" in p.parts},
+            "src": {len(p.relative_to(src_and_tests_repo).parts)
+                    for p in all_files if "src" in p.parts},
+        }
+        assert max(depths["tests"]) < min(depths["src"]), (
+            f"fixture no longer inverts depth: {depths}"
+        )
+
+        assert not any(c.startswith("tests/") for c in chosen), (
+            f"tests consumed the budget before source: {chosen[:5]}"
+        )
+        assert len(chosen) == 30
+        assert all(c.startswith("src/") for c in chosen)
+
+    def test_tests_are_demoted_not_excluded(self, src_and_tests_repo):
+        """They fill the slots source does not need — a test-only repo must
+        still be indexable, and the gatherer demotes rather than drops."""
+        # A budget that BINDS (50 slots for 30 source + 60 tests). With 90 the
+        # whole repo fits and the assertion would hold whatever the ranking is —
+        # a test that cannot fail is not a guard.
+        index = ProjectIndex(str(src_and_tests_repo))
+        selected, _ = index._select_files(["**/*.py"], 50)
+        chosen = [str(Path(p).relative_to(src_and_tests_repo)) for p, _ in selected]
+
+        assert sum(1 for c in chosen if c.startswith("src/")) == 30, (
+            "source did not get first claim on a binding budget"
+        )
+        assert sum(1 for c in chosen if c.startswith("tests/")) == 20, (
+            "tests were excluded rather than demoted into the remaining slots"
+        )
+
+    def test_a_test_only_repo_still_indexes(self, tmp_path):
+        for i in range(10):
+            _write(tmp_path, f"tests/test_a{i}.py", f"def test_{i}(): assert {i}\n")
+        index = ProjectIndex(str(tmp_path))
+        selected, _ = index._select_files(["**/*.py"], 100)
+        assert len(selected) == 10
+
+    def test_ranking_stays_deterministic_within_each_group(self, tmp_path):
+        """Source before tests, then shallower, then alphabetical — the last
+        two keys are unchanged and still decide order inside a group."""
+        _write(tmp_path, "src/pkg/deep/z.py", "def z(): pass\n")
+        _write(tmp_path, "src/b.py", "def b(): pass\n")
+        _write(tmp_path, "src/a.py", "def a(): pass\n")
+        index = ProjectIndex(str(tmp_path))
+        selected, _ = index._select_files(["**/*.py"], 100)
+        chosen = [str(Path(p).relative_to(tmp_path)) for p, _ in selected]
+        assert chosen == ["src/a.py", "src/b.py", "src/pkg/deep/z.py"]
+
+    def test_testdata_directories_are_not_treated_as_tests(self, tmp_path):
+        """`is_test_path` is imported, not restated, so its careful cases hold:
+        `testdata/` is ordinary source and must not be demoted."""
+        _write(tmp_path, "testdata/fixture.py", "VALUE = 1\n")
+        _write(tmp_path, "tests/test_real.py", "def test_x(): assert 1\n")
+        index = ProjectIndex(str(tmp_path))
+        selected, _ = index._select_files(["**/*.py"], 1)
+        chosen = [str(Path(p).relative_to(tmp_path)) for p, _ in selected]
+        assert chosen == ["testdata/fixture.py"], (
+            f"testdata/ was demoted as if it were a test tree: {chosen}"
+        )
+
+
 class TestExclusions:
     def test_worktree_files_are_excluded(self, dotnet_repo):
         """The subtree is pruned, and the report counts the subtree.
