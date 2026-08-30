@@ -520,6 +520,28 @@
   Changes to layer ordering, the 2/3 constraint cap, or the inline `(changed from: X)`
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
+- **Delivery-cap sweep** (`docs/delivery-cap-sweep-2026-08-30.md`;
+  `rank_mine_eval.py --max-files N`). `--max-files` (default 30) had never been
+  measured, and could not be until it was fixed: `calculate_adaptive_limit`
+  returned its three broad-prompt buckets VERBATIM, so `--max-files 5` on a
+  vague prompt delivered 15 — the only bucket honouring the ceiling was the
+  specific one, which returns `default_max` by construction. Sweeping below 25
+  therefore moved nothing for any prompt that was not highly specific.
+  **The knee is ~10 files and the shape replicates across repos 29x apart in
+  size** (neo 99 candidates, m365dotnet 2,882): R@10 and H@10 both peak at cap
+  10 and improve nowhere beyond. Pooled paired over 100 cases, **cap 30 vs cap
+  10: 6 better, 2 worse, 92 tied, p = 0.289** — tripling the delivered files
+  changes 8 outcomes in 100, in both directions, while costing **+50% context
+  bytes on neo (131 KB -> 197 KB) and +15% on m365dotnet**. Below 10 there IS
+  loss (neo 5->10: 6/0, p = 0.031). Byte cost is **not monotonic in file
+  count** — cap 5 spends MORE than cap 10 (142 KB vs 131 KB) while retrieving
+  worse, because `--max-bytes` is apportioned across whatever is admitted, so
+  10 is both the quality saturation point and the cost minimum.
+  **The default was deliberately NOT changed**: this evidence is retrieval-only,
+  and R@k cannot see whether the other 20 files help the model REASON (the
+  effectiveness doc's §2b shows context presence is causally necessary for a
+  usable patch). Validating 10 needs an answer-quality arm — the planted-bug
+  design at cap 10 vs 30 — which has not been run.
 - **Effectiveness evidence** (`docs/effectiveness-evidence-2026-08-30.md`,
   `tools/rank_baseline_eval.py`). Absolute R@k figures have no comparator and
   cannot answer "is neo effective". The baseline harness scores four naive
