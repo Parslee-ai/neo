@@ -551,13 +551,24 @@ def calculate_adaptive_limit(prompt: str, default_max: int = 30) -> int:
     # Map to range 15-default_max with adjusted thresholds
     # Broad prompts now get MORE files to provide overview context
     if specificity < 2:
-        return 15  # Very vague: "review this" - need broad context
+        floor = 15  # Very vague: "review this" - need broad context
     elif specificity < 5:
-        return 20  # Somewhat vague: "review this codebase" - need overview
+        floor = 20  # Somewhat vague: "review this codebase" - need overview
     elif specificity < 10:
-        return 25  # Moderate: "review the semantic search implementation"
+        floor = 25  # Moderate: "review the semantic search implementation"
     else:
-        return default_max  # Specific: "review ProjectIndex.retrieve() and _project_index_boost()"
+        floor = default_max  # Specific: "review ProjectIndex.retrieve() and _project_index_boost()"
+
+    # `default_max` is the caller's CEILING (`--max-files`), whose help calls it
+    # a "Cap on files", so it must bound the result. The three broad-prompt
+    # buckets used to be returned verbatim, so a vague prompt under
+    # `--max-files 5` delivered 15 files — the flag was exceeded by 3x and the
+    # only bucket that honoured it was the specific one, which returns
+    # `default_max` by construction. A cap that can be exceeded is not a cap,
+    # and it also made the knob unmeasurable: sweeping it below 25 moved
+    # nothing for any prompt that was not highly specific.
+    # No behaviour change at the default (30) — every bucket is already <= 30.
+    return min(floor, default_max)
 
 
 def infer_language(path: str) -> Optional[str]:

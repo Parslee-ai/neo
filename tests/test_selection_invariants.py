@@ -426,6 +426,47 @@ class TestTruncationIsAlwaysMarked:
         assert f"{cut} {noun} truncated, marked inline" in banner, banner
 
 
+class TestTheFileCapIsHonoured:
+    """G3-inv, applied to `--max-files`: a cap that can be exceeded is not a cap.
+
+    `calculate_adaptive_limit` picks a file budget from prompt specificity, and
+    its three broad-prompt buckets used to be returned VERBATIM — so a vague
+    prompt under `--max-files 5` was given 15 files, 3x the requested ceiling.
+    Only the specific bucket honoured it, and that one does so by construction
+    (it returns `default_max`), which is why nothing caught this.
+
+    It also made the knob unmeasurable: sweeping `--max-files` below 25 moved
+    nothing for any prompt that was not highly specific, so a delivery-cap
+    sweep measured the adaptive floor rather than the cap.
+    """
+
+    @pytest.mark.parametrize("prompt", [
+        "review this",                                   # very vague  -> 15
+        "review this codebase",                          # somewhat    -> 20
+        "refactor memory delete synthesis",              # moderate    -> 25
+        "review ProjectIndex.retrieve() in src/neo/index/project_index.py",
+    ])
+    @pytest.mark.parametrize("ceiling", [1, 5, 10, 25, 30, 50])
+    def test_never_exceeds_the_requested_ceiling(self, prompt, ceiling):
+        from neo.context_gatherer import calculate_adaptive_limit
+        assert calculate_adaptive_limit(prompt, ceiling) <= ceiling
+
+    def test_the_default_budget_is_unchanged(self):
+        """The fix must not silently re-tune the shipped default. At
+        `--max-files 30` every bucket is already <= 30, so the mapping stands."""
+        from neo.context_gatherer import calculate_adaptive_limit
+        assert calculate_adaptive_limit("review this", 30) == 15
+        assert calculate_adaptive_limit("review this codebase", 30) == 20
+        assert calculate_adaptive_limit("refactor memory delete synthesis", 30) == 25
+
+    def test_a_generous_ceiling_still_gets_the_specificity_budget(self):
+        """The cap bounds the result; it does not replace the heuristic. A vague
+        prompt with a huge ceiling must still get its small overview budget,
+        not the ceiling."""
+        from neo.context_gatherer import calculate_adaptive_limit
+        assert calculate_adaptive_limit("review this", 500) == 15
+
+
 class TestThePaidHalfStaysOptIn:
     """The round trip must not become a per-PR cost by accident.
 

@@ -297,7 +297,8 @@ def recent_files(repo: str, window: int = 50) -> set[str]:
 
 def rank_files(repo: str, tree: str, query: str, timeout: int,
                use_git: bool = False,
-               semantic: bool = False) -> Optional[list[str]]:
+               semantic: bool = False,
+               max_files: Optional[int] = None) -> Optional[list[str]]:
     """The ranked, de-duplicated file list the model would have been sent.
 
     Returns None for a run that FAILED and [] for one that completed and chose
@@ -319,6 +320,11 @@ def rank_files(repo: str, tree: str, query: str, timeout: int,
         cmd = [sys.executable, "-m", "neo.cli", "--dry-run"]
         if not use_git:
             cmd.append("--no-git")     # gates git_recent only; see module docstring
+        if max_files is not None:
+            # Sweeping the DELIVERY cap. `calculate_adaptive_limit` may still
+            # cut below this per prompt, so the swept value is a ceiling, not
+            # the delivered count -- read the curve as "cap", not "files sent".
+            cmd += ["--max-files", str(max_files)]
         if semantic:
             # A HINT, not a lane: it raises the weight and depth of the
             # embedding catalog inside the one pipeline. Passing it against a
@@ -393,6 +399,10 @@ def main() -> int:
                     help="pass --semantic to every case. It biases the "
                          "embedding catalog's weight and depth; with no "
                          "catalog in the repo it changes nothing")
+    ap.add_argument("--max-files", type=int, default=None,
+                    help="delivery-cap ceiling passed to every case; omit for "
+                         "the CLI default (30). A ceiling, not the delivered "
+                         "count -- the adaptive limit may cut below it.")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -416,7 +426,8 @@ def main() -> int:
     raw = []
     for i, case in enumerate(cases, start=1):
         raw.append(rank_files(args.repo, args.tree, case["query"], args.timeout,
-                              use_git=args.with_git, semantic=args.semantic))
+                              use_git=args.with_git, semantic=args.semantic,
+                              max_files=args.max_files))
         print(f"  {i}/{len(cases)}", end="\r", file=sys.stderr, flush=True)
 
     # A failed case is DROPPED, not scored as a zero. Scoring it would let a
@@ -468,6 +479,7 @@ def main() -> int:
     # the ranker was read from, never which ranker it was.
     result["tree_head"] = tree_head
     result["semantic"] = bool(args.semantic)
+    result["max_files"] = args.max_files
     # Per case, so a SUBSET can be scored without re-running 50 subprocesses.
     # The unified-store plan asks for the concept-shaped queries reported
     # separately from the ones that name a path, and those two populations
