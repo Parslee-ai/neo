@@ -25,6 +25,10 @@ Two caps that were not caps. `neo --index` spent its whole file budget on tests 
 
   Only the *specific* bucket honoured the ceiling, and it does so by construction — it returns `default_max`. The one branch that could not fail was the only one a specific prompt exercised, which is why nothing caught it. Now `min(floor, default_max)`. **No behaviour change at the shipped default** (every bucket is already ≤ 30), and the cap *bounds* the heuristic rather than replacing it: a vague prompt with `--max-files 500` still gets 15. Pinned in the Guard-invariant battery beside the other no-silent-caps checks.
 
+- **A performance test measured process warmup, not the code under test.** `test_consolidation_performance_with_all_boosts` timed the *first* call to `_merge_cluster`, so one-time process costs dominated: cold n=5 reads ~18ms, warm n=5 reads **0.06ms**, and cold n=40 reads 2.8ms — eight times the work in a seventh of the time. A performance assertion whose reading falls as the input grows is measuring startup.
+
+  It flapped for the same reason (18ms against a 100ms bound is 5× headroom, so ordinary full-suite load tripped it, and the bound had already been raised 50ms → 100ms once). Fixed by warming up outside the measurement, giving ~870× headroom while keeping the assertion live — injecting a 150ms slowdown still fails it. Per the rule adopted in #183: no assertion may depend on how fast the machine running it is.
+
 ### Added
 
 - **`tools/rank_baseline_eval.py`** — scores four naive rankers (`random`, `recency`, `size`, `filename`, `grep`) over the *identical* candidate set, queries and ground truth that `rank_mine_eval.py` uses, so the ranking rule is the only thing that differs. Absolute R@k figures have no comparator and cannot answer "is this working"; this supplies one.
