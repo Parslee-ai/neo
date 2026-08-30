@@ -129,6 +129,23 @@ def test_citation_stats_since_filters_old_events(capsys):
     assert out["requests"] == 0
 
 
+def _give_project_a_fact_store(project_id: str) -> None:
+    """Create `facts_project_<id>.json` for a ledger project.
+
+    learning-stats counts a project only when its fact store exists, because a
+    promotion WRITES to that file and a project id with no such file cannot
+    have received one. Production always satisfies this: `FactStore.initialize`
+    creates the file on a brand-new project, before any episode can be
+    recorded. A test that saves episodes without it is modelling a state that
+    only hand-run drill state reaches.
+    """
+    from neo.memory.store import FACTS_DIR
+    FACTS_DIR.mkdir(parents=True, exist_ok=True)
+    (FACTS_DIR / f"facts_project_{project_id}.json").write_text(
+        '{"facts": []}', encoding="utf-8"
+    )
+
+
 def test_learning_stats_aggregates_ledger(capsys):
     """learning-stats sums promotions/rollbacks and candidate statuses from the
     episode ledger, and reports the loop as ACTIVE when facts move."""
@@ -140,6 +157,7 @@ def test_learning_stats_aggregates_ledger(capsys):
     )
     from neo.subcommands import _handle_learning_stats
 
+    _give_project_a_fact_store("proj")
     es = LearningEpisodeStore("proj")  # base_dir defaults to ~/.neo/episodes (fake home)
     ep1 = LearningEpisode(episode_id="e1", started_at=1000.0,
                           final_outcome="suggested_pending_downstream_outcome")
@@ -177,6 +195,7 @@ def test_learning_stats_cited_fact_credit_counts_as_active(capsys):
     )
     from neo.subcommands import _handle_learning_stats
 
+    _give_project_a_fact_store("proj")
     es = LearningEpisodeStore("proj")
     ep = LearningEpisode(episode_id="e1", started_at=1000.0, final_outcome="accepted")
     ep.memory_mutations.append(MemoryMutationEvidence(
@@ -199,6 +218,7 @@ def test_learning_stats_idle_when_no_promotions(capsys):
     )
     from neo.subcommands import _handle_learning_stats
 
+    _give_project_a_fact_store("proj")
     es = LearningEpisodeStore("proj")
     ep = LearningEpisode(episode_id="e1", started_at=1000.0,
                          final_outcome="suggested_pending_downstream_outcome")
@@ -212,6 +232,82 @@ def test_learning_stats_idle_when_no_promotions(capsys):
     assert out["episodes"] == 1
     assert out["promotions"] == 0 and out["rollbacks"] == 0
     assert out["interactive_loop_active"] is False
+
+
+def test_learning_stats_excludes_projects_with_no_fact_store(capsys):
+    """A project id with no `facts_project_<id>.json` is excluded from every
+    count, and the exclusion is REPORTED rather than silently applied.
+
+    Hand-run drills leave exactly this shape. A live ledger held 50
+    `testproj1234` episodes whose 19 `durable` candidates were the entirety of
+    a reported "21 promoted -> loop ACTIVE" against zero real promotions.
+    """
+    import json
+    from types import SimpleNamespace
+    from neo.memory.episodes import (
+        LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        MemoryMutationEvidence,
+    )
+    from neo.subcommands import _handle_learning_stats
+
+    # A drill project: episodes and a promotion, but no fact store behind it.
+    drill = LearningEpisodeStore("testproj1234")
+    ep = LearningEpisode(episode_id="d1", started_at=1000.0, final_outcome="accepted")
+    ep.memory_candidates.append(MemoryCandidateEvidence(
+        candidate_id="c1", suggestion_id="s1", subject="x", body="y",
+        kind="pattern", status="durable"))
+    ep.memory_mutations.append(MemoryMutationEvidence(
+        mutation_id="m1", operation="promote_repeated_episode_candidate",
+        fact_id="f1"))
+    drill.save(ep)
+
+    _handle_learning_stats(SimpleNamespace(json=True, since=None))
+    out = json.loads(capsys.readouterr().out)
+    assert out["episodes"] == 0
+    assert out["promotions"] == 0
+    assert out["candidate_status"] == {}
+    assert out["interactive_loop_active"] is False
+    assert out["excluded_projects_without_fact_store"] == [
+        {"project_id": "testproj1234", "episodes": 1}
+    ]
+
+
+def test_learning_stats_reports_exclusion_when_ledger_is_only_drill_state(capsys):
+    """The empty-ledger branch must still print the exclusion, or a ledger
+    holding nothing BUT drill state reads as 'neo has never run' instead of
+    'what is here is junk'."""
+    from types import SimpleNamespace
+    from neo.memory.episodes import LearningEpisode, LearningEpisodeStore
+    from neo.subcommands import _handle_learning_stats
+
+    LearningEpisodeStore("testproj1234").save(
+        LearningEpisode(episode_id="d1", started_at=1000.0, final_outcome="accepted"))
+
+    _handle_learning_stats(SimpleNamespace(json=False, since=None))
+    printed = capsys.readouterr().out
+    assert "no learning episodes recorded yet" in printed
+    assert "testproj1234" in printed
+    assert "no fact store" in printed
+
+
+def test_learning_stats_keeps_the_unscoped_sentinel(capsys):
+    """`unscoped` is the id `LearningEpisodeStore` assigns when a run resolves
+    no project, so its episodes are real runs (engine errors land there) and
+    must survive the fact-store filter that removes drill projects."""
+    import json
+    from types import SimpleNamespace
+    from neo.memory.episodes import LearningEpisode, LearningEpisodeStore
+    from neo.subcommands import _handle_learning_stats
+
+    LearningEpisodeStore("").save(  # -> "unscoped"
+        LearningEpisode(episode_id="u1", started_at=1000.0,
+                        final_outcome="engine_error"))
+
+    _handle_learning_stats(SimpleNamespace(json=True, since=None))
+    out = json.loads(capsys.readouterr().out)
+    assert out["episodes"] == 1
+    assert out["final_outcomes"]["engine_error"] == 1
+    assert out["excluded_projects_without_fact_store"] == []
 
 
 def test_learning_stats_buckets_suggestions_four_ways(tmp_path, monkeypatch):
@@ -368,8 +464,11 @@ def _write_session(name: str, root: str, paths: list[str]) -> None:
 
 
 def _record_idle_episode() -> None:
-    """The bucket report is only reached once at least one episode exists."""
+    """The bucket report is only reached once at least one COUNTED episode
+    exists — and an episode is only counted when its project has a fact store,
+    which production guarantees and a bare ledger write does not."""
     from neo.memory.episodes import LearningEpisode, LearningEpisodeStore
+    _give_project_a_fact_store("proj")
     LearningEpisodeStore("proj").save(LearningEpisode(
         episode_id="e1", started_at=1000.0,
         final_outcome="suggested_pending_downstream_outcome"))

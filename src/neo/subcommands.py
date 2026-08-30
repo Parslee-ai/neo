@@ -1034,7 +1034,9 @@ def _handle_learning_stats(args) -> None:
 
     from neo.memory.episodes import LearningEpisodeStore
     from neo.memory.models import FactKind
-    from neo.memory.store import FactStore
+    # Imported inside the function so the test suite's home-isolation fixture,
+    # which re-points `store.FACTS_DIR` after import, is honoured.
+    from neo.memory.store import FACTS_DIR, FactStore
 
     episodes_root = Path.home() / ".neo" / "episodes"
     cutoff = None
@@ -1053,8 +1055,29 @@ def _handle_learning_stats(args) -> None:
     # signature -> {episode_id: repository_revision}, per project, mirroring
     # `_promote_repeatedly_supported_candidate` exactly. See `_promotion_gates`.
     gate_groups: list[tuple[dict[str, dict[str, str]], set[str]]] = []
+    # Episode dirs with no fact store behind them are counted separately, never
+    # silently: a promotion WRITES to `facts_project_<id>.json`, so a project id
+    # with no such file cannot have received one, and its candidates cannot
+    # represent real learning. Hand-run drills leave exactly this shape — a live
+    # ledger held 50 `testproj1234` episodes whose 19 `durable` candidates were
+    # the whole of a reported "21 promoted, loop ACTIVE" against zero real
+    # promotions. `unscoped` is NOT such a dir: it is the sentinel
+    # `LearningEpisodeStore` assigns when a run resolves no project id, so its
+    # episodes are real runs (engine errors land there) and stay counted.
+    orphan_projects: list[tuple[str, int]] = []
     if episodes_root.exists():
         for project_dir in sorted(p for p in episodes_root.iterdir() if p.is_dir()):
+            if project_dir.name != "unscoped" and not (
+                FACTS_DIR / f"facts_project_{project_dir.name}.json"
+            ).exists():
+                orphan = LearningEpisodeStore(project_dir.name, base_dir=episodes_root)
+                orphan_episodes = [
+                    e for e in orphan.list()
+                    if cutoff is None or float(e.started_at or 0) >= cutoff
+                ]
+                if orphan_episodes:
+                    orphan_projects.append((project_dir.name, len(orphan_episodes)))
+                continue
             store = LearningEpisodeStore(project_dir.name, base_dir=episodes_root)
             listed = store.list()
             counted_here = 0
@@ -1119,6 +1142,10 @@ def _handle_learning_stats(args) -> None:
             "cited_fact_credits": mutations.get("credit_used_retrieved_fact", 0),
             "interactive_loop_active": active,
             "promotion_gates": gates,
+            "excluded_projects_without_fact_store": [
+                {"project_id": name, "episodes": count}
+                for name, count in orphan_projects
+            ],
         }, indent=2))
         return
 
@@ -1126,9 +1153,23 @@ def _handle_learning_stats(args) -> None:
     scope_note = ("interactive/attributed path — background synthesis "
                   "(observer + transcript mining) mints facts without episodes "
                   "and is NOT counted here")
+    orphan_note = ""
+    if orphan_projects:
+        detail = ", ".join(f"{name} ({count})" for name, count in orphan_projects)
+        orphan_note = (
+            f"  note: excluded {sum(c for _, c in orphan_projects)} episode(s) "
+            f"from {len(orphan_projects)} project id(s) with no fact store — "
+            f"{detail}.\n        Nothing can be promoted into a store that does "
+            "not exist, so these\n        cannot be real learning; they are "
+            "typically hand-run drill state."
+        )
     if episodes == 0:
         print(f"[Neo] learning pulse ({scope_note}{window_label}): "
               "no learning episodes recorded yet")
+        # Print the exclusion even here, or a ledger holding nothing BUT drill
+        # state reads as "neo has never run" rather than "what is here is junk".
+        if orphan_note:
+            print(orphan_note)
         return
     print(f"[Neo] learning pulse ({scope_note}{window_label}):")
     print(f"  {episodes} episode(s) across {projects} project(s)")
@@ -1172,6 +1213,8 @@ def _handle_learning_stats(args) -> None:
             print("    note: those cleared the acceptance bar and were held by "
                   "the\n          distinct-revision requirement, not by needing "
                   "another accept.")
+    if orphan_note:
+        print(orphan_note)
     buckets = _suggestion_verifiability()
     total_sugg = sum(buckets.values())
     verifiable = buckets["verifiable"]
