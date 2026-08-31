@@ -524,24 +524,30 @@
   `rank_mine_eval.py --max-files N`). `--max-files` (default 30) had never been
   measured, and could not be until it was fixed: `calculate_adaptive_limit`
   returned its three broad-prompt buckets VERBATIM, so `--max-files 5` on a
-  vague prompt delivered 15 — the only bucket honouring the ceiling was the
-  specific one, which returns `default_max` by construction. Sweeping below 25
-  therefore moved nothing for any prompt that was not highly specific.
-  **The knee is ~10 files and the shape replicates across repos 29x apart in
-  size** (neo 99 candidates, m365dotnet 2,882): R@10 and H@10 both peak at cap
-  10 and improve nowhere beyond. Pooled paired over 100 cases, **cap 30 vs cap
-  10: 6 better, 2 worse, 92 tied, p = 0.289** — tripling the delivered files
-  changes 8 outcomes in 100, in both directions, while costing **+50% context
-  bytes on neo (131 KB -> 197 KB) and +15% on m365dotnet**. Below 10 there IS
-  loss (neo 5->10: 6/0, p = 0.031). Byte cost is **not monotonic in file
-  count** — cap 5 spends MORE than cap 10 (142 KB vs 131 KB) while retrieving
-  worse, because `--max-bytes` is apportioned across whatever is admitted, so
-  10 is both the quality saturation point and the cost minimum.
-  **The default was deliberately NOT changed**: this evidence is retrieval-only,
-  and R@k cannot see whether the other 20 files help the model REASON (the
-  effectiveness doc's §2b shows context presence is causally necessary for a
-  usable patch). Validating 10 needs an answer-quality arm — the planted-bug
-  design at cap 10 vs 30 — which has not been run.
+  vague prompt delivered 15, and sweeping below 25 moved nothing for any prompt
+  that was not highly specific.
+  **The default of 30 is well chosen and must not be cut to 10.** Rescored over
+  everything the model receives: recall(delivered) rises monotonically —
+  neo 0.523 / 0.654 / 0.776 / **0.813** / 0.869 and m365dotnet 0.571 / 0.652 /
+  0.714 / **0.741** / 0.750 at caps 5/10/20/30/50. Going 10 -> 30 buys +24%
+  relative recall on neo and +14% on m365dotnet for +50% context bytes; 30 -> 50
+  buys +7% / +1% for a further +28% bytes AND degrades the top of the list
+  (MRR 0.763 -> 0.752, R@1 0.403 -> 0.377), so extra files dilute the ranking
+  they extend. 30 sits where returns flatten without that dilution.
+  **Footgun, and the reason a first pass concluded the opposite:** R@10 and MRR
+  are **structurally blind to ranks 11+**, so a correct answer delivered at rank
+  15 cannot move either number at any cap. They read flat from cap 10 to 50
+  because they COULD NOT VARY, and the first analysis published "the knee is ~10,
+  the default costs 15-50% for nothing" in v0.52.0's changelog and release notes
+  before this was caught. Measured properly, **truth sits at rank 11-30 for 15%
+  of neo's answer files and 11% of m365dotnet's**, so a cap of 10 would drop 23
+  of 107 and 14 of 112 respectively (concretely: `src/neo/cli.py` at rank 14,
+  `project_index.py` at rank 12). **A delivery question needs recall over the
+  DELIVERED set, never recall@10** — using a top-k metric to size a cap larger
+  than k measures nothing about the files the cap admits.
+  Byte cost is **not monotonic in file count** — cap 5 spends MORE than cap 10
+  (142 KB vs 131 KB) while delivering less, because `--max-bytes` is apportioned
+  across whatever is admitted. Below 10 there is real loss on both metrics.
 - **Effectiveness evidence** (`docs/effectiveness-evidence-2026-08-30.md`,
   `tools/rank_baseline_eval.py`). Absolute R@k figures have no comparator and
   cannot answer "is neo effective". The baseline harness scores four naive
