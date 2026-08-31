@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.52.1] - 2026-08-30
+
+Documentation only. **Retracts a measurement claim published in 0.52.0.** No code changed; no behaviour changed.
+
+### Corrected
+
+- **"The delivery-cap knee is ~10 files; the default of 30 costs 15–50% more for nothing" was wrong**, and is retracted.
+
+  The error was the metric. That conclusion rested on R@10 and MRR, which are **structurally blind to ranks 11+**: a correct answer delivered at rank 15 cannot move a top-ten metric at any cap. Those numbers read flat from cap 10 to cap 50 because they *could not vary*, not because the extra files carried nothing. Using recall@10 to size a cap larger than 10 measures nothing about the files the cap admits.
+
+  Rescored over everything the model actually receives, recall rises monotonically — neo 0.523 / 0.654 / 0.776 / **0.813** / 0.869 and m365dotnet 0.571 / 0.652 / 0.714 / **0.741** / 0.750 at caps 5/10/20/30/50. Ground truth sits at **rank 11–30 for 15% of neo's answer files and 11% of m365dotnet's**, so a cap of 10 would drop **23 of 107** and **14 of 112** answer files respectively — concretely `src/neo/cli.py` at rank 14 and `src/neo/index/project_index.py` at rank 12.
+
+  **The shipped default of 30 is well chosen and should not be cut.** Going 10 → 30 buys +24% relative recall on neo and +14% on m365dotnet for +50% context bytes; 30 → 50 buys only +7% / +1% for a further +28% bytes *and* degrades the top of the list (MRR 0.763 → 0.752, R@1 0.403 → 0.377), so extra files begin to dilute the ranking they extend. 30 sits where the returns flatten without that dilution.
+
+  **No 0.52.0 code is affected**: the default was deliberately left unchanged at the time, and the `--max-files`-is-not-a-cap fix is independent and stands. The v0.52.0 release notes carry the same correction.
+
 ## [0.52.0] - 2026-08-30
 
 Two caps that were not caps. `neo --index` spent its whole file budget on tests before examining a single source file, and `--max-files` — whose help calls it a "Cap on files" — could be exceeded threefold. Both are fixed, and this release also adds the tooling that found them: neo's retrieval is now measured against naive baselines rather than reported as bare absolutes.
