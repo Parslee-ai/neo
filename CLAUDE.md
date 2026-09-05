@@ -1609,39 +1609,45 @@
   in README; `hooks.json` deliberately does NOT wrap the command in
   `|| true`, because that reintroduces the shell dependency (and `2>/dev/null`
   is invalid in `cmd.exe`) that choosing a subcommand was meant to avoid.
-- **Host adapters must stay in parity.** There are TWO checked-in integration
+- **Host adapters must stay in parity.** There are THREE checked-in integration
   surfaces, and they are easy to miss: the Claude Code plugin (manifests in
   `.claude-plugin/`; agent, 6 slash commands and the hook at the REPO ROOT —
-  see the layout rule above) and **`plugins/neo/`** (Codex CLI plugin + 6
-  skills, manifest at
-  `plugins/neo/.codex-plugin/plugin.json`, registered by
-  `.agents/plugins/marketplace.json`). `.agents/skills/` holds RELEASE
+  see the layout rule above), **`plugins/neo/`** (Codex CLI plugin + 6 skills,
+  manifest at `plugins/neo/.codex-plugin/plugin.json`, registered by
+  `.agents/plugins/marketplace.json`), and **`plugins/cursor-neo/`** (Cursor
+  plugin + 6 skills + Neo agent, manifest at
+  `plugins/cursor-neo/.cursor-plugin/plugin.json`, registered by
+  `.cursor-plugin/marketplace.json`). `.agents/skills/` holds RELEASE
   maintenance skills, not the Neo capabilities — looking there and concluding
-  the Codex plugin is missing is a documented wrong turn. Neither adapter owns
-  an output format: both invoke `neo --json` and read the same `orchestrator`
-  envelope. When the contract changes, BOTH change — the Codex skills sat on
+  the Codex or Cursor plugin is missing is a documented wrong turn. No adapter
+  owns an output format: all invoke `neo --json` and read the same `orchestrator`
+  envelope. When the contract changes, ALL change — the Codex skills sat on
   "parse the four structured sections: CONFIDENCE, PLAN, SIMULATIONS, CODE
   SUGGESTIONS" while the Claude side had already moved to `--json`.
-  `tests/test_host_adapter_parity.py` pins it: both surfaces expose the same
+  `tests/test_host_adapter_parity.py` pins it: all three surfaces expose the same
   six capabilities, invoke `--json`, teach `orchestrator.summary`/`cautions`,
   document the error shape and attribution, and use phase/event names that
-  actually exist in `events.py`. It also pins that both plugin manifests match
+  actually exist in `events.py`. It also pins that all plugin manifests match
   the `pyproject.toml` version — `prepare-release` documents bumping them, but
   a documented step with no enforcement gets skipped (they had reached 0.19.0 /
   0.37.0 / 0.41.0). **The version is now single-sourced**: `pyproject.toml` is
   the truth and `tools/sync_version.py` (`make sync-version`) propagates it to
-  `src/neo/__init__.py` and both manifests. Release bumps edit ONE file; never
-  hand-edit the derived three. `--check` reports drift without writing. Edits
-  are surgical regex replacements, not `json.dumps` re-serialization — a
-  version bump must stay a one-line diff or it becomes unreviewable — and only
-  the FIRST `"version"` key is rewritten so a nested one can't be clobbered.
+  `src/neo/__init__.py` and the Claude / Codex / Cursor manifests. Release bumps
+  edit ONE file; never hand-edit the derived files. `--check` reports drift
+  without writing. Edits are surgical regex replacements, not `json.dumps`
+  re-serialization — a version bump must stay a one-line diff or it becomes
+  unreviewable — and only the FIRST `"version"` key is rewritten so a nested
+  one can't be clobbered.
   `tools/` is now covered by lint; it never was, which is why a dead import sat
   in `ab_controlled.py`. The ruff invocation is duplicated in `Makefile`
   (`lint` + `ci-local`), `.github/workflows/ci.yml` and `.githooks/pre-commit`
-  — all four MUST stay identical or local green stops predicting CI green. Role differs even though protocol does not: Claude Code
-  delegates to Neo as a subagent (visible boundary), Codex calls Neo mid-loop
-  (no boundary), so the Codex skills carry stronger attribution wording and an
-  explicit "Neo's result is an input, not the deliverable".
+  — all four MUST stay identical or local green stops predicting CI green. Role
+  differs even though protocol does not: Claude Code (and the Cursor **agent**)
+  delegates to Neo as a subagent (visible boundary); Codex and Cursor **skills**
+  call Neo mid-loop (no boundary), so those skills carry stronger attribution
+  wording and an explicit "Neo's result is an input, not the deliverable".
+  Cursor mid-loop skills use Codex's `--no-scan` / advise `--no-memory` defaults;
+  the Cursor agent keeps Claude's looser advise invoke.
 - CarAdapter defaults `intent_hint={"task":"code","prefer_quality":True}` so CAR's router
   routes neo to the most capable model, not the chat/cost default. This is the *intended*
   router API, not a hack:
