@@ -357,3 +357,368 @@ class TestSelectChunksBudget:
         content = "\n".join(f"line {i} padding" for i in range(2000))
         chunks = select_chunks(content, set())
         assert len(chunks) == 1 and chunks[0][1] == 1
+
+
+class TestRealPathPredicate:
+    """The not-found WARNING fires on the no-match case, so every prose token
+    `_PATH_LIKE` over-captures becomes a bogus "check spelling" for something
+    the user never claimed was a path.
+
+    Observed on a real run: "ASP.NET Core 10" produced
+        Warning: prompt names a path but no scanned file matched (asp.net)
+    """
+
+    @pytest.mark.parametrize("token", [
+        "asp.net",        # "ASP.NET Core 10"
+        "e.g",            # prose
+        "0.42.0",         # a version
+        "vs.the",         # sloppy punctuation
+        "etc.and",
+    ])
+    def test_prose_is_not_warnable(self, token):
+        from neo.context_gatherer import _looks_like_a_real_path
+        assert not _looks_like_a_real_path(token), (
+            f"{token!r} would produce a bogus not-found warning"
+        )
+
+    @pytest.mark.parametrize("token", [
+        "src/neo/context_gatherer.py",
+        "context_gatherer.py",
+        "README.md",
+        "pyproject.toml",
+        "web/src/App.tsx",
+        "Program.cs",
+        "some/dir/without-extension",   # a separator is proof enough
+        "config.yaml",
+        # Genuinely ambiguous, and deliberately resolved as "warn". `js` is a
+        # real extension and a file named node.js is entirely plausible, so
+        # "Node.js" cannot be told from a filename BY VALUE. The alternative is
+        # a denylist of technology names, which never ends and would suppress
+        # warnings for real files. A rare spurious warning about a token that
+        # genuinely looks like a filename is the cheaper error.
+        "node.js",
+    ])
+    def test_genuine_paths_are_warnable(self, token):
+        from neo.context_gatherer import _looks_like_a_real_path
+        assert _looks_like_a_real_path(token), (
+            f"{token!r} is a real path reference and must still warn"
+        )
+
+    @pytest.mark.parametrize("token,expected", [
+        ("schema.graphql", "schema.graphql"),
+        ("notes.markdown", "notes.markdown"),
+        ("Dockerfile.build", "dockerfile.build"),
+    ])
+    def test_long_extensions_are_not_truncated(self, token, expected):
+        """At {0,5} the pattern matched a long extension but TRUNCATED it:
+        "schema.graphql" came out as "schema.graphq". A truncated token
+        matches no real file, so the named file lost EXPLICIT_PATH_BOOST, and
+        it was not a known extension either, so the not-found warning stayed
+        quiet — the file the user explicitly named quietly did not arrive."""
+        from neo.context_gatherer import extract_explicit_paths
+        assert expected in extract_explicit_paths(token)
+
+    def test_predicate_is_case_insensitive(self):
+        """The lowering was done by the caller and stated nowhere, so a direct
+        call with "README.MD" returned False."""
+        from neo.context_gatherer import _looks_like_a_real_path
+        assert _looks_like_a_real_path("README.MD")
+        assert _looks_like_a_real_path("Config.YAML")
+
+    def test_extraction_itself_is_unchanged(self):
+        """The predicate gates the WARNING only. The candidate set stays loose
+        so EXPLICIT_PATH_BOOST keeps its reach — a token matching nothing costs
+        nothing there, which is what the regex comment actually promises."""
+        from neo.context_gatherer import extract_explicit_paths
+        found = extract_explicit_paths("we use ASP.NET and src/neo/engine.py")
+        assert "asp.net" in found
+        assert "src/neo/engine.py" in found
+
+
+
+
+class TestDocBonusRequiresBroadPromptOrContent:
+    """+0.8 for any path containing "design"/"docs/"/"readme", with NO content
+    signal, is four times MIN_SCORE_THRESHOLD and above the relative floor. It
+    admitted documentation on filename alone — which is why a review prompt
+    naming controllers and entities came back holding design documents while
+    the implementation files it asked about were crowded out.
+
+    Assertions are placed at the ADMISSION BOUNDARY, because that is where the
+    bonus does its damage. Asserting merely that a matching source file
+    outranks a content-free doc passes with the bonus ungated (1.25 vs 0.80)
+    and proves nothing — an earlier version of this class did exactly that and
+    survived mutation.
+    """
+
+    SPECIFIC = {"controller", "entity", "tenant", "isolation",
+                "audit", "migration", "constraint"}
+
+    @staticmethod
+    def _score(path, prompt_tokens, content_relevance):
+        return score_candidate(
+            path, 1000, prompt_tokens, _EMPTY, _ENTRY,
+            demote_tests=False, content_relevance=content_relevance,
+        )
+
+    @staticmethod
+    def _floor(top_organic):
+        from neo.context_gatherer import MIN_SCORE_THRESHOLD, RELATIVE_SCORE_FLOOR
+        return max(MIN_SCORE_THRESHOLD, top_organic * RELATIVE_SCORE_FLOOR)
+
+    def test_content_free_doc_falls_below_the_admission_floor(self):
+        """The boundary. Ungated this scores 0.80 against a floor of ~0.48 and
+        is admitted on its filename; gated it scores 0.0 and is not."""
+        top_organic = self._score("api/src/TenantController.cs", self.SPECIFIC, 1.0)
+        floor = self._floor(top_organic)
+        doc = self._score("docs/plans/2026-design-notes.md", self.SPECIFIC, 0.0)
+
+        assert doc < floor, (
+            f"content-free design doc scores {doc:.2f} against floor "
+            f"{floor:.2f} — admitted on its filename alone"
+        )
+
+    def test_broad_prompt_still_gets_the_full_doc_bonus(self):
+        """The bonus's stated purpose. A prompt too short to name a target has
+        documentation as its best available answer."""
+        from neo.context_gatherer import BROAD_PROMPT_TOKENS
+
+        broad = {"what", "is", "this"}
+        assert len(broad) <= BROAD_PROMPT_TOKENS
+
+        with_doc = self._score("README.md", broad, 0.0)
+        without = self._score("srcfile.py", broad, 0.0)
+
+        assert with_doc - without >= 0.79, (
+            f"broad prompt lost the documentation boost "
+            f"({with_doc:.2f} vs {without:.2f})"
+        )
+
+    def test_matching_doc_still_clears_the_floor(self):
+        """Scaled, not dropped: a design doc that DOES match is still worth
+        surfacing."""
+        top_organic = self._score("api/src/TenantController.cs", self.SPECIFIC, 1.0)
+        floor = self._floor(top_organic)
+        matching = self._score("docs/tenant-isolation.md", self.SPECIFIC, 0.9)
+
+        assert matching > floor, (
+            f"a strongly matching doc ({matching:.2f}) was cut by the floor "
+            f"({floor:.2f})"
+        )
+
+
+class TestRelativeFloorAdmissionBoundary:
+    """Asserted through gather_context, on what it actually SELECTS.
+
+    Two earlier attempts at this class were vacuous and both survived
+    mutation. The first reimplemented `max(absolute, top * relative)` in the
+    test file and asserted against the copy. The second asserted
+    `len(selected) < 41` under `max_files=30` — true by construction. A third
+    trap is recomputing the floor from the constants: the production bug would
+    be in how gather_context USES them, and a test that derives the floor
+    itself cannot see that.
+
+    So: build a repo, run the real gatherer, count what comes back.
+    Measured on this fixture — with the relative floor: 1 file. Without it: 26,
+    of which 25 are content-free path-token matches.
+    """
+
+    PROMPT = (
+        "how does the widget registry class register a widget and append "
+        "it to the widget list"
+    )
+
+    @staticmethod
+    def _build(tmp_path, n_helpers=25):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "widget_registry.py").write_text(
+            "class WidgetRegistry:\n"
+            "    def register_widget(self, widget):\n"
+            "        self.widget_list.append(widget)\n" * 10
+        )
+        # Path-token matches with NO content signal: three prompt tokens in the
+        # filename, nothing relevant inside. Exactly what cleared 0.2.
+        for i in range(n_helpers):
+            (tmp_path / "src" / f"widget_registry_list_helper_{i}.py").write_text(
+                f"# note {i}\nX = {i}\n"
+            )
+
+    def _gather(self, tmp_path):
+        from neo.context_gatherer import GatherConfig, gather_context
+
+        # max_files well above the file count: the FLOOR must be the only
+        # thing that can exclude anything, or the cap masks the result.
+        return gather_context(GatherConfig(
+            root=str(tmp_path), prompt=self.PROMPT, exts=None, includes=[],
+            excludes=[], max_files=100, use_git=False,
+        ))
+
+    def test_path_only_matches_are_not_admitted(self, tmp_path):
+        self._build(tmp_path)
+        selected = [
+            getattr(f, "rel_path", getattr(f, "path", ""))
+            for f in self._gather(tmp_path)
+        ]
+        helpers = [p for p in selected if "helper" in p]
+
+        assert any("widget_registry.py" in p for p in selected), (
+            "the file that actually matches was dropped"
+        )
+        assert not helpers, (
+            f"{len(helpers)} content-free path-token matches admitted: "
+            f"{helpers[:3]}"
+        )
+
+    def test_the_matching_file_survives_the_floor(self, tmp_path):
+        """The floor must not be so aggressive it cuts the real answer."""
+        self._build(tmp_path)
+        selected = [
+            getattr(f, "rel_path", getattr(f, "path", ""))
+            for f in self._gather(tmp_path)
+        ]
+        assert len(selected) >= 1
+        assert any("widget_registry.py" in p for p in selected)
+
+
+class TestGitFailureIsNotSilence:
+    """An empty recent-files set must mean "git said nothing", never "git
+    broke".
+
+    Only the rev-parse probe passed check=True; the three calls that actually
+    produce data ignored their exit status. A git exiting 128 — corrupt index,
+    detected dubious ownership, a held lock — writes to stderr and nothing to
+    stdout, so the parse loops saw no lines and the function returned an empty
+    set, byte-identical to a clean repo.
+
+    The signal is no longer only a tie-breaker either: recency feeds
+    top_organic_score, so a silent zero changes WHICH files are admitted.
+    """
+
+    def _repo(self, tmp_path):
+        import subprocess
+        subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True)
+        (tmp_path / "a.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "a.py"], cwd=tmp_path, check=True)
+        return tmp_path
+
+    def test_healthy_repo_reports_its_changes(self, tmp_path):
+        from neo.context_gatherer import get_git_recent_files
+        assert "a.py" in get_git_recent_files(str(self._repo(tmp_path)))
+
+    def test_corrupt_index_is_reported_not_swallowed(self, tmp_path, capsys):
+        from neo.context_gatherer import get_git_recent_files
+
+        repo = self._repo(tmp_path)
+        (repo / ".git" / "index").write_bytes(b"garbage")
+
+        result = get_git_recent_files(str(repo))
+        note = capsys.readouterr().err
+
+        assert result == set()
+        assert "git status" in note and "failed" in note, (
+            f"a broken repo looked exactly like a clean one; notes were: {note!r}"
+        )
+
+    def test_every_git_query_is_bounded(self):
+        """Four git invocations per gather, none of which was bounded. A held
+        lock or a wedged credential helper could hang the run before a single
+        file was scored."""
+        import subprocess
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        with patch.object(cg.subprocess, "run", fake_run):
+            cg.get_git_recent_files(".")
+
+        assert seen, "no git query was attempted"
+        assert all(t == cg.GIT_QUERY_TIMEOUT_SECONDS for t in seen), seen
+
+    def test_timeout_is_reported(self, capsys):
+        import subprocess
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        with patch.object(
+            cg.subprocess, "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(cmd, 10)
+            ),
+        ):
+            assert cg.get_git_recent_files(".") == set()
+
+        assert "timed out" in capsys.readouterr().err
+
+
+class TestSystemicParserFailureIsReported:
+    """A file this parser cannot read and the parser being absent are
+    different events. The bare except treated them identically, so a broken
+    tree-sitter removed the symbol signal from every file in the repo in
+    silence."""
+
+    def test_parser_init_failure_is_announced_once(self, capsys):
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        cache = {}
+        with patch(
+            "neo.index.language_parser.TreeSitterParser",
+            side_effect=RuntimeError("no grammars"),
+        ):
+            for _ in range(5):
+                assert cg._symbol_score("x.py", {"widget"}, cache) == 0.0
+
+        note = capsys.readouterr().err
+        assert "tree-sitter parser unavailable" in note
+        assert note.count("tree-sitter parser unavailable") == 1, (
+            "reported once per FILE instead of once per gather"
+        )
+
+
+class TestRetrievalBoostFailuresAreReported:
+    """A feature the user never enabled may fail silently. One they DID enable
+    and that is now contributing nothing must say so.
+
+    The "no index" case is handled explicitly earlier in _project_index_boost and
+    returns before the except, so what reaches the handler is a catalog that
+    EXISTS and broke — a corrupt snapshot, faiss failing to import, retrieve()
+    raising. Same distinction as an absent tree-sitter parser.
+    """
+
+    def test_semantic_rerank_failure_is_announced(self, capsys, tmp_path):
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        with patch(
+            "neo.index.project_index.ProjectIndex",
+            side_effect=RuntimeError("corrupt snapshot"),
+        ):
+            out = cg._project_index_boost(str(tmp_path), "widget registry", k=5)
+
+        assert out == {}
+        note = capsys.readouterr().err
+        assert "semantic re-rank failed" in note, note
+
+    def test_history_boost_failure_is_announced(self, capsys, tmp_path):
+        from unittest.mock import patch
+
+        from neo import context_gatherer as cg
+
+        with patch(
+            "neo.memory.store.FactStore",
+            side_effect=RuntimeError("store corrupt"),
+        ):
+            out = cg._history_boost(str(tmp_path), "widget registry", k=5)
+
+        assert out == {}
+        note = capsys.readouterr().err
+        assert "history boost failed" in note, note

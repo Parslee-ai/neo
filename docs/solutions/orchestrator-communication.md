@@ -249,7 +249,7 @@ per-host wording lives entirely in the adapters.
 
 | Surface | Location | Shape |
 |---|---|---|
-| Claude Code | `.claude-plugin/` | agent + 6 slash commands |
+| Claude Code | `.claude-plugin/` manifests; `agents/` + `commands/` + `hooks/` at repo root | agent + 6 slash commands + edit hook |
 | Codex CLI | `plugins/neo/` | plugin manifest + 6 skills |
 | Cursor | `plugins/cursor-neo/` | plugin manifest + 6 skills + Neo agent |
 | CAR / A2A | `neo.a2ui`, `neo serve` | A2A status + artifact events |

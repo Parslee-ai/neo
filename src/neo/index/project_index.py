@@ -449,11 +449,40 @@ class ProjectIndex:
             language = language_for_path(path) or path.suffix.lstrip('.')
             by_language.setdefault(language, []).append(path)
 
-        # Rank within a language: shallower paths first, then alphabetical.
-        # This is a weak heuristic, not centrality — but it is deterministic,
-        # and it beats whatever order the filesystem happened to yield.
+        # Rank within a language: source before tests, then shallower paths,
+        # then alphabetical.
+        #
+        # **The test key is the load-bearing one.** Depth alone is a proxy for
+        # centrality that INVERTS on the most common Python layout: with
+        # `src/<pkg>/…` beside `tests/…`, every test sits at depth 2 and every
+        # source file at depth 3, so the whole test tree sorted ahead of the
+        # whole source tree and `--max-files` was spent before a single source
+        # file was examined. Measured on this repo: 105 Python files at depth 2,
+        # first non-test at rank 102, default cap 100 — the catalog came out
+        # **100% tests**, and the build reported success because the cap had
+        # genuinely bound and the report was truthful about that. Nothing said
+        # the 100 files it kept were all tests. (#213)
+        #
+        # This module already treats "tests outrank the source they test" as a
+        # failure mode — `_embed_chunks` embeds a structured summary rather than
+        # the raw body precisely because assertion strings carry a query's
+        # keywords verbatim. That mitigation runs at embedding time and so never
+        # got a chance: selection had already spent the budget.
+        #
+        # Tests are DEMOTED, not excluded. They fill the slots source does not
+        # need, which keeps a test-only repository indexable and matches what
+        # the gatherer does with the same predicate. `is_test_path` is imported
+        # rather than restated: a second copy of that rule would agree with the
+        # first only by coincidence, and it is the same single-source discipline
+        # `neo/eligibility.py` enforces for exclusion.
+        from neo.context_gatherer import is_test_path
+
         for paths in by_language.values():
-            paths.sort(key=lambda p: (len(p.relative_to(self.repo_root).parts), str(p)))
+            paths.sort(key=lambda p: (
+                is_test_path(str(p.relative_to(self.repo_root))),
+                len(p.relative_to(self.repo_root).parts),
+                str(p),
+            ))
 
         counts = {lang: len(paths) for lang, paths in by_language.items()}
         eligible = sum(counts.values())

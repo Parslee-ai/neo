@@ -1,5 +1,9 @@
 ---
-description: "Get debugging assistance from Neo"
+description: >-
+  Get Neo's help on a defect whose cause is not where the symptom appears —
+  intermittent failures, race conditions, state corruption. Use after reading
+  the stack trace has failed to localize it. Skip for compile errors,
+  straightforward tracebacks, and failures with an obvious single-file cause.
 ---
 
 Get debugging assistance from Neo.

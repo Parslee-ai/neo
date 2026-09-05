@@ -84,7 +84,7 @@ orchestrator_voice:
     caution_low_confidence: "I'm at {confidence} on this. Don't take it on trust — check it."
     caution_check_failed: "{tool} isn't happy: {summary}"
     caution_sim_issues: "I ran this through and hit {count} problem(s) with my own approach."
-    caution_unverified_skipped: "I ran out of time before the checkers. This code is unverified."
+    caution_unverified_skipped: "No change was proposed, so the checkers had nothing to verify."
     caution_unverified_no_tools: "No checkers on this machine. This code is unverified."
     caution_no_verifiable_change: >-
       {count} suggestion(s) named a file but carried no diff and no code.
@@ -113,7 +113,7 @@ orchestrator_voice:
     phase_checks_none: "No checkers here. Nothing verified this."
     phase_checks_inconclusive: "The checkers ran and could evaluate none of it. Treat this as unverified."
     phase_checks_considering: "Considering the checkers."
-    phase_checks_skipped: "Out of time before I could run them. This is unchecked."
+    phase_checks_nothing_to_check: "No change to check. Nothing was verified because nothing was proposed."
 
 # Base expressions per personality stage (fallback when no specific beat matches)
 base_expressions:

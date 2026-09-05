@@ -3,7 +3,9 @@ name: neo-architect
 description: >-
   Get Neo's architectural guidance for design decisions. Trade-off analysis for
   choices like microservices vs monolith, sync vs async, and event-driven vs
-  request-response, with optional explicitly authorized memory recall.
+  request-response, with optional explicitly authorized memory recall. Skip for
+  decisions already made, style preferences, and anything settled by reading
+  one file.
 disable-model-invocation: true
 ---
 

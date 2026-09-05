@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neo-reasoner"
-version = "0.46.0"
+version = "0.52.1"
 description = "A self-improving code reasoning engine with persistent semantic memory"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,7 +48,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.21.0"]
+# Upper-capped at the next major. 1.0.0 REMOVED `temperature` from
+# `Messages.create()`, so every call raised a client-side TypeError before
+# reaching the network — the adapter now recovers from that (see
+# `_sdk_rejects_keyword`), but the cap is what stops the NEXT major from
+# retiring a parameter we have not learned to drop yet. Caught by the release
+# gate rather than by 2769 tests, because every adapter test mocks the SDK and
+# a mock accepts any keyword.
+anthropic = ["anthropic>=0.21.0,<2.0"]
 openai = ["openai>=1.0.0"]
 google = ["google-genai>=0.2.0"]
 ollama = ["requests>=2.31.0"]
@@ -100,7 +107,7 @@ car = [
     "psutil>=5.9.0",
 ]
 all = [
-    "anthropic>=0.21.0",
+    "anthropic>=0.21.0,<2.0",
     "openai>=1.0.0",
     "google-genai>=0.2.0",
     "requests>=2.31.0",
@@ -113,7 +120,7 @@ dev = [
     # rule set and rule behavior in minor bumps, so a range means a contributor's
     # local ruff and CI's can disagree — which is how a green local tree pushed a
     # red main in 0.39.0. Bump this deliberately, with the lint delta reviewed.
-    "ruff==0.16.2",
+    "ruff==0.16.5",
     "mypy>=1.0.0",
 ]
 

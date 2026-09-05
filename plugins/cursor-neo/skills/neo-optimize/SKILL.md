@@ -3,7 +3,8 @@ name: neo-optimize
 description: >-
   Ask Neo for optimization suggestions on a function, file, or hot path.
   Targets algorithmic improvements, redundant work, allocation/hot-loop issues
-  — not micro-style.
+  — not micro-style. Skip when nothing has been measured yet — profile first,
+  because Neo cannot tell you where the time actually goes.
 disable-model-invocation: true
 ---
 

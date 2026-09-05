@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 from urllib.request import Request, urlopen
@@ -168,6 +169,76 @@ def _get_current_version() -> str:
         return importlib.metadata.version(PYPI_PACKAGE_NAME)
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
+
+
+def _version_reaches(installed: str, target: str) -> bool:
+    """Did `installed` reach AT LEAST `target`?
+
+    Not `==`. `new_version` comes from a cache up to UPDATE_CHECK_INTERVAL old,
+    while `pipx upgrade` installs whatever is latest RIGHT NOW. If a release
+    lands inside that window, an exact match reports a perfectly good upgrade
+    as a failure — the same false-report defect this module is fixing, with the
+    sign flipped. `>=` also absorbs PEP440 normalization skew between PyPI's
+    `info.version` and the dist-info `Version:` field ("0.48" vs "0.48.0").
+    """
+    if installed == "unknown":
+        return False
+    try:
+        from packaging import version
+        try:
+            return version.parse(installed) >= version.parse(target)
+        except version.InvalidVersion:
+            return installed == target
+    except ImportError:
+        return installed == target
+
+
+def _get_installed_version_fresh() -> str:
+    """Read the ON-DISK installed version, from a NEW interpreter.
+
+    `_get_current_version()` is not a safe way to confirm an upgrade.
+    `importlib.metadata` resolves through an mtime-keyed directory cache, so
+    an in-place dist-info swap USUALLY self-invalidates and is read correctly
+    — but when the write lands in the same mtime tick, or on a filesystem with
+    coarse mtime granularity, the stale entry survives and `version()` returns
+    the old value or `None`. "Usually correct, occasionally silently wrong" is
+    the worst possible property for a verification routine; it is the exact
+    failure class this function exists to eliminate.
+
+    A new interpreter has no such cache and is unconditionally correct, for
+    ~50ms on a path that just spent up to 120s on a network install.
+
+    Returns "unknown" when the probe cannot run. Callers must treat that as
+    "could not verify", never as "verified".
+    """
+    try:
+        result = subprocess.run(
+            [
+                # -E matches the installed pipx shim
+                # (`#!.../bin/python -E`): it ignores PYTHONPATH. Without it a
+                # dev shell with PYTHONPATH set can resolve a DIFFERENT
+                # neo_reasoner dist-info than the one pipx just upgraded, and
+                # the probe returns a confident wrong answer — the exact
+                # failure class this function exists to remove.
+                sys.executable, "-E", "-c",
+                "import importlib.metadata as m;"
+                f"print(m.version({PYPI_PACKAGE_NAME!r}))",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug(f"Fresh version probe failed: {e}")
+        return "unknown"
+    if result.returncode != 0:
+        logger.debug(f"Fresh version probe exited {result.returncode}")
+        return "unknown"
+    # Last line, not the whole buffer: a `.pth` file or `sitecustomize` that
+    # prints a banner to stdout would otherwise make this "banner\n0.48.0",
+    # which never equals the target — a permanent false negative.
+    lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    return lines[-1] if lines else "unknown"
 
 
 def _fetch_latest_version_from_pypi() -> Optional[str]:
@@ -377,10 +448,21 @@ def _append_log(message: str) -> None:
 
 
 def _run_pipx_upgrade(quiet: bool = True) -> tuple[bool, str]:
-    """Run `pipx upgrade neo-reasoner`. Returns (success, stderr)."""
+    """Run `pipx upgrade neo-reasoner`. Returns (exit-code-was-zero, stderr).
+
+    The bool is ONLY "the command exited 0". It is not "the upgrade happened" —
+    pipx exits 0 when it upgrades nothing. Callers must verify separately; see
+    _perform_upgrade_and_verify.
+
+    `quiet` was previously accepted and never used, so `neo update` silently
+    did not get the verbose output it asked for.
+    """
+    cmd = ["pipx", "upgrade", PYPI_PACKAGE_NAME]
+    if not quiet:
+        cmd.append("--verbose")
     try:
         result = subprocess.run(
-            ["pipx", "upgrade", PYPI_PACKAGE_NAME],
+            cmd,
             capture_output=True,
             text=True,
             timeout=120,
@@ -406,6 +488,83 @@ def _run_pip_upgrade(quiet: bool = True) -> tuple[bool, str]:
         return False, "pip upgrade timed out after 120s"
 
 
+class UpgradeOutcome(str, Enum):
+    """What an upgrade attempt was OBSERVED to do.
+
+    Four outcomes, because `(bool, str)` cannot express them and collapsing any
+    two of them is how this module kept shipping the same bug:
+
+    * UPGRADED     - the disk now reports at least the target. The only success.
+    * NOOP         - the tool exited 0 and the disk did not move. A no-op that
+                     lied. Evidence of a real problem; safe to throttle on.
+    * FAILED       - the tool itself errored. Evidence about the tool.
+    * UNVERIFIABLE - the tool exited 0 and the probe could not read the disk.
+                     Evidence of NOTHING. Never throttle on it, never render it
+                     as "did not happen".
+    """
+
+    UPGRADED = "upgraded"
+    NOOP = "noop"
+    FAILED = "failed"
+    UNVERIFIABLE = "unverifiable"
+
+
+def _perform_upgrade_and_verify(
+    method: str, target: str, *, quiet: bool = True,
+) -> tuple[UpgradeOutcome, str]:
+    """Run the upgrade for `method`, then confirm against the disk.
+
+    THE INVARIANT THIS MODULE MUST HOLD:
+
+        No upgrade path may report success, clear the update cache, or suppress
+        further action based only on a zero process exit code. The version that
+        confirms an action comes from the disk, never from a process's own
+        memory and never from an exit status.
+
+    This lives here, between the dumb command runners and the two presentation
+    layers (`perform_auto_install`, `perform_update`), because verification is
+    upgrade POLICY: the runners do not know the target version, and both
+    callers need the identical guarantee. Hardening one caller is what produced
+    the current split, where `neo update` still trusted its exit code long
+    after the automatic path stopped.
+
+    History, for anyone tempted to patch a fifth cause instead of holding the
+    invariant: #81 (broken RECORD files on Homebrew Python), #89 (routing
+    through the owning install method), and this change are three DIFFERENT
+    causes of one symptom — an auto_update.log full of upgrades that never
+    happened.
+
+    Returns (outcome, detail) where detail is a human-readable fragment.
+    """
+    try:
+        if method == INSTALL_PIPX:
+            ok, err = _run_pipx_upgrade(quiet=quiet)
+        else:  # INSTALL_PIP_VENV
+            ok, err = _run_pip_upgrade(quiet=quiet)
+    except Exception as e:
+        logger.debug(f"Upgrade raised: {e}")
+        return UpgradeOutcome.FAILED, str(e)
+
+    if not ok:
+        return UpgradeOutcome.FAILED, err or "upgrade command failed"
+
+    installed = _get_installed_version_fresh()
+    if _version_reaches(installed, target):
+        return UpgradeOutcome.UPGRADED, installed
+    if installed == "unknown":
+        return UpgradeOutcome.UNVERIFIABLE, (
+            "the version probe could not read the installed version"
+        )
+    return UpgradeOutcome.NOOP, installed
+
+
+def _manual_upgrade_hint(method: str) -> str:
+    return (
+        f"pipx upgrade {PYPI_PACKAGE_NAME}" if method == INSTALL_PIPX
+        else f"pip install --upgrade {PYPI_PACKAGE_NAME}"
+    )
+
+
 def perform_auto_install(new_version: str) -> bool:
     """
     Perform automatic background update installation.
@@ -426,7 +585,11 @@ def perform_auto_install(new_version: str) -> bool:
     """
     current_version = _get_current_version()
     if current_version == new_version:
-        return True
+        # Confirm against the disk before claiming there is nothing to do. The
+        # in-process read is exactly the source of truth this module may not
+        # trust; see _get_installed_version_fresh.
+        if _version_reaches(_get_installed_version_fresh(), new_version):
+            return True
 
     method = _detect_install_method()
 
@@ -442,6 +605,22 @@ def perform_auto_install(new_version: str) -> bool:
         return False
 
     # Auto-installable methods.
+    #
+    # If a previous run already ran this exact upgrade and WATCHED it change
+    # nothing, do not run it again. check_for_updates acts on a cached
+    # new_version with no freshness gate (see the cache-hit branch above), so
+    # without this bail every subsequent neo invocation would re-spend a
+    # 120s-capable subprocess plus a probe to re-learn the same answer, and
+    # re-print the same warning, forever. Only a VERIFIED no-op marks the
+    # version (see the mismatch branch below); a failed probe leaves it unset
+    # so the next run retries.
+    if _already_notified(new_version):
+        logger.debug(
+            f"Skipping auto-install of {new_version}: a previous run verified "
+            "it did not take effect."
+        )
+        return False
+
     timestamp = _now_iso()
     _append_log(
         f"\n[{timestamp}] Auto-updating from {current_version} to {new_version} via {method}\n"
@@ -452,18 +631,10 @@ def perform_auto_install(new_version: str) -> bool:
     )
     print("   This happens in the background. Please wait...\n", file=sys.stderr)
 
-    try:
-        if method == INSTALL_PIPX:
-            ok, err = _run_pipx_upgrade(quiet=True)
-        else:  # INSTALL_PIP_VENV
-            ok, err = _run_pip_upgrade(quiet=True)
-    except Exception as e:
-        logger.debug(f"Auto-update failed: {e}")
-        _append_log(f"   ✗ Failed: {e}\n")
-        return False
+    outcome, detail = _perform_upgrade_and_verify(method, new_version, quiet=True)
 
-    if ok:
-        _append_log(f"   ✓ Success! Updated to {new_version}\n")
+    if outcome is UpgradeOutcome.UPGRADED:
+        _append_log(f"   ✓ Success! Verified {detail} on disk\n")
         print(f"✓ Auto-update completed: {new_version}", file=sys.stderr)
         print("   Restart neo to use the new version.\n", file=sys.stderr)
         # Clear the version-check cache so next run re-verifies.
@@ -472,8 +643,36 @@ def perform_auto_install(new_version: str) -> bool:
             cache_file.unlink()
         return True
 
-    _append_log(f"   ✗ Failed: {err}\n")
-    logger.debug(f"Auto-update failed: {err}")
+    if outcome is UpgradeOutcome.FAILED:
+        _append_log(f"   ✗ Failed: {detail}\n")
+        logger.debug(f"Auto-update failed: {detail}")
+        return False
+
+    if outcome is UpgradeOutcome.NOOP:
+        # A VERIFIED no-op. Throttle it: check_for_updates acts on a cached
+        # new_version with no freshness gate, so without this every subsequent
+        # neo invocation would re-spend a 120s-capable subprocess to re-learn
+        # the same answer and re-print the same warning. Replacing a silent
+        # false-success loop with a loud false-alarm loop is not an improvement.
+        _mark_notified(new_version)
+        _append_log(
+            f"   ✗ Upgrade exited 0 but the disk still shows {detail} "
+            f"(wanted {new_version})\n"
+        )
+        print(
+            f"⚠ Auto-update did not take effect: {method} exited 0 but the "
+            f"installed version is still {detail}, not {new_version}.",
+            file=sys.stderr,
+        )
+    else:  # UNVERIFIABLE — evidence of nothing, so deliberately NOT throttled.
+        _append_log(f"   ? Upgrade exited 0 but {detail} (wanted {new_version})\n")
+        print(
+            f"⚠ Could not verify the update: {method} exited 0 but {detail}, "
+            f"so neo cannot confirm {new_version} was installed.",
+            file=sys.stderr,
+        )
+
+    print(f"   Upgrade manually: {_manual_upgrade_hint(method)}", file=sys.stderr)
     return False
 
 
@@ -505,22 +704,32 @@ def perform_update() -> bool:
 
     print(f"Updating {PYPI_PACKAGE_NAME} from {current_version} to {new_version} (via {method})...")
 
-    try:
-        if method == INSTALL_PIPX:
-            ok, err = _run_pipx_upgrade(quiet=False)
-        else:  # INSTALL_PIP_VENV
-            ok, err = _run_pip_upgrade(quiet=False)
-    except Exception as e:
-        print(f"✗ Unexpected error during update: {e}", file=sys.stderr)
-        return False
+    # Same verification as the automatic path. This is the command a user runs
+    # DELIBERATELY because they suspect something is wrong; it is the last
+    # place that should take an exit code at its word.
+    outcome, detail = _perform_upgrade_and_verify(method, new_version, quiet=False)
 
-    if ok:
-        print(f"✓ Successfully updated to version {new_version}")
+    if outcome is UpgradeOutcome.UPGRADED:
+        print(f"✓ Successfully updated to version {detail}")
         print("\nPlease restart neo for changes to take effect.")
         cache_file = _get_cache_file()
         if cache_file.exists():
             cache_file.unlink()
         return True
 
-    print(f"✗ Update failed: {err}", file=sys.stderr)
+    if outcome is UpgradeOutcome.FAILED:
+        print(f"✗ Update failed: {detail}", file=sys.stderr)
+    elif outcome is UpgradeOutcome.NOOP:
+        print(
+            f"✗ Update did not take effect: {method} exited 0 but the installed "
+            f"version is still {detail}, not {new_version}.",
+            file=sys.stderr,
+        )
+        print(f"  Try manually: {_manual_upgrade_hint(method)}", file=sys.stderr)
+    else:  # UNVERIFIABLE
+        print(
+            f"? Update could not be verified: {method} exited 0 but {detail}.",
+            file=sys.stderr,
+        )
+        print(f"  Check manually: {_manual_upgrade_hint(method)}", file=sys.stderr)
     return False

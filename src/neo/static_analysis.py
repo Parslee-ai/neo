@@ -15,6 +15,7 @@ Adding a new language analyzer:
 import json
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -26,6 +27,27 @@ from neo.models import CodeSuggestion, StaticCheckResult
 # Python - Ruff
 # ============================================================================
 
+# Every checker below shells out to an external tool. None of these calls was
+# bounded, so a wedged `pyright` or an `eslint` waiting on a lockfile could
+# hang a neo run indefinitely — in the one phase whose whole job is to make the
+# output trustworthy. Bounded here so the checks are cheap enough to run
+# UNCONDITIONALLY (see EngineCore's static-check phase); a checker that times
+# out reports that plainly rather than silently contributing no diagnostics.
+STATIC_CHECK_TIMEOUT_SECONDS = 30
+
+# Bounding each SUBPROCESS is not bounding the PHASE, and conflating the two is
+# how removing the old time gate could have replaced "never verifies" with "can
+# run for half an hour". Each (suggestion, checker) pair costs up to two bounded
+# subprocesses — `patch` inside apply_diff_to_content, then the tool — and
+# nothing caps how many suggestions arrive. 10 suggestions x 3 checkers x 60s is
+# 30 minutes in a foreground phase.
+#
+# So the phase carries its own monotonic deadline. Checks that do not start
+# before it expires are reported as `skipped` with a reason, never as passed and
+# never as silently absent.
+STATIC_CHECK_PHASE_BUDGET_SECONDS = 180
+
+
 def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
     """
     Run ruff in check-only mode on the suggested code.
@@ -33,6 +55,9 @@ def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
     Creates a temporary file with the suggested changes and runs ruff on it.
     """
     diagnostics = []
+    # "" means "let run_static_checks derive it from the diagnostics". Only the
+    # timeout path sets it explicitly; see that handler for why.
+    status = ""
 
     try:
         # Apply diff to get the new content
@@ -55,6 +80,7 @@ def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['ruff', 'check', '--output-format=json', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse JSON output
@@ -74,6 +100,19 @@ def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"ruff timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
+        # Set EXPLICITLY. run_static_checks derives an empty status from the
+        # diagnostics, and a timeout produces none — no error severities, no
+        # "not found", no "failed:" — so the derivation lands on "passed" and
+        # a wedged checker reads as CLEAN. That is what licenses the early
+        # exit and suppresses the unverified caution. The prose said "treat
+        # this check as NOT run" while the field the engine actually reads
+        # said the opposite.
+        status = "unavailable"
     except FileNotFoundError:
         summary = "ruff not found - install with: pip install ruff"
     except Exception as e:
@@ -83,6 +122,7 @@ def run_ruff_check(suggestion: CodeSuggestion) -> StaticCheckResult:
         tool_name="ruff",
         diagnostics=diagnostics,
         summary=summary,
+        status=status,
     )
 
 
@@ -95,6 +135,9 @@ def run_pyright_check(suggestion: CodeSuggestion) -> StaticCheckResult:
     Run pyright in check-only mode on the suggested code.
     """
     diagnostics = []
+    # "" means "let run_static_checks derive it from the diagnostics". Only the
+    # timeout path sets it explicitly; see that handler for why.
+    status = ""
 
     try:
         # Apply diff to get the new content
@@ -117,6 +160,7 @@ def run_pyright_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['pyright', '--outputjson', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse JSON output
@@ -135,6 +179,19 @@ def run_pyright_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"pyright timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
+        # Set EXPLICITLY. run_static_checks derives an empty status from the
+        # diagnostics, and a timeout produces none — no error severities, no
+        # "not found", no "failed:" — so the derivation lands on "passed" and
+        # a wedged checker reads as CLEAN. That is what licenses the early
+        # exit and suppresses the unverified caution. The prose said "treat
+        # this check as NOT run" while the field the engine actually reads
+        # said the opposite.
+        status = "unavailable"
     except FileNotFoundError:
         summary = "pyright not found - install with: npm install -g pyright"
     except Exception as e:
@@ -144,6 +201,7 @@ def run_pyright_check(suggestion: CodeSuggestion) -> StaticCheckResult:
         tool_name="pyright",
         diagnostics=diagnostics,
         summary=summary,
+        status=status,
     )
 
 
@@ -156,6 +214,9 @@ def run_mypy_check(suggestion: CodeSuggestion) -> StaticCheckResult:
     Run mypy in check-only mode on the suggested code.
     """
     diagnostics = []
+    # "" means "let run_static_checks derive it from the diagnostics". Only the
+    # timeout path sets it explicitly; see that handler for why.
+    status = ""
 
     try:
         # Apply diff to get the new content
@@ -178,6 +239,7 @@ def run_mypy_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['mypy', '--no-error-summary', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse output (line format: file:line:col: severity: message)
@@ -196,6 +258,19 @@ def run_mypy_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"mypy timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
+        # Set EXPLICITLY. run_static_checks derives an empty status from the
+        # diagnostics, and a timeout produces none — no error severities, no
+        # "not found", no "failed:" — so the derivation lands on "passed" and
+        # a wedged checker reads as CLEAN. That is what licenses the early
+        # exit and suppresses the unverified caution. The prose said "treat
+        # this check as NOT run" while the field the engine actually reads
+        # said the opposite.
+        status = "unavailable"
     except FileNotFoundError:
         summary = "mypy not found - install with: pip install mypy"
     except Exception as e:
@@ -205,6 +280,7 @@ def run_mypy_check(suggestion: CodeSuggestion) -> StaticCheckResult:
         tool_name="mypy",
         diagnostics=diagnostics,
         summary=summary,
+        status=status,
     )
 
 
@@ -217,6 +293,9 @@ def run_eslint_check(suggestion: CodeSuggestion) -> StaticCheckResult:
     Run eslint in no-fix mode on the suggested code.
     """
     diagnostics = []
+    # "" means "let run_static_checks derive it from the diagnostics". Only the
+    # timeout path sets it explicitly; see that handler for why.
+    status = ""
 
     try:
         # Apply diff to get the new content
@@ -242,6 +321,7 @@ def run_eslint_check(suggestion: CodeSuggestion) -> StaticCheckResult:
             ['eslint', '--format=json', '--no-eslintrc', temp_path],
             capture_output=True,
             text=True,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Parse JSON output
@@ -262,6 +342,19 @@ def run_eslint_check(suggestion: CodeSuggestion) -> StaticCheckResult:
 
         summary = f"Found {len(diagnostics)} issue(s)" if diagnostics else "No issues found"
 
+    except subprocess.TimeoutExpired:
+        summary = (
+            f"eslint timed out after {STATIC_CHECK_TIMEOUT_SECONDS}s - "
+            "no diagnostics; treat this check as NOT run"
+        )
+        # Set EXPLICITLY. run_static_checks derives an empty status from the
+        # diagnostics, and a timeout produces none — no error severities, no
+        # "not found", no "failed:" — so the derivation lands on "passed" and
+        # a wedged checker reads as CLEAN. That is what licenses the early
+        # exit and suppresses the unverified caution. The prose said "treat
+        # this check as NOT run" while the field the engine actually reads
+        # said the opposite.
+        status = "unavailable"
     except FileNotFoundError:
         summary = "eslint not found - install with: npm install -g eslint"
     except Exception as e:
@@ -271,6 +364,7 @@ def run_eslint_check(suggestion: CodeSuggestion) -> StaticCheckResult:
         tool_name="eslint",
         diagnostics=diagnostics,
         summary=summary,
+        status=status,
     )
 
 
@@ -306,6 +400,7 @@ def apply_diff_to_content(unified_diff: str, original_content: str) -> str:
 
     # For actual diff application, use patch (would need patch command)
     # For now, try simple extraction of new content
+    orig_path = diff_path = None
     try:
         import tempfile
         import subprocess
@@ -320,30 +415,63 @@ def apply_diff_to_content(unified_diff: str, original_content: str) -> str:
             f.write(unified_diff)
             diff_path = f.name
 
-        # Apply patch
+        # Apply patch.
+        #
+        # --batch and stdin=DEVNULL, because `patch` PROMPTS on a malformed
+        # diff ("File to patch:", "Assume -R? [n]") and otherwise inherits
+        # neo's own stdin — the stdin a host may be feeding the prompt on. The
+        # timeout bounds the hang; only these two stop it eating input that
+        # was not meant for it.
         subprocess.run(
-            ['patch', orig_path, diff_path],
+            ['patch', '--batch', orig_path, diff_path],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=STATIC_CHECK_TIMEOUT_SECONDS,
         )
 
         # Read patched content
         patched_content = Path(orig_path).read_text()
 
-        # Clean up
-        Path(orig_path).unlink()
-        Path(diff_path).unlink()
-
         return patched_content
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):  # patch command failed or file issues
-        # Fallback: extract lines starting with +
+    # TimeoutExpired is a SubprocessError, NOT an OSError and not a
+    # CalledProcessError, so without naming it here it escaped this function
+    # entirely — straight past the +-lines fallback below, into the CALLING
+    # checker's own `except subprocess.TimeoutExpired`, where it was reported
+    # as "ruff timed out" on a run where ruff had never been invoked.
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
+            FileNotFoundError, OSError):  # patch command failed or file issues
+        # Fallback: reconstruct from the diff's + and context lines.
+        #
+        # The header guard used to be one-sided: "+++ b/file" was excluded from
+        # the ADDED branch but the context branch does not start with "-",
+        # "@@" or "---", so it fell through and was appended VERBATIM. The
+        # reconstructed file then carried a literal "+++ b/file" line, which
+        # the checkers dutifully linted and reported as a real diagnostic
+        # against the user's code.
         lines = []
         for line in unified_diff.splitlines():
-            if line.startswith('+') and not line.startswith('+++'):
+            if line.startswith('+++') or line.startswith('---') or line.startswith('@@'):
+                continue
+            if line.startswith('+'):
                 lines.append(line[1:])
-            elif not line.startswith('-') and not line.startswith('@@') and not line.startswith('---'):
-                # Keep context lines
-                lines.append(line)
+            elif not line.startswith('-'):
+                # Context lines carry a single leading space in unified diff
+                # format. Appending them verbatim shifted EVERY context line
+                # one column right, which in Python is not cosmetic: the
+                # reconstructed file is mis-indented and the checkers report
+                # indentation errors against code the user never wrote.
+                lines.append(line[1:] if line.startswith(' ') else line)
         return '\n'.join(lines) if lines else original_content
+    finally:
+        # In a finally: the old cleanup sat after the `return`, so every path
+        # that raised — which is now every path that times out — leaked both
+        # temp files.
+        for path in (orig_path, diff_path):
+            if path:
+                try:
+                    Path(path).unlink()
+                except OSError:
+                    pass
 
 
 # ============================================================================
@@ -431,6 +559,7 @@ def run_static_checks(
     }
     available_tools = detect_available_tools()
     results: list[StaticCheckResult] = []
+    deadline = time.monotonic() + STATIC_CHECK_PHASE_BUDGET_SECONDS
 
     for suggestion in suggestions:
         suffix = Path(suggestion.file_path).suffix.lower()
@@ -438,6 +567,22 @@ def run_static_checks(
             if suffix not in checker.extensions:
                 continue
             if not enable_map.get(checker.tool_name, False):
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Reported, not dropped. A check that never started is not a
+                # check that passed, and the phase has to be able to say which
+                # of its work it did not reach.
+                results.append(StaticCheckResult(
+                    tool_name=checker.tool_name,
+                    diagnostics=[],
+                    summary=(
+                        f"{checker.tool_name} not run - the static-check phase "
+                        f"budget of {STATIC_CHECK_PHASE_BUDGET_SECONDS}s expired"
+                    ),
+                    kind=_TOOL_KINDS[checker.tool_name],
+                    status="skipped",
+                ))
                 continue
             if checker.tool_name not in available_tools:
                 results.append(StaticCheckResult(

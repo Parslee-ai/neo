@@ -394,6 +394,11 @@
   reinforcements = 0). Across 6,613 valid facts in every project, **zero have
   ever reached `success_count >= 3`**, so `find_contributable` has never once
   returned a fact and `neo contribute` has never been reachable.
+  **That absence had a SECOND, independent cause, and restoring the link alone
+  would not have lifted it** — the cited-credit path reached no `save()` at all,
+  so the one mechanism that can carry a fact past the 2 that promotion writes
+  was discarding its own work. See "A credited fact must reach a SAVE" below;
+  read the two together before concluding the contribution gate is fixed.
   The fix does NOT restore per-suggestion fact minting — that is the unverified
   flood `412a174` existed to stop. It resolves the link through the episode
   candidate instead: `find_durable_fact_for_candidate(subject)` matches the
@@ -405,6 +410,41 @@
   owns. **Footgun**: match the frozen field, never a recomputed signature, and
   never let an empty target match the empty default — every unpromoted fact
   would answer for every candidate.
+- **A credited fact must reach a SAVE, and the cited-credit path had none.**
+  `detect_implicit_feedback` credits two different populations: linked ORIGINAL
+  facts (a suggestion re-applying a durable fact), which move `linked_count`;
+  and CITED retrieved facts, credited by `_apply_used_fact_feedback`, which bump
+  `success_count` on the live Fact objects and record an episode mutation and
+  **nothing else**. The single save was `if linked_count: self.save()`, so a run
+  that credited a cited fact with no linked original fact never wrote the store
+  and the credit died with the process — the normal case, since
+  `suggestion_fact_ids` is empty unless the candidate already resolves to a
+  durable fact. The episode ledger still recorded the mutation, so
+  `learning-stats` reported reinforcements the store never received; the
+  reporter and the data disagreed and the REPORTER was the honest one.
+  Measured live: **0 of 88 valid GLOBAL facts had ever reached
+  `success_count > 0`** while 64 carried a non-zero `access_count` (global facts
+  are almost never the linked original, so theirs were the credits always
+  dropped), and PROJECT facts topped out at exactly **2** — the value promotion
+  writes from its two supporting episodes — so no fact among 6,613 ever cleared
+  the `success_count >= 3` contribution bar and `neo contribute` was
+  mechanically unreachable, not merely starved. Gate is now
+  `if linked_count or touched_fact_ids`.
+  **Footgun — two neighbours save for their own reasons and will mask this.**
+  The no-link ACCEPTED fallback calls `add_fact`, which saves; and the janitor
+  chain under `if outcomes:` ends in `if changed: self.save()`. The credit
+  survived whenever either happened to fire, which is what made the bug
+  load-dependent. The real modern path reaches neither: an ACCEPTED outcome
+  carrying an episode candidate takes the candidate branch and `continue`s past
+  the fallback, and a FIRST acceptance promotes nothing.
+  `test_cited_fact_credit_survives_the_process` therefore sets `candidate_id`,
+  pins the janitor to "changed nothing", stubs promotion to `None`, and RELOADS
+  FROM DISK — all four load-bearing; the first two cuts of that test passed
+  against the broken code, once via `add_fact` and once via the janitor. Every
+  other test in `TestRetrievedFactAttribution` asserts the mutated in-memory
+  object and never reloads, which is how a suite thorough about attribution
+  stayed silent about persistence. **Any new credit path needs its own save,
+  and a test that reads the fact back off disk.**
 - **A re-accepted durable pattern is reinforced in place, not re-minted.**
   `_promote_repeatedly_supported_candidate` looks for an existing valid PROJECT
   fact at the target signature before calling `add_fact`, and on a hit folds in
@@ -480,6 +520,79 @@
   Changes to layer ordering, the 2/3 constraint cap, or the inline `(changed from: X)`
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
+- **Delivery-cap sweep** (`docs/delivery-cap-sweep-2026-08-30.md`;
+  `rank_mine_eval.py --max-files N`). `--max-files` (default 30) had never been
+  measured, and could not be until it was fixed: `calculate_adaptive_limit`
+  returned its three broad-prompt buckets VERBATIM, so `--max-files 5` on a
+  vague prompt delivered 15, and sweeping below 25 moved nothing for any prompt
+  that was not highly specific.
+  **The default of 30 is well chosen and must not be cut to 10.** Rescored over
+  everything the model receives: recall(delivered) rises monotonically —
+  neo 0.523 / 0.654 / 0.776 / **0.813** / 0.869 and m365dotnet 0.571 / 0.652 /
+  0.714 / **0.741** / 0.750 at caps 5/10/20/30/50. Going 10 -> 30 buys +24%
+  relative recall on neo and +14% on m365dotnet for +50% context bytes; 30 -> 50
+  buys +7% / +1% for a further +28% bytes AND degrades the top of the list
+  (MRR 0.763 -> 0.752, R@1 0.403 -> 0.377), so extra files dilute the ranking
+  they extend. 30 sits where returns flatten without that dilution.
+  **Footgun, and the reason a first pass concluded the opposite:** R@10 and MRR
+  are **structurally blind to ranks 11+**, so a correct answer delivered at rank
+  15 cannot move either number at any cap. They read flat from cap 10 to 50
+  because they COULD NOT VARY, and the first analysis published "the knee is ~10,
+  the default costs 15-50% for nothing" in v0.52.0's changelog and release notes
+  before this was caught. Measured properly, **truth sits at rank 11-30 for 15%
+  of neo's answer files and 11% of m365dotnet's**, so a cap of 10 would drop 23
+  of 107 and 14 of 112 respectively (concretely: `src/neo/cli.py` at rank 14,
+  `project_index.py` at rank 12). **A delivery question needs recall over the
+  DELIVERED set, never recall@10** — using a top-k metric to size a cap larger
+  than k measures nothing about the files the cap admits.
+  Byte cost is **not monotonic in file count** — cap 5 spends MORE than cap 10
+  (142 KB vs 131 KB) while delivering less, because `--max-bytes` is apportioned
+  across whatever is admitted. Below 10 there is real loss on both metrics.
+- **Effectiveness evidence** (`docs/effectiveness-evidence-2026-08-30.md`,
+  `tools/rank_baseline_eval.py`). Absolute R@k figures have no comparator and
+  cannot answer "is neo effective". The baseline harness scores four naive
+  rankers over the IDENTICAL candidate set, queries and ground truth
+  `rank_mine_eval.py` used, so only the ranking rule differs.
+  **The load-bearing baseline is `grep`** — prompt-token counts over file
+  CONTENT — because the mining leak (a file holds the commit's terms because
+  that commit put them there) helps any content-reading ranker and does nothing
+  for `size`/`recency`. Comparing only against content-blind baselines would let
+  the leak masquerade as ranker quality. Measured, MRR vs grep: neo 0.778/0.584
+  (1.3×), aieweb 0.729/0.511 (1.4×), m365dotnet 0.536/0.219 (2.4×); **pooled
+  over 150 cases 81 better / 37 worse / 32 tied, sign p = 6.3e-05**. The margin
+  GROWS with repo size (vs random 6× → 32× → 43×) because naive heuristics
+  collapse as the candidate pool grows — `size` runs MRR 0.443 on neo's 99 files
+  and 0.098 on m365dotnet's 2,882. The comparison is **conservative toward neo**:
+  neo is scored on the ~30 files it would actually deliver while every baseline
+  ranks the full set (99 / 480 / 2,882). **Footgun**: `random` must be seeded
+  from `hashlib`, not `hash()` — the latter is salted per process and did not
+  reproduce; and `recency` is mtime-based, so editing this harness (which lives
+  in the repo it measures) moves its own score. Both are floor comparators; the
+  deterministic ones reproduce byte-identically across runs. **The answer link is
+  measured too**, in a constructed pre-fix repo (git-mined cases cannot show it —
+  the fix is already at HEAD, so neo correctly proposes nothing): three planted
+  bugs, each with a failing test defining "fixed", run with the buggy file in
+  context vs `--exclude`d. **3/3 patches applied and passed with the file, 0/3
+  without.** The mechanism is narrower than it looks and is recorded as such:
+  arm B's fix LOGIC was right (for one bug byte-identical to the passing arm) and
+  the patch was rejected because the surrounding context lines were hallucinated.
+  Retrieval's measured contribution there is **groundedness, not reasoning** — on
+  textbook defects priors supply the fix either way. **A second experiment closes
+  that gap**: two conventions defined only in a scratch repo (a `ConfigError`
+  whose `code` kwarg is required, a key rule stripping an `acme::` prefix), with
+  the CONVENTION file excluded in arm B while the file to edit stays in context,
+  so only project knowledge varies. **2/2 pass with the convention visible, 0/2
+  without** — and the failure mode is REFUSAL, not a wrong guess: neo names the
+  file it needs and says the convention "cannot be verified". Instructive
+  contrast with the textbook case, where priors gave it false confidence and it
+  patched against hallucinated context. **Footgun that invalidated the first
+  run**: the tests defining the conventions lived IN the repo and were retrieved
+  at score 2.52, so the no-context arm read the answer out of the answer key and
+  "passed". A benchmark whose answer key is inside the corpus measures nothing —
+  the tests now live outside the repository. **What this does NOT show**: how
+  often real tasks turn on project-specific knowledge (n=2 is an existence proof,
+  not a rate), and the learning loop delivering value in practice — on a live install that loop is starved, 2
+  accepted outcomes in 208 episodes and both from drills.
 - Learning-loop benchmark (`memory/evaluation.py`, `benchmarks/learning_loop_v1.json`,
   `neo memory evaluate-learning`). **`accepted` is a correctness verdict and nothing
   else — never gate it on wall-clock time.** Everything it enforces is reproducible on
@@ -544,6 +657,16 @@
   never see. **Not opt-in**: `maybe_autostart_observer()`
   (called from `cli.main`) auto-registers it whenever `car-server` is reachable;
   opt out with `NEO_OBSERVER_AUTOSTART=0`. No CAR → one-time hint, then silent.
+  **Footgun — that export belongs in `~/.zshenv`, never `~/.zshrc`.** The gate is
+  a plain `os.getenv` (`observer.py`), read by whichever process runs `neo`, and
+  most of those are NOT interactive shells: an editor plugin, a CI step, a git
+  hook, an agent tool call. zsh sources `.zshrc` for interactive shells only, so
+  an export there leaves every programmatic invocation autostarting the observer
+  while the terminal prints `0` and looks correct. Measured directly: with it in
+  `.zshrc`, `zsh -c`, `zsh -lc` and a non-interactive tool call all read empty;
+  only `zsh -ic` read `0`. **Verify without `-i`** — that flag forces the single
+  mode that works, so the obvious check passes for the wrong reason and confirms
+  nothing.
   Projects are discovered from `~/.claude/projects/*` (decoded roots), minus
   **container roots** (`observer._is_container_root`): a decoded root that holds
   another discovered root and is not itself a repo. Claude Code mints a
@@ -725,6 +848,26 @@
      one function later — chunks arrive grouped by file and files by language, so
      the slice kept 1000 C# chunks and dropped every other language, with 37 of
      the 100 selected files contributing nothing.
+     **And the order WITHIN a language is source-before-tests, then depth, then
+     alphabetical** — the test key being the load-bearing one. Depth alone is a
+     centrality proxy that INVERTS on the conventional Python layout: with
+     `src/<pkg>/…` beside `tests/…` every test sits at depth 2 and every source
+     file at depth 3, so the whole test tree sorted ahead of the whole source
+     tree and `--max-files` was spent before one source file was examined.
+     Measured here: 131 Python files at depth 2, and the catalog came out
+     **100% tests** while the build reported success — the cap had genuinely
+     bound and the report was truthful about that, but nothing said the files
+     it kept were all tests (#213). This module already treats "tests outrank
+     the source they test" as a failure mode — `_embed_chunks` embeds a
+     structured summary rather than the raw body precisely because assertion
+     strings carry a query's keywords verbatim — but that mitigation runs at
+     EMBEDDING time and so never got a chance; selection had already spent the
+     budget. Tests are DEMOTED, not excluded: they fill the slots source does
+     not need, so a test-only repo still indexes. `is_test_path` is IMPORTED
+     from `context_gatherer`, never restated — a second copy of that rule would
+     agree with the first only by coincidence, and its careful cases
+     (`testdata/` and `testing/` are ordinary source; `Foo.Tests/` is not) are
+     exactly what a re-implementation loses.
   2. **Exclusion is two layers and `bin`/`build`/`out`/`target`/`dist`/`vendor`
      belong to neither by name.** Both layers, and the walk that applies them,
      live in `neo/eligibility.py` — the ONE eligibility module, consumed by
@@ -1147,12 +1290,50 @@
   `ProjectIndex._select_files` ranks shallowest-path-first, so on `src/<pkg>/…`
   + `tests/…` every test is depth 2 and every source file depth 3 — 105 Python
   files at depth 2 here, first non-test at rank 102, `--max-files` default 100.
-  Not fixed in this goal (the front door consumes the catalog; the index builds
-  it). Through the front door the same broken catalog yields 0.705 / 0.708,
-  because it is one channel of four. So `SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT`
-  is a defensible default, NOT a tuned one — re-measure it against a catalog
-  built after #213 lands, and do not quote the −0.007 MRR under the flag as a
-  property of the weight; it is a property of the catalog's contents.
+  Through the front door the same broken catalog yields 0.705 / 0.708, because
+  it is one channel of four. **#213 is now FIXED** — selection ranks source
+  before tests (see index invariant 1) and a rebuild of this repo's catalog went
+  from 82% tests / 52 files to **100% source / 94 files**.
+  **The deferred re-measurement has been RUN across all three flagships, and
+  the honest answer is NULL — the semantic lane's value is a function of
+  CATALOG COVERAGE, not of the weight.** `tools/rank_mine_eval.py`, 50
+  git-mined cases per repo, `--no-git`, clean trees, 0 failed cases, each
+  against a freshly built post-#213 catalog (100% source in all three, across
+  Python, TS/TSX and C#). `--semantic` against flag-off, paired by case:
+
+  | repo | MRR off → on | win/lose/tie | p | catalog coverage |
+  |---|---|---|---|---|
+  | neo | 0.778 → 0.841 (+0.063) | 11/2/37 | **0.022** | 49.5% |
+  | aieweb | 0.729 → 0.706 (−0.023) | 4/10/36 | 0.180 | 13.2% |
+  | m365dotnet | 0.536 → 0.542 (+0.006) | 3/6/41 | 0.508 | 1.8% |
+
+  **Pooled over 150 cases: 18 better, 18 worse, sign p = 1.000.** Exactly null.
+  A neo-only reading of this was written up first and was wrong to generalize:
+  the one repo where the flag helps is the only one whose catalog covers a
+  meaningful share of the repository.
+  **Coverage is the mechanism, and it was tested causally rather than inferred
+  from three points.** Rebuilding neo's OWN catalog at `--max-files 30` (49.5%
+  → 14.7% coverage, same repo, same 50 cases, same code) collapses the effect:
+  **+0.063 at p=0.022 becomes +0.011 at p=0.832**, win/lose 11/2 → 12/10. The
+  lane is not weak, it is STARVED — `--max-files` defaults to 100, so on any
+  real repository the catalog holds a rounding error of the codebase (84 of
+  4,563 eligible on m365dotnet). Raising or repo-relativising that cap is the
+  lever; the weight is not.
+  So `SEMANTIC_HINT_WEIGHT = CONTENT_WEIGHT` stays, now for a sharper reason
+  than symmetry: **at realistic coverage the weight cannot be tuned into
+  mattering**, and at high coverage 3.0 is already on a broad plateau (sweep on
+  neo, MRR: 1.0 → 0.769, 2.0 → 0.803, 3.0 → 0.841, 6.0 → 0.853, 9.0 → 0.832;
+  6.0 is not distinguishable from 3.0, paired 6/2 of 50, p = 0.289, and its R@1
+  is lower). The old −0.007 MRR is superseded either way — it was a property of
+  the 100%-test catalog it was measured against.
+  **The 3× depth does nothing on its own**: pinning the weight to 1.0 while
+  `SEMANTIC_HINT_DEPTH` stays at 3× scores MRR 0.769, *below* flag-off's 0.778
+  (1 better / 3 worse, p = 0.625). What pays — when anything does — is weighing
+  the catalog, not reading further into it.
+  Every caveat in the harness docstring still applies: absolutes are upper
+  bounds (the corpus has already seen the answer), the mined population is
+  filtered upward, and 50 cases per repo is a modest sample. Full tables,
+  setup and limits: `docs/semantic-lane-remeasurement-2026-08-30.md`.
   **The renderer's per-file cap is NOT the front door's** and the two are
   deliberately still separate: `engine._render_context_files` keeps its 3,000
   character cut for unpinned files, with its own marker. Collapsing them would
@@ -1355,10 +1536,84 @@
   response — a peer that sees generic `ProcessingError` assumes its own request
   was malformed and stops retrying. The lock releases in a `finally`, so a
   failed run doesn't leave the engine permanently busy (pinned by a test).
+- **Claude Code components live at the PLUGIN ROOT, never in `.claude-plugin/`.**
+  Claude Code discovers `agents/`, `commands/`, `skills/` and `hooks/` at the
+  plugin root and reads only manifests (`plugin.json`, `marketplace.json`) out
+  of `.claude-plugin/`. Nested there they are silently not loaded: the plugin
+  installs, `claude plugin validate` passes, and nothing fires — `claude plugin
+  details` is the only check that proves a component loaded. This repo shipped
+  the wrong layout, and so did CAR, which is why
+  `test_the_manifest_directory_holds_no_components` fails on any non-manifest
+  entry rather than merely asserting the components exist at the root (a stray
+  copy left behind keeps every other assertion green).
+- **The edit-recording hook (`neo hook record`, `neo/hook.py`)** is a
+  `PostToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit` that appends one
+  line to `~/.neo/sessions/host_events.jsonl`: tool, path, host cwd, and HEAD at
+  edit time. It exists because acceptance is otherwise inferred from a repo-wide
+  git diff on the NEXT invocation, which cannot see an edit that was never
+  followed by another Neo run. Three rules, two of them mutation-pinned:
+  (1) **it never fails** — `run_hook` returns 0 on every path *by construction*,
+  including an unknown action, because a hook exiting non-zero reports an error
+  against a tool call that already succeeded. That means `except BaseException`,
+  not `except Exception`: `KeyboardInterrupt`/`SystemExit`/`GeneratorExit` walk
+  straight out of the narrower handler, and the failure-REPORTING path is
+  guarded too (a closed stderr, or a custom `__str__` that raises, would defeat
+  the guarantee from inside the code announcing it). Both gaps were found by
+  running `neo` against this module and by no test — every case in
+  `TestNeverFails` raised an `Exception` subclass, so none of them could
+  distinguish the two handlers. Only SIGKILL and a library `os._exit` remain
+  outside its reach, and the docstring says so; (2) **it stays cheap** —
+  `import neo.cli` is 0.04s but `neo --version` is 0.36s, and the whole
+  difference is `FactStore` construction, so `cli.main` dispatches to it before
+  argument parsing, the update check and the observer autostart
+  (`test_hook_stays_off_the_slow_path` fails if anything moves above it);
+  (3) **paths, never contents** — `tool_input` carries the text being written.
+  Opt out with `NEO_HOOKS=0`. `HOOK_LEDGER` captures `Path.home()` at import, so
+  it is registered in `conftest.HOME_PATH_CONSTANTS`.
+  **`collect_outcomes` reads the ledger** (`_load_host_edit_events`), unioning
+  host-recorded edits into the git-derived `changed_files`. It ADDS evidence and
+  removes none: git still reports everything committed or dirty.
+  **Attribution is by `file_path` and never by `cwd` or `head`** — those name the
+  directory the HOST was launched in, not the repository the edited file belongs
+  to. Measured: an edit to a scratch repo, made from a Claude Code session rooted
+  in the neo checkout, recorded neo's OWN head. A record is ours when its path
+  resolves inside `codebase_root`.
+  The read is hoisted OUT of the per-session loop for the same reason
+  `_get_working_tree_changes` was — retention means many pending sessions, and a
+  per-session re-read puts a linear cost on the request hot path
+  (`test_the_ledger_is_read_once_per_call_not_once_per_session`). The rotated
+  `.1` generation is read too: rotation moves the RECENT records there and leaves
+  the active file nearly empty, so reading only the active file would lose
+  exactly the window this exists to protect. A malformed LINE is skipped rather
+  than discarding the file — the ledger is append-only, so a torn final write is
+  the expected corruption.
+  **The concrete gap it closes is the UNTRACKED new file.**
+  `git diff --name-only HEAD` lists tracked modifications ONLY, so a suggestion
+  to create a new file — which `suggestion_is_verifiable` explicitly admits as
+  legitimate — was invisible to detection until someone committed it. Closing
+  that needed BOTH halves: the ledger surfaces the path, and
+  `_get_file_diff_since` gained a third source (`git diff --no-index` against
+  `os.devnull`, gated on `_is_untracked`) so the classifier can actually see the
+  content. With only the first half the outcome was UNVERIFIED, which mutates
+  nothing — a file reported as changed that no diff could confirm. `--no-index`
+  exits 1 when files differ, which is the normal result, so only stdout decides.
+  Both halves are separately mutation-pinned in `tests/test_host_edit_ledger.py`.
+  **Every test in that file runs against a DIRTY tree**, because a spotless
+  working tree is the one state neo is never invoked in — the mistake that let
+  the per-session retention bug ship.
+  **Footgun — the plugin now has a hard CLI version floor.** The plugin updates
+  from this repo; the CLI comes from PyPI. On a `neo` predating the subcommand,
+  `neo hook record` is an argparse error exiting **2**, the one code Claude Code
+  treats specially — the identical defect filed against CAR as
+  Parslee-ai/car#993, reproduced here while writing that issue. Floor documented
+  in README; `hooks.json` deliberately does NOT wrap the command in
+  `|| true`, because that reintroduces the shell dependency (and `2>/dev/null`
+  is invalid in `cmd.exe`) that choosing a subcommand was meant to avoid.
 - **Host adapters must stay in parity.** There are THREE checked-in integration
-  surfaces, and they are easy to miss: `.claude-plugin/` (agent + 6 slash
-  commands), **`plugins/neo/`** (Codex CLI plugin + 6 skills, manifest at
-  `plugins/neo/.codex-plugin/plugin.json`, registered by
+  surfaces, and they are easy to miss: the Claude Code plugin (manifests in
+  `.claude-plugin/`; agent, 6 slash commands and the hook at the REPO ROOT —
+  see the layout rule above), **`plugins/neo/`** (Codex CLI plugin + 6 skills,
+  manifest at `plugins/neo/.codex-plugin/plugin.json`, registered by
   `.agents/plugins/marketplace.json`), and **`plugins/cursor-neo/`** (Cursor
   plugin + 6 skills + Neo agent, manifest at
   `plugins/cursor-neo/.cursor-plugin/plugin.json`, registered by

@@ -313,7 +313,10 @@ def test_skipped_static_checks_still_open_the_phase_they_close(monkeypatch):
         enable_persistent_memory=False,
         event_sink=sink,
     )
-    # Zero budget: elapsed always exceeds the static-check buffer.
+    # The checkers have no time gate any more, so the budget is irrelevant to
+    # whether this phase is skipped — it is skipped because the fake LM
+    # proposes no change to check. Left pinned at zero to prove exactly that:
+    # a budget of 0.0 no longer forces a skip on its own.
     monkeypatch.setattr(engine, "_get_time_budget", lambda difficulty: 0.0)
     engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
 
@@ -328,13 +331,28 @@ def test_skipped_static_checks_still_open_the_phase_they_close(monkeypatch):
     assert skip.data["status"] == "skipped"
 
 
-def test_skipped_static_checks_caution_names_the_budget_not_missing_tools(monkeypatch):
+def test_skipped_static_checks_caution_names_the_real_reason(monkeypatch):
     """Two different facts with two different remedies: install a linter, or
-    give the run more time."""
+    the model proposed nothing to check.
+
+    This used to assert the caution named the BUDGET ("ran out of time"). That
+    was the wrong claim in two ways. The gate it described reserved nothing —
+    time_budget never bounded the LM call — and it compared elapsed time
+    against 30/60/120s budgets drawn from algorithm-problem percentiles, so on
+    real work it resolved to "verify only if the whole run took under 27
+    seconds". Users were told their code was unverified because time ran out,
+    on runs whose actual state was that no diff had been produced at all.
+    """
     engine = NeoEngine(lm_adapter=FakeLM(_response()), enable_persistent_memory=False)
     monkeypatch.setattr(engine, "_get_time_budget", lambda difficulty: 0.0)
     output = engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
-    assert any("ran out of time" in c for c in output.orchestrator.cautions)
+
+    assert any("nothing to verify" in c for c in output.orchestrator.cautions), (
+        output.orchestrator.cautions
+    )
+    assert not any("ran out of time" in c for c in output.orchestrator.cautions), (
+        "caution still blames the clock for a skip the clock did not cause"
+    )
     assert not any("No checkers on this machine" in c for c in output.orchestrator.cautions)
 
 

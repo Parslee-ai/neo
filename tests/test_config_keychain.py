@@ -299,3 +299,60 @@ def test_config_set_log_level_rejects_invalid(monkeypatch, capsys):
 
     assert exc.value.code == 1
     assert "Invalid log level" in capsys.readouterr().err
+
+
+class TestKeychainCallsAreBounded:
+    """`security` PROMPTS for keychain unlock when the keychain is locked, and
+    an unattended run has nobody to answer. Unbounded, that is an indefinite
+    hang during config load — before neo does any work at all."""
+
+    def test_read_is_bounded_and_timeout_yields_no_key(self, monkeypatch, caplog):
+        import logging
+        import subprocess
+
+        from neo import config as cfg
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            raise subprocess.TimeoutExpired(cmd, cfg.KEYCHAIN_TIMEOUT_SECONDS)
+
+        monkeypatch.setattr(cfg, "keychain_available", lambda: True)
+        monkeypatch.setattr(cfg.subprocess, "run", fake_run)
+
+        with caplog.at_level(logging.WARNING, logger="neo.config"):
+            assert cfg.load_api_key_from_keychain("openai") is None
+
+        assert seen["timeout"] == cfg.KEYCHAIN_TIMEOUT_SECONDS
+        assert any("timed out" in r.getMessage() for r in caplog.records), (
+            "a locked keychain looked exactly like a missing key"
+        )
+
+    def test_write_timeout_is_not_swallowed(self, monkeypatch):
+        """This function's contract is "the key is stored or you hear about
+        it". A timeout means we do not know whether it was written, and
+        reporting success would promise a durable secret that may not exist."""
+        import subprocess
+
+        import pytest
+
+        from neo import config as cfg
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            raise subprocess.TimeoutExpired(cmd, cfg.KEYCHAIN_TIMEOUT_SECONDS)
+
+        monkeypatch.setattr(cfg, "keychain_available", lambda: True)
+        monkeypatch.setattr(cfg.subprocess, "run", fake_run)
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            cfg.store_api_key_in_keychain("openai", "sk-test")
+
+        # Asserted explicitly. Forcing the exception from the mock proves the
+        # exception is not swallowed, but says nothing about whether the call
+        # was BOUNDED — an earlier version of this test passed with the
+        # timeout deleted from production.
+        assert seen["timeout"] == cfg.KEYCHAIN_TIMEOUT_SECONDS

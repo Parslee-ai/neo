@@ -285,14 +285,28 @@ class TestPerformanceIntegration:
             entry.embedding = np.random.rand(768).astype(np.float32)
             entries.append(entry)
 
-        # Measure consolidation time
+        # Warm up OUTSIDE the measurement. Without this the test does not
+        # measure `_merge_cluster` at all: the first call pays one-time
+        # process costs, and they dominate completely. Measured — cold n=5
+        # takes ~18ms while WARM n=5 takes 0.06ms, and cold n=40 takes 2.8ms,
+        # i.e. eight times the work in a seventh of the time. A "performance"
+        # assertion whose reading falls as the input grows is measuring
+        # startup, not the algorithm.
+        #
+        # That is also why it flapped: 18ms against a 100ms bound is 5x
+        # headroom, so ordinary full-suite load failed it (it did, blocking a
+        # release), and the bound had already been raised 50ms -> 100ms once
+        # for the same reason. Warming first gives ~870x headroom at the worst
+        # of 12 observed runs, so the bound now needs a real algorithmic
+        # regression to trip rather than a busy machine — which is the rule
+        # this repo already adopted in #183: no assertion may depend on how
+        # fast the machine running it is.
+        memory._merge_cluster(list(entries))
+
         start = time.perf_counter()
         merged = memory._merge_cluster(entries)
         elapsed_ms = (time.perf_counter() - start) * 1000
 
-        # Should complete quickly (<100ms for 5 entries — loose bound so the
-        # assertion catches algorithmic regressions without flapping on
-        # shared CI runners, where 50ms drifts under load).
         assert elapsed_ms < 100, f"Consolidation took {elapsed_ms:.1f}ms, expected <100ms"
         assert merged.merge_count == 5
 

@@ -2391,6 +2391,80 @@ class TestRetrievedFactAttribution:
         assert merely_retrieved.metadata.success_count == 0
         assert merely_retrieved.metadata.effectiveness_n == 0
 
+    def test_cited_fact_credit_survives_the_process(self, store):
+        """The credit must reach DISK, not just the in-memory Fact.
+
+        Every other test in this class asserts the mutated object and never
+        reloads, so all of them passed while the only `self.save()` in
+        `detect_implicit_feedback` was gated on `linked_count` — a counter the
+        cited-credit path never increments. A run that credited a cited fact
+        but had no linked original fact (the normal case: `suggestion_fact_ids`
+        is empty unless the candidate already resolves to a durable fact) threw
+        the credit away on exit, while the episode ledger still recorded the
+        mutation. Measured live: 0 of 88 valid GLOBAL facts had ever reached
+        `success_count > 0`, and PROJECT facts topped out at exactly 2 — the
+        value promotion writes — so nothing ever cleared the `>= 3`
+        contribution bar.
+        """
+        used = store.add_fact(
+            subject="persisted convention",
+            body="Use typed identifiers",
+            kind=FactKind.PATTERN,
+            confidence=0.6,
+        )
+        # `candidate_id` is what makes this the REAL path. An ACCEPTED
+        # outcome carrying an episode candidate takes the candidate branch and
+        # `continue`s, skipping the no-link REVIEW fallback whose `add_fact`
+        # would otherwise save — and persist the credit INCIDENTALLY. Without a
+        # candidate this test passes against the broken code, which is how the
+        # first cut of it did.
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED,
+            file_path="src/new.py",
+            retrieved_fact_ids=[used.id],
+            used_fact_ids=[used.id],
+            candidate_id="cand-1",
+        )
+
+        # The janitor chain that runs just after (`prune`/`demote`/`purge`/
+        # `strip`) ends in its own `if changed: self.save()`, which can persist
+        # the credit INCIDENTALLY. That is what made the bug load-dependent and
+        # is why a first cut of this test passed against the broken code. Pin
+        # the janitor to "changed nothing" so the only reachable save is the
+        # one under test.
+        with patch.object(
+            store._outcome_tracker,
+            "detect_outcomes",
+            return_value=([outcome], {}),   # NO linked fact -> linked_count stays 0
+        ), patch.object(
+            store._outcome_tracker, "compute_arch_delta", return_value=None
+        ), patch.object(
+            store, "prune_stale_facts", return_value=0
+        ), patch.object(
+            store, "demote_unhelpful_facts", return_value=0
+        ), patch.object(
+            store, "purge_dead_facts", return_value=0
+        ), patch.object(
+            store, "strip_tombstone_embeddings", return_value=0
+        ), patch.object(
+            # A FIRST acceptance promotes nothing; promotion has its own save,
+            # and letting it fire here would mask the defect again.
+            store, "_promote_repeatedly_supported_candidate", return_value=None
+        ):
+            store.detect_implicit_feedback({}, [])
+
+        assert used.metadata.success_count == 1, "in-memory bump missing"
+
+        reloaded = FactStore(
+            codebase_root=store.codebase_root, eager_init=False
+        )
+        on_disk = [f for f in reloaded._facts if f.id == used.id]
+        assert on_disk, "credited fact is not on disk at all"
+        assert on_disk[0].metadata.success_count == 1, (
+            "cited-fact credit was lost on process exit: disk says "
+            f"{on_disk[0].metadata.success_count}"
+        )
+
     def test_attributed_modification_applies_bounded_demotion(self, store):
         used = store.add_fact(
             subject="project convention",
@@ -3521,3 +3595,123 @@ class TestDurableFactLinkage:
 
         assert store._find_valid_fact_by_signature("") is None
         assert store.find_durable_fact_for_candidate("   ") is None
+
+
+class TestBuildContextCaching:
+    """One neo request builds this context twice.
+
+    _decide_reasoning_mode -> _compute_memory_signal and _process_combined ->
+    _format_combined_prompt both call build_context, which is why the
+    constraint-overflow warning prints twice per run. Each call re-embeds the
+    query and re-ranks the whole corpus.
+    """
+
+    def test_repeat_call_reuses_the_assembled_context(self, store):
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            first = store.build_context("same query")
+            second = store.build_context("same query")
+
+        assert spy.call_count == 1, "re-assembled an identical context"
+        assert first is second
+
+    def test_different_query_is_not_served_from_cache(self, store):
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("query one")
+            store.build_context("query two")
+
+        assert spy.call_count == 2
+
+    def test_added_fact_invalidates_the_cache(self, store):
+        store.add_fact(subject="first", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+            store.add_fact(subject="second", body="b", kind=FactKind.PATTERN)
+            store.build_context("same query")
+
+        assert spy.call_count == 2, "served a stale context after a new fact"
+
+    def test_invalidated_fact_invalidates_the_cache(self, store):
+        """Supersession flips is_valid in place without changing list length —
+        a plain length check would miss it and serve a retracted fact."""
+        f = store.add_fact(subject="first", body="b", kind=FactKind.PATTERN)
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+            f.is_valid = False
+            store.build_context("same query")
+
+        assert spy.call_count == 2, "served a context containing a retracted fact"
+
+    def test_reload_invalidates_the_cache(self, store):
+        """load() replaces the whole corpus from disk. len and valid-count are
+        routinely IDENTICAL across a reload, so the content fingerprint cannot
+        see it and a pre-reload ContextResult was served — holding Fact
+        objects no longer in the store."""
+        store.add_fact(subject="original", body="b", kind=FactKind.PATTERN)
+        store.build_context("same query")
+
+        store.load()
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+
+        assert spy.call_count == 1, "served a context built before the reload"
+
+    def test_begin_request_resets_the_memo(self, store):
+        """The duplication this cache exists for is WITHIN one request. Scoping
+        it to the request bounds any staleness the fingerprint misses."""
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+        store.build_context("same query")
+
+        store.begin_request()
+
+        with patch.object(
+            store._assembler, "assemble", wraps=store._assembler.assemble
+        ) as spy:
+            store.build_context("same query")
+
+        assert spy.call_count == 1
+
+    def test_environment_identity_is_not_part_of_the_key(self, store):
+        """It was keyed on id(environment). CPython reuses the address of a
+        freed empty dict, so build_context(q, environment={}) followed by
+        build_context(q, environment={"git": ...}) could be a false hit that
+        silently dropped the git environment from the prompt."""
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        first = store.build_context("same query", environment={})
+        second = store.build_context("same query", environment={"git": "abc"})
+
+        # Same fingerprint by design, so this IS a cache hit — the point is
+        # that it is a hit on a stable key rather than on a reusable address.
+        assert first is second
+
+    def test_cache_hit_does_not_restamp_access_metadata(self, store):
+        """Counting one request as several retrievals would inflate the
+        recency and access-count signals rank_score reads."""
+        store.add_fact(subject="s", body="b", kind=FactKind.PATTERN)
+
+        result = store.build_context("same query")
+        if not result.valid_facts:
+            pytest.skip("no valid facts retrieved to observe")
+        counts_before = [f.metadata.access_count for f in result.valid_facts]
+
+        store.build_context("same query")
+        counts_after = [f.metadata.access_count for f in result.valid_facts]
+
+        assert counts_after == counts_before

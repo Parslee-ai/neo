@@ -3,7 +3,9 @@ name: neo-debug
 description: >-
   Ask Neo to help debug intermittent, complex, or hard-to-reproduce issues.
   Particularly useful for race conditions, memory issues, distributed-systems
-  bugs, and cases where the symptom is not the root cause.
+  bugs, and cases where the symptom is not the root cause. Skip for compile
+  errors, straightforward tracebacks, and failures with an obvious single-file
+  cause.
 disable-model-invocation: true
 ---
 

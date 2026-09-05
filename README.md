@@ -349,11 +349,19 @@ Neo ships as a **Claude Code plugin** with a specialized agent and six slash com
 /plugin install neo
 ```
 
+`Parslee-ai/neo` also carries its own marketplace manifest, so
+`/plugin marketplace add Parslee-ai/neo` installs the same plugin directly
+without the intermediate repository.
+
 Once installed:
 
 - **Slash commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
 - **Specialized agent**: invoke with `Use the Neo agent to ...` for delegated semantic reasoning
 - **Shared memory**: same `~/.neo/facts/` store used by the CLI, Codex, and Cursor plugins
+- **Edit-recording hook**: a `PostToolUse` hook records which files Claude Code
+  edited, so Neo can observe whether a suggestion was applied instead of
+  inferring it from a later git diff. It records paths, never file contents, and
+  costs no model context. Opt out with `NEO_HOOKS=0`.
 
 Examples:
 
@@ -366,7 +374,22 @@ Examples:
 
 The plugin wraps the local `neo` CLI, so the binary must be installed first (`pip install neo-reasoner[openai]` and `OPENAI_API_KEY` set, or your provider of choice).
 
-Plugin sources live under [`.claude-plugin/`](.claude-plugin/) — `plugin.json` is the manifest, `agents/neo.md` defines the agent, and `commands/*.md` defines each slash command.
+**The plugin requires `neo-reasoner` 0.47.0 or newer.** The plugin updates from
+this repository while the CLI comes from PyPI, so the two can drift. On an older
+CLI the edit-recording hook invokes a subcommand that does not exist, and the
+argument parser exits 2 — the one exit code Claude Code treats as a hook
+failure. Nothing is corrupted, but every edit reports an error. `pip install -U
+neo-reasoner` resolves it.
+
+Plugin sources: [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json) is
+the manifest and [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)
+the marketplace entry. **Components live at the repository root, not inside
+`.claude-plugin/`** — [`agents/neo.md`](agents/neo.md) defines the agent,
+[`commands/*.md`](commands/) each slash command, and
+[`hooks/hooks.json`](hooks/hooks.json) the edit-recording hook. Claude Code
+discovers components at the plugin root and reads only manifests from
+`.claude-plugin/`; nested there they are silently not loaded, which is what
+`tests/test_host_adapter_parity.py` now pins.
 
 
 ## Codex Plugin
@@ -913,7 +936,17 @@ neo memory observer kick     # force a cycle now (maps to CAR agents_restart)
 
 It **autostarts** whenever `car-server` is reachable — opt out with
 `NEO_OBSERVER_AUTOSTART=0`. With no CAR present it prints a one-time hint and
-stays silent. Requires the `[car]` extra and a running `car-server`
+stays silent.
+
+> **Put that export in `~/.zshenv`, not `~/.zshrc`** (or `~/.bash_profile`'s
+> non-interactive equivalent). The gate is a plain `os.getenv` read by whichever
+> process runs `neo`, and most of them are **not** interactive shells — an editor
+> plugin, a CI step, a git hook, an agent tool call. zsh sources `.zshrc` only for
+> interactive shells, so an export placed there leaves every programmatic
+> invocation autostarting the observer while `echo $NEO_OBSERVER_AUTOSTART` in
+> your terminal cheerfully prints `0`. Verify with `zsh -c 'echo
+> $NEO_OBSERVER_AUTOSTART'` — **without** `-i`, which forces the one mode that
+> works and makes the check pass for the wrong reason. Requires the `[car]` extra and a running `car-server`
 (car-runtime ≥ 0.18.0). Logs land in
 `~/.car/logs/neo-observer.{stdout,stderr}.log`. Tunables:
 `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
@@ -1327,7 +1360,7 @@ export NEO_ALLOW_PLAINTEXT_API_KEY=1              # permit storing api_key in co
 **Background observer**
 
 ```bash
-export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer
+export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer (put in ~/.zshenv, not ~/.zshrc)
 export NEO_OBSERVER_INTERVAL_SECONDS=300          # sweep interval
 export NEO_OBSERVER_COOLDOWN=60                   # per-process cooldown between cycles
 export NEO_OBSERVER_RECYCLE_CYCLES=48             # re-exec after N cycles to bound RSS (0 disables)

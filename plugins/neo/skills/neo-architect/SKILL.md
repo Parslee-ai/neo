@@ -1,6 +1,6 @@
 ---
 name: neo-architect
-description: Get Neo's architectural guidance for design decisions. Trade-off analysis for choices like microservices vs monolith, sync vs async, and event-driven vs request-response, with optional explicitly authorized memory recall.
+description: Get Neo's architectural guidance for design decisions. Trade-off analysis for choices like microservices vs monolith, sync vs async, and event-driven vs request-response, with optional explicitly authorized memory recall. Skip for decisions already made, style preferences, and anything settled by reading one file.
 ---
 
 # Neo Architectural Guidance
@@ -34,7 +34,7 @@ When the user invokes this skill (`$neo-architect <question>`), do the following
 
 5. **Present Neo's plan and simulations together.** Architecture answers benefit from the SIMULATIONS section especially — those describe how the recommendation would actually play out.
 
-6. **Surface any architectural facts Neo retrieved from memory.** If past projects had similar decisions, Neo references them — those are higher-trust than fresh reasoning.
+6. **If — and only if — memory was enabled for this call, surface any architectural facts Neo retrieved.** Past decisions from similar projects are higher-trust than fresh reasoning. Under the default `--no-memory` there are none, and Neo's answer is reasoning alone: do not present it as informed by past projects.
 
 `--no-scan` is mandatory: Codex already summarized the relevant architecture
 context, so Neo must not silently add working-directory files to the provider

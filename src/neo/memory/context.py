@@ -79,12 +79,42 @@ class ContextAssembler:
         # Reserve at least 1/3 of budget for non-constraint content.
         constraint_cap = max_tokens * 2 // 3
         uncapped_total = sum(f.size_hint() for f in constraints)
-        constraints = self._accumulate_within_budget(constraints, constraint_cap, at_least_one=True)
+        uncapped_count = len(constraints)
+
+        # WHEN CONSTRAINTS OVERFLOW, RELEVANCE DECIDES WHICH SURVIVE.
+        #
+        # Scope order alone is a stable sort, so within a scope the order is
+        # whatever the store yielded — effectively creation order. Combined
+        # with a prefix cut that stops at the first fact that does not fit,
+        # that made the injected set "the globals, plus the OLDEST project
+        # constraints until the budget fills". Measured on a real store: 2,445
+        # valid constraints against an 8,000-token cap, so ~1.4% were injected
+        # and the newest were structurally unreachable no matter how well they
+        # matched the query. The highest-authority memory layer was the only
+        # one not consulting the query, while ordinary facts were ranked by
+        # similarity right below (see _score_facts).
+        #
+        # Scope still leads: globals and org constraints are few and are
+        # deliberately authoritative. Ranking applies WITHIN each scope, and
+        # only matters at all once the layer overflows.
+        constraint_scores: dict[str, float] = {}
+        if uncapped_total > constraint_cap and len(constraints) > 1:
+            constraints, constraint_scores = (
+                self._rank_constraints_by_scope_then_relevance(
+                    constraints, scope_order, query_embedding,
+                )
+            )
+
+        constraints = self._accumulate_within_budget(
+            constraints, constraint_cap, at_least_one=True, skip_oversized=True,
+        )
         constraint_tokens = sum(f.size_hint() for f in constraints)
         if uncapped_total > constraint_cap:
             logger.warning(
-                "Constraints would consume %d tokens (cap %d); truncated to %d tokens",
-                uncapped_total, constraint_cap, constraint_tokens,
+                "Constraints would consume %d tokens (cap %d); kept the %d most "
+                "relevant of %d (%d tokens)",
+                uncapped_total, constraint_cap, len(constraints),
+                uncapped_count, constraint_tokens,
             )
 
         # Rank valid facts by similarity + confidence + recency
@@ -115,30 +145,105 @@ class ContextAssembler:
             working_set=session_capped,
             environment=environment or {},
             known_unknowns=unknowns_capped,
-            retrieval_scores={f.id: score for f, score in scored_valid},
+            # Constraint scores included. The layer holding two-thirds of the
+            # token budget was the ONLY one whose selection left no trace:
+            # nothing recorded what it chose or why, so replacing "age silently
+            # decides" with "relevance silently decides" would have been a
+            # better selection with an unchanged reporting posture. Valid-fact
+            # scores win a key collision — an id cannot be in both layers, and
+            # if that ever changes the primary layer is the one consumers
+            # already read.
+            retrieval_scores={
+                **constraint_scores,
+                **{f.id: score for f, score in scored_valid},
+            },
         )
 
     @staticmethod
     def _accumulate_within_budget(
         facts: list[Fact], budget: int, *, at_least_one: bool = False,
+        skip_oversized: bool = False,
     ) -> list[Fact]:
         """Accumulate facts until budget is exhausted.
 
         Args:
             at_least_one: If True, always include the first fact even if it
                 exceeds the budget. Only used for valid_facts (primary layer).
+            skip_oversized: If True, a fact that does not fit is SKIPPED and
+                accumulation continues. Default False stops at the first
+                non-fitting fact, which is correct for a relevance-ordered
+                list where everything after it ranks lower anyway.
+
+                Constraints pass True: they are ordered by scope first, so a
+                single large global constraint would otherwise truncate every
+                project constraint behind it regardless of relevance — one
+                verbose fact silently emptying the layer.
         """
         result: list[Fact] = []
         used = 0
         for fact in facts:
             cost = fact.size_hint()
             if used + cost > budget:
+                if skip_oversized:
+                    # Skip THIS fact, keep going. Deliberately does not consume
+                    # budget for something that was not included.
+                    continue
                 if not result and at_least_one:
                     result.append(fact)
                 break
             result.append(fact)
             used += cost
+
+        # The "at least one" guarantee is a floor, not a priority claim. Under
+        # skip_oversized it applies only when nothing fit at all — otherwise a
+        # single oversized fact at the front (a verbose global constraint, say)
+        # would be admitted over every smaller fact behind it and blow the cap
+        # that exists to protect the other layers.
+        if not result and at_least_one and facts:
+            result.append(facts[0])
         return result
+
+    def _rank_constraints_by_scope_then_relevance(
+        self,
+        constraints: list[Fact],
+        scope_order: dict,
+        query_embedding: Optional[np.ndarray],
+    ) -> tuple[list[Fact], dict[str, float]]:
+        """Order constraints by scope tier, then by relevance within the tier.
+
+        Returns the ordered constraints AND the score each was ranked on, so
+        the selection is inspectable. A layer that silently decides what the
+        model sees is half the defect this ranking exists to fix; the other
+        half is that nothing could tell you what it decided.
+
+        With no query embedding there is nothing to rank on, so the incoming
+        scope order is returned untouched — the pre-existing behaviour, not a
+        silent fallback to something else.
+        """
+        if query_embedding is None:
+            # Nothing to rank on, so the incoming scope order stands — but say
+            # so. Silently reverting to scope-then-insertion order is the exact
+            # age-ordering defect this function exists to remove, and it would
+            # come back precisely when the memory layer is already degraded.
+            logger.warning(
+                "Constraint layer overflowed (%d constraints) with no query "
+                "embedding: falling back to scope order, so which constraints "
+                "are injected is decided by insertion order, not relevance.",
+                len(constraints),
+            )
+            return constraints, {}
+
+        scored = self._score_facts(constraints, query_embedding)
+        rank = {id(fact): position for position, (fact, _) in enumerate(scored)}
+        scores = {fact.id: score for fact, score in scored}
+        ordered = sorted(
+            constraints,
+            key=lambda f: (
+                scope_order.get(f.scope, 99),
+                rank.get(id(f), len(constraints)),
+            ),
+        )
+        return ordered, scores
 
     def _score_facts(
         self,
@@ -155,7 +260,18 @@ class ContextAssembler:
             return []
 
         now = time.time()
-        sims = batched_cosine([f.embedding for f in facts], query_embedding)
+        # default=0.0 (no evidence), not 0.5: a fact with no embedding must not
+        # be scored as moderately similar to a query it was never compared to.
+        sims = batched_cosine(
+            [f.embedding for f in facts], query_embedding,
+            default=0.0, no_query_default=0.5,
+        )
+        missing = sum(1 for f in facts if f.embedding is None)
+        if missing and facts:
+            logger.warning(
+                "%d of %d facts have no embedding and were ranked with no "
+                "similarity evidence", missing, len(facts),
+            )
         scored = [(f, rank_score(f, s, now)) for f, s in zip(facts, sims)]
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored

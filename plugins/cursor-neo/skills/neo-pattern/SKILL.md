@@ -3,7 +3,9 @@ name: neo-pattern
 description: >-
   Ask Neo to extract a reusable pattern from a piece of code, or to find
   existing patterns in the codebase that match a description. Useful for
-  codifying conventions and finding duplicated logic.
+  codifying conventions and finding duplicated logic. Skip for one-off code and
+  speculative abstractions — this is the one Neo skill that writes durable
+  memory, so a wrong lesson outlives the session.
 disable-model-invocation: true
 ---
 

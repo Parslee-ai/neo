@@ -3,9 +3,10 @@
 Neo publishes one host-neutral contract (`neo.events` + `OrchestratorMessage`)
 and thin per-host adapters that tell an orchestrator how to consume it:
 
-    .claude-plugin/       -> Claude Code agent + slash commands
-    plugins/neo/          -> Codex CLI plugin + skills
-    plugins/cursor-neo/   -> Cursor plugin + skills + Neo agent
+    .claude-plugin/    -> Claude Code manifests (plugin.json, marketplace.json)
+    agents/ commands/  -> Claude Code components, at the PLUGIN ROOT
+    plugins/neo/       -> Codex CLI plugin + skills
+    plugins/cursor-neo/ -> Cursor plugin + skills + Neo agent
 
 Adapters drift. The Codex skills sat on "parse the four structured sections"
 for a full release after the Claude side moved to `--json`, which is exactly
@@ -22,11 +23,21 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parent.parent
-CLAUDE_PLUGIN = REPO / ".claude-plugin"
+# Claude Code discovers components at the PLUGIN ROOT and reads only manifests
+# out of `.claude-plugin/`. This plugin's root is the repository itself
+# (`marketplace.json` declares `"source": "./"`), so those are two different
+# directories and must not hide behind one name — which is how the components
+# sat somewhere Claude Code never looks.
+CLAUDE_MANIFEST = REPO / ".claude-plugin"
+CLAUDE_ROOT = REPO
 CODEX_PLUGIN = REPO / "plugins" / "neo"
 CURSOR_PLUGIN = REPO / "plugins" / "cursor-neo"
+
+# What is allowed to live in the manifest directory.
+CLAUDE_MANIFEST_FILES = {"plugin.json", "marketplace.json"}
 
 # The six capabilities Neo claims on every integration surface.
 CAPABILITIES = ["neo", "neo-review", "neo-debug", "neo-architect",
@@ -48,12 +59,12 @@ def _cursor_skill(name: str) -> str:
     return (CURSOR_PLUGIN / "skills" / name / "SKILL.md").read_text()
 
 
-def _claude_command(name: str) -> str:
-    return (CLAUDE_PLUGIN / "commands" / f"{name}.md").read_text()
-
-
 def _claude_agent() -> str:
-    return (CLAUDE_PLUGIN / "agents" / "neo.md").read_text()
+    return (CLAUDE_ROOT / "agents" / "neo.md").read_text()
+
+
+def _claude_command(name: str) -> str:
+    return (CLAUDE_ROOT / "commands" / f"{name}.md").read_text()
 
 
 def _cursor_agent() -> str:
@@ -66,24 +77,54 @@ def _cursor_agent() -> str:
 def test_all_integration_surfaces_are_checked_in():
     """The README claims three surfaces. A claim with no directory is found
     false by a user, not by us."""
-    assert (CLAUDE_PLUGIN / "plugin.json").is_file()
+    assert (CLAUDE_MANIFEST / "plugin.json").is_file()
     assert (CODEX_PLUGIN / ".codex-plugin" / "plugin.json").is_file()
     assert (CURSOR_PLUGIN / ".cursor-plugin" / "plugin.json").is_file()
     assert (CURSOR_PLUGIN / "agents" / "neo.md").is_file()
+
+
+def test_claude_components_live_at_the_plugin_root():
+    """Claude Code reads components from the plugin root and manifests from
+    `.claude-plugin/`. Nested inside `.claude-plugin/` they are simply not
+    found — the plugin installs, `claude plugin validate` passes, and it loads
+    nothing. `claude plugin details` is the check that proves otherwise."""
+    assert (CLAUDE_ROOT / "agents" / "neo.md").is_file()
+    assert (CLAUDE_ROOT / "commands").is_dir()
+
+
+def test_the_manifest_directory_holds_no_components():
+    """The complement of the test above, and the half that actually holds.
+
+    Asserting components exist at the root proves only that they are *also*
+    there. A copy left behind in `.claude-plugin/` keeps every other assertion
+    in this file green while Claude Code loads neither — which is how the
+    layout stayed wrong for as long as it did. CAR shipped the identical
+    mistake in its own repo, so this is pinned rather than left to review.
+    """
+    stray = sorted(
+        entry.name
+        for entry in CLAUDE_MANIFEST.iterdir()
+        if entry.name not in CLAUDE_MANIFEST_FILES and not entry.name.startswith(".")
+    )
+    assert not stray, (
+        f".claude-plugin/ holds manifests only; found {stray}. Component "
+        "directories (agents/, commands/, skills/, hooks/) belong at the "
+        "plugin root, which is the repository root."
+    )
 
 
 @pytest.mark.parametrize("name", CAPABILITIES)
 def test_every_capability_exists_on_all_surfaces(name):
     assert (CODEX_PLUGIN / "skills" / name / "SKILL.md").is_file(), f"codex: {name}"
     assert (CURSOR_PLUGIN / "skills" / name / "SKILL.md").is_file(), f"cursor: {name}"
-    assert (CLAUDE_PLUGIN / "commands" / f"{name}.md").is_file(), f"claude: {name}"
+    assert (CLAUDE_ROOT / "commands" / f"{name}.md").is_file(), f"claude: {name}"
 
 
 def test_no_surface_carries_extra_capabilities():
     """'The same six skills' has to stay six on every host."""
     codex = {p.name for p in (CODEX_PLUGIN / "skills").iterdir() if p.is_dir()}
     cursor = {p.name for p in (CURSOR_PLUGIN / "skills").iterdir() if p.is_dir()}
-    claude = {p.stem for p in (CLAUDE_PLUGIN / "commands").glob("*.md")}
+    claude = {p.stem for p in (CLAUDE_ROOT / "commands").glob("*.md")}
     assert codex == set(CAPABILITIES)
     assert cursor == set(CAPABILITIES)
     assert claude == set(CAPABILITIES)
@@ -115,7 +156,7 @@ def test_cursor_marketplace_points_at_the_cursor_plugin():
 def test_plugin_manifests_match_the_package_version():
     version = _package_version()
     for manifest in (
-        CLAUDE_PLUGIN / "plugin.json",
+        CLAUDE_MANIFEST / "plugin.json",
         CODEX_PLUGIN / ".codex-plugin" / "plugin.json",
         CURSOR_PLUGIN / ".cursor-plugin" / "plugin.json",
     ):
@@ -234,6 +275,13 @@ def test_cursor_skills_teach_the_orchestrator_envelope(name):
     assert "orchestrator.cautions" in body, name
 
 
+def test_cursor_agent_uses_advise_without_mandatory_no_scan():
+    """Claude-parity agent path: visible boundary, not mid-loop privacy defaults."""
+    agent = _cursor_agent()
+    assert "neo --json --mode advise" in agent
+    assert "neo --json --no-scan --no-memory --mode advise" not in agent
+
+
 # ------------------------------------------------------------ shared contract
 
 
@@ -322,8 +370,46 @@ def test_documented_event_types_exist_in_the_code():
             assert name in valid, f"{label}: {name}"
 
 
-def test_cursor_agent_uses_advise_without_mandatory_no_scan():
-    """Claude-parity agent path: visible boundary, not mid-loop privacy defaults."""
-    agent = _cursor_agent()
-    assert 'neo --json --mode advise' in agent
-    assert "neo --json --no-scan --no-memory --mode advise" not in agent
+# ------------------------------------------------------------ descriptions
+
+
+def _description(body: str) -> str:
+    """The `description:` a host reads when deciding whether to invoke.
+
+    Parsed as YAML rather than pattern-matched, because that is how the host
+    reads it — and an unquoted plain scalar containing ": " is a parse error,
+    not a long description. One was written during this change and caught here.
+    """
+    return yaml.safe_load(body.split("---")[1])["description"]
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_all_surfaces_describe_when_to_invoke_and_when_not(name):
+    """A description that names no trigger is a component that never fires.
+
+    The *negative* half is what is pinned here rather than merely encouraged.
+    Each invocation costs 5-30s and an LLM call, so a description that says
+    when to reach for Neo and never when not to buys reach with spend.
+    """
+    for surface, body in (
+        ("codex", _codex_skill(name)),
+        ("cursor", _cursor_skill(name)),
+        ("claude", _claude_command(name)),
+    ):
+        description = _description(body)
+        assert "Skip" in description, (
+            f"{surface}:{name} description names no condition NOT to invoke Neo"
+        )
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_every_description_is_readable_by_the_host(name):
+    """Hosts parse this frontmatter as YAML. A description that raises is
+    indistinguishable from a component that does not exist."""
+    for surface, body in (
+        ("codex", _codex_skill(name)),
+        ("cursor", _cursor_skill(name)),
+        ("claude", _claude_command(name)),
+    ):
+        description = _description(body)
+        assert isinstance(description, str) and description.strip(), f"{surface}:{name}"

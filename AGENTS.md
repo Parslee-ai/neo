@@ -151,13 +151,13 @@
   fact retrieval, constraints, four-layer assembly) and prints what *would* be sent to
   the LM, then exits without making the LLM call. Faster iteration on context-gatherer
   and retrieval changes than waiting for an inference round trip.
-- Host adapters (three surfaces, one `neo --json` contract): `.claude-plugin/`
-  (Claude Code agent + commands), `plugins/neo/` (Codex skills),
-  `plugins/cursor-neo/` (Cursor skills + Neo agent, marketplace at
-  `.cursor-plugin/marketplace.json`). Keep all three in sync; versions via
-  `make sync-version`. Mid-loop skills (Codex + Cursor `/neo*`) use
-  `--no-scan` / advise `--no-memory`; Claude and the Cursor agent are the
-  visible-boundary path. `.agents/skills/` is release maintenance only.
+- Host adapters (three surfaces, one `neo --json` contract): Claude Code
+  (manifests in `.claude-plugin/`; agent/commands/hooks at repo root),
+  `plugins/neo/` (Codex skills), `plugins/cursor-neo/` (Cursor skills + Neo
+  agent, marketplace at `.cursor-plugin/marketplace.json`). Keep all three in
+  sync; versions via `make sync-version`. Mid-loop skills (Codex + Cursor
+  `/neo*`) use `--no-scan` / advise `--no-memory`; Claude and the Cursor agent
+  are the visible-boundary path. `.agents/skills/` is release maintenance only.
 - CarAdapter defaults `intent_hint={"task":"code"}` so CAR's router picks a code-capable
   model rather than the chat default. This is the local workaround for
   [Parslee-ai/car-releases#52](https://github.com/Parslee-ai/car-releases/issues/52)

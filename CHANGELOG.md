@@ -1,5 +1,218 @@
 # Changelog
 
+## [0.52.1] - 2026-08-30
+
+Documentation only. **Retracts a measurement claim published in 0.52.0.** No code changed; no behaviour changed.
+
+### Corrected
+
+- **"The delivery-cap knee is ~10 files; the default of 30 costs 15–50% more for nothing" was wrong**, and is retracted.
+
+  The error was the metric. That conclusion rested on R@10 and MRR, which are **structurally blind to ranks 11+**: a correct answer delivered at rank 15 cannot move a top-ten metric at any cap. Those numbers read flat from cap 10 to cap 50 because they *could not vary*, not because the extra files carried nothing. Using recall@10 to size a cap larger than 10 measures nothing about the files the cap admits.
+
+  Rescored over everything the model actually receives, recall rises monotonically — neo 0.523 / 0.654 / 0.776 / **0.813** / 0.869 and m365dotnet 0.571 / 0.652 / 0.714 / **0.741** / 0.750 at caps 5/10/20/30/50. Ground truth sits at **rank 11–30 for 15% of neo's answer files and 11% of m365dotnet's**, so a cap of 10 would drop **23 of 107** and **14 of 112** answer files respectively — concretely `src/neo/cli.py` at rank 14 and `src/neo/index/project_index.py` at rank 12.
+
+  **The shipped default of 30 is well chosen and should not be cut.** Going 10 → 30 buys +24% relative recall on neo and +14% on m365dotnet for +50% context bytes; 30 → 50 buys only +7% / +1% for a further +28% bytes *and* degrades the top of the list (MRR 0.763 → 0.752, R@1 0.403 → 0.377), so extra files begin to dilute the ranking they extend. 30 sits where the returns flatten without that dilution.
+
+  **No 0.52.0 code is affected**: the default was deliberately left unchanged at the time, and the `--max-files`-is-not-a-cap fix is independent and stands. The v0.52.0 release notes carry the same correction.
+
+## [0.52.0] - 2026-08-30
+
+Two caps that were not caps. `neo --index` spent its whole file budget on tests before examining a single source file, and `--max-files` — whose help calls it a "Cap on files" — could be exceeded threefold. Both are fixed, and this release also adds the tooling that found them: neo's retrieval is now measured against naive baselines rather than reported as bare absolutes.
+
+### Fixed
+
+- **`neo --index` built a catalog of 100% test files on any `src/` + `tests/` repo** ([#213](https://github.com/Parslee-ai/neo/issues/213)). `ProjectIndex._select_files` ranked shallowest-path-first, and depth is a proxy for centrality that **inverts** on the conventional Python layout: with `src/<pkg>/…` beside `tests/…`, every test sits at depth 2 and every source file at depth 3, so the whole test tree sorted ahead of the whole source tree and `--max-files` was spent before one source file was examined.
+
+  Measured on this repo: 131 Python files at depth 2, and the existing catalog held 52 files of which 43 (82%) were tests. Rebuilt after the fix, same language scope: **94 files, 100% source**. The build reported success either way, and the selection report was truthful that the cap bound — nothing said the files it kept were all tests.
+
+  The sort key is now `(is_test, depth, path)`. Tests are **demoted, not excluded** — they fill the slots source does not need, so a test-only repository still indexes. `is_test_path` is **imported** from `context_gatherer` rather than restated, so its careful cases hold (`testdata/` and `testing/` stay ordinary source; `Foo.Tests/` does not).
+
+  Worth recording: this module already treated "tests outrank the source they test" as a failure mode — `_embed_chunks` embeds a structured summary instead of the raw body for exactly that reason. That mitigation runs at *embedding* time and never got a chance, because selection had spent the budget one stage earlier.
+
+- **`--max-files` was not a cap.** `calculate_adaptive_limit` picks a file budget from prompt specificity and returned its three broad-prompt buckets verbatim, ignoring the caller's ceiling — so `--max-files 5` on a vague prompt delivered **15 files**, three times what was asked.
+
+  | prompt | `--max-files=5` | `=10` | `=30` |
+  |---|---|---|---|
+  | "review this" | **15** | **15** | 15 |
+  | "review this codebase" | **20** | **20** | 20 |
+  | "refactor memory delete synthesis" | **25** | **25** | 25 |
+  | "review ProjectIndex.retrieve() in src/…" | 5 | 10 | 30 |
+
+  Only the *specific* bucket honoured the ceiling, and it does so by construction — it returns `default_max`. The one branch that could not fail was the only one a specific prompt exercised, which is why nothing caught it. Now `min(floor, default_max)`. **No behaviour change at the shipped default** (every bucket is already ≤ 30), and the cap *bounds* the heuristic rather than replacing it: a vague prompt with `--max-files 500` still gets 15. Pinned in the Guard-invariant battery beside the other no-silent-caps checks.
+
+- **A performance test measured process warmup, not the code under test.** `test_consolidation_performance_with_all_boosts` timed the *first* call to `_merge_cluster`, so one-time process costs dominated: cold n=5 reads ~18ms, warm n=5 reads **0.06ms**, and cold n=40 reads 2.8ms — eight times the work in a seventh of the time. A performance assertion whose reading falls as the input grows is measuring startup.
+
+  It flapped for the same reason (18ms against a 100ms bound is 5× headroom, so ordinary full-suite load tripped it, and the bound had already been raised 50ms → 100ms once). Fixed by warming up outside the measurement, giving ~870× headroom while keeping the assertion live — injecting a 150ms slowdown still fails it. Per the rule adopted in #183: no assertion may depend on how fast the machine running it is.
+
+### Added
+
+- **`tools/rank_baseline_eval.py`** — scores four naive rankers (`random`, `recency`, `size`, `filename`, `grep`) over the *identical* candidate set, queries and ground truth that `rank_mine_eval.py` uses, so the ranking rule is the only thing that differs. Absolute R@k figures have no comparator and cannot answer "is this working"; this supplies one.
+
+  The load-bearing baseline is **`grep`** — prompt-token counts over file *content* — because the mining leak (a file holds the commit's terms because that commit put them there) helps any content-reading ranker and does nothing for `size` or `recency`. Comparing only against content-blind baselines would let the leak masquerade as ranker quality.
+
+- **`rank_mine_eval.py --max-files N`** — sweeps the delivery cap, which was unmeasurable until the cap fix above.
+
+### Measured
+
+Recorded in `docs/`, with limits stated rather than left to be rediscovered:
+
+- **Effectiveness** (`effectiveness-evidence-2026-08-30.md`): neo's selection beats the strongest naive baseline on three repos — pooled over 150 cases, **81 better / 37 worse / 32 tied, p = 6.3 × 10⁻⁵** — and the margin grows with repo size (1.3× → 2.4×). Controlled experiments show retrieval is causally necessary both for a patch that *applies* (3/3 vs 0/3) and for project-specific correctness priors cannot supply (2/2 vs 0/2), where the failure mode is **refusal, not hallucination**.
+- **Semantic lane** (`semantic-lane-remeasurement-2026-08-30.md`): pooled across three repos the `--semantic` flag is **null** (18 better / 18 worse, p = 1.000). Its value tracks **catalog coverage**, tested causally by starving neo's own catalog 49.5% → 14.7%, which collapses a significant effect (p = 0.022) to nothing (p = 0.832). The lane is starved, not weak; the lever is the catalog cap, not the weight.
+- **Delivery cap** (`delivery-cap-sweep-2026-08-30.md`): the knee is **~10 files** on repos 29× apart in size. Cap 30 vs cap 10 over 100 cases is 6 better / 2 worse / 92 tied (p = 0.289) while costing **15–50% more context bytes**. The default is deliberately **unchanged** — that evidence is retrieval-only, and R@k cannot see whether the extra files help the model reason.
+
+## [0.51.0] - 2026-08-30
+
+The edit-recording hook has been writing a ledger since it shipped and nothing read it. Now `collect_outcomes` does — and the first thing that falls out is that a suggestion to create a **new file** was never verifiable at all.
+
+### Added
+
+- **`collect_outcomes` reads the host edit ledger.** `neo hook record` appends every host Edit/Write to `~/.neo/sessions/host_events.jsonl`; `_load_host_edit_events` unions those into the git-derived `changed_files`. It ADDS evidence and removes none — git still reports everything committed or dirty.
+
+  **The concrete gap this closes is the untracked new file.** `git diff --name-only HEAD` lists tracked modifications ONLY, so a suggestion to create a new file — which `suggestion_is_verifiable` explicitly admits as legitimate, since proposing one is normal and shows up in `git log` once committed — was invisible to outcome detection until somebody committed it.
+
+  Closing it needed **both** halves, and the first alone is not enough: the ledger surfaces the path, and `_get_file_diff_since` gained a third source (`git diff --no-index` against `os.devnull`, gated on a new `_is_untracked`) so the classifier can see the content it is being asked to verify. With only the union, `_match_to_suggestions` found no diff to compare and returned UNVERIFIED — which by design mutates nothing, i.e. a file reported as changed that no diff could confirm. That was the observed behaviour of the first cut, not a prediction.
+
+  Confirmed end to end on a live run: neo suggested creating `src/validators.py`, the file was created and left untracked, an unrelated file was left dirty, and the next invocation recorded `accepted` for that path — while `git diff --name-only HEAD` never listed it and no commit occurred, so git could not have been the source.
+
+  **Attribution is by `file_path`, never by `cwd` or `head`.** Those name the directory the HOST was launched in, not the repository the edited file belongs to — measured directly: an edit to a scratch repository, made from a Claude Code session rooted in the neo checkout, recorded neo's OWN head. A record is ours when its path resolves inside `codebase_root`, which also stops one machine-wide ledger cross-attributing between projects.
+
+  The read is hoisted out of the per-session loop, for the same reason `_get_working_tree_changes` had to be — retention means many pending sessions, and a per-session re-read puts a linear cost on the request hot path. The rotated `.1` generation is read too: rotation moves the RECENT records there and leaves the active file nearly empty, so reading only the active file would lose exactly the window this exists to protect. A missing, unreadable or malformed ledger yields an empty list, and a malformed LINE is skipped rather than discarding the file — the ledger is append-only, so a torn final write is the expected corruption.
+
+  Every test in `tests/test_host_edit_ledger.py` runs against a **dirty** working tree, because a spotless one is the state neo is never actually invoked in. Both halves are separately mutation-pinned.
+
+### Known limits
+
+- A session that has already aged out at `PENDING_SESSION_TTL_SECONDS` (14 days) is gone before the ledger can help. The ledger makes a longer TTL *useful* — previously a longer window would only have retained records nothing could resolve — but the TTL itself is unchanged here.
+- A new-file acceptance classifies as `feature` → `decision` kind, which is deliberately non-promotable. The acceptance is now detected; it still does not mint a durable pattern.
+
+## [0.50.0] - 2026-08-30
+
+The learning loop had a hard mechanical ceiling, and it was one `if`. Neo credited the facts its reasoning actually used, recorded the credit in the episode ledger, reported it in `learning-stats` — and then threw it away without writing it to disk. `neo contribute` has never been reachable on any install, and this is why.
+
+### Fixed
+
+- **The cited-fact credit never reached a `save()`.** `detect_implicit_feedback` credits two different populations. Linked ORIGINAL facts — a suggestion re-applying a durable fact — move `linked_count`. CITED retrieved facts, credited by `_apply_used_fact_feedback`, do not: they bump `success_count` on the live `Fact` objects and record an episode mutation, and nothing else. The single save was `if linked_count: self.save()`, so a run that credited a cited fact but had no linked original fact never wrote the store and the credit died with the process. That is the **normal** case — `suggestion_fact_ids` is empty unless the candidate already resolves to a durable fact.
+
+  The episode ledger still recorded the mutation, so `learning-stats` reported reinforcements the fact store had never received. The reporter and the data disagreed, and the reporter was the honest one.
+
+  Measured on a live install: **0 of 88 valid GLOBAL facts had ever reached `success_count > 0`**, while 64 carried a non-zero `access_count` — global facts are almost never the linked original, so theirs were the credits always dropped. PROJECT facts topped out at exactly **2**, the value promotion writes from its two supporting episodes, because the credit that would carry one past 2 never survived. Consequently **no fact among 6,613 ever cleared the `success_count >= 3` contribution bar**. `neo contribute` was mechanically unreachable, not merely starved — and restoring the suggestion→fact link, previously recorded as the cause, would not by itself have lifted it.
+
+  Reproduced live before fixing: a drill run credited one fact with `before={'success_count': 0} after={'success_count': 1}` in the ledger while the fact on disk still read 0, immediately after and later.
+
+  **Why no test caught it, and why the obvious test still doesn't.** Two neighbouring paths save for their own reasons and persist the credit as a side effect: the no-link ACCEPTED fallback calls `add_fact`, which saves, and the janitor chain under `if outcomes:` ends in `if changed: self.save()`. So the credit survived whenever either happened to fire, which made the defect load-dependent. The real modern path reaches neither — an ACCEPTED outcome carrying an episode candidate takes the candidate branch and `continue`s past the fallback, and a *first* acceptance promotes nothing. `test_cited_fact_credit_survives_the_process` is written against that path specifically: it sets `candidate_id`, pins the janitor to "changed nothing", stubs promotion to `None`, and **reloads from disk**. All four are load-bearing; two earlier cuts of that test passed against the broken code, once via `add_fact` and once via the janitor. Every other test in `TestRetrievedFactAttribution` asserts the mutated in-memory object and never reloads — which is how a suite thorough about attribution stayed silent about persistence.
+
+- **Two Codex skills claimed memory they had disabled.** Five of the six pass `--no-memory`, documented as *"Disable persistent fact retrieval AND learning for this request"* — a deliberate privacy control, since retrieved facts become provider context. The flag stays. The prose beside it was wrong in two places: `neo/SKILL.md` said the skill "may retrieve established memory", contradicting its own privacy note eleven lines earlier; and `neo-architect/SKILL.md` step 6 instructed the agent to surface "architectural facts Neo retrieved from memory… higher-trust than fresh reasoning", which under `--no-memory` is unexecutable and invites presenting reasoning-only output as informed by past projects. The other four skills documented the flag correctly and are untouched.
+
+## [0.49.0] - 2026-08-30
+
+A diagnostic that invented a presence, and an extractor that never got to answer. `learning-stats` exists to tell an operator whether the accept-driven loop is running; on a live install it reported a healthy loop that was not running at all. And the transcript miner had been asking reasoning models for lessons in a budget they spend before they speak.
+
+### Fixed
+
+- **`neo memory learning-stats` counted hand-run drill state as learning.** It reported `21 promoted -> interactive loop is ACTIVE` on an install whose real promotion count was **zero**. The reporter walks every directory under `~/.neo/episodes` and counts what it finds, and 50 of the 253 episodes there belonged to `testproj1234` — drill state, with subjects like `pattern: x [a.py]` and `fp:deadbeef`, in files named `crashed.json` rather than the 32-hex ids the engine mints. Its 19 `durable` candidates *were* the promotion figure.
+
+  Cross-checking the ledger against the store is what exposed it, and it is the check worth keeping: of the 7 `promoted_fact_id`s recorded, **6 named facts that exist in no fact file**, and the 7th was an already-retracted `drill_artifact_incorrect_lesson`. Removing the drill directory alone moved accepted outcomes 44 → 2, promotions 21 → 1, rollbacks 4 → 0, demotions 4 → 0.
+
+  A project id with no `facts_project_<id>.json` cannot have received a promotion, because promotion **writes** that file. The ledger walk now counts a project only when its store exists. Two things that had to be right:
+
+  `unscoped` is exempt — it is the id `LearningEpisodeStore` assigns when a run resolves no project, so its episodes are real runs (engine errors land there), and a bare fact-store test would have thrown them away. And the exclusion is **reported, never silent**, including in the empty-ledger branch: a ledger holding nothing but drill state must not read "neo has never run" when the truth is "what is here is junk". This project's rule about never blaming a cap for an absence it did not cause, applied to a diagnostic that was inventing a presence instead.
+
+  **Why no test caught it:** three existing tests build a ledger for a project with no fact store, so the suite had encoded the broken state as the expected one. That state does not occur — `FactStore.initialize` creates the file for a brand-new project before any episode can be recorded (verified directly), and on the live ledger all 11 real project dirs had a store while only the drill dir did not. The tests were modelling drill state; they now create the store the way production does.
+
+- **The transcript lesson extractor asked for 1024 max tokens, and reasoning models spent it before answering.** `TranscriptIngester._lm_json` capped output at a number that predates reasoning models, which consume the budget on reasoning tokens before emitting a visible character. The observer log shows the result: `incomplete_details.reason = max_output_tokens`, **850 of 1024 spent reasoning**, the lessons array cut mid-object, and the whole extraction discarded. Raised to 4096, the adapters' own default — this call site was the outlier, not the target.
+
+  The failure was already loud (`transcript: LM call failed` at WARNING), which is why it is a budget bug rather than a silent one; it just named the symptom and not the cause.
+
+## [0.48.0] - 2026-08-25
+
+Two credentials problems and two silent ones. Neo could not reach a model on a machine where CAR already held the key — the two tools use disjoint names for the same entry in the same keychain, so both truthfully reported "no key" while it sat between them. The edit-recording hook promised it returns 0 on every path *by construction* and had two ways out that an `except Exception` cannot catch. And `learning-stats` named a cause it had never checked.
+
+### Fixed
+
+- **A provider key stored by CAR was invisible to Neo.** Neo looks for `neo-reasoner:openai:api_key` (account `openai`); CAR stores at service `car`, key `OPENAI_API_KEY`. Same machine, same keychain, same credential, two namespaces — and each layer accurate about the name it checked and silent about the neighbouring one. `NeoConfig.load()` now falls back to CAR's store via the `car` CLI when an environment variable and Neo's own keychain have both missed.
+
+  Delegating to the CLI rather than reading the keychain directly keeps CAR's naming inside CAR, and it is the only portable route: Neo's `keychain_available()` is literally `platform.system() == "Darwin"`, while CAR's store spans Keychain, Credential Manager and Secret Service. **So this also gives Neo credential storage on Windows and Linux, which it has never had.** Last in the chain and test-pinned there, because it forks a subprocess and must never run when something cheaper has already answered. Both names are tried, since they diverge — CAR calls the Gemini key `GEMINI_API_KEY` while Neo calls the provider `google`. Quiet on every absence; opt out with `NEO_CAR_SECRETS=0`. ([#228](https://github.com/Parslee-ai/neo/pull/228))
+
+- **`run_hook` could exit non-zero two ways, against a documented guarantee that it cannot.** `except Exception` does not catch `KeyboardInterrupt`, `SystemExit` or `GeneratorExit`; and the failure-*reporting* path could itself raise — `_debug` writes to stderr from inside the handler that exists to stop the hook failing, so a closed stderr defeated the guarantee by way of the code announcing it, as could a custom `__str__`. Both closed. Only SIGKILL and a library `os._exit` remain outside reach, and the docstring now says so rather than repeating a claim it cannot keep.
+
+  A `PostToolUse` hook exiting non-zero reports an error against a tool call that **already succeeded**, which is the whole reason for the contract. Swallowing `KeyboardInterrupt` is normally wrong and is right here: the process lives ~60ms, does one append, and is spawned by the host rather than a terminal.
+
+  **Why no test caught it:** `TestNeverFails` is exhaustive about *inputs* — malformed stdin, unknown actions, an unwritable ledger, opt-out — and blind to exception *class*. Every case it raises is an `Exception` subclass, so both handlers pass all of them identically and no assertion could distinguish them. A suite can be complete along the axis it was written for and silent on the one that matters. Found by running `neo` against its own module. ([#227](https://github.com/Parslee-ai/neo/pull/227))
+
+### Added
+
+- **`neo memory learning-stats` now names the promotion gate that actually binds.** It reported `supported_once (1 accept, needs 2)` — a cause it had never checked. A candidate sits there either because it genuinely has one acceptance, or because it has two or more that landed at the same `repository_revision` and the distinct-revision gate held it. Different problems, different remedies, and the label asserted the first. That is this project's own rule about never blaming a cap for an absence it did not cause, broken in the one line an operator reads to decide what is wrong.
+
+  ```
+  promotion gates (why unpromoted patterns are unpromoted):
+    promoted (durable)                             1
+    awaiting a 2nd acceptance                      1
+    blocked: acceptances share a revision          1
+  ```
+
+  It reuses `_supporting_episodes_span_distinct_revisions` rather than restating "two distinct revisions" in its own words — a second copy of a threshold agrees with the first only by coincidence, and the failure mode here is a diagnostic confidently naming the wrong blocker. It also decides an open question: that gate's docstring records the shared-revision case as a known limitation and names the acceptance-carrying sha as the fix, but it runs *downstream* of acceptance, and the measured ledger had zero accepted outcomes — so it may never have fired. `blocked_by_revision_span` turns that into a measurement instead of a guess, before anyone spends an episode schema bump on it. ([#226](https://github.com/Parslee-ai/neo/pull/226))
+
+### Documentation
+
+- **`NEO_OBSERVER_AUTOSTART=0` belongs in `~/.zshenv`, not `~/.zshrc`.** zsh sources `.zshrc` for interactive shells only, and the gate is a plain `os.getenv` read by whichever process runs `neo` — an editor plugin, a CI step, a git hook, an agent tool call, none of them interactive. Placed in `.zshrc` the export is inert for every caller that matters while `echo $NEO_OBSERVER_AUTOSTART` prints `0` in your terminal. Measured in all four shell modes. The docs also say to verify **without** `-i`, because `zsh -lic` forces the single mode where `.zshrc` is read and so passes over a setting that is doing nothing. ([#225](https://github.com/Parslee-ai/neo/pull/225))
+
+## [0.47.1] - 2026-08-23
+
+Every Anthropic call in 0.47.0 fails before it reaches the network. `anthropic` 1.0.0 removed `temperature` from `Messages.create()`, and `pyproject.toml` declared `anthropic>=0.21.0` with no upper bound, so the major bump arrived on its own. 0.47.0 never reached PyPI — the release gate caught this and stopped the publish — but its GitHub release artifacts carry the defect; use 0.47.1.
+
+### Fixed
+
+- **A provider can retire a sampling parameter in two ways, and only one of them is an HTTP error.** `adapters.py` already recovered from the 400 — catch it, drop the param, retry, remember the model. It had no handling for the SDK dropping the keyword from the *signature*, which raises a client-side `TypeError` before any request exists to carry a status code:
+
+  ```
+  ProcessingError: Messages.create() got an unexpected keyword argument 'temperature'
+  ```
+
+  `_sdk_rejects_keyword` closes it, in the Anthropic adapter **and** in the shared OpenAI-family path — the hole was identical, and fixing only the copy that bit would leave a known defect in half of a duplicated rule. Matching is deliberately narrow (CPython's `unexpected keyword argument` phrase *and* the quoted parameter name) because this sits on the inference path, where swallowing an unrelated `TypeError` would silently degrade every call. Verified against the real `anthropic` 1.0.0 rather than a mock.
+
+  `anthropic` is now capped at `<2.0`. The recovery handles a parameter we know to drop; the cap is what stops the next major retiring one we do not. ([#223](https://github.com/Parslee-ai/neo/pull/223))
+
+  **The durable lesson is about the gate, not the parameter.** This was found by `language-roundtrip` — one real LLM round trip per language — and by nothing else in 2,769 tests, because every adapter test mocks the SDK and **a mock accepts any keyword**. A mocked boundary cannot detect the boundary changing shape. It also vindicates the gate's design decision in [`docs/release-gate.md`](docs/release-gate.md): the job **fails rather than skips** when `ANTHROPIC_API_KEY` is absent, because an absent credential is a red gate, not a green one. Had it skipped, 0.47.0 would have shipped to PyPI unable to make a single inference call.
+
+## [0.47.0] - 2026-08-22
+
+Two halves of the same loop. [#219](https://github.com/Parslee-ai/neo/pull/219) restored the link that lets a verified acceptance reinforce the fact it re-applied; this release adds the input that never existed — a `PostToolUse` hook that records which files Claude Code actually edited, so acceptance can be **observed** rather than inferred from a repo-wide git diff on some later invocation. And the Claude Code plugin, which had never loaded a single component, now loads.
+
+### Fixed
+
+- **The Claude Code plugin loaded nothing — no agent, no commands, no hooks.** Components were nested inside `.claude-plugin/`, and Claude Code discovers them at the **plugin root**, reading only manifests out of that directory. A fresh install reported `Skills (0) / Agents (0)`. `claude plugin validate` passes a plugin that loads nothing, so the failure was invisible to the obvious check; `claude plugin details` is the one that proves a component loaded. Now `Skills (6) / Agents (1) / Hooks (1)`. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+- **The parity suite had stopped guarding the surface it exists to guard.** `tests/test_host_adapter_parity.py` still resolved the pre-move paths, so 18 of 54 tests failed — including every assertion about the agent contract. A parity suite that cannot open the file it checks is not a guard. `CLAUDE_PLUGIN` meant the manifest directory and the component root at once, which are now different places, and is split accordingly.
+
+  Asserting the components exist at the root is **not** sufficient, and that is the half worth keeping: it proves only that they are *also* there. A stray copy left behind in `.claude-plugin/` keeps every other assertion green while Claude Code loads neither. `test_the_manifest_directory_holds_no_components` fails on any non-manifest entry, mutation-verified by re-nesting a copy. CAR shipped the identical nesting mistake in its own repo — this is a mistake the organisation has now made twice, which is why it is pinned rather than left to review. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+- **`suggestion_fact_ids` had been unconditionally empty since 2026-07-18**, so no fact's `success_count` moved in 90 days and `neo memory replay-feedback` — the documented repair command for a broken memory loop — was a no-op reporting success. Across 6,613 valid facts, zero had ever reached `success_count >= 3`, so `neo contribute` had never once been reachable. Also bounds the protection boost by evidence (it compounded per *process start*, not per verified success: 57 facts sat at exactly 1.00), keeps `durable` a terminal candidate status, and reports only the contribution gate that actually binds. ([#219](https://github.com/Parslee-ai/neo/pull/219))
+
+### Added
+
+- **`neo hook record` — the edit-recording hook.** A `PostToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit` appends one line per edit to `~/.neo/sessions/host_events.jsonl`: the tool, the path, the host's working directory, and HEAD **at the moment of the edit**. Declared by `hooks/hooks.json` at the plugin root; `claude plugin details` reports it as harness-only, with **no model context cost**. Opt out with `NEO_HOOKS=0`.
+
+  Three properties, two of them mutation-pinned. **It never fails** — `run_hook` returns 0 on every path *by construction*, not by catching anticipated errors, because a hook exiting non-zero reports an error against a tool call that already succeeded. **It stays cheap** — it fires on every edit, and while `import neo.cli` costs 0.04s, `neo --version` costs 0.36s, the whole difference being `FactStore` construction; `cli.main` therefore dispatches to the hook before argument parsing, the update check and the observer autostart, and `test_hook_stays_off_the_slow_path` fails if anything moves above it. Measured end to end at **0.06s**. **It records paths, never contents** — `tool_input` carries the text being written.
+
+  **Nothing reads the ledger yet.** `collect_outcomes` still infers acceptance from git. The split is deliberate rather than partial delivery: a ledger is only worth reading once it has history, and history cannot be recorded retroactively, so the recorder must land first regardless of when the consumer does. The consumer has to be written against a **dirty tree** — the last fix in `outcomes.py` passed every test because they all ran on a pristine one, the single state neo is never invoked in, and lost acceptances anyway. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+- **A marketplace manifest in this repository**, so `/plugin marketplace add Parslee-ai/neo` installs the plugin directly, alongside the existing `Parslee-ai/claude-code-plugins` entry. Both resolve to the same plugin.
+
+### Changed
+
+- **Both host surfaces now say when *not* to invoke Neo.** All twelve descriptions — six Claude commands, six Codex skills — restated their own titles: *"Get architectural guidance from Neo on design decisions"* names what the command is and gives a model no basis for choosing it. `claude plugin details` inventories every one as model-invocable, so the description is the whole interface. Each now carries the conditions that warrant Neo **and** the conditions that do not: profile before `neo-optimize`, skip `neo-debug` for a straightforward traceback, `neo-pattern` writes durable memory so a wrong lesson outlives the session.
+
+  The negative half is what keeps cost bounded, since every invocation is 5–30s and an LLM call, and it is the clause most likely to be dropped when someone shortens a line — so `test_both_surfaces_describe_when_to_invoke_and_when_not` pins it across both surfaces, mutation-verified. A companion test parses the frontmatter as YAML rather than pattern-matching it, because that is how the host reads it: a `": "` inside an unquoted plain scalar is a parse error, not a long description, and a `SKILL.md` that fails to parse is indistinguishable from one that is absent. Measured cost of the added text: always-on 246 → 725 tokens. ([#221](https://github.com/Parslee-ai/neo/pull/221))
+
+### Documentation
+
+- [`docs/solutions/host-hooks-for-outcome-detection.md`](docs/solutions/host-hooks-for-outcome-detection.md) — the measured case for observing acceptance, the payload fields confirmed against a shipped implementation rather than documentation, and the constraints any consumer must respect. It also **corrects an overclaim in its own first draft**: capturing HEAD at edit time does *not* close the shared-revision defect, because two applications of one lesson in a single sitting share a HEAD if no commit intervened — which is exactly the measured 40% case. Better evidence, not a fix.
+
+- **The plugin now has a CLI version floor, and it is documented.** The plugin updates from this repository while the CLI comes from PyPI, so the two drift. On a `neo` predating `hook record`, argparse rejects the argv and exits **2** — the one exit code Claude Code treats as a hook failure. The same defect was filed against CAR as [Parslee-ai/car#993](https://github.com/Parslee-ai/car/issues/993) and then reproduced here while writing that issue up. `hooks.json` deliberately does **not** wrap the command in `|| true`: semantically lossless, since the hook never uses its exit code, but it reintroduces the shell dependency (`2>/dev/null` is invalid in `cmd.exe`) that choosing a subcommand exists to avoid.
+
+- README's plugin section described the layout this release fixed, and CLAUDE.md's parity entry said the same. Both corrected, and CLAUDE.md gains the component-layout rule and the hook subsystem.
+
 ## [0.46.0] - 2026-08-13
 
 The unified store release, and the close of the ten-goal climb that built it. Neo used to retrieve down two independent lanes that walked the repository separately, disagreed about what was eligible, and answered to two different front doors — so a fix applied to one was silently absent from the other. There is now **one walker, one persistent content index, and one retrieval front door**. The largest flagship repository moved from **MRR 0.051 to 0.738** and recall@10 from **0.097 to 0.883** across the climb; the eligibility walk itself went from 4.6–6.9 s to **0.12 s** warm, and file selection is now 0.37 s of a warm call.

@@ -964,6 +964,61 @@ def _handle_citation_stats(args) -> None:
                   f"used={stats['used']}  ({rate:.1f}% survival)")
 
 
+def _promotion_gates(
+    per_project_groups: "list[tuple[dict[str, dict[str, str]], set[str]]]",
+) -> dict[str, int]:
+    """Which promotion gate is actually holding each correlated pattern back.
+
+    `candidate_status` alone cannot answer this. A candidate reads
+    `supported_once` both when it genuinely has one acceptance and when it has
+    two or more that all landed at the same `repository_revision` — and those
+    are different problems with different remedies. The old label asserted the
+    first ("1 accept, needs 2"), which is this repo's own rule about never
+    blaming a cap for an absence it did not cause, broken in the one line an
+    operator reads to decide what is wrong.
+
+    It also answers a question the codebase has been unable to settle: whether
+    `_supporting_episodes_span_distinct_revisions` has ever actually rejected
+    anything. Its docstring records the distinct-revision requirement as a known
+    limitation and names the acceptance-carrying sha as the fix — but that gate
+    sits DOWNSTREAM of acceptance, and the measured ledger had zero accepted
+    outcomes, so it may never have fired. `blocked_by_revision_span` is the
+    number that decides whether fixing it is worth a schema bump.
+
+    Grouping mirrors `_promote_repeatedly_supported_candidate` and reuses its
+    own predicate rather than restating the threshold, so the report cannot
+    drift from the gate it describes.
+    """
+    from neo.memory.store import FactStore
+
+    gates = {
+        "correlated_signatures": 0,
+        "promoted": 0,
+        "awaiting_second_acceptance": 0,
+        "blocked_by_revision_span": 0,
+        "eligible_not_promoted": 0,
+    }
+    for groups, durable_signatures in per_project_groups:
+        for signature, supporting in groups.items():
+            gates["correlated_signatures"] += 1
+            # Checked FIRST: a promoted signature has by definition cleared
+            # every gate below, and counting it as "eligible but not promoted"
+            # would report a success as an unexplained stall.
+            if signature in durable_signatures:
+                gates["promoted"] += 1
+                continue
+            revisions = list(supporting.values())
+            if len(supporting) < 2:
+                gates["awaiting_second_acceptance"] += 1
+            elif not FactStore._supporting_episodes_span_distinct_revisions(revisions):
+                gates["blocked_by_revision_span"] += 1
+            else:
+                # Cleared both gates and still not durable — something further
+                # down declined it: the rollback guard, or a kind/scope check.
+                gates["eligible_not_promoted"] += 1
+    return gates
+
+
 def _handle_learning_stats(args) -> None:
     """Learning pulse for the INTERACTIVE / attributed path: is neo minting and
     reinforcing facts from real task outcomes? Reads the episode ledger
@@ -978,6 +1033,10 @@ def _handle_learning_stats(args) -> None:
     from collections import Counter
 
     from neo.memory.episodes import LearningEpisodeStore
+    from neo.memory.models import FactKind
+    # Imported inside the function so the test suite's home-isolation fixture,
+    # which re-points `store.FACTS_DIR` after import, is honoured.
+    from neo.memory.store import FACTS_DIR, FactStore
 
     episodes_root = Path.home() / ".neo" / "episodes"
     cutoff = None
@@ -993,11 +1052,37 @@ def _handle_learning_stats(args) -> None:
     outcomes: Counter = Counter()
     candidates: Counter = Counter()
     mutations: Counter = Counter()
+    # signature -> {episode_id: repository_revision}, per project, mirroring
+    # `_promote_repeatedly_supported_candidate` exactly. See `_promotion_gates`.
+    gate_groups: list[tuple[dict[str, dict[str, str]], set[str]]] = []
+    # Episode dirs with no fact store behind them are counted separately, never
+    # silently: a promotion WRITES to `facts_project_<id>.json`, so a project id
+    # with no such file cannot have received one, and its candidates cannot
+    # represent real learning. Hand-run drills leave exactly this shape — a live
+    # ledger held 50 `testproj1234` episodes whose 19 `durable` candidates were
+    # the whole of a reported "21 promoted, loop ACTIVE" against zero real
+    # promotions. `unscoped` is NOT such a dir: it is the sentinel
+    # `LearningEpisodeStore` assigns when a run resolves no project id, so its
+    # episodes are real runs (engine errors land there) and stay counted.
+    orphan_projects: list[tuple[str, int]] = []
     if episodes_root.exists():
         for project_dir in sorted(p for p in episodes_root.iterdir() if p.is_dir()):
+            if project_dir.name != "unscoped" and not (
+                FACTS_DIR / f"facts_project_{project_dir.name}.json"
+            ).exists():
+                orphan = LearningEpisodeStore(project_dir.name, base_dir=episodes_root)
+                orphan_episodes = [
+                    e for e in orphan.list()
+                    if cutoff is None or float(e.started_at or 0) >= cutoff
+                ]
+                if orphan_episodes:
+                    orphan_projects.append((project_dir.name, len(orphan_episodes)))
+                continue
             store = LearningEpisodeStore(project_dir.name, base_dir=episodes_root)
             listed = store.list()
             counted_here = 0
+            groups: dict[str, dict[str, str]] = {}
+            durable_signatures: set[str] = set()
             for episode in listed:
                 if cutoff is not None and float(episode.started_at or 0) < cutoff:
                     continue
@@ -1005,11 +1090,25 @@ def _handle_learning_stats(args) -> None:
                 outcomes[episode.final_outcome or "pending"] += 1
                 for candidate in episode.memory_candidates:
                     candidates[candidate.status or "observed_unverified"] += 1
+                    if candidate.kind != FactKind.PATTERN.value:
+                        continue
+                    if candidate.status not in {"supported_once", "durable"}:
+                        continue
+                    signature = FactStore._episode_signature(candidate.subject)
+                    groups.setdefault(signature, {}).setdefault(
+                        episode.episode_id, episode.repository_revision
+                    )
+                    if candidate.status == "durable":
+                        durable_signatures.add(signature)
                 for mutation in episode.memory_mutations:
                     mutations[mutation.operation] += 1
             if counted_here:
                 projects += 1
                 episodes += counted_here
+            if groups:
+                gate_groups.append((groups, durable_signatures))
+
+    gates = _promotion_gates(gate_groups)
 
     promotions_project = mutations.get("promote_repeated_episode_candidate", 0)
     promotions_global = mutations.get("promote_cross_project_candidate", 0)
@@ -1042,6 +1141,11 @@ def _handle_learning_stats(args) -> None:
             "reinforcements": reinforcements,
             "cited_fact_credits": mutations.get("credit_used_retrieved_fact", 0),
             "interactive_loop_active": active,
+            "promotion_gates": gates,
+            "excluded_projects_without_fact_store": [
+                {"project_id": name, "episodes": count}
+                for name, count in orphan_projects
+            ],
         }, indent=2))
         return
 
@@ -1049,9 +1153,23 @@ def _handle_learning_stats(args) -> None:
     scope_note = ("interactive/attributed path — background synthesis "
                   "(observer + transcript mining) mints facts without episodes "
                   "and is NOT counted here")
+    orphan_note = ""
+    if orphan_projects:
+        detail = ", ".join(f"{name} ({count})" for name, count in orphan_projects)
+        orphan_note = (
+            f"  note: excluded {sum(c for _, c in orphan_projects)} episode(s) "
+            f"from {len(orphan_projects)} project id(s) with no fact store — "
+            f"{detail}.\n        Nothing can be promoted into a store that does "
+            "not exist, so these\n        cannot be real learning; they are "
+            "typically hand-run drill state."
+        )
     if episodes == 0:
         print(f"[Neo] learning pulse ({scope_note}{window_label}): "
               "no learning episodes recorded yet")
+        # Print the exclusion even here, or a ledger holding nothing BUT drill
+        # state reads as "neo has never run" rather than "what is here is junk".
+        if orphan_note:
+            print(orphan_note)
         return
     print(f"[Neo] learning pulse ({scope_note}{window_label}):")
     print(f"  {episodes} episode(s) across {projects} project(s)")
@@ -1062,7 +1180,11 @@ def _handle_learning_stats(args) -> None:
         print(f"  memory candidates ({sum(candidates.values())}):")
         labels = {
             "durable": "durable (promoted to a fact)",
-            "supported_once": "supported_once (1 accept, needs 2)",
+            # NOT "1 accept, needs 2" — that names a cause this counter has
+            # not checked. A candidate sits here either for want of a second
+            # acceptance or because it HAS two that share a revision. The
+            # promotion-gates block below is what separates them.
+            "supported_once": "supported_once (not yet promoted)",
             "contradicted": "contradicted (rolled back)",
             "rejected_by_verification": "rejected_by_verification (det. failure)",
             "unverified": "unverified",
@@ -1076,6 +1198,23 @@ def _handle_learning_stats(args) -> None:
     print(f"    {'rollbacks':<42} {rollbacks:>5}")
     print(f"    {'demotions':<42} {demotions:>5}")
     print(f"    {'reinforcements (incl. cited-fact credit)':<42} {reinforcements:>5}")
+    if gates["correlated_signatures"]:
+        print("  promotion gates (why unpromoted patterns are unpromoted):")
+        print(f"    {'promoted (durable)':<42} {gates['promoted']:>5}")
+        print(f"    {'awaiting a 2nd acceptance':<42} "
+              f"{gates['awaiting_second_acceptance']:>5}")
+        print(f"    {'blocked: acceptances share a revision':<42} "
+              f"{gates['blocked_by_revision_span']:>5}")
+        if gates["eligible_not_promoted"]:
+            print(f"    {'eligible but not promoted':<42} "
+                  f"{gates['eligible_not_promoted']:>5}"
+                  "   (rollback guard, or kind/scope)")
+        if gates["blocked_by_revision_span"]:
+            print("    note: those cleared the acceptance bar and were held by "
+                  "the\n          distinct-revision requirement, not by needing "
+                  "another accept.")
+    if orphan_note:
+        print(orphan_note)
     buckets = _suggestion_verifiability()
     total_sugg = sum(buckets.values())
     verifiable = buckets["verifiable"]

@@ -1,5 +1,10 @@
 ---
-description: "Get optimization suggestions from Neo"
+description: >-
+  Get Neo's optimization analysis for a measured performance problem. Use
+  when you have a profile, a benchmark, or a known slow path and want the fix
+  ranked against how the code is structured. Skip when nothing has been
+  measured yet — profile first, because Neo cannot tell you where the time
+  actually goes.
 ---
 
 Get optimization suggestions from Neo.

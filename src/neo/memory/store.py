@@ -474,6 +474,28 @@ class FactStore:
         if self._emit_metrics:
             metrics_record(event, **fields)
 
+    def begin_request(self) -> None:
+        """Reset per-request memoization. Called by the engine at request start.
+
+        The duplication this cache exists for is WITHIN one request: two call
+        sites in a single process() build the same context. A store-lifetime
+        cache is therefore the wrong scope — it outlives every request and
+        every reload, which is what made a stale hit possible at all. Resetting
+        here bounds any staleness to a single request no matter what the
+        fingerprint misses.
+        """
+        self._invalidate_context_cache()
+
+    def _invalidate_context_cache(self) -> None:
+        """Drop the memoized build_context result.
+
+        Called from every mutator whose effect the cache fingerprint cannot
+        see. Named and explicit precisely so "what invalidates this?" is
+        answerable by grep, which is the property a two-integer content
+        fingerprint does not have.
+        """
+        self._context_cache = None
+
     def add_fact(
         self,
         subject: str,
@@ -726,7 +748,13 @@ class FactStore:
                 return []
 
             now = time.time()
-            sims = batched_cosine([f.embedding for f in valid_facts], query_embedding)
+            # default=0.0 (this fact is uncomparable while others are not) is
+            # a different absence from no_query_default=0.5 (similarity is
+            # uninformative for everyone, so let confidence decide).
+            sims = batched_cosine(
+                [f.embedding for f in valid_facts], query_embedding,
+                default=0.0, no_query_default=0.5,
+            )
 
             # Hybrid dense + sparse (paper 2603.19935 Memori §3.3). BM25
             # over the same corpus catches keyword matches the dense
@@ -854,6 +882,38 @@ class FactStore:
 
         Delegates to ContextAssembler to organize facts into layers.
         """
+        # A single neo request builds this context more than once —
+        # _decide_reasoning_mode -> _compute_memory_signal and
+        # _process_combined -> _format_combined_prompt both call it, which is
+        # why the constraint-overflow warning prints twice per run. Each call
+        # re-embeds the query and re-ranks the whole corpus (19,688 facts on a
+        # real store), so the repeat is pure waste.
+        #
+        # Keyed on len + valid-count + query + k, and EXPLICITLY invalidated by
+        # the mutators that a count cannot see. The fingerprint alone is not a
+        # sufficient invalidator and must not be treated as one: it is two
+        # integers over a corpus of ~20,000 facts, and confidence adjustments
+        # and re-embedding both change WHICH facts are injected while leaving
+        # both integers identical. `load()` was the proven hole — it replaces
+        # the whole list from disk, routinely at the same counts.
+        #
+        # `environment` is deliberately NOT part of the key. It was keyed on
+        # `id(environment)`, which is pointer identity: CPython reuses the
+        # address of a freed empty dict, so build_context(q, environment={})
+        # followed by build_context(q, environment={"git": ...}) could be a
+        # false hit that silently dropped the git environment. Callers within a
+        # request pass the same environment; the invalidation below covers the
+        # rest.
+        fingerprint = (
+            len(self._facts),
+            sum(1 for f in self._facts if f.is_valid),
+            query,
+            k,
+        )
+        cached = getattr(self, "_context_cache", None)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+
         query_embedding = self._embed_text(query)
         result = self._assembler.assemble(
             facts=self._facts,
@@ -867,6 +927,11 @@ class FactStore:
         now = time.time()
         for fact in result.valid_facts:
             self._mark_retrieved(fact, now)
+
+        # Cached AFTER the access stamps so a cache hit does not re-stamp:
+        # counting one request as several retrievals would inflate the recency
+        # and access-count signals that rank_score reads.
+        self._context_cache = (fingerprint, result)
 
         self._record_metric(
             "retrieve",
@@ -2429,9 +2494,33 @@ class FactStore:
                 source_candidate_id=outcome.candidate_id or None,
             )
 
-        if linked_count:
+        # `touched_fact_ids` is load-bearing here, not decoration.
+        # `_apply_used_fact_feedback` credits CITED retrieved facts — a
+        # different population from the linked-original facts that move
+        # `linked_count` — and it bumps `success_count` on the live Fact
+        # objects without touching that counter. Gating the only save on
+        # `linked_count` alone therefore discarded every cited-fact credit
+        # made by a run that had no linked original fact, which is the normal
+        # case: `suggestion_fact_ids` is empty unless the candidate already
+        # resolves to a durable fact. The episode ledger still recorded the
+        # mutation, so `learning-stats` reported reinforcements that the fact
+        # store never received — the reporter and the data disagreed, and the
+        # reporter was the honest one.
+        #
+        # Measured on a live install: of 88 valid GLOBAL facts, ZERO had ever
+        # reached `success_count > 0` while 64 carried a non-zero
+        # `access_count` — global facts are almost never the linked original,
+        # so their credits were the ones always dropped. PROJECT facts topped
+        # out at exactly 2, the value promotion writes, because the credit
+        # that would carry one past 2 never survived the process. That is why
+        # no fact in 6,613 ever reached the `success_count >= 3` contribution
+        # bar and `neo contribute` was unreachable.
+        if linked_count or touched_fact_ids:
             self.save()
-            logger.info(f"Boosted/demoted {linked_count} original fact(s) from outcomes")
+            logger.info(
+                "Boosted/demoted %d original fact(s) and credited %d cited "
+                "fact(s) from outcomes", linked_count, len(touched_fact_ids)
+            )
         if outcomes:
             modified = sum(1 for o in outcomes if o.outcome_type == OutcomeType.MODIFIED)
             regressions = sum(1 for o in outcomes if o.outcome_type == OutcomeType.REGRESSION)
@@ -2920,6 +3009,7 @@ class FactStore:
                 removed_ids.append(f.id)
         purged = len(removed_ids)
         if purged:
+            self._invalidate_context_cache()
             self._facts = kept
             # Record physical deletions so the merge-on-save can't resurrect
             # them from another process's stale copy on disk. Recorded even when
@@ -3107,8 +3197,9 @@ class FactStore:
             logger.info(f"Demote/protect cycle affected {affected} fact(s)")
         return affected
 
-    def load(self) -> None:
+    def load(self) -> None:  # noqa: D401 - see _invalidate_context_cache
         """Load facts from all scoped files and merge."""
+        self._invalidate_context_cache()
         self._facts = []
         # Fresh load = fresh concurrency bookkeeping: forget prior deletions
         # and re-baseline the per-file mtimes we compare against on save.

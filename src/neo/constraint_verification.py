@@ -352,5 +352,12 @@ If no clear constraints, return "none"."""
 
             return constraints
         except Exception:
-            return []
+            # Deliberately re-raised, not swallowed. This used to return [],
+            # and "extraction produced no constraints" is indistinguishable
+            # from "the prompt declared none" — which means the caller reports
+            # the code as constraint-clean on a check that never ran. The one
+            # caller (NeoEngine._extract_prompt_constraints) now catches this,
+            # records the failure, and emits a StaticCheckResult with status
+            # "unavailable" so the run cannot vouch for what it did not check.
+            raise
 

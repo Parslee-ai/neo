@@ -1339,7 +1339,14 @@ class TranscriptIngester:
         try:
             out = self._lm.generate(
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
+                # A reasoning model spends this budget on reasoning tokens
+                # BEFORE it emits a visible character, so 1024 — which predates
+                # them — left no room for the answer: a live observer log shows
+                # `incomplete_details.reason = max_output_tokens` with 850 of
+                # 1024 spent reasoning and the lessons array cut mid-object, so
+                # the whole extraction was discarded. 4096 is the adapters' own
+                # default; this call site was the outlier, not the target.
+                max_tokens=4096,
                 temperature=0.2,
             )
         except Exception as e:

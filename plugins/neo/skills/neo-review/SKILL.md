@@ -1,6 +1,6 @@
 ---
 name: neo-review
-description: Get Neo's code review with semantic pattern matching. Focuses on security vulnerabilities, edge cases, error handling, and performance issues across the target file or module.
+description: Get Neo's code review with semantic pattern matching. Focuses on security vulnerabilities, edge cases, error handling, and performance issues across the target file or module. Skip for formatting, lint-catchable issues, and single-line changes.
 ---
 
 # Neo Code Review

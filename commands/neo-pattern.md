@@ -1,5 +1,9 @@
 ---
-description: "Extract reusable patterns with Neo"
+description: >-
+  Extract a reusable pattern from a solution that has proven itself, and
+  record it in Neo's durable memory. Use deliberately, when a lesson should
+  inform later runs. Skip for one-off code and speculative abstractions —
+  this writes persistent memory, so a wrong lesson outlives the session.
 ---
 
 Extract reusable patterns with Neo.
