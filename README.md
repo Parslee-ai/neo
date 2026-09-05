@@ -353,7 +353,7 @@ Once installed:
 
 - **Slash commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
 - **Specialized agent**: invoke with `Use the Neo agent to ...` for delegated semantic reasoning
-- **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Codex plugin
+- **Shared memory**: same `~/.neo/facts/` store used by the CLI, Codex, and Cursor plugins
 
 Examples:
 
@@ -392,7 +392,7 @@ plugin**, which looks like success and provides no skills. The subcommand is
 Once installed:
 
 - **Skills**: `$neo`, `$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`
-- **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Claude Code plugin
+- **Shared memory**: same `~/.neo/facts/` store used by the CLI, Claude Code, and Cursor plugins
 - **Explicit context boundary**: Codex selects the relevant excerpts and every
   skill invokes `neo --no-scan`, so Neo cannot silently add files or project
   instruction documents from the current directory
@@ -426,15 +426,46 @@ both retrieved-fact and persistence effects before provider approval.
 
 Plugin sources live under [`plugins/neo/`](plugins/neo/) — see the manifest and skill definitions.
 
-Both plugins consume the **same host-neutral contract**: the skills invoke
+
+## Cursor Plugin
+
+Neo ships as a **Cursor plugin** with the same six skills plus a dedicated Neo
+agent, packaged under [`plugins/cursor-neo/`](plugins/cursor-neo/) and listed in
+the in-repo marketplace [`.cursor-plugin/marketplace.json`](.cursor-plugin/marketplace.json).
+
+**Local install (recommended for development):**
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+ln -s "$(pwd)/plugins/cursor-neo" ~/.cursor/plugins/local/neo
+# Then: Developer: Reload Window
+```
+
+**Team / repo marketplace:** import this repository as a Cursor team marketplace
+(it reads `.cursor-plugin/marketplace.json`, named `neo-cursor`), then install
+the `neo` plugin. Official [Cursor Marketplace](https://cursor.com/marketplace)
+listing is optional and separate.
+
+Once installed:
+
+- **Skills** (mid-loop, `/` in Agent chat): `/neo`, `/neo-review`, `/neo-optimize`,
+  `/neo-architect`, `/neo-debug`, `/neo-pattern` — same Codex privacy defaults
+  (`--no-scan`, advise `--no-memory`)
+- **Neo agent** (visible boundary): delegate with “use the Neo agent…” — Claude-style
+  `neo --json --mode advise` without mandatory `--no-scan` / `--no-memory`
+- **Shared memory**: same `~/.neo/facts/` store as the CLI, Claude Code, and Codex plugins
+
+The plugin wraps the local `neo` CLI (`pip install neo-reasoner[…]` + provider
+key). It is intentionally skills + agent, not an MCP server.
+
+All three host adapters consume the **same host-neutral contract**: they invoke
 `neo --json` and read the `orchestrator` envelope described under
-[Orchestrator output](#orchestrator-output). Neither hosts its own output
+[Orchestrator output](#orchestrator-output). None hosts its own output
 format, and `tests/test_host_adapter_parity.py` fails if one surface teaches a
-contract the other does not. The difference is role, not protocol — under
-Claude Code, Neo is usually a delegated subagent with a visible boundary;
-under Codex, Neo is a step inside the same coding loop, which is why the Codex
-skills insist on explicit attribution and on continuing the task rather than
-treating Neo's answer as the deliverable.
+contract the others do not. Role differs: Claude Code and the Cursor **agent**
+are delegated specialists with a visible boundary; Codex and Cursor **skills**
+are mid-loop steps that insist on explicit attribution and on continuing the
+task rather than treating Neo's answer as the deliverable.
 
 
 ## Works Alongside Your AI Tools
@@ -468,7 +499,8 @@ use:**
 
 - **Claude Code** users get the deepest integration via the [Claude Code Plugin](#claude-code-plugin), but neo runs standalone too.
 - **Codex CLI** users get parity via the [Codex Plugin](#codex-plugin) — same six skills, packaged for Codex. Neo also automatically picks up `AGENTS.md` (the cross-tool standard Codex co-led) plus anything under `.codex/`.
-- **Cursor / Windsurf / Aider / Continue / Augment** users — the rules dirs you've curated land in every neo session's context.
+- **Cursor** users get parity via the [Cursor Plugin](#cursor-plugin) — same six skills plus a Neo agent; project rules under `.cursor/rules/` still land in every neo session's context.
+- **Windsurf / Aider / Continue / Augment** users — the rules dirs you've curated land in every neo session's context.
 - **GitHub Copilot** users — `.github/copilot-instructions.md` is read on every invocation.
 - **Spec Kit** projects — your specs are folded into neo's reasoning context, no manual paste.
 

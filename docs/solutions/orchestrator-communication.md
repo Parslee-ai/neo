@@ -241,7 +241,7 @@ not bury the reasons to doubt it. Two consequences:
 `phase_summary` copies each record, not just the list. These dicts are live
 engine state and the object is handed to foreign consumers.
 
-## One contract, two adapters
+## One contract, three adapters
 
 The contract is host-neutral by construction: `events.py` and
 `OrchestratorMessage` know nothing about who is consuming them, and the
@@ -251,50 +251,54 @@ per-host wording lives entirely in the adapters.
 |---|---|---|
 | Claude Code | `.claude-plugin/` | agent + 6 slash commands |
 | Codex CLI | `plugins/neo/` | plugin manifest + 6 skills |
+| Cursor | `plugins/cursor-neo/` | plugin manifest + 6 skills + Neo agent |
 | CAR / A2A | `neo.a2ui`, `neo serve` | A2A status + artifact events |
 
 (`.agents/skills/` holds *release-maintenance* skills, not Neo capabilities.
-Looking there for the Codex plugin and concluding it is missing is an easy
-wrong turn — the manifest is at `plugins/neo/.codex-plugin/plugin.json`,
-registered by `.agents/plugins/marketplace.json`.)
+Looking there for the Codex or Cursor plugin and concluding it is missing is an
+easy wrong turn — Codex is at `plugins/neo/.codex-plugin/plugin.json` /
+`.agents/plugins/marketplace.json`; Cursor is at
+`plugins/cursor-neo/.cursor-plugin/plugin.json` /
+`.cursor-plugin/marketplace.json`.)
 
 **Adapters drift, and drift is invisible.** The Codex skills instructed the
 model to parse "four structured sections: `CONFIDENCE`, `PLAN`, `SIMULATIONS`,
 `CODE SUGGESTIONS`" out of terminal-formatted prose — the exact anti-pattern
 the Claude side had just stopped doing. One adapter got the contract change;
 the other did not, and nothing failed. `test_host_adapter_parity.py` now pins
-the invariant: same six capabilities on both surfaces, both invoking `--json`,
-both teaching `orchestrator.summary`/`cautions`, both documenting the error
-shape and attribution, and every documented phase/event name checked against
-`events.py` rather than against prose.
+the invariant: same six capabilities on all three host surfaces, all invoking
+`--json`, all teaching `orchestrator.summary`/`cautions`, all documenting the
+error shape and attribution, and every documented phase/event name checked
+against `events.py` rather than against prose.
 
 The same test pins manifest versions against `pyproject.toml`. `prepare-release`
-documents bumping both plugin manifests, but a documented step with no
+documents bumping the plugin manifests, but a documented step with no
 enforcement is a step that gets skipped: the package, the Claude manifest, and
 the Codex manifest had reached 0.41.0 / 0.37.0 / 0.19.0.
 
-**Role differs even though protocol does not.** Under Claude Code, Neo is
-usually a delegated subagent — the user can see the boundary. Under Codex, Neo
-is a step inside the same coding loop: Codex calls Neo, reads the result, then
-edits files and runs tests in the same breath. Nothing marks where Neo's
-reasoning ends and Codex's begins, so the Codex skills carry stronger
-attribution wording ("Neo found …") and an explicit instruction that Neo's
-result is an input, not the deliverable.
+**Role differs even though protocol does not.** Under Claude Code (and the
+Cursor **agent**), Neo is usually a delegated subagent — the user can see the
+boundary. Under Codex (and Cursor **skills**), Neo is a step inside the same
+coding loop: the host calls Neo, reads the result, then edits files and runs
+tests in the same breath. Nothing marks where Neo's reasoning ends and the
+host's begins, so mid-loop skills carry stronger attribution wording
+("Neo found …") and an explicit instruction that Neo's result is an input, not
+the deliverable.
 
-**Context authority differs too.** Codex has already read and selected the
-relevant workspace excerpts before it invokes Neo. Every Codex skill therefore
-passes `--no-scan`: without it the CLI would perform a second, implicit scan of
-the working directory and separately discover project instruction documents.
-Advise skills also pass `--no-memory` by default so unrelated persistent facts
-cannot enter the provider prompt. Shared memory remains available only when the
-user explicitly asks for it and authorizes stored facts as a provider data
-category; deliberate pattern learning discloses both retrieval and persistence
-effects. The Codex adapter also
-requires the approval description to name the configured Neo provider and the
-files or data categories being sent. Sensitive production, private, or
-customer context requires provider-and-scope-specific authorization. These are
-Codex host-boundary rules; the Claude plugin's agent and commands remain a
-separate adapter and continue to use their established context contract.
+**Context authority differs too.** Codex and Cursor mid-loop skills have
+already read and selected the relevant workspace excerpts before invoking Neo.
+Every such skill therefore passes `--no-scan`: without it the CLI would perform
+a second, implicit scan of the working directory and separately discover
+project instruction documents. Advise skills also pass `--no-memory` by default
+so unrelated persistent facts cannot enter the provider prompt. Shared memory
+remains available only when the user explicitly asks for it and authorizes
+stored facts as a provider data category; deliberate pattern learning discloses
+both retrieval and persistence effects. Mid-loop adapters also require naming
+the configured Neo provider and the files or data categories being sent before
+an external-provider call. Sensitive production, private, or customer context
+requires provider-and-scope-specific authorization. These are mid-loop
+host-boundary rules; the Claude plugin (and Cursor agent) remain a separate
+adapter path and continue to use their established context contract.
 
 ## Sink failures are findable
 

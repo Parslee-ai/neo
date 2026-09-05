@@ -25,8 +25,8 @@ Updates version numbers, CHANGELOG.md, and builds distributions for a new releas
 2. **Reviews** commits since last release tag
 3. **Updates** CHANGELOG.md with new version section and categorized changes
 4. **Updates** the version in `pyproject.toml`, then runs `make sync-version`
-   to propagate it to the three derived files (`src/neo/__init__.py`, both
-   plugin manifests)
+   to propagate it to the four derived files (`src/neo/__init__.py`, Claude /
+   Codex / Cursor plugin manifests)
 5. **Syncs** the local editable install metadata so `importlib.metadata.version("neo-reasoner")` matches the new version
 6. **Builds** wheel and sdist distributions
 7. **Reports** what was done and next steps
@@ -77,12 +77,14 @@ Edit **one** file, then propagate:
 make sync-version
 ```
 
-That rewrites `src/neo/__init__.py`, `.claude-plugin/plugin.json`, and
-`plugins/neo/.codex-plugin/plugin.json` to match. Do **not** hand-edit those
-three: this step used to be "update the version string in all four files", and
-the manifests silently drifted to 0.37.0 and 0.19.0 while the package was at
-0.41.0. `tests/test_host_adapter_parity.py` fails if they are out of sync, and
-`python tools/sync_version.py --check` reports drift without writing.
+That rewrites `src/neo/__init__.py`, `.claude-plugin/plugin.json`,
+`plugins/neo/.codex-plugin/plugin.json`, and
+`plugins/cursor-neo/.cursor-plugin/plugin.json` to match. Do **not** hand-edit
+those four: this step used to be "update the version string in all files by
+hand", and the manifests silently drifted to 0.37.0 and 0.19.0 while the
+package was at 0.41.0. `tests/test_host_adapter_parity.py` fails if they are
+out of sync, and `python tools/sync_version.py --check` reports drift without
+writing.
 
 ### Step 5: Sync Local Editable Metadata
 
@@ -113,7 +115,10 @@ Verify both files were created in `dist/` directory.
 Show what was updated and provide next steps:
 ```bash
 # Next steps:
-git add CHANGELOG.md pyproject.toml src/neo/__init__.py .claude-plugin/plugin.json plugins/neo/.codex-plugin/plugin.json
+git add CHANGELOG.md pyproject.toml src/neo/__init__.py \
+  .claude-plugin/plugin.json \
+  plugins/neo/.codex-plugin/plugin.json \
+  plugins/cursor-neo/.cursor-plugin/plugin.json
 git commit -m "chore: bump version to {new_version}"
 git tag v{new_version}
 git push origin main --tags

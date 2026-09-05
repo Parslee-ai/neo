@@ -78,9 +78,10 @@ for step in output.plan:
     print(f"- {step.description}")
 ```
 
-## 6. Use Neo from Your AI CLI (Optional)
+## 6. Use Neo from Your AI CLI / IDE (Optional)
 
-Neo ships as a plugin for both major AI coding CLIs. Pick whichever you use — the same six commands are available in each, and the fact store is shared.
+Neo ships as a plugin for Claude Code, Codex CLI, and Cursor. Pick whichever you
+use — the same six capabilities are available in each, and the fact store is shared.
 
 **Claude Code:**
 
@@ -95,12 +96,22 @@ Then: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/
 
 ```bash
 codex plugin marketplace add Parslee-ai/neo
-# then install "Neo" from Codex's plugin directory
+# then: codex plugin add neo@neo-local
 ```
 
 Then: `$neo`, `$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`.
 
-**Important:** Both plugins require the Neo CLI (step 1) installed and an API key (step 2) set.
+**Cursor:**
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+ln -s "$(pwd)/plugins/cursor-neo" ~/.cursor/plugins/local/neo
+# Developer: Reload Window
+```
+
+Then: `/neo`, `/neo-review`, … in Agent chat, or “use the Neo agent…”.
+
+**Important:** All plugins require the Neo CLI (step 1) installed and an API key (step 2) set.
 
 ## 7. Host Neo as an Agent (Optional)
 
