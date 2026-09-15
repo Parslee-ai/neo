@@ -298,10 +298,17 @@ _TRANSCRIPT_TAG = "transcript-derived"
 
 #: How many passes an episode may fail with a NON-transient LM error before it
 #: is given up. Such an error — a 400 for an oversized prompt, a reply cut off
-#: by max_output_tokens — recurs identically on every retry, so without a cap
-#: it is retried forever. Transient errors (see ``_is_transient_lm_error``) do
-#: not count against it: an outage says nothing about the episode.
+#: by max_output_tokens, output that is not JSON — recurs identically on every
+#: retry, so without a cap it is retried forever.
 MAX_EPISODE_LM_FAILURES = 3
+
+#: The same cap for TRANSIENT errors, deliberately much higher. An outage says
+#: nothing about the episode, so it must not burn one in a few cycles — but a
+#: "transient" error can also be the episode's own fault (a prompt that always
+#: times out), and uncapped, that episode would stop its source and the whole
+#: observer sweep every cycle, forever. At the observer's pace this is hours
+#: of retrying before one episode is given up.
+MAX_EPISODE_TRANSIENT_FAILURES = 20
 
 
 class LMUnavailable(Exception):
@@ -319,18 +326,19 @@ class LMUnavailable(Exception):
         self.transient = _is_transient_lm_error(cause)
 
 
-#: HTTP statuses the openai/anthropic SDKs themselves treat as retryable. The
-#: SDK has already retried by the time one reaches us, so seeing it means the
-#: provider is unavailable, not that the episode is bad.
-_TRANSIENT_STATUSES = frozenset({408, 409, 429})
+#: HTTP statuses that mean "the provider could not serve this now". Narrower
+#: than the SDKs' own retry set on purpose: 409 and 501/505 are deterministic
+#: for a given request, so retrying them is the per-episode cap's job, not an
+#: outage's.
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 def _is_transient_lm_error(exc: BaseException) -> bool:
     """True when ``exc`` says the provider could not be reached or served, and
     nothing about the request itself.
 
-    Conservative in one direction on purpose: a transient verdict retries the
-    episode without bound, so only errors that are unambiguously about
+    Conservative: a transient verdict stops the pass and retries under the much
+    larger ``MAX_EPISODE_TRANSIENT_FAILURES``, so only errors that are about
     reachability qualify — socket/connection/timeout errors, the SDKs'
     connection errors, and retryable HTTP statuses. Anything unrecognised
     (including a CAR adapter error) is non-transient and hits the per-episode
@@ -344,7 +352,7 @@ def _is_transient_lm_error(exc: BaseException) -> bool:
         if isinstance(cur, (ConnectionError, TimeoutError)):
             return True
         status = getattr(cur, "status_code", None)
-        if isinstance(status, int) and (status in _TRANSIENT_STATUSES or status >= 500):
+        if isinstance(status, int) and status in _TRANSIENT_STATUSES:
             return True
         if isinstance(cur, socket.gaierror):
             return True
@@ -358,6 +366,58 @@ def _is_transient_lm_error(exc: BaseException) -> bool:
                 return True
         cur = cur.__cause__ or cur.__context__
     return False
+
+def _source_root_key(source) -> str:
+    """Which transcript directory a source's drain mark describes.
+
+    The watermark FILE is keyed by project_id, and two clones of one remote
+    share it (`flyx/fms` and `flyx/fms2`). Sharing ``consumed`` is right — anchors
+    are uuids — but a drain mark is a claim about one directory's files: keyed
+    per file, `fms` draining would arm the skip against `fms2`'s backlog."""
+    return str(getattr(source, "codebase_root", None) or "")
+
+
+def _episode_epoch(timestamp: str) -> Optional[float]:
+    """Epoch seconds for an episode timestamp, or None when unparseable.
+
+    Claude Code and Codex records carry ISO 8601 (``...Z``); CAR sessions an
+    epoch float."""
+    if not timestamp:
+        return None
+    try:
+        return float(timestamp)
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = datetime.datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None  # a naive time names no instant; do not guess a zone
+    return dt.timestamp()
+
+
+def _drain_mark(collect_started: float, pending: list) -> Optional[float]:
+    """Epoch time before which a source's files hold no unconsumed episode.
+
+    ``min(collect_started, earliest pending episode timestamp)``. Safe because
+    transcripts are append-only: a file's mtime is never earlier than the
+    timestamps of the records inside it, so every file holding a pending
+    episode has mtime >= the mark and is read next pass. It keeps ADVANCING
+    while a backlog drains — a mark that moved only when a pass consumed
+    everything would never move for a project producing more episodes per
+    rotation than the budget, which is the full-parse-every-visit cost the gate
+    exists to avoid. None (leave the previous mark) when a pending episode's
+    time cannot be read: its file was collected this pass, so the previous
+    mark already admits it."""
+    mark = collect_started
+    for ep in pending:
+        ts = _episode_epoch(ep.timestamp)
+        if ts is None:
+            return None
+        mark = min(mark, ts)
+    return mark
+
 
 _EXTRACT_PROMPT = """You are mining a coding-assistant transcript for GENERALIZABLE engineering lessons that would help on FUTURE tasks in this or other codebases.
 
@@ -1166,10 +1226,12 @@ class TranscriptIngester:
         and a crash mid-episode reprocesses it. An LM failure is NOT "no
         lessons": a transient one (outage) leaves the episode unconsumed and
         stops the whole pass (``stats["lm_unavailable"]``, which the observer
-        uses to stop its sweep); any other is retried on later passes and given
-        up after ``MAX_EPISODE_LM_FAILURES``. A source's ``drained_at`` mark —
-        what lets unchanged transcripts be skipped — advances only when a pass
-        consumed everything it collected.
+        uses to stop its sweep); any other is retried on later passes. Each kind
+        has its own per-episode cap (``MAX_EPISODE_LM_FAILURES``,
+        ``MAX_EPISODE_TRANSIENT_FAILURES``) so neither a poison episode nor an
+        always-timing-out one can wedge its source. A source's drain mark — what
+        lets unchanged transcripts be skipped — never passes the earliest
+        episode still unconsumed (``_drain_mark``).
         Watermarks are namespaced by source and (for project-scoped sources) by
         project_id, so sources never collide and the key survives worktrees/clones
         that share the same git remote.
@@ -1201,7 +1263,7 @@ class TranscriptIngester:
                 break
             state = self._load_watermark(source)
             consumed = state["consumed"]
-            failures = state["failures"]
+            root_key = _source_root_key(source)
             # Taken BEFORE collecting, so a transcript written while this pass
             # runs is newer than the drain mark and is read next time.
             collect_started = time.time()
@@ -1217,57 +1279,37 @@ class TranscriptIngester:
             # Optional per-source trust overrides (default None → today's behavior).
             src_kind = getattr(source, "fact_kind", None)
             src_tags = getattr(source, "extra_tags", None)
-            drained = True
             for ep in new:
                 if stop_now():
-                    drained = False
                     break
                 try:
                     stats["facts_admitted"] += self.ingest_episode(
                         ep, source.scope, fact_kind=src_kind, extra_tags=src_tags)
                 except LMUnavailable as e:
-                    if e.transient:
-                        logger.warning(
-                            "transcript: LM unavailable (%s); stopping the pass at "
-                            "%s episode %s, it stays unconsumed", e, source.name,
-                            ep.anchor_uuid)
-                        stats["lm_unavailable"] = True
-                        outage = True
-                        drained = False
-                        break
-                    attempts = failures.get(ep.anchor_uuid, 0) + 1
-                    stats["episodes_failed"] += 1
                     stats["episodes_processed"] += 1  # it spent LM calls
-                    if attempts < MAX_EPISODE_LM_FAILURES:
-                        logger.warning(
-                            "transcript: LM call failed for %s episode %s "
-                            "(attempt %d of %d): %s", source.name, ep.anchor_uuid,
-                            attempts, MAX_EPISODE_LM_FAILURES, e)
-                        failures[ep.anchor_uuid] = attempts
-                        drained = False
-                    else:
-                        logger.warning(
-                            "transcript: giving up on %s episode %s after %d failed "
-                            "LM attempts: %s", source.name, ep.anchor_uuid, attempts, e)
-                        failures.pop(ep.anchor_uuid, None)
-                        consumed.add(ep.anchor_uuid)
+                    stats["episodes_failed"] += 1
+                    if self._record_lm_failure(source, state, ep, e):
                         stats["episodes_abandoned"] += 1
-                    if not self._persist_watermark(source, state):
-                        outage = True  # cannot record progress: stop, don't re-mine
-                        drained = False
+                    if not self._persist_watermark(source, state) or e.transient:
+                        # An outage is global: stop rather than fail the same
+                        # call once per remaining episode. An unwritable
+                        # watermark stops too — mining on would re-mine
+                        # episodes whose consumption cannot be recorded.
+                        stats["lm_unavailable"] = stats["lm_unavailable"] or e.transient
+                        outage = True
                         break
                     continue
                 consumed.add(ep.anchor_uuid)
-                failures.pop(ep.anchor_uuid, None)
+                state["failures"].pop(ep.anchor_uuid, None)
+                state["transient_failures"].pop(ep.anchor_uuid, None)
                 stats["episodes_processed"] += 1
                 if not self._persist_watermark(source, state):  # advance only after durable
-                    # Carrying on would mine episodes whose consumption can't be
-                    # recorded, and re-mine them next pass as duplicate facts.
                     outage = True
-                    drained = False
                     break
-            if drained:
-                state["drained_at"] = collect_started
+            mark = _drain_mark(collect_started,
+                               [e for e in new if e.anchor_uuid not in consumed])
+            if mark is not None:
+                state["drained_at"][root_key] = mark
                 self._persist_watermark(source, state)
 
         # Correlate neo's own past suggestions (durable ledger) against all
@@ -1397,8 +1439,7 @@ class TranscriptIngester:
             suffix = "global"
         return SESSIONS_DIR / f"transcript_watermark_{source.name}_{suffix}.json"
 
-    #: Subtracted from the watermark file's mtime before using it as a skip
-    #: threshold. A transcript written *while* the previous ingest was running
+    #: Subtracted from the drain mark before using it as a skip threshold. A transcript written *while* the previous ingest was running
     #: could otherwise be judged "already seen" and skipped forever. One hour is
     #: far longer than any observed ingest, and over-parsing is free where
     #: under-parsing silently loses learning.
@@ -1426,31 +1467,32 @@ class TranscriptIngester:
     def _collected_through(self, source) -> Optional[float]:
         """Epoch time before which this source's inputs are fully ingested.
 
-        This is the ``drained_at`` mark: the start of the last pass that
-        consumed EVERY episode it collected. It is deliberately not the
-        watermark file's mtime, which is what it used to be. That file is
-        rewritten after every consumed episode, including by a pass that stops
-        on its episode budget with a backlog left in the same transcript — and
-        the next pass then skipped that transcript as "untouched since the
-        watermark", stranding the backlog for good. Measured live: 152 of 1,800
-        episodes unconsumed, every one of them in a file the gate had stopped
+        The source's drain mark (see ``_drain_mark``), less the skew margin. It
+        is deliberately not the watermark file's mtime, which is what it used to
+        be: that file is rewritten after every consumed episode, including by a
+        pass that stops on its episode budget with a backlog left in the same
+        transcript — and the next pass skipped that transcript as "untouched
+        since the watermark", stranding the backlog for good. Measured live: 152
+        of 1,800 episodes unconsumed, every one in a file the gate had stopped
         reading.
 
-        Returns None — parse everything — when no pass has drained yet, which
-        includes every watermark written before the mark existed. That first
-        full read is also what recovers episodes already stranded.
+        Returns None — parse everything — when this source's directory has no
+        mark yet, which includes every watermark written before marks existed.
+        That first full read is also what recovers episodes already stranded.
         """
-        mark = self._load_watermark(source).get("drained_at")
+        mark = self._load_watermark(source)["drained_at"].get(_source_root_key(source))
         if not isinstance(mark, (int, float)):
             return None
         return float(mark) - self._COLLECT_SKEW_SECONDS
 
     def _load_watermark(self, source) -> dict:
-        """``{"consumed": set, "failures": {anchor: n}, "drained_at": float|None}``.
+        """``consumed`` (set), ``failures`` / ``transient_failures``
+        ({anchor: attempts}) and ``drained_at`` ({root key: epoch}).
 
         Tolerates the legacy ``{"consumed": [...]}`` shape and a corrupt file
         (treated as empty, as before)."""
-        state: dict = {"consumed": set(), "failures": {}, "drained_at": None}
+        state: dict = {"consumed": set(), "failures": {}, "transient_failures": {},
+                       "drained_at": {}}
         path = self._watermark_path(source)
         if not path or not path.exists():
             return state
@@ -1461,11 +1503,14 @@ class TranscriptIngester:
         if not isinstance(raw, dict):
             return state
         state["consumed"] = set(raw.get("consumed", []))
-        failures = raw.get("failures")
-        if isinstance(failures, dict):
-            state["failures"] = {str(k): int(v) for k, v in failures.items()
-                                 if isinstance(v, int)}
-        state["drained_at"] = raw.get("drained_at")
+        for key in ("failures", "transient_failures"):
+            book = raw.get(key)
+            if isinstance(book, dict):
+                state[key] = {str(k): v for k, v in book.items() if isinstance(v, int)}
+        marks = raw.get("drained_at")
+        if isinstance(marks, dict):
+            state["drained_at"] = {str(k): v for k, v in marks.items()
+                                   if isinstance(v, (int, float))}
         return state
 
     def _load_consumed(self, source) -> set:
@@ -1473,6 +1518,39 @@ class TranscriptIngester:
 
     def _load_failures(self, source) -> dict:
         return self._load_watermark(source)["failures"]
+
+    def _record_lm_failure(self, source, state: dict, ep: Episode,
+                           error: LMUnavailable) -> bool:
+        """Count a failed attempt at ``ep``; give it up at its cap.
+
+        Returns True when the episode was abandoned (marked consumed unmined).
+        The two caps are counted separately so an outage's attempts never
+        spend an episode's small non-transient budget. ``failures`` entries for
+        anchors whose transcripts are later deleted are never pruned: a
+        throttled source (the PR source returns nothing between fetches) makes
+        "not collected this pass" mean nothing, and the growth is one int per
+        failing episode, next to a ``consumed`` set that grows the same way."""
+        book_key, cap = (("transient_failures", MAX_EPISODE_TRANSIENT_FAILURES)
+                         if error.transient
+                         else ("failures", MAX_EPISODE_LM_FAILURES))
+        book = state[book_key]
+        attempts = book.get(ep.anchor_uuid, 0) + 1
+        if attempts < cap:
+            book[ep.anchor_uuid] = attempts
+            logger.warning(
+                "transcript: LM call failed for %s episode %s (%s attempt %d of %d): %s",
+                source.name, ep.anchor_uuid,
+                "transient" if error.transient else "non-transient",
+                attempts, cap, error)
+            return False
+        logger.warning(
+            "transcript: giving up on %s episode %s after %d %s LM failures: %s",
+            source.name, ep.anchor_uuid, attempts,
+            "transient" if error.transient else "non-transient", error)
+        state["failures"].pop(ep.anchor_uuid, None)
+        state["transient_failures"].pop(ep.anchor_uuid, None)
+        state["consumed"].add(ep.anchor_uuid)
+        return True
 
     def _persist_watermark(self, source, state: dict) -> bool:
         """Write the watermark atomically. False when it could not be written,
@@ -1482,10 +1560,9 @@ class TranscriptIngester:
         if not path:
             return True
         payload: dict = {"consumed": sorted(state["consumed"])}
-        if state.get("failures"):
-            payload["failures"] = dict(sorted(state["failures"].items()))
-        if state.get("drained_at") is not None:
-            payload["drained_at"] = state["drained_at"]
+        for key in ("failures", "transient_failures", "drained_at"):
+            if state.get(key):
+                payload[key] = dict(sorted(state[key].items()))
         try:
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
             atomic_write_json(path, payload)
@@ -1512,4 +1589,12 @@ class TranscriptIngester:
             # Not logged here: the caller knows which episode this was, and an
             # outage now stops the pass instead of logging once per episode.
             raise LMUnavailable(e) from e
-        return _parse_json(out)
+        data = _parse_json(out)
+        if data is None:
+            # Truncated or non-JSON output is not "no lessons" either: consumed
+            # on the first pass, the episode would never be mined. Counted
+            # against the non-transient cap, since a prompt that yields
+            # garbage tends to yield it again.
+            raise LMUnavailable(ValueError(
+                f"LM output is not a JSON object ({len(out or '')} chars)"))
+        return data

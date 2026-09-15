@@ -1248,6 +1248,28 @@ class TestSweepStopsOnLMOutage:
         assert swept == ["/a"]
         assert "LM unavailable, stopping; 2 project(s) deferred" in capsys.readouterr().err
 
+    def test_deferred_projects_are_first_next_cycle(self, monkeypatch):
+        """The round-robin offset had already moved past the whole batch, so
+        "deferred" projects waited a full rotation — and could keep losing
+        their turn to the same outage."""
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer, ObserverConfig
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c", "/d"])
+        swept = []
+        outage = {"on": True}
+
+        def rp(self, root, peer_roots=None, shared_store=None):
+            swept.append(root)
+            self._lm_unavailable = outage["on"]
+            return (0, 0, object())
+
+        monkeypatch.setattr(Observer, "_run_project", rp)
+        o = Observer(global_mode=True, config=ObserverConfig(max_projects_per_cycle=3))
+        o._cycle()
+        outage["on"] = False
+        o._cycle()
+        assert swept == ["/a", "/a", "/b", "/c"]
+
     def test_ingest_records_the_outage_from_stats(self, monkeypatch, fake_project_id):
         from neo.memory.observer import Observer
 

@@ -1,5 +1,6 @@
 """Tests for Claude Code transcript parsing (Stage A) and ingestion (B/C)."""
 
+import datetime
 import json
 import time
 import time as _time
@@ -1190,16 +1191,42 @@ def test_transient_lm_failure_does_not_consume_the_episode(temp_store, tmp_path,
     assert _fresh_ingester(temp_store, up, src)._load_consumed(src) == {"e1", "e2"}
 
 
-def test_retryable_status_is_transient(temp_store, tmp_path, monkeypatch):
+def test_a_real_openai_503_is_transient(temp_store, tmp_path, monkeypatch):
+    """Through the adapter neo actually runs, not a hand-built exception: the
+    gpt-5 path used to raise ValueError("API error 503: ...") with no status,
+    which would have read as the episode's fault and burned it in 3 passes."""
+    import httpx
+    from neo.adapters import OpenAIAdapter
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    adapter = OpenAIAdapter(model="gpt-5.6", api_key="test-key")
+    adapter.client = adapter.client.copy(http_client=httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(503, json={"error": {"message": "overloaded"}}))))
+    src = _StaticSource([_ep("e1", "ask one")])
+    stats = _fresh_ingester(temp_store, adapter, src).ingest()
+    assert stats["lm_unavailable"] is True
+    assert _fresh_ingester(temp_store, None, src)._load_consumed(src) == set()
+
+
+def test_transient_classification_is_about_reachability_only():
     import httpx
     import openai
-    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
-    src = _StaticSource([_ep("e1", "ask one")])
-    resp = httpx.Response(503, request=httpx.Request("POST", "https://x/v1/responses"))
-    err = openai.APIStatusError("overloaded", response=resp, body=None)
-    stats = _fresh_ingester(temp_store, _FailingAdapter(err), src).ingest()
-    assert stats["lm_unavailable"] is True
-    assert _fresh_ingester(temp_store, None, src)._load_failures(src) == {}
+    from neo.memory.transcript import _is_transient_lm_error
+    req = httpx.Request("POST", "https://x/v1/responses")
+
+    def status(code):
+        return openai.APIStatusError("e", response=httpx.Response(code, request=req), body=None)
+
+    for code in (408, 429, 500, 502, 503, 504):
+        assert _is_transient_lm_error(status(code)), code
+    # Deterministic for the request: the per-episode cap handles these.
+    for code in (400, 401, 404, 409, 413, 501, 505):
+        assert not _is_transient_lm_error(status(code)), code
+    assert _is_transient_lm_error(httpx.ConnectError("dns", request=req))
+    wrapped = RuntimeError("adapter wrapper")
+    wrapped.__cause__ = ConnectionResetError(54, "Connection reset by peer")
+    assert _is_transient_lm_error(wrapped), "the cause chain is walked"
+    assert not _is_transient_lm_error(ValueError("No completed message in response"))
 
 
 def test_persistent_failure_is_abandoned_after_the_cap(temp_store, tmp_path, monkeypatch):
@@ -1286,9 +1313,11 @@ def test_backlog_in_an_old_transcript_file_drains(temp_store, tmp_path, monkeypa
     assert consumed == {"u0", "u1", "u2"}
 
 
-def test_drained_source_still_skips_unchanged_files(temp_store, tmp_path, monkeypatch):
-    """The fix must not give back the optimization: once a pass has consumed
-    everything it collected, files untouched since then are skipped again."""
+def test_drain_mark_advances_while_a_backlog_persists(temp_store, tmp_path, monkeypatch):
+    """The mark is the earliest episode still unconsumed, not "set when a pass
+    finished everything": a project producing more episodes per rotation than
+    the budget would otherwise never re-arm the skip and pay a full parse on
+    every visit — the RSS cost the gate exists to avoid."""
     monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
     seen_since = []
 
@@ -1297,15 +1326,71 @@ def test_drained_source_still_skips_unchanged_files(temp_store, tmp_path, monkey
             seen_since.append(since)
             return list(self._episodes)
 
-    src = _SinceSource([_ep("e1", "ask one"), _ep("e2", "ask two")])
-    before = time.time()
+    base = 1_700_000_000
+    eps = []
+    for i in range(4):
+        ep = _ep(f"e{i}", f"ask {i}")
+        ep.timestamp = datetime.datetime.fromtimestamp(
+            base + i * 60, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        eps.append(ep)
+    src = _SinceSource(eps)
+    skew = TranscriptIngester._COLLECT_SKEW_SECONDS
+
     _fresh_ingester(temp_store, _StubAdapter([_LESSON]), src).ingest(max_episodes=1)
     _fresh_ingester(temp_store, _StubAdapter([_LESSON]), src).ingest(max_episodes=1)
-    assert seen_since[0] is None
-    assert seen_since[1] is None, "a pass that left a backlog must not arm the skip"
     _fresh_ingester(temp_store, _StubAdapter([_LESSON]), src).ingest()
-    assert seen_since[2] is not None
-    assert seen_since[2] >= before - TranscriptIngester._COLLECT_SKEW_SECONDS - 1
+    before = time.time()
+    _fresh_ingester(temp_store, _StubAdapter([_LESSON]), src).ingest()
+    assert seen_since[0] is None
+    assert seen_since[1] == pytest.approx(base + 60 - skew), "e0 consumed; e1 is earliest pending"
+    assert seen_since[2] == pytest.approx(base + 120 - skew), "the mark moved with the backlog"
+    assert seen_since[3] <= before and seen_since[3] > base + 180, "drained: mark is the pass start"
+
+
+def test_unreadable_timestamp_keeps_the_previous_mark(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    seen_since = []
+
+    class _SinceSource(_StaticSource):
+        def collect_episodes(self, since=None):
+            seen_since.append(since)
+            return list(self._episodes)
+
+    src = _SinceSource([_ep("e1", "ask one"), _ep("e2", "ask two")])  # timestamp "t"
+    _fresh_ingester(temp_store, _StubAdapter([_LESSON]), src).ingest(max_episodes=1)
+    _fresh_ingester(temp_store, _StubAdapter([_LESSON]), src).ingest(max_episodes=1)
+    assert seen_since == [None, None], "cannot place e2 in time, so the skip must not arm"
+
+
+def test_clones_sharing_a_watermark_keep_separate_drain_marks(temp_store, tmp_path, monkeypatch):
+    """Two clones of one remote share a project_id and so a watermark file.
+    One draining must not arm the skip against the other's transcripts."""
+    import os
+    from neo.memory.transcript import ClaudeCodeSource
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    projects = tmp_path / "projects"
+    monkeypatch.setattr("neo.memory.transcript.CLAUDE_PROJECTS_DIR", projects)
+    old = time.time() - 3 * 86400
+    for root, n in (("/work/fms", 1), ("/work/fms2", 3)):
+        tdir = projects / root.replace("/", "-")
+        tdir.mkdir(parents=True)
+        records = []
+        for i in range(n):
+            records += [_user(f"{root}-u{i}", "s", text=f"fix bug {i} in {root}"),
+                        _assistant(f"{root}-a{i}", "s", text="the venv was missing pytest-asyncio",
+                                   tools=["Bash"])]
+        fp = tdir / "session.jsonl"
+        _write(fp, records)
+        os.utime(fp, (old, old))
+
+    fms2 = ClaudeCodeSource("/work/fms2")
+    fms = ClaudeCodeSource("/work/fms")
+    _fresh_ingester(temp_store, _StubAdapter([_LESSON]), fms2).ingest(max_episodes=1)
+    _fresh_ingester(temp_store, _StubAdapter([_LESSON]), fms).ingest()  # drains fms
+    for _ in range(2):
+        _fresh_ingester(temp_store, _StubAdapter([_LESSON]), fms2).ingest(max_episodes=1)
+    consumed = _fresh_ingester(temp_store, None, fms2)._load_consumed(fms2)
+    assert {f"/work/fms2-u{i}" for i in range(3)} <= consumed
 
 
 def test_legacy_watermark_without_drain_mark_parses_everything(temp_store, tmp_path, monkeypatch):
@@ -1321,3 +1406,42 @@ def test_legacy_watermark_without_drain_mark_parses_everything(temp_store, tmp_p
     path.write_text(json.dumps({"consumed": ["old"]}), encoding="utf-8")
     assert ing._collected_through(src) is None
     assert ing._load_consumed(src) == {"old"}
+
+
+def test_repeated_transient_failure_is_eventually_abandoned(temp_store, tmp_path, monkeypatch):
+    """An episode whose own prompt always times out looks transient. Uncapped,
+    it would stop its source and the whole sweep every cycle, forever."""
+    from neo.memory.transcript import MAX_EPISODE_TRANSIENT_FAILURES
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    src = _StaticSource([_ep("slow", "an ask that always times out")])
+    for attempt in range(1, MAX_EPISODE_TRANSIENT_FAILURES + 1):
+        stats = _fresh_ingester(temp_store, _FailingAdapter(TimeoutError("read")), src).ingest()
+        assert stats["lm_unavailable"] is True, "an outage still stops the pass"
+        consumed = _fresh_ingester(temp_store, None, src)._load_consumed(src)
+        assert ("slow" in consumed) == (attempt == MAX_EPISODE_TRANSIENT_FAILURES)
+    assert _fresh_ingester(temp_store, None, src)._load_failures(src) == {}
+
+
+def test_transient_attempts_do_not_spend_the_non_transient_budget(temp_store, tmp_path, monkeypatch):
+    from neo.memory.transcript import MAX_EPISODE_LM_FAILURES
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    src = _StaticSource([_ep("e1", "ask one")])
+    for _ in range(MAX_EPISODE_LM_FAILURES + 1):
+        _fresh_ingester(temp_store, _FailingAdapter(_connection_error()), src).ingest()
+    assert _fresh_ingester(temp_store, None, src)._load_consumed(src) == set()
+
+
+def test_unparseable_output_is_a_failure_not_no_lessons(temp_store, tmp_path, monkeypatch):
+    """A reply cut off mid-JSON used to parse to None, read as "no lessons",
+    and consume the episode on the first pass."""
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+
+    class _Truncated:
+        def generate(self, messages, **kw):
+            return '{"lessons": [{"kind": "pattern", "subject": "cut off mid'
+
+    src = _StaticSource([_ep("e1", "ask one")])
+    stats = _fresh_ingester(temp_store, _Truncated(), src).ingest()
+    assert stats["episodes_failed"] == 1 and stats["lm_unavailable"] is False
+    assert _fresh_ingester(temp_store, None, src)._load_consumed(src) == set()
+    assert _fresh_ingester(temp_store, None, src)._load_failures(src) == {"e1": 1}

@@ -593,8 +593,14 @@ class Observer:
                 if self._lm_unavailable:
                     # An outage is not per-project. Sweeping on would load up
                     # to two dozen more fact stores to fail the same first LM
-                    # call in each; the deferred projects lose nothing, since
-                    # their episodes stay unconsumed until the next visit.
+                    # call in each. The offset already moved past this whole
+                    # batch, so rewind it: the deferred projects go first next
+                    # cycle instead of waiting a rotation, and the ones already
+                    # swept cost next to nothing to revisit (unchanged
+                    # transcripts are skipped). `batch` was regrouped by
+                    # project id, so `i` does not map back to `roots` — the
+                    # batch's start does.
+                    self._sweep_offset = start
                     deferred = n - i
                     print(
                         f"neo observer sweep: LM unavailable, stopping; "
