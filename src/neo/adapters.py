@@ -298,14 +298,6 @@ class OpenAIAdapter(LMAdapter):
         ):
             # gpt-5* and codex models use /v1/responses endpoint
             if "codex" in self.model.lower() or "gpt-5" in self.model.lower():
-                import httpx
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-                base_url = self.base_url or "https://api.openai.com"
-                url = f"{base_url}/v1/responses"
-
                 payload: dict = {
                     "model": self.model,
                     "input": messages,
@@ -317,10 +309,27 @@ class OpenAIAdapter(LMAdapter):
                 if reasoning_effort is not None:
                     payload["reasoning"] = {"effort": reasoning_effort}
 
-                response = httpx.post(url, headers=headers, json=payload, timeout=600.0)  # 10 minutes for complex queries
-                if response.status_code != 200:
-                    raise ValueError(f"API error {response.status_code}: {response.text}")
-                data = response.json()
+                # Through the SDK client, never a bare httpx.post: the SDK
+                # retries connection errors, 408/409/429 and 5xx with backoff
+                # (honouring Retry-After) and raises a typed APIStatusError
+                # carrying status_code. The raw post had neither, so a single
+                # `Connection reset by peer` failed the whole neo run, and a
+                # 503 surfaced as an untyped ValueError no caller could tell
+                # apart from a malformed response. base_url follows the SDK's
+                # convention (ends in /v1), the same one the chat path already
+                # used — the raw post appended /v1 itself, so one base_url
+                # could not serve both paths.
+                #
+                # No `timeout=` here: the client default is already
+                # Timeout(connect=5, read=600), and a bare float would raise
+                # connect to 600 too, so a blackholed connect hung ten minutes
+                # per attempt. `to_dict(warnings=False)` rather than
+                # model_dump(): it omits unset fields (the dict matches the
+                # raw JSON this parser was written against) and does not print
+                # a pydantic serialization warning to stderr — the --json
+                # event stream — when the API adds an output item type.
+                response = self.client.responses.create(**payload)
+                data = response.to_dict(warnings=False)
                 self._emit_usage_metric(data.get("usage", {}))
 
                 # Extract text from output array
@@ -332,7 +341,13 @@ class OpenAIAdapter(LMAdapter):
                             if c.get("type") == "output_text":
                                 return c.get("text", "")
 
-                raise ValueError(f"No completed message in response: {data}")
+                # Name the response, not its content: the whole dict carries the
+                # model's partial output, which lands in episode error text and
+                # observer logs. `incomplete_details` is what diagnoses the
+                # common case (max_output_tokens spent on reasoning).
+                summary = {k: data.get(k) for k in
+                           ("id", "status", "incomplete_details", "error")}
+                raise ValueError(f"No completed message in response: {summary}")
             else:
                 # Standard chat completions for other models. Route through the
                 # resilient helper so o-series (and other reasoning models that

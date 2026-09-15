@@ -921,6 +921,29 @@ def _print_supplied_files(context_files) -> None:
         )
 
 
+def _is_network_timeout(exc: BaseException) -> bool:
+    """True when ``exc`` is a network timeout from any LM transport.
+
+    Two shapes: httpx's own, and the openai SDK's ``APITimeoutError``, which
+    wraps httpx's and is what every OpenAI and Azure call raises. Checking only
+    httpx left the ``NetworkTimeout`` envelope unreachable for both, so a
+    timeout was reported as a generic ``ProcessingError``.
+    """
+    timeout_types: list[type] = []
+    try:
+        import httpx
+        # The base class: WriteTimeout and PoolTimeout are timeouts too.
+        timeout_types.append(httpx.TimeoutException)
+    except ImportError:
+        pass
+    try:
+        import openai
+        timeout_types.append(openai.APITimeoutError)
+    except ImportError:
+        pass
+    return bool(timeout_types) and isinstance(exc, tuple(timeout_types))
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # The host-hook recorder fires on every editor tool call, so it dispatches
@@ -1457,7 +1480,6 @@ def main():
         error_output = {
             "error": "RequestTimeout",
             "message": "LLM request exceeded timeout limit",
-            "timeout_seconds": 300,
             "details": str(e),
             "suggestions": [
                 "Try simplifying your prompt",
@@ -1497,24 +1519,21 @@ def main():
         print(json.dumps(error_output, indent=2))
         sys.exit(1)
     except Exception as e:
-        # Import httpx to check for timeout errors
-        try:
-            import httpx
-            if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout)):
-                error_output = {
-                    "error": "NetworkTimeout",
-                    "message": f"Network request timed out: {str(e)}",
-                    "timeout_seconds": 300,
-                    "suggestions": [
-                        "Check your internet connection",
-                        "Verify API endpoint is accessible",
-                        "Try again in a moment"
-                    ]
-                }
-                print(json.dumps(error_output, indent=2))
-                sys.exit(1)
-        except ImportError:
-            pass
+        # No `timeout_seconds` in this envelope (or RequestTimeout's): the
+        # limit is per-adapter, and the fixed 300 both used to report matched
+        # none of them — the OpenAI SDK reads for 600s.
+        if _is_network_timeout(e):
+            error_output = {
+                "error": "NetworkTimeout",
+                "message": f"Network request timed out: {str(e)}",
+                "suggestions": [
+                    "Check your internet connection",
+                    "Verify API endpoint is accessible",
+                    "Try again in a moment"
+                ]
+            }
+            print(json.dumps(error_output, indent=2))
+            sys.exit(1)
 
         # Generic error handler. The message is scrubbed on the way out: this
         # goes to a HOST, which may log or forward it, and an exception string

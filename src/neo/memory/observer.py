@@ -43,6 +43,7 @@ Tunables (env, read by the daemon child):
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib.metadata
 import json
 import logging
@@ -355,6 +356,8 @@ class Observer:
         # Name of the last transcript-ingest exception (or None), surfaced in
         # the cycle record so a failing LM key isn't invisible.
         self._last_ingest_error: Optional[str] = None
+        self._lm_unavailable = False
+        self._lm_answered_this_cycle = False
         # Surface manager (async). Created in run() since it needs an
         # event loop.
         self._surface = None
@@ -536,6 +539,7 @@ class Observer:
         from neo.memory.scope import clear_remote_url_cache
 
         t0 = time.time()
+        self._lm_answered_this_cycle = False
         # Fresh view of every project's git remote once per cycle; within the
         # cycle the memo removes ~3 redundant forks per project.
         clear_remote_url_cache()
@@ -589,6 +593,25 @@ class Observer:
                     f"{mined} mined ({time.time() - p0:.1f}s)",
                     flush=True,
                 )
+                if self._lm_unavailable:
+                    # An outage is not per-project: sweeping on would load up
+                    # to two dozen more fact stores to fail the same first LM
+                    # calls in each. The round-robin offset is deliberately
+                    # NOT rewound. A rewind re-ran the same batch in the same
+                    # order next cycle, so two episodes that fail in a project
+                    # no earlier project vouches for stopped the sweep at the
+                    # same place forever and nothing past that batch was ever
+                    # reached. Advancing costs the deferred projects one
+                    # rotation, and shifts which projects precede the stuck
+                    # one — which is what lets another project's answer supply
+                    # the evidence that charges its failures.
+                    deferred = n - i
+                    print(
+                        f"neo observer sweep: LM unavailable, stopping; "
+                        f"{deferred} project(s) deferred",
+                        file=sys.stderr, flush=True,
+                    )
+                    break
             except Exception as e:
                 errors += 1
                 print(
@@ -638,6 +661,7 @@ class Observer:
         key is visible in the cycle record, not just stderr.
         """
         self._last_ingest_error = None
+        self._lm_unavailable = False
         if self.config.ingest_budget <= 0:
             return 0
         try:
@@ -655,7 +679,15 @@ class Observer:
                 max_episodes=self.config.ingest_budget,
                 max_seconds=self.config.ingest_deadline_seconds,
                 should_stop=lambda: self._stop,  # honor SIGTERM between episodes
+                # An earlier project's answer this cycle is what lets a lone
+                # failing episode be charged (see TranscriptIngester.ingest).
+                provider_known_good=self._lm_answered_this_cycle,
             )
+            self._lm_unavailable = bool(stats.get("lm_unavailable"))
+            if stats.get("lm_answers"):
+                self._lm_answered_this_cycle = True
+            elif self._lm_unavailable:
+                self._lm_answered_this_cycle = False
             return int(stats.get("facts_admitted", 0))
         except Exception as e:
             self._last_ingest_error = type(e).__name__
@@ -854,6 +886,12 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": str(e)}
 
     reaped = _reap_orphan_observers()
+    # Before migrating or registering anything: under skew those calls fail
+    # with a raw handshake error, or write the local manifest behind the
+    # daemon's back, before this could explain why.
+    blind = _supervisor_blind_spot(car, _find_managed_agent(car, GLOBAL_AGENT_ID))
+    if blind:
+        return {"status": "error", "reaped": reaped, "message": blind}
     migrated = _migrate_legacy_per_project_agents(car)
     try:
         car.agents_upsert(json.dumps(_build_global_spec()))
@@ -893,6 +931,9 @@ def stop_observer(codebase_root: Optional[str] = None) -> dict:
     reaped = _reap_orphan_observers()
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
+    blind = _supervisor_blind_spot(car, existing)
+    if blind:
+        return {"status": "error", "reaped": reaped, "message": blind}
     if not existing:
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "reaped": reaped, "message": "no managed agent registered"}
@@ -923,6 +964,9 @@ def kick_observer(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": str(e)}
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
+    blind = _supervisor_blind_spot(car, existing)
+    if blind:
+        return {"status": "error", "message": blind}
     if not existing:
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "message": "no managed agent registered"}
@@ -1089,6 +1133,76 @@ def _reap_orphan_observers(codebase_root: Optional[str] = None,
     return reaped
 
 
+def _observer_lock_held() -> bool:
+    """True when a live observer holds the single-instance lock.
+
+    The lock is the one ground truth for "an observer is sweeping" that does
+    not route through CAR: the kernel holds it exactly as long as the daemon's
+    fd is open. Probed by trying to take it and letting go at once. A lock file
+    that cannot even be opened reads as not held — this only ever ADDS a
+    warning, so an unknown must not invent one.
+    """
+    probe = _SingleInstanceLock(_LOCK_PATH)
+    if probe.acquire():
+        probe.release()
+        return False
+    return True
+
+
+#: A managed-agent id that never exists. Stopping it is a no-op on any
+#: supervisor that can be reached, and returns the routing error on one that
+#: cannot — which is the only place car-runtime reports that failure.
+_ROUTING_PROBE_ID = "neo-observer-routing-probe"
+
+
+def _supervisor_blind_spot(car, existing: Optional[dict]) -> Optional[str]:
+    """Explain why CAR's answer about the observer cannot be trusted, or None.
+
+    car-runtime's ``agents_list`` routes to the car-server daemon when the
+    daemon owns the supervisor, and when that call fails it SILENTLY falls
+    back to the on-disk manifest, whose rows carry default runtime fields:
+    every agent ``stopped``, ``pid`` None. Measured: car-runtime 0.50.0 speaks
+    wire protocol v2, a CarHost 0.52.1 daemon requires v3, and ``neo memory
+    observer status`` printed ``stopped`` for an observer that had been sweeping
+    for nine days — while stop/kick returned ``not_running`` without acting and
+    start would have spawned a second, unsupervised copy. CarHost updates
+    itself and a pipx install does not, so this skew recurs on its own.
+
+    Reports ONLY a demonstrated routing failure. A held lock beside a
+    non-running status is also what a normal ``stop`` looks like while the
+    daemon finishes its current episode, and what ``starting`` looks like, so
+    the lock alone proves nothing; the probe is what separates "CAR's view is
+    stale" from "CAR's view is live and the process is on its way out".
+    """
+    if existing and existing.get("status") == "running":
+        return None
+    if not _observer_lock_held():
+        return None
+    if _find_managed_agent(car, _ROUTING_PROBE_ID) is not None:
+        return None  # someone registered the probe id: never send it a stop
+    try:
+        car.agents_stop(_ROUTING_PROBE_ID)
+        return None  # no error at all: nothing demonstrated
+    except Exception as e:  # noqa: BLE001 — the message IS the diagnosis
+        text = str(e)
+    # A reachable supervisor answers "agent <id> not found" (verified against
+    # a live car-server 0.52.1: `-32603 agent neo-observer-routing-probe not
+    # found`). Matched as that exact phrase: "not found" alone also appears in
+    # a "method not found" routing failure, even one that names the id.
+    if f"{_ROUTING_PROBE_ID} not found" in text.lower():
+        return None
+    reported = existing.get("status", "unknown") if existing else "not registered"
+    return (
+        f"an observer holds {_LOCK_PATH}, but CAR reports it '{reported}', and "
+        f"CAR's supervisor failed a no-op probe with: {text}. car-runtime is "
+        f"most likely not reaching the car-server daemon (a wire-protocol "
+        f"mismatch after the daemon updated), so this status cannot be trusted "
+        f"and start/stop/kick would act on the wrong supervisor. Upgrade "
+        f"car-runtime to match the daemon (pipx: `pipx runpip neo-reasoner "
+        f"install -U car-runtime`)."
+    )
+
+
 def observer_status(codebase_root: Optional[str] = None) -> dict:
     orphans = _find_orphan_observers()
 
@@ -1098,6 +1212,10 @@ def observer_status(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": str(e), "orphans": orphans}
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
+    blind = _supervisor_blind_spot(car, existing)
+    if blind:
+        return {"status": "unverified", "agent_id": GLOBAL_AGENT_ID,
+                "message": blind, "orphans": orphans}
     if not existing:
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "message": "no managed agent registered", "orphans": orphans}
@@ -1380,5 +1498,47 @@ def _daemon_main(argv: list[str]) -> int:
         lock.release()
 
 
+class _TimestampedStream:
+    """Prefix every line written through ``stream`` with a local timestamp.
+
+    The observer's logs had none, so 610 consecutive `LM call failed` lines
+    could not be placed in time — not even to tell a ten-minute DNS outage
+    from failures spread over nine days. Wrapping the stream, rather than
+    stamping each print, also covers the stdlib's last-resort logging handler
+    (which writes to whatever ``sys.stderr`` is when it emits) and anything a
+    library prints. Output a child process writes to the inherited fd directly
+    is not covered.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        parts = []
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start:
+                parts.append(datetime.datetime.now().astimezone()
+                             .isoformat(timespec="seconds") + " ")
+            parts.append(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._stream.write("".join(parts))
+        return len(text)
+
+    def writelines(self, lines) -> None:
+        # Explicit, or __getattr__ would hand it to the raw stream unstamped.
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 if __name__ == "__main__":
+    # Here, not in _daemon_main: tests call that in-process, and a re-exec
+    # recycle comes back through this block, so the stamping survives it.
+    sys.stdout = _TimestampedStream(sys.stdout)
+    sys.stderr = _TimestampedStream(sys.stderr)
     sys.exit(_daemon_main(sys.argv[1:]))

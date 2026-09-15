@@ -3715,3 +3715,66 @@ class TestBuildContextCaching:
         counts_after = [f.metadata.access_count for f in result.valid_facts]
 
         assert counts_after == counts_before
+
+
+class TestRetireLegacySuggestionFacts:
+    """238 per-suggestion facts minted as never-decaying DECISIONs were 49% of
+    the memory injected into prompts over 30 days on a live install, with ~4%
+    of those injections used."""
+
+    @staticmethod
+    def _legacy(fid="legacy", **over):
+        kw = dict(
+            id=fid, subject="feature: Write a Python one-liner that returns the sum of s",
+            body="Reasoning: use sum()\nSuggestion: sum(xs)", kind=FactKind.DECISION,
+            scope=FactScope.PROJECT, org_id="testorg", project_id="testproj1234",
+            tags=["feature"],
+            metadata=FactMetadata(confidence=1.0, created_at=time.time() - 120 * 86400),
+        )
+        kw.update(over)
+        return Fact(**kw)
+
+    def test_legacy_shape_is_retired_and_stays_retired_on_reload(self, store):
+        store._facts.append(self._legacy())
+        assert store.retire_legacy_suggestion_facts() == 1
+        store.load()
+        [fact] = [f for f in store._facts if f.id == "legacy"]
+        assert fact.is_valid is False
+        assert fact.invalidation_reason == "legacy_unverified_suggestion"
+
+    def test_a_retired_fact_with_successes_cannot_fill_prompts(self, store):
+        """The reclassify-to-REVIEW version turned facts with a recorded
+        success into constant-score fillers; a retired fact is not retrievable."""
+        fact = self._legacy(metadata=FactMetadata(
+            confidence=1.0, success_count=2, created_at=time.time() - 120 * 86400))
+        store._facts.append(fact)
+        store.retire_legacy_suggestion_facts(save=False)
+        assert all(f.id != "legacy" for f in store._facts if f.is_valid)
+
+    def test_near_misses_are_untouched(self, store):
+        promoted = self._legacy("promoted", canonical_signature="sig")
+        real_decision = self._legacy("decision", body="We chose SQLite for the content index.")
+        other_task = self._legacy("refactor", tags=["refactor"], subject="refactor: split module",
+                                  kind=FactKind.ARCHITECTURE)
+        store._facts.extend([promoted, real_decision, other_task])
+        assert store.retire_legacy_suggestion_facts() == 0
+        assert all(f.is_valid for f in store._facts)
+
+    def test_idempotent_and_runs_on_cold_start(self, store, tmp_path):
+        """With a REAL stale last_accessed: every live match was last touched
+        58-206 days ago, and purge_dead_facts runs later in the same cold start.
+        The default last_accessed (now) is what let the first version of this
+        test pass while the tombstone was being hard-deleted."""
+        stale = time.time() - 120 * 86400
+        store._facts.append(self._legacy(metadata=FactMetadata(
+            confidence=1.0, created_at=stale, last_accessed=stale)))
+        store.save()
+        from neo.memory.store import FactStore
+        fresh = FactStore(codebase_root=store.codebase_root)  # cold start runs the chain
+        [fact] = [f for f in fresh._facts if f.id == "legacy"]
+        assert fact.is_valid is False
+        assert fact.invalidation_reason == "legacy_unverified_suggestion"
+        fresh.load()
+        assert [f.invalidation_reason for f in fresh._facts if f.id == "legacy"] == [
+            "legacy_unverified_suggestion"], "the tombstone must reach disk"
+        assert fresh.retire_legacy_suggestion_facts() == 0

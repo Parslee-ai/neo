@@ -445,6 +445,27 @@
   object and never reloads, which is how a suite thorough about attribution
   stayed silent about persistence. **Any new credit path needs its own save,
   and a test that reads the fact back off disk.**
+- **Legacy per-suggestion facts are INVALIDATED on every cold start**
+  (`store.retire_legacy_suggestion_facts`, `invalidation_reason=legacy_unverified_suggestion`).
+  It stamps `last_accessed` before invalidating: `purge_dead_facts` runs later in the same cold
+  start and hard-deletes tombstones untouched 30+ days, and every live match was 58–206 days
+  stale, so without the stamp the audit tombstone never reached disk. It is kept 30 days, then
+  purged like any other.
+  Before episodes replaced immediate fact-writing (`412a174`), every feature suggestion was
+  written straight to the store as an unverified DECISION — a stable kind that bypasses recall
+  decay and that `update_recall` never stamps — and the since-bounded protection ratchet had
+  already lifted them to 0.9–1.0. **Measured on a live install: 238 such facts were 49% of all
+  memory injected into prompts over 30 days (1,217 of 2,477 inclusions), ~4% of those used in
+  reasoning**, the most-injected being drill prompts. Transcript-mined lessons were 1.6%.
+  The match is structural, not a date (first tag `feature`, subject `feature: `, body
+  `Reasoning: `, no `canonical_signature`), because installs kept minting the shape until they
+  upgraded. **Reclassifying them to a decaying kind was built first and is WRONG — do not
+  reintroduce it.** The stale prune skips confidence >= `STALE_MAX_CONFIDENCE` (0.4) and any
+  fact with a success, so 232 of 239 would have sat hidden on disk forever; and a decayed
+  fact's similarity term goes to ~0 while `success_bonus` is similarity-independent, so the 93
+  with a recorded success became constant-score fillers taking the same slots on every query.
+  **That second half is a live ranking hazard for ANY decaying fact with successes**, not just
+  these — today no other fact has one, which is the only reason it is not biting.
 - **A re-accepted durable pattern is reinforced in place, not re-minted.**
   `_promote_repeatedly_supported_candidate` looks for an existing valid PROJECT
   fact at the target signature before calling `add_fact`, and on a hit folds in
@@ -648,7 +669,7 @@
 - Async transcript-mining observer (`memory.observer`): a **single global**
   background process (CAR agent `neo-observer`, daemon `--daemon --all`) that
   **sweeps all discovered projects** each cycle — round-robin/budgeted
-  (`max_projects_per_cycle`, default 25; watermark- AND mtime-gated so unchanged projects do near-zero work (the watermark alone gates only *admission*: sources still parsed every transcript each cycle, measured at 298 MB for one project, which is what drove multi-GB observer RSS. `_unchanged_since` now skips files untouched since the watermark file's mtime minus a 1h skew margin; every error path falls back to parsing, because a wrong skip loses learning silently)) — running transcript mining per project. (It also ran
+  (`max_projects_per_cycle`, default 25; watermark- AND mtime-gated so unchanged projects do near-zero work (the watermark alone gates only *admission*: sources still parsed every transcript each cycle, measured at 298 MB for one project, which is what drove multi-GB observer RSS. `_unchanged_since` skips files untouched since the source's drain mark minus a 1h skew margin; every error path falls back to parsing, because a wrong skip loses learning silently. **The drain mark, never the watermark file's mtime** — that file is rewritten after every consumed episode, so a pass stopped by the 8-episode budget armed the skip against the very transcript still holding its backlog; measured live, 152 of 1,800 episodes were stranded that way. The mark (`transcript._drain_mark`) is `min(pass start, earliest timestamp of any episode still unconsumed)`: safe because a transcript's mtime is never earlier than its records, and it keeps advancing while a backlog drains (a mark set only on a fully-drained pass never moves for a busy project, i.e. full parse every visit). An unreadable pending timestamp leaves the previous mark. Marks are keyed **per transcript directory** (`codebase_root`) inside the project_id-keyed watermark, because two clones share that file and one clone draining must not arm the skip against the other. A legacy watermark has no mark and parses everything once, which also recovers the stranded)). **An LM failure is not "no lessons"** (`transcript.LMUnavailable`): `_lm_json` used to swallow every exception AND treat unparseable output as empty, so each of 610 live DNS failures consumed an episode unmined — unrecoverable, since nothing records which. **A failure is charged to an episode only when an answer vouches for the provider** — an answer during that episode (extract answered, then the judge call failed or the output was unusable) or in a LATER episode of the same pass; an answer from earlier in the pass proves nothing about calls made after it (a key revoked after episode 1 would otherwise strike every remaining episode). Failures wait in `held` until then. Two held failures in a row stop the pass AND the observer's sweep, whatever the error class — a revoked key (401), disabled billing (403) or quota 429 fails every episode alike, and charging per episode wrote off the whole backlog in three cycles. `ingest(provider_known_good=True)` (an earlier project answered this observer cycle; the observer clears it once a project reports unavailable) is the one exception: it charges a lone held failure at the end of a pass, and the two held failures at a stop, since two poison episodes are then likelier than an outage beginning at that instant and would otherwise stop the sweep on every visit. The sweep does NOT rewind its round-robin offset on that stop: a rewind re-ran the same batch in the same order, so two unanswered failures in a project nothing earlier vouched for wedged the sweep at the same place forever. Once charged, `_is_transient_lm_error` (connection/timeout/`gaierror`, SDK connection errors, 408/429/500/502/503/504 via `status_code` or google-genai's `code` on the cause chain — NOT 409/501/505) picks the cap: `MAX_EPISODE_LM_FAILURES` (3) or `MAX_EPISODE_TRANSIENT_FAILURES` (20), so neither a poison episode nor one whose prompt always times out is retried forever. Known limits: a lone failing episode with no evidence either way (overnight, or `--cwd` single-project mode) is never charged — one failing call per visit, and it pins its source's drain mark so that directory is re-parsed every visit; drain-mark safety assumes a transcript's mtime is not earlier than its records, which holds for Claude Code/Codex append-only files and for cp/rsync, not for a clock stepped back past the 1h margin; a Codex rollout that changes owning root when a nested peer leaves discovery can be skipped by the parent's mark; `_aware_epoch` (not `_episode_epoch`, which reads naive times as local) feeds the mark. All of an episode's LM calls run before its first admission — admitting part-way and retrying would re-extract the same lessons in new wording that exact-signature dedup does not catch — running transcript mining per project. (It also ran
   `synthesize_reviews` until that subsystem was removed.) Two roots can share a `project_id` (two
   clones of one remote, e.g. `flyx/fms` + `flyx/fms2`), meaning one fact file and
   one pid-keyed watermark; the sweep keeps a per-cycle `store_cache` so such a
@@ -1654,10 +1675,20 @@
   now enforced at runtime by `_require_car_runtime` (version check, not just the `agents_*`
   attr); latest validated against car-runtime **0.40.0** (full `test_car_adapter`
   suite including the live calls, against a car-server 0.37.0 daemon). Note the
-  pin `car-runtime>=0.27.0,<1.0` lets the client drift well ahead of a daemon
-  that ships inside CarHost.app, so a client/daemon **version skew is the normal
-  state**, not a fault: car-runtime prints a warning on every invocation, both
-  sides speak wire protocol v1, and neo's usage is unaffected. Updating the
+  pin `car-runtime>=0.27.0,<1.0` lets the client drift from a daemon that ships
+  inside CarHost.app, so a client/daemon **version skew is the normal state**,
+  and it is harmless ONLY while both sides speak the same wire protocol. **It stopped being harmless at the v2→v3 protocol bump**: car-runtime 0.50.0 (v2)
+  against a CarHost 0.52.1 daemon (v3) fails `server.handshake`, and `agents_list`
+  then SILENTLY falls back to the manifest — every agent `stopped`, pid None — so
+  `neo memory observer status` printed `stopped` for an observer nine days into
+  sweeping, and stop/kick returned `not_running` without acting. CarHost updates
+  itself and pipx does not, so this recurs. `observer._supervisor_blind_spot`
+  cross-checks CAR's answer against `~/.neo/observer.lock` (the one liveness signal
+  that does not route through CAR); on disagreement status reads `unverified`,
+  start/stop/kick refuse, and a no-op `agents_stop` on a nonexistent id surfaces
+  car-runtime's routing error — the only place it reports one. A hand-rolled
+  WebSocket client that skips the handshake was rejected: it works today only
+  because the daemon tolerates the missing handshake. Updating the
   daemon means updating CarHost.app — there is no `car` CLI to run and nothing
   neo can do about it. Do not paper over it with `CAR_NO_VERSION_WARNING=1`; the
   warning is accurate.

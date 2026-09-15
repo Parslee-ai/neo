@@ -159,6 +159,10 @@ PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 # explicit observation (success_count > 0), being re-retrieved
 # (access_count ≥ 2), or surviving the probation window.
 PROBATION_TAG = "probation"
+
+#: ``invalidation_reason`` on a fact ``retire_legacy_suggestion_facts`` retired,
+#: so the tombstone says why it died.
+LEGACY_SUGGESTION_REASON = "legacy_unverified_suggestion"
 PROBATION_AGE_DAYS = 3
 PROBATION_PROMOTE_ACCESS = 2  # accesses needed to promote out of probation
 GLOBAL_PROMOTION_MIN_PROJECTS = 2
@@ -434,7 +438,8 @@ class FactStore:
         try:
             # Defer each step's save and flush once at the end — a cold start on
             # a multi-MB fact file otherwise pays 4 full merge-on-save rewrites.
-            changed = self.prune_stale_facts(save=False)
+            changed = self.retire_legacy_suggestion_facts(save=False)
+            changed += self.prune_stale_facts(save=False)
             changed += self.demote_unhelpful_facts(save=False)
             changed += self.purge_dead_facts(save=False)
             changed += self.strip_tombstone_embeddings(save=False)
@@ -2532,7 +2537,8 @@ class FactStore:
             # -> strip tombstone embeddings. The four janitors defer their saves
             # and flush once here. (REVIEW->PATTERN synthesis used to lead this
             # chain; it was removed — see the note on PROTECTED_TAGS.)
-            changed = self.prune_stale_facts(save=False)
+            changed = self.retire_legacy_suggestion_facts(save=False)
+            changed += self.prune_stale_facts(save=False)
             changed += self.demote_unhelpful_facts(save=False)
             changed += self.purge_dead_facts(save=False)
             changed += self.strip_tombstone_embeddings(save=False)
@@ -3019,6 +3025,72 @@ class FactStore:
                 self.save()
             logger.info(f"Purged {purged} dead invalid facts")
         return purged
+
+    @staticmethod
+    def _is_legacy_suggestion_fact(fact: Fact) -> bool:
+        """The exact shape ``engine._store_reasoning`` minted for every feature
+        suggestion before episodes replaced immediate fact-writing (412a174):
+        kind DECISION, first tag ``feature``, subject ``feature: <prompt>``,
+        body ``Reasoning: ...``. A promoted fact always carries a
+        ``canonical_signature``, which that path never wrote, so no durable
+        lesson can match; nothing mints this shape any more.
+        """
+        return (
+            fact.is_valid
+            and fact.kind == FactKind.DECISION
+            and fact.tags[:1] == ["feature"]
+            and fact.subject.startswith("feature: ")
+            and fact.body.startswith("Reasoning: ")
+            and not fact.canonical_signature
+        )
+
+    def retire_legacy_suggestion_facts(self, save: bool = True) -> int:
+        """Invalidate legacy per-suggestion facts.
+
+        Every feature-classified suggestion used to be written straight to the
+        store as a DECISION, unverified. DECISION is a stable kind: it bypasses
+        recall decay (``models._decays``), and ``update_recall`` never stamps
+        it. With the protection boost ratchet those facts reached 0.9-1.0
+        confidence, and they never aged out. Measured on a live install: 238
+        of them were 49% of all memory injected into prompts over 30 days, and
+        about 4% of those injections were used in reasoning. The most-injected
+        were throwaway drill prompts ("Write a Python one-liner that returns
+        the sum of...", included 53 times).
+
+        **Why invalidation, not reclassification to a decaying kind** — that was
+        built first and review measured it wrong on both halves. The stale
+        prune skips a fact at confidence >= ``STALE_MAX_CONFIDENCE`` or with any
+        success, so 232 of 239 would have sat hidden on disk forever. Worse, a
+        decayed fact's similarity term goes to ~0 while ``success_bonus`` does
+        not depend on similarity, so the 93 with a recorded success became
+        constant-score fillers that took the same prompt slots on every query
+        regardless of relevance. Their successes date from the implicit-feedback
+        era that recorded false accepts.
+
+        Runs on every cold start and is idempotent: a tombstone's body is
+        stripped, so it can never match again. A peer process on an older
+        release that still holds one valid writes it back on its next save
+        (validity does not propagate through the reconciler) and the next cold
+        start retires it again. Returns the number of facts retired.
+        """
+        retired = 0
+        for fact in self._facts:
+            if not self._is_legacy_suggestion_fact(fact):
+                continue
+            fact.invalidation_reason = LEGACY_SUGGESTION_REASON
+            # Stamp access so the tombstone survives `purge_dead_facts`, which
+            # runs two steps later in this same cold start and physically
+            # deletes invalid facts untouched for 30+ days. Every live match was
+            # last accessed 58-206 days ago, so without this the "tombstone"
+            # never reached disk and installs kept no record of why it died.
+            fact.metadata.last_accessed = time.time()
+            self._invalidate(fact)
+            retired += 1
+        if retired:
+            logger.info("retired %d legacy unverified suggestion fact(s)", retired)
+            if save:
+                self.save()
+        return retired
 
     def strip_tombstone_embeddings(self, save: bool = True) -> int:
         """Drop the 768-dim embedding from invalidated facts.
