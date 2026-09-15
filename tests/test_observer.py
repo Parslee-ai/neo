@@ -1389,10 +1389,12 @@ class TestSupervisorBlindSpot:
         import neo.memory.observer as obs
         self._stopped_rows(fake_car)
         monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
-        fake_car.agents_stop.side_effect = RuntimeError("-32601 method not found: agents.stop")
-        result = obs.observer_status()
-        assert result["status"] == "unverified"
-        assert "method not found" in result["message"]
+        for text in ("-32601 method not found: agents.stop",
+                     f"agent {obs._ROUTING_PROBE_ID}: -32601 method not found: agents.stop"):
+            fake_car.agents_stop.side_effect = RuntimeError(text)
+            result = obs.observer_status()
+            assert result["status"] == "unverified", text
+            assert "method not found" in result["message"]
 
     def test_a_registered_probe_id_is_never_stopped(self, fake_car, monkeypatch):
         import neo.memory.observer as obs

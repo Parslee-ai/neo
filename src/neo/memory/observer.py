@@ -1184,10 +1184,11 @@ def _supervisor_blind_spot(car, existing: Optional[dict]) -> Optional[str]:
         return None  # no error at all: nothing demonstrated
     except Exception as e:  # noqa: BLE001 — the message IS the diagnosis
         text = str(e)
-    # A reachable supervisor answers "agent <id> not found". Matched on the id,
-    # not on "not found" alone, which a "method not found" routing failure also
-    # contains.
-    if _ROUTING_PROBE_ID in text and "not found" in text.lower():
+    # A reachable supervisor answers "agent <id> not found" (verified against
+    # a live car-server 0.52.1: `-32603 agent neo-observer-routing-probe not
+    # found`). Matched as that exact phrase: "not found" alone also appears in
+    # a "method not found" routing failure, even one that names the id.
+    if f"{_ROUTING_PROBE_ID} not found" in text.lower():
         return None
     reported = existing.get("status", "unknown") if existing else "not registered"
     return (
