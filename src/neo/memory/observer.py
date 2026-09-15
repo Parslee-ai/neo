@@ -43,6 +43,7 @@ Tunables (env, read by the daemon child):
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib.metadata
 import json
 import logging
@@ -1497,5 +1498,42 @@ def _daemon_main(argv: list[str]) -> int:
         lock.release()
 
 
+class _TimestampedStream:
+    """Prefix every line written through ``stream`` with a local timestamp.
+
+    The observer's logs had none, so 610 consecutive `LM call failed` lines
+    could not be placed in time — not even to tell a ten-minute DNS outage
+    from failures spread over nine days. Wrapping the stream, rather than
+    stamping each print, also covers the stdlib's last-resort logging handler
+    (which writes to whatever ``sys.stderr`` is when it emits) and anything a
+    library prints. Output a child process writes to the inherited fd directly
+    is not covered.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        parts = []
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start:
+                parts.append(datetime.datetime.now().astimezone()
+                             .isoformat(timespec="seconds") + " ")
+            parts.append(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._stream.write("".join(parts))
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 if __name__ == "__main__":
+    # Here, not in _daemon_main: tests call that in-process, and a re-exec
+    # recycle comes back through this block, so the stamping survives it.
+    sys.stdout = _TimestampedStream(sys.stdout)
+    sys.stderr = _TimestampedStream(sys.stderr)
     sys.exit(_daemon_main(sys.argv[1:]))

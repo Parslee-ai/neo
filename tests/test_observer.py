@@ -1421,3 +1421,49 @@ class TestSupervisorBlindSpot:
         monkeypatch.setattr(obs, "_observer_lock_held", lambda: False)
         assert obs.observer_status()["status"] == "stopped"
         fake_car.agents_stop.assert_not_called()
+
+
+class TestTimestampedDaemonOutput:
+    """610 `LM call failed` lines in a live observer log could not be placed
+    in time, because nothing it wrote carried a timestamp."""
+
+    _STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} "
+
+    def test_every_line_is_stamped_once_even_across_partial_writes(self):
+        import io
+        import re as _re
+        from neo.memory.observer import _TimestampedStream
+        buf = io.StringIO()
+        out = _TimestampedStream(buf)
+        out.write("first line\nsecond ")
+        out.write("line continues\n")
+        out.write("")
+        out.write("third\n")
+        lines = buf.getvalue().splitlines()
+        assert len(lines) == 3
+        for line, body in zip(lines, ["first line", "second line continues", "third"]):
+            assert _re.fullmatch(self._STAMP + _re.escape(body), line), line
+
+    def test_the_real_daemon_entrypoint_stamps_print_and_logging(self, tmp_path):
+        """Through `python -m neo.memory.observer`, the way CAR launches it:
+        argparse's usage error goes through print, and a logging warning goes
+        through the stdlib's last-resort handler — both must be stamped."""
+        import os
+        import re as _re
+        import subprocess
+        code = (
+            "import logging, runpy, sys; "
+            "sys.argv = ['neo.memory.observer', '--daemon']; "
+            "import neo.memory.observer as o; "
+            "sys.stderr = o._TimestampedStream(sys.stderr); "
+            "logging.getLogger('neo.memory.transcript').warning('probe warning')"
+        )
+        env = {**os.environ, "PYTHONPATH": "src"}
+        warn = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                              text=True, env=env, timeout=60)
+        assert _re.search(self._STAMP + "probe warning", warn.stderr), warn.stderr
+        main = subprocess.run(
+            [sys.executable, "-m", "neo.memory.observer", "--daemon"],
+            capture_output=True, text=True, env=env, timeout=60)
+        assert main.returncode == 2
+        assert _re.search(self._STAMP + "observer requires --all or --cwd", main.stderr), main.stderr
