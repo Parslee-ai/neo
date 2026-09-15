@@ -49,20 +49,22 @@ def _responses_body(text="ok", status="completed"):
 
 def _adapter(model, handler, base_url=None):
     """A real OpenAIAdapter whose SDK client talks to ``handler`` instead of
-    the network. Built with the adapter's own constructor, then given a client
-    carrying the mock transport — the SDK code path is untouched."""
+    the network. The constructor's own client is COPIED with only the transport
+    swapped, so whatever the adapter configured (base_url, timeouts, retries)
+    is what the request actually uses — building a fresh client here would
+    test the SDK, not the adapter."""
     adapter = OpenAIAdapter(model=model, api_key="test-key", base_url=base_url)
-    kwargs = {"api_key": "test-key",
-              "http_client": httpx.Client(transport=httpx.MockTransport(handler))}
-    if base_url:
-        kwargs["base_url"] = base_url
-    adapter.client = openai.OpenAI(**kwargs)
+    adapter.client = adapter.client.copy(
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)))
     return adapter
 
 
 @pytest.fixture(autouse=True)
-def _no_metrics(monkeypatch):
+def _isolated_env(monkeypatch):
     monkeypatch.setenv("NEO_METRICS", "off")
+    # The SDK reads OPENAI_BASE_URL when base_url is None; a developer's
+    # proxy setting must not move the URLs these tests assert.
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
 
 
 def test_gpt5_responses_payload_includes_output_controls_but_omits_temperature():
@@ -159,8 +161,11 @@ def test_incomplete_response_still_raises():
     def handler(request):
         return httpx.Response(200, json=_responses_body(status="incomplete"))
 
-    with pytest.raises(ValueError, match="No completed message"):
+    with pytest.raises(ValueError, match="No completed message") as exc:
         _adapter("gpt-5.6", handler).generate([{"role": "user", "content": "hi"}])
+    # Diagnosable without echoing the model's partial output into logs.
+    assert "incomplete" in str(exc.value)
+    assert "output_text" not in str(exc.value)
 
 
 def test_responses_base_url_follows_sdk_convention():
@@ -175,3 +180,59 @@ def test_responses_base_url_follows_sdk_convention():
     _adapter("gpt-5.6", handler, base_url="https://proxy.example/v1").generate(
         [{"role": "user", "content": "hi"}])
     assert urls == ["https://proxy.example/v1/responses"]
+
+
+def test_responses_call_keeps_the_short_connect_timeout():
+    """A per-call `timeout=600.0` float raised the SDK's 5s connect timeout to
+    600s, so a blackholed connect hung ten minutes per attempt, three times."""
+    timeouts = []
+
+    def handler(request):
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json=_responses_body())
+
+    _adapter("gpt-5.6", handler).generate([{"role": "user", "content": "hi"}])
+    assert timeouts[0]["connect"] <= 10, timeouts[0]
+    assert timeouts[0]["read"] >= 600, timeouts[0]
+
+
+def test_unknown_output_item_type_prints_no_warning(recwarn):
+    """The API adds output item types over time. Serializing one must not emit
+    a pydantic warning: stderr is the --json event stream."""
+    body = _responses_body("still ok")
+    body["output"].insert(0, {"type": "some_future_item", "id": "x", "payload": 1})
+
+    def handler(request):
+        return httpx.Response(200, json=body)
+
+    assert _adapter("gpt-5.6", handler).generate(
+        [{"role": "user", "content": "hi"}]) == "still ok"
+    assert not [w for w in recwarn if "serializ" in str(w.message).lower()]
+
+
+def test_sdk_timeout_is_classified_as_a_network_timeout():
+    """The CLI's NetworkTimeout envelope checked only httpx timeouts, which the
+    SDK wraps — so it never fired for an OpenAI or Azure call."""
+    from neo.cli import _is_network_timeout
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    assert _is_network_timeout(openai.APITimeoutError(request=request))
+    assert _is_network_timeout(httpx.ReadTimeout("slow", request=request))
+    assert not _is_network_timeout(
+        openai.APIConnectionError(message="dns", request=request))
+    assert not _is_network_timeout(ValueError("API error 400"))
+
+
+def test_exhausted_retries_keep_the_status_code():
+    """When every attempt returns 503 the caller must still get a TYPED error
+    with the status: transcript mining decides retry-later vs give-up on it."""
+    attempts = []
+
+    def handler(request):
+        attempts.append(1)
+        return httpx.Response(503, json={"error": {"message": "overloaded"}})
+
+    with pytest.raises(openai.APIStatusError) as exc:
+        _adapter("gpt-5.6", handler).generate([{"role": "user", "content": "hi"}])
+    assert exc.value.status_code == 503
+    assert len(attempts) == 3  # one call + the SDK's two retries

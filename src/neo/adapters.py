@@ -319,10 +319,17 @@ class OpenAIAdapter(LMAdapter):
                 # convention (ends in /v1), the same one the chat path already
                 # used — the raw post appended /v1 itself, so one base_url
                 # could not serve both paths.
-                response = self.client.responses.create(
-                    **payload, timeout=600.0,  # 10 minutes for complex queries
-                )
-                data = response.model_dump()
+                #
+                # No `timeout=` here: the client default is already
+                # Timeout(connect=5, read=600), and a bare float would raise
+                # connect to 600 too, so a blackholed connect hung ten minutes
+                # per attempt. `to_dict(warnings=False)` rather than
+                # model_dump(): it omits unset fields (the dict matches the
+                # raw JSON this parser was written against) and does not print
+                # a pydantic serialization warning to stderr — the --json
+                # event stream — when the API adds an output item type.
+                response = self.client.responses.create(**payload)
+                data = response.to_dict(warnings=False)
                 self._emit_usage_metric(data.get("usage", {}))
 
                 # Extract text from output array
@@ -334,7 +341,13 @@ class OpenAIAdapter(LMAdapter):
                             if c.get("type") == "output_text":
                                 return c.get("text", "")
 
-                raise ValueError(f"No completed message in response: {data}")
+                # Name the response, not its content: the whole dict carries the
+                # model's partial output, which lands in episode error text and
+                # observer logs. `incomplete_details` is what diagnoses the
+                # common case (max_output_tokens spent on reasoning).
+                summary = {k: data.get(k) for k in
+                           ("id", "status", "incomplete_details", "error")}
+                raise ValueError(f"No completed message in response: {summary}")
             else:
                 # Standard chat completions for other models. Route through the
                 # resilient helper so o-series (and other reasoning models that
