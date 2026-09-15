@@ -1271,7 +1271,6 @@ class TranscriptIngester:
         outage = False
         # Failures not yet attributable to their episode (see the except).
         held: list[tuple] = []
-        unanswered = 0
         answers_at_start = self._lm_answers
         for source in self.sources:
             if outage or stop_now():
@@ -1297,63 +1296,56 @@ class TranscriptIngester:
             for ep in new:
                 if stop_now():
                     break
+                answers_before = self._lm_answers
                 try:
-                    stats["facts_admitted"] += self.ingest_episode(
+                    admitted = self.ingest_episode(
                         ep, source.scope, fact_kind=src_kind, extra_tags=src_tags)
                 except LMUnavailable as e:
                     stats["episodes_processed"] += 1  # it spent LM calls
                     stats["episodes_failed"] += 1
-                    if self._lm_answers > answers_at_start:
-                        # The provider has answered in this pass, so the
-                        # failure is this episode's — and so is any held one.
-                        unanswered = 0
-                        held.append((source, state, ep, e))
-                        if not all([self._charge(*h, stats) for h in held]):
-                            outage = True  # watermark unwritable
+                    held.append((source, state, ep, e))
+                    if self._lm_answers > answers_before:
+                        # The provider answered during this very episode (then
+                        # the judge call failed, or the output was unusable):
+                        # it is serving, so every held failure is its episode's.
+                        if not self._charge_held(held, stats):
+                            outage = True
                             break
-                        held.clear()
                         continue
-                    unanswered += 1
-                    if unanswered >= 2:
-                        # Two failures and not one answer: the provider is not
-                        # serving us, WHATEVER the error class says — a 401,
-                        # 403 or quota 429 fails every episode alike, and
-                        # charging them would write off the backlog one cap at
-                        # a time. Nothing further is charged.
+                    if len(held) >= 2:
+                        # Two failures in a row with no answer between them:
+                        # the provider is not serving us, WHATEVER the error
+                        # class says — a 401, 403 or quota 429 fails every
+                        # episode alike, and charging them would write off the
+                        # backlog one cap at a time. The exception: the caller
+                        # saw this provider answer earlier this cycle, which
+                        # makes two poison episodes likelier than an outage
+                        # starting at exactly this moment — without charging
+                        # them they would stop the sweep on every visit.
+                        if provider_known_good:
+                            self._charge_held(held, stats)
+                        held.clear()
                         logger.warning(
                             "transcript: LM unavailable (%s); stopping the pass", e)
                         stats["lm_unavailable"] = True
                         outage = True
                         break
-                    if provider_known_good:
-                        # The caller saw this provider answer recently (an
-                        # earlier project this cycle), so a lone failure is the
-                        # episode's. Without this a poison episode that is the
-                        # only one left in its project would never be charged
-                        # and would be retried on every visit forever.
-                        if not self._charge(source, state, ep, e, stats):
-                            outage = True
-                            break
-                    else:
-                        # One failure proves nothing: an unreachable provider,
-                        # a revoked key and a bad episode look the same. Hold
-                        # it and try one more episode.
-                        held.append((source, state, ep, e))
-                    continue
-                if self._lm_answers > answers_at_start:
-                    # An answer: the provider works, so any held failure was
-                    # that episode's after all. (A non-substantive episode
-                    # "succeeds" with no LM call and proves nothing — hence
-                    # the answer count, not success.)
-                    unanswered = 0
-                    for h in held:
-                        self._charge(*h, stats)
-                    held.clear()
+                    continue  # one failure proves nothing: try the next episode
+                stats["facts_admitted"] += admitted
+                # An answer clears the held failures as the episodes' own. A
+                # non-substantive episode "succeeds" with no LM call and proves
+                # nothing — hence the answer count, not success.
+                if held and self._lm_answers > answers_before:
+                    if not self._charge_held(held, stats):
+                        outage = True
+                        break
                 consumed.add(ep.anchor_uuid)
                 state["failures"].pop(ep.anchor_uuid, None)
                 state["transient_failures"].pop(ep.anchor_uuid, None)
                 stats["episodes_processed"] += 1
                 if not self._persist_watermark(source, state):  # advance only after durable
+                    # Mining on would re-mine episodes whose consumption cannot
+                    # be recorded, as duplicate facts next pass.
                     outage = True
                     break
             mark = _drain_mark(collect_started,
@@ -1371,6 +1363,12 @@ class TranscriptIngester:
             logger.warning("transcript: suggestion-outcome mining failed: %s", e)
             stats["outcomes_mined"] = 0
 
+        if held and provider_known_good and not stats["lm_unavailable"]:
+            # A lone failure with nothing after it to vouch for the provider.
+            # The caller's evidence charges it; without that a poison episode
+            # left alone in its project is retried on every visit and pins the
+            # drain mark (see the limits in CLAUDE.md for the no-evidence case).
+            self._charge_held(held, stats)
         stats["lm_answers"] = self._lm_answers - answers_at_start
         if stats["episodes_processed"] or stats.get("outcomes_mined"):
             metrics_record("transcript_ingest", **stats)
@@ -1570,13 +1568,17 @@ class TranscriptIngester:
     def _load_failures(self, source) -> dict:
         return self._load_watermark(source)["failures"]
 
-    def _charge(self, source, state: dict, ep: Episode, error: LMUnavailable,
-                stats: dict) -> bool:
-        """Charge a failure to ``ep`` and persist. False when the watermark
-        could not be written."""
-        if self._record_lm_failure(source, state, ep, error):
-            stats["episodes_abandoned"] += 1
-        return self._persist_watermark(source, state)
+    def _charge_held(self, held: list, stats: dict) -> bool:
+        """Charge every held ``(source, state, episode, error)`` to its episode,
+        persist each source's watermark, and clear ``held``. False when any
+        watermark could not be written."""
+        ok = True
+        for source, state, ep, error in held:
+            if self._record_lm_failure(source, state, ep, error):
+                stats["episodes_abandoned"] += 1
+            ok = self._persist_watermark(source, state) and ok
+        held.clear()
+        return ok
 
     def _record_lm_failure(self, source, state: dict, ep: Episode,
                            error: LMUnavailable) -> bool:

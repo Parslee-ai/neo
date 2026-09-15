@@ -1502,3 +1502,90 @@ def test_naive_timestamp_does_not_advance_the_drain_mark():
     aware.timestamp = "2026-01-01T00:00:00Z"
     assert _drain_mark(time.time(), [aware]) == datetime.datetime(
         2026, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
+
+
+def _revoked_key():
+    import httpx
+    import openai
+    req = httpx.Request("POST", "https://x/v1/responses")
+    return openai.AuthenticationError(
+        "invalid key", response=httpx.Response(401, request=req), body=None)
+
+
+class _DiesAfter(_StubAdapter):
+    """Answers normally for ``ok_calls`` calls, then raises ``exc`` forever."""
+
+    def __init__(self, ok_calls, exc):
+        super().__init__([_LESSON], keep=True)
+        self._ok_calls, self._exc, self.n = ok_calls, exc, 0
+
+    def generate(self, messages, **kw):
+        self.n += 1
+        if self.n > self._ok_calls:
+            raise self._exc
+        return super().generate(messages, **kw)
+
+
+def test_provider_dying_mid_pass_stops_without_charging(temp_store, tmp_path, monkeypatch):
+    """An answer early in a pass is not evidence about calls made after the
+    provider went away: a key revoked after episode 1 must not put a strike on
+    every remaining episode in the budget."""
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    src = _StaticSource([_ep(f"e{i}", f"ask {i}") for i in range(6)])
+    ad = _DiesAfter(ok_calls=2, exc=_revoked_key())  # e0: extract + verify
+    stats = _fresh_ingester(temp_store, ad, src).ingest()
+    assert stats["lm_unavailable"] is True
+    assert ad.n == 4, "e1 and e2 fail, then the pass stops"
+    ing = _fresh_ingester(temp_store, None, src)
+    assert ing._load_consumed(src) == {"e0"}
+    assert ing._load_failures(src) == {}
+
+
+def test_two_poison_episodes_after_known_answers_are_charged(temp_store, tmp_path, monkeypatch):
+    """With an answer earlier this cycle, two failures in a row are likelier two
+    bad episodes than an outage starting at that instant. Left uncharged they
+    would stop the sweep on every visit."""
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    src = _StaticSource([_ep("p1", "poison one"), _ep("p2", "poison two")])
+    stats = _fresh_ingester(temp_store, _FailingAdapter(ValueError("context too long")), src).ingest(
+        provider_known_good=True)
+    assert stats["lm_unavailable"] is True, "the pass still stops"
+    assert _fresh_ingester(temp_store, None, src)._load_failures(src) == {"p1": 1, "p2": 1}
+
+
+def test_a_charge_that_cannot_be_written_stops_the_pass(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+
+    class _PoisonFirst(_StubAdapter):
+        def __init__(self):
+            super().__init__([_LESSON], keep=True)
+            self.asks = []
+
+        def generate(self, messages, **kw):
+            content = messages[0]["content"]
+            if '"lessons"' in content:
+                self.asks.append(content)
+            if "the poison ask" in content:
+                raise ValueError("bad request")
+            return super().generate(messages, **kw)
+
+    def unwritable(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("neo.memory.transcript.atomic_write_json", unwritable)
+    ad = _PoisonFirst()
+    src = _StaticSource([_ep("bad", "the poison ask"), _ep("good", "a healthy ask"),
+                         _ep("third", "a third ask")])
+    _fresh_ingester(temp_store, ad, src).ingest()
+    assert not any("a third ask" in a for a in ad.asks), \
+        "no episode may be mined after progress stopped being recordable"
+
+
+def test_non_substantive_success_is_not_an_answer(temp_store, tmp_path, monkeypatch):
+    monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
+    hollow = Episode(session_id="s", anchor_uuid="hollow", last_uuid="hollow",
+                     timestamp="t", ask="just asking")  # no assistant text: no LM call
+    src = _StaticSource([_ep("f1", "ask one"), hollow, _ep("f2", "ask two")])
+    stats = _fresh_ingester(temp_store, _FailingAdapter(_revoked_key()), src).ingest()
+    assert stats["lm_unavailable"] is True
+    assert _fresh_ingester(temp_store, None, src)._load_failures(src) == {}
