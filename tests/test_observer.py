@@ -1248,27 +1248,27 @@ class TestSweepStopsOnLMOutage:
         assert swept == ["/a"]
         assert "LM unavailable, stopping; 2 project(s) deferred" in capsys.readouterr().err
 
-    def test_deferred_projects_are_first_next_cycle(self, monkeypatch):
-        """The round-robin offset had already moved past the whole batch, so
-        "deferred" projects waited a full rotation — and could keep losing
-        their turn to the same outage."""
+    def test_a_stuck_project_cannot_wedge_the_rotation(self, monkeypatch):
+        """A project whose two first episodes always fail with no answer stops
+        the sweep on every visit. If the offset rewound to the batch start, the
+        same batch would re-run in the same order forever and no project past
+        it would ever be swept."""
         import neo.memory.observer as obs
         from neo.memory.observer import Observer, ObserverConfig
-        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c", "/d"])
+        roots = ["/stuck", "/b", "/c", "/d", "/e"]
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: roots)
         swept = []
-        outage = {"on": True}
 
         def rp(self, root, peer_roots=None, shared_store=None):
             swept.append(root)
-            self._lm_unavailable = outage["on"]
+            self._lm_unavailable = root == "/stuck"
             return (0, 0, object())
 
         monkeypatch.setattr(Observer, "_run_project", rp)
-        o = Observer(global_mode=True, config=ObserverConfig(max_projects_per_cycle=3))
-        o._cycle()
-        outage["on"] = False
-        o._cycle()
-        assert swept == ["/a", "/a", "/b", "/c"]
+        o = Observer(global_mode=True, config=ObserverConfig(max_projects_per_cycle=2))
+        for _ in range(6):
+            o._cycle()
+        assert set(swept) == set(roots), f"never reached: {set(roots) - set(swept)}"
 
     def test_ingest_records_the_outage_from_stats(self, monkeypatch, fake_project_id):
         from neo.memory.observer import Observer

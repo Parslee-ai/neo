@@ -593,17 +593,17 @@ class Observer:
                     flush=True,
                 )
                 if self._lm_unavailable:
-                    # An outage is not per-project. Sweeping on would load up
+                    # An outage is not per-project: sweeping on would load up
                     # to two dozen more fact stores to fail the same first LM
-                    # calls in each. The offset already moved past this whole
-                    # batch, so rewind it to the batch's start: the whole batch
-                    # — the failing project first — re-runs next cycle, rather
-                    # than the deferred projects waiting a full rotation. The
-                    # projects already swept cost next to nothing to revisit
-                    # (unchanged transcripts are skipped), and nothing mines
-                    # during an outage anyway. `batch` was regrouped by project
-                    # id, so `i` does not map back to `roots`; `start` does.
-                    self._sweep_offset = start
+                    # calls in each. The round-robin offset is deliberately
+                    # NOT rewound. A rewind re-ran the same batch in the same
+                    # order next cycle, so two episodes that fail in a project
+                    # no earlier project vouches for stopped the sweep at the
+                    # same place forever and nothing past that batch was ever
+                    # reached. Advancing costs the deferred projects one
+                    # rotation, and shifts which projects precede the stuck
+                    # one — which is what lets another project's answer supply
+                    # the evidence that charges its failures.
                     deferred = n - i
                     print(
                         f"neo observer sweep: LM unavailable, stopping; "
