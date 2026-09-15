@@ -298,14 +298,6 @@ class OpenAIAdapter(LMAdapter):
         ):
             # gpt-5* and codex models use /v1/responses endpoint
             if "codex" in self.model.lower() or "gpt-5" in self.model.lower():
-                import httpx
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-                base_url = self.base_url or "https://api.openai.com"
-                url = f"{base_url}/v1/responses"
-
                 payload: dict = {
                     "model": self.model,
                     "input": messages,
@@ -317,10 +309,20 @@ class OpenAIAdapter(LMAdapter):
                 if reasoning_effort is not None:
                     payload["reasoning"] = {"effort": reasoning_effort}
 
-                response = httpx.post(url, headers=headers, json=payload, timeout=600.0)  # 10 minutes for complex queries
-                if response.status_code != 200:
-                    raise ValueError(f"API error {response.status_code}: {response.text}")
-                data = response.json()
+                # Through the SDK client, never a bare httpx.post: the SDK
+                # retries connection errors, 408/409/429 and 5xx with backoff
+                # (honouring Retry-After) and raises a typed APIStatusError
+                # carrying status_code. The raw post had neither, so a single
+                # `Connection reset by peer` failed the whole neo run, and a
+                # 503 surfaced as an untyped ValueError no caller could tell
+                # apart from a malformed response. base_url follows the SDK's
+                # convention (ends in /v1), the same one the chat path already
+                # used — the raw post appended /v1 itself, so one base_url
+                # could not serve both paths.
+                response = self.client.responses.create(
+                    **payload, timeout=600.0,  # 10 minutes for complex queries
+                )
+                data = response.model_dump()
                 self._emit_usage_metric(data.get("usage", {}))
 
                 # Extract text from output array
