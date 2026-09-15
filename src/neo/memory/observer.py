@@ -892,6 +892,9 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": f"agents_upsert failed: {e}"}
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
+    blind = _supervisor_blind_spot(car, existing)
+    if blind:
+        return {"status": "error", "message": blind}
     if existing and existing.get("status") == "running":
         return {"status": "already_running", "agent_id": GLOBAL_AGENT_ID,
                 "pid": existing.get("pid"), "migrated": migrated,
@@ -924,6 +927,9 @@ def stop_observer(codebase_root: Optional[str] = None) -> dict:
     reaped = _reap_orphan_observers()
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
+    blind = _supervisor_blind_spot(car, existing)
+    if blind:
+        return {"status": "error", "reaped": reaped, "message": blind}
     if not existing:
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "reaped": reaped, "message": "no managed agent registered"}
@@ -954,6 +960,9 @@ def kick_observer(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": str(e)}
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
+    blind = _supervisor_blind_spot(car, existing)
+    if blind:
+        return {"status": "error", "message": blind}
     if not existing:
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "message": "no managed agent registered"}
@@ -1120,6 +1129,71 @@ def _reap_orphan_observers(codebase_root: Optional[str] = None,
     return reaped
 
 
+def _observer_lock_held() -> bool:
+    """True when a live observer holds the single-instance lock.
+
+    The lock is the one ground truth for "an observer is sweeping" that does
+    not route through CAR: the kernel holds it exactly as long as the daemon's
+    fd is open. Probed by trying to take it and letting go at once. A lock file
+    that cannot even be opened reads as not held — this only ever ADDS a
+    warning, so an unknown must not invent one.
+    """
+    probe = _SingleInstanceLock(_LOCK_PATH)
+    if probe.acquire():
+        probe.release()
+        return False
+    return True
+
+
+#: A managed-agent id that never exists. Stopping it is a no-op on any
+#: supervisor that can be reached, and returns the routing error on one that
+#: cannot — which is the only place car-runtime reports that failure.
+_ROUTING_PROBE_ID = "neo-observer-routing-probe"
+
+
+def _supervisor_blind_spot(car, existing: Optional[dict]) -> Optional[str]:
+    """Explain why CAR reports the observer not running while one is, or None.
+
+    car-runtime's ``agents_list`` routes to the car-server daemon when the
+    daemon owns the supervisor, and when that call fails it SILENTLY falls
+    back to the on-disk manifest, whose rows carry default runtime fields:
+    every agent ``stopped``, ``pid`` None. Measured: car-runtime 0.50.0 speaks
+    wire protocol v2, a CarHost 0.52.1 daemon requires v3, and ``neo memory
+    observer status`` printed ``stopped`` for an observer that had been sweeping
+    for nine days — while stop/kick returned ``not_running`` without acting and
+    start would have spawned a second, unsupervised copy. CarHost updates
+    itself and a pipx install does not, so this skew recurs on its own.
+    """
+    if existing and existing.get("status") == "running":
+        return None
+    if not _observer_lock_held():
+        return None
+    reported = existing.get("status", "unknown") if existing else "not registered"
+    routing_error = ""
+    try:
+        car.agents_stop(_ROUTING_PROBE_ID)
+    except Exception as e:  # noqa: BLE001 — the message IS the diagnosis
+        if "not found" not in str(e).lower():
+            routing_error = str(e)
+    if routing_error:
+        return (
+            f"an observer holds {_LOCK_PATH}, but CAR reports it '{reported}' "
+            f"because car-runtime cannot reach the car-server daemon's supervisor "
+            f"({routing_error}). This status cannot be trusted, and start/stop/"
+            f"kick would act on the wrong supervisor. Upgrade car-runtime to "
+            f"match the daemon (pipx: `pipx runpip neo-reasoner install -U "
+            f"car-runtime`)."
+        )
+    # CAR's view is live and genuinely says not running, so the lock holder is
+    # a process CAR does not manage: an orphan of a dead car-server, or an
+    # observer started by hand. Not a CAR fault — do not blame one.
+    return (
+        f"an observer holds {_LOCK_PATH}, but CAR reports it '{reported}': the "
+        f"running observer is not the CAR-managed one (an orphan, or one started "
+        f"outside CAR). Stop that process before starting the managed observer."
+    )
+
+
 def observer_status(codebase_root: Optional[str] = None) -> dict:
     orphans = _find_orphan_observers()
 
@@ -1129,6 +1203,10 @@ def observer_status(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": str(e), "orphans": orphans}
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
+    blind = _supervisor_blind_spot(car, existing)
+    if blind:
+        return {"status": "unverified", "agent_id": GLOBAL_AGENT_ID,
+                "message": blind, "orphans": orphans}
     if not existing:
         return {"status": "not_running", "agent_id": GLOBAL_AGENT_ID,
                 "message": "no managed agent registered", "orphans": orphans}

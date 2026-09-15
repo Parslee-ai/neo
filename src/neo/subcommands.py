@@ -433,6 +433,9 @@ def _handle_observer(args) -> None:
         parts.append(f"log={result['log_file']}")
     print(" ".join(parts))
 
+    if result.get("status") == "unverified":
+        print(f"[Neo] WARNING: {result.get('message')}", file=sys.stderr)
+
     orphans = result.get("orphans") or []
     if orphans:
         pidlist = " ".join(str(p) for p in orphans)

@@ -1654,10 +1654,20 @@
   now enforced at runtime by `_require_car_runtime` (version check, not just the `agents_*`
   attr); latest validated against car-runtime **0.40.0** (full `test_car_adapter`
   suite including the live calls, against a car-server 0.37.0 daemon). Note the
-  pin `car-runtime>=0.27.0,<1.0` lets the client drift well ahead of a daemon
-  that ships inside CarHost.app, so a client/daemon **version skew is the normal
-  state**, not a fault: car-runtime prints a warning on every invocation, both
-  sides speak wire protocol v1, and neo's usage is unaffected. Updating the
+  pin `car-runtime>=0.27.0,<1.0` lets the client drift from a daemon that ships
+  inside CarHost.app, so a client/daemon **version skew is the normal state**,
+  and it is harmless ONLY while both sides speak the same wire protocol. **It stopped being harmless at the v2→v3 protocol bump**: car-runtime 0.50.0 (v2)
+  against a CarHost 0.52.1 daemon (v3) fails `server.handshake`, and `agents_list`
+  then SILENTLY falls back to the manifest — every agent `stopped`, pid None — so
+  `neo memory observer status` printed `stopped` for an observer nine days into
+  sweeping, and stop/kick returned `not_running` without acting. CarHost updates
+  itself and pipx does not, so this recurs. `observer._supervisor_blind_spot`
+  cross-checks CAR's answer against `~/.neo/observer.lock` (the one liveness signal
+  that does not route through CAR); on disagreement status reads `unverified`,
+  start/stop/kick refuse, and a no-op `agents_stop` on a nonexistent id surfaces
+  car-runtime's routing error — the only place it reports one. A hand-rolled
+  WebSocket client that skips the handshake was rejected: it works today only
+  because the daemon tolerates the missing handshake. Updating the
   daemon means updating CarHost.app — there is no `car` CLI to run and nothing
   neo can do about it. Do not paper over it with `CAR_NO_VERSION_WARNING=1`; the
   warning is accurate.

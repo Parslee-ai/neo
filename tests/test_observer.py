@@ -1313,3 +1313,81 @@ class TestProviderEvidenceAcrossProjects:
         o._cycle()
         o._cycle()
         assert seen == [("/a", False), ("/b", True), ("/a", False), ("/b", True)]
+
+
+class TestSupervisorBlindSpot:
+    """car-runtime silently falls back to manifest rows (all `stopped`, pid
+    None) when it cannot reach the daemon's supervisor. Live: a wire-protocol
+    v2 client against a v3 daemon printed `stopped` for an observer that had
+    been sweeping for nine days."""
+
+    _SKEW = ("server.handshake rejected by daemon: -32006 protocol version "
+             "mismatch: client requested v2, but this daemon requires v3")
+
+    def _stopped_rows(self, fake_car):
+        from neo.memory.observer import GLOBAL_AGENT_ID
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": GLOBAL_AGENT_ID, "pid": None, "status": "stopped",
+              "restart_count": 0, "last_exit_code": None}])
+
+    def test_lock_probe_sees_a_real_holder(self, tmp_path, monkeypatch):
+        """No mock: a second open file description cannot flock what the
+        first holds, which is exactly the daemon-vs-status-process case."""
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_LOCK_PATH", str(tmp_path / "observer.lock"))
+        assert obs._observer_lock_held() is False
+        holder = obs._SingleInstanceLock(obs._LOCK_PATH)
+        assert holder.acquire()
+        try:
+            assert obs._observer_lock_held() is True
+        finally:
+            holder.release()
+        assert obs._observer_lock_held() is False
+
+    def test_status_is_unverified_and_names_the_routing_error(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        result = obs.observer_status()
+        assert result["status"] == "unverified"
+        assert "protocol version mismatch" in result["message"]
+        assert "car-runtime" in result["message"]
+
+    def test_stop_and_kick_refuse_instead_of_claiming_not_running(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        assert obs.stop_observer()["status"] == "error"
+        assert obs.kick_observer()["status"] == "error"
+        fake_car.agents_restart.assert_not_called()
+        stopped = [c.args for c in fake_car.agents_stop.call_args_list]
+        assert all(a == (obs._ROUTING_PROBE_ID,) for a in stopped), \
+            "only the no-op probe may be sent, never a real stop"
+
+    def test_start_does_not_spawn_a_second_observer(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        assert obs.start_observer()["status"] == "error"
+        fake_car.agents_start.assert_not_called()
+
+    def test_unmanaged_holder_is_not_blamed_on_car(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(
+            f"agent {obs._ROUTING_PROBE_ID} not found")
+        result = obs.observer_status()
+        assert result["status"] == "unverified"
+        assert "not the CAR-managed one" in result["message"]
+        assert "car-runtime" not in result["message"]
+
+    def test_no_lock_holder_keeps_the_plain_answer(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: False)
+        assert obs.observer_status()["status"] == "stopped"
+        fake_car.agents_stop.assert_not_called()
