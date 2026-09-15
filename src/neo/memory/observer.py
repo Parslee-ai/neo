@@ -1527,6 +1527,11 @@ class _TimestampedStream:
         self._stream.write("".join(parts))
         return len(text)
 
+    def writelines(self, lines) -> None:
+        # Explicit, or __getattr__ would hand it to the raw stream unstamped.
+        for line in lines:
+            self.write(line)
+
     def __getattr__(self, name):
         return getattr(self._stream, name)
 

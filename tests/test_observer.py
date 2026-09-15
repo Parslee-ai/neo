@@ -1439,9 +1439,11 @@ class TestTimestampedDaemonOutput:
         out.write("line continues\n")
         out.write("")
         out.write("third\n")
+        out.writelines(["fourth\n", "fifth\n"])
         lines = buf.getvalue().splitlines()
-        assert len(lines) == 3
-        for line, body in zip(lines, ["first line", "second line continues", "third"]):
+        assert len(lines) == 5
+        for line, body in zip(lines, ["first line", "second line continues", "third",
+                                      "fourth", "fifth"]):
             assert _re.fullmatch(self._STAMP + _re.escape(body), line), line
 
     def test_the_real_daemon_entrypoint_stamps_print_and_logging(self, tmp_path):
@@ -1458,7 +1460,11 @@ class TestTimestampedDaemonOutput:
             "sys.stderr = o._TimestampedStream(sys.stderr); "
             "logging.getLogger('neo.memory.transcript').warning('probe warning')"
         )
-        env = {**os.environ, "PYTHONPATH": "src"}
+        # Absolute, from this file: a relative "src" run from another cwd would
+        # let the editable install supply a different tree's code.
+        from pathlib import Path
+        src = str(Path(__file__).resolve().parents[1] / "src")
+        env = {**os.environ, "PYTHONPATH": src}
         warn = subprocess.run([sys.executable, "-c", code], capture_output=True,
                               text=True, env=env, timeout=60)
         assert _re.search(self._STAMP + "probe warning", warn.stderr), warn.stderr
