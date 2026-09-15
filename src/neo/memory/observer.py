@@ -355,6 +355,7 @@ class Observer:
         # Name of the last transcript-ingest exception (or None), surfaced in
         # the cycle record so a failing LM key isn't invisible.
         self._last_ingest_error: Optional[str] = None
+        self._lm_unavailable = False
         # Surface manager (async). Created in run() since it needs an
         # event loop.
         self._surface = None
@@ -589,6 +590,18 @@ class Observer:
                     f"{mined} mined ({time.time() - p0:.1f}s)",
                     flush=True,
                 )
+                if self._lm_unavailable:
+                    # An outage is not per-project. Sweeping on would load up
+                    # to two dozen more fact stores to fail the same first LM
+                    # call in each; the deferred projects lose nothing, since
+                    # their episodes stay unconsumed until the next visit.
+                    deferred = n - i
+                    print(
+                        f"neo observer sweep: LM unavailable, stopping; "
+                        f"{deferred} project(s) deferred",
+                        file=sys.stderr, flush=True,
+                    )
+                    break
             except Exception as e:
                 errors += 1
                 print(
@@ -638,6 +651,7 @@ class Observer:
         key is visible in the cycle record, not just stderr.
         """
         self._last_ingest_error = None
+        self._lm_unavailable = False
         if self.config.ingest_budget <= 0:
             return 0
         try:
@@ -656,6 +670,7 @@ class Observer:
                 max_seconds=self.config.ingest_deadline_seconds,
                 should_stop=lambda: self._stop,  # honor SIGTERM between episodes
             )
+            self._lm_unavailable = bool(stats.get("lm_unavailable"))
             return int(stats.get("facts_admitted", 0))
         except Exception as e:
             self._last_ingest_error = type(e).__name__

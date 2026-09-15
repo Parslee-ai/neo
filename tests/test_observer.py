@@ -1225,3 +1225,41 @@ class TestRecycleToBoundRSS:
 
         monkeypatch.setattr(obs.os, "execv", boom)
         obs._reexec_self()  # must not raise
+
+
+class TestSweepStopsOnLMOutage:
+    """An LM outage is global: a live observer logged 591 consecutive
+    `LM call failed` lines as one sweep failed the same first call once per
+    project (and, before that fix, once per episode)."""
+
+    def test_outage_stops_the_sweep_and_defers_the_rest(self, monkeypatch, capsys):
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c"])
+        swept = []
+
+        def rp(self, root, peer_roots=None, shared_store=None):
+            swept.append(root)
+            self._lm_unavailable = True  # what _ingest_transcripts records
+            return (0, 0, object())
+
+        monkeypatch.setattr(Observer, "_run_project", rp)
+        Observer(global_mode=True)._cycle()
+        assert swept == ["/a"]
+        assert "LM unavailable, stopping; 2 project(s) deferred" in capsys.readouterr().err
+
+    def test_ingest_records_the_outage_from_stats(self, monkeypatch, fake_project_id):
+        from neo.memory.observer import Observer
+
+        class _Ingester:
+            def __init__(self, **kw):
+                pass
+
+            def ingest(self, **kw):
+                return {"facts_admitted": 0, "lm_unavailable": True}
+
+        monkeypatch.setattr("neo.memory.transcript.TranscriptIngester", _Ingester)
+        monkeypatch.setattr("neo.adapters.resolve_adapter", lambda cfg: object())
+        o = Observer(global_mode=True)
+        assert o._ingest_transcripts(store=None, root="/tmp/x") == 0
+        assert o._lm_unavailable is True
