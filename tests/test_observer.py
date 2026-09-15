@@ -1374,16 +1374,44 @@ class TestSupervisorBlindSpot:
         assert obs.start_observer()["status"] == "error"
         fake_car.agents_start.assert_not_called()
 
-    def test_unmanaged_holder_is_not_blamed_on_car(self, fake_car, monkeypatch):
+    def test_a_live_supervisor_is_trusted_while_the_observer_drains(self, fake_car, monkeypatch):
+        """After `stop`, CAR says stopped while the daemon finishes its episode
+        with the lock still held. A reachable supervisor answers the probe with
+        "not found", and that must read as a normal stop, not a blind spot."""
         import neo.memory.observer as obs
         self._stopped_rows(fake_car)
         monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
         fake_car.agents_stop.side_effect = RuntimeError(
             f"agent {obs._ROUTING_PROBE_ID} not found")
+        assert obs.observer_status()["status"] == "stopped"
+
+    def test_method_not_found_is_a_routing_failure_not_a_live_answer(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError("-32601 method not found: agents.stop")
         result = obs.observer_status()
         assert result["status"] == "unverified"
-        assert "not the CAR-managed one" in result["message"]
-        assert "car-runtime" not in result["message"]
+        assert "method not found" in result["message"]
+
+    def test_a_registered_probe_id_is_never_stopped(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        fake_car.agents_list.return_value = json.dumps([
+            {"id": obs.GLOBAL_AGENT_ID, "pid": None, "status": "stopped"},
+            {"id": obs._ROUTING_PROBE_ID, "pid": 1, "status": "running"},
+        ])
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        obs.observer_status()
+        fake_car.agents_stop.assert_not_called()
+
+    def test_start_under_skew_migrates_and_registers_nothing(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        assert obs.start_observer()["status"] == "error"
+        fake_car.agents_upsert.assert_not_called()
+        fake_car.agents_remove.assert_not_called()
 
     def test_no_lock_holder_keeps_the_plain_answer(self, fake_car, monkeypatch):
         import neo.memory.observer as obs

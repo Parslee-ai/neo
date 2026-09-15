@@ -885,6 +885,12 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": str(e)}
 
     reaped = _reap_orphan_observers()
+    # Before migrating or registering anything: under skew those calls fail
+    # with a raw handshake error, or write the local manifest behind the
+    # daemon's back, before this could explain why.
+    blind = _supervisor_blind_spot(car, _find_managed_agent(car, GLOBAL_AGENT_ID))
+    if blind:
+        return {"status": "error", "reaped": reaped, "message": blind}
     migrated = _migrate_legacy_per_project_agents(car)
     try:
         car.agents_upsert(json.dumps(_build_global_spec()))
@@ -892,9 +898,6 @@ def start_observer(codebase_root: Optional[str] = None) -> dict:
         return {"status": "error", "message": f"agents_upsert failed: {e}"}
 
     existing = _find_managed_agent(car, GLOBAL_AGENT_ID)
-    blind = _supervisor_blind_spot(car, existing)
-    if blind:
-        return {"status": "error", "message": blind}
     if existing and existing.get("status") == "running":
         return {"status": "already_running", "agent_id": GLOBAL_AGENT_ID,
                 "pid": existing.get("pid"), "migrated": migrated,
@@ -1152,7 +1155,7 @@ _ROUTING_PROBE_ID = "neo-observer-routing-probe"
 
 
 def _supervisor_blind_spot(car, existing: Optional[dict]) -> Optional[str]:
-    """Explain why CAR reports the observer not running while one is, or None.
+    """Explain why CAR's answer about the observer cannot be trusted, or None.
 
     car-runtime's ``agents_list`` routes to the car-server daemon when the
     daemon owns the supervisor, and when that call fails it SILENTLY falls
@@ -1163,34 +1166,38 @@ def _supervisor_blind_spot(car, existing: Optional[dict]) -> Optional[str]:
     for nine days — while stop/kick returned ``not_running`` without acting and
     start would have spawned a second, unsupervised copy. CarHost updates
     itself and a pipx install does not, so this skew recurs on its own.
+
+    Reports ONLY a demonstrated routing failure. A held lock beside a
+    non-running status is also what a normal ``stop`` looks like while the
+    daemon finishes its current episode, and what ``starting`` looks like, so
+    the lock alone proves nothing; the probe is what separates "CAR's view is
+    stale" from "CAR's view is live and the process is on its way out".
     """
     if existing and existing.get("status") == "running":
         return None
     if not _observer_lock_held():
         return None
-    reported = existing.get("status", "unknown") if existing else "not registered"
-    routing_error = ""
+    if _find_managed_agent(car, _ROUTING_PROBE_ID) is not None:
+        return None  # someone registered the probe id: never send it a stop
     try:
         car.agents_stop(_ROUTING_PROBE_ID)
+        return None  # no error at all: nothing demonstrated
     except Exception as e:  # noqa: BLE001 — the message IS the diagnosis
-        if "not found" not in str(e).lower():
-            routing_error = str(e)
-    if routing_error:
-        return (
-            f"an observer holds {_LOCK_PATH}, but CAR reports it '{reported}' "
-            f"because car-runtime cannot reach the car-server daemon's supervisor "
-            f"({routing_error}). This status cannot be trusted, and start/stop/"
-            f"kick would act on the wrong supervisor. Upgrade car-runtime to "
-            f"match the daemon (pipx: `pipx runpip neo-reasoner install -U "
-            f"car-runtime`)."
-        )
-    # CAR's view is live and genuinely says not running, so the lock holder is
-    # a process CAR does not manage: an orphan of a dead car-server, or an
-    # observer started by hand. Not a CAR fault — do not blame one.
+        text = str(e)
+    # A reachable supervisor answers "agent <id> not found". Matched on the id,
+    # not on "not found" alone, which a "method not found" routing failure also
+    # contains.
+    if _ROUTING_PROBE_ID in text and "not found" in text.lower():
+        return None
+    reported = existing.get("status", "unknown") if existing else "not registered"
     return (
-        f"an observer holds {_LOCK_PATH}, but CAR reports it '{reported}': the "
-        f"running observer is not the CAR-managed one (an orphan, or one started "
-        f"outside CAR). Stop that process before starting the managed observer."
+        f"an observer holds {_LOCK_PATH}, but CAR reports it '{reported}', and "
+        f"CAR's supervisor failed a no-op probe with: {text}. car-runtime is "
+        f"most likely not reaching the car-server daemon (a wire-protocol "
+        f"mismatch after the daemon updated), so this status cannot be trusted "
+        f"and start/stop/kick would act on the wrong supervisor. Upgrade "
+        f"car-runtime to match the daemon (pipx: `pipx runpip neo-reasoner "
+        f"install -U car-runtime`)."
     )
 
 
