@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.53.0] - 2026-09-15
+
+The one learning path that works — transcript mining by the background observer — was silently losing episodes, the observer's own status was wrong, and half of the memory neo put into prompts was stale suggestion residue. All found by auditing a live install; all fixed in [#239](https://github.com/Parslee-ai/neo/pull/239).
+
+### Fixed
+
+- **An LM failure was recorded as "this episode has no lessons".** `_lm_json` swallowed every exception (and unparseable output), so the episode's watermark advanced and it was never mined. A live observer logged **610** such failures during a DNS outage — each one an episode lost for good, and unrecoverable, since nothing records which. A failure now leaves the episode unconsumed, and is charged to the episode only when an answer from the provider vouches for it — two failures in a row with no answer stop the pass and the sweep with nothing charged, whatever the error class (a revoked key, disabled billing or quota exhaustion fails every episode alike). Per-episode caps (3 non-transient, 20 transient) keep a poison episode from being retried forever, and all of an episode's LM calls run before its first admission.
+- **A budget-stopped pass stranded the rest of older transcripts.** The skip-unchanged-files gate used the watermark file's mtime, which is rewritten after every consumed episode, so a pass stopped by the 8-episode budget armed the skip against the transcript still holding its backlog. Measured: **152 of 1,800** episodes stranded. The gate now uses a per-directory drain mark (`min(pass start, earliest unconsumed episode timestamp)`); existing watermarks parse once on upgrade, which recovers the stranded episodes.
+- **One dropped connection failed a whole run.** The gpt-5/codex Responses path was a bare `httpx.post` with no retry, and a 503 surfaced as an untyped `ValueError`. It now goes through the OpenAI SDK client: connection errors, 429 and 5xx are retried, errors arrive typed, the SDK's 5-second connect timeout is kept, and error messages no longer carry the model's partial output. The CLI's `NetworkTimeout` envelope — which never fired for SDK timeouts — now does, without the fixed `timeout_seconds: 300` that matched no adapter.
+- **`neo memory observer status` reported a running observer as `stopped`.** When car-runtime cannot reach the car-server daemon's supervisor — car-runtime 0.50.0 speaks wire protocol v2, a CarHost 0.52.1 daemon requires v3 — `agents_list` silently falls back to manifest rows, so status said `stopped` for an observer nine days into sweeping, and stop/kick did nothing. neo now cross-checks CAR against the observer's single-instance lock: status reads `unverified` with the routing error, and start/stop/kick refuse rather than act on the wrong supervisor. Fix it by upgrading car-runtime to match the daemon.
+- **Half of the memory in every prompt was stale suggestion residue.** Before the episode ledger replaced immediate fact-writing, every feature suggestion was stored as an unverified, never-decaying DECISION fact. **238 of them were 49% of all memory injected into prompts over 30 days, and ~4% of those injections were used** — the most-injected were drill prompts. They are retired on the next start (tombstoned with `invalidation_reason=legacy_unverified_suggestion`).
+
+### Added
+
+- Observer log lines (`~/.car/logs/neo-observer.*.log`) carry timestamps.
+
+### Changed
+
+- **`base_url` for gpt-5/codex models follows the OpenAI SDK convention and must end in `/v1`**, as the chat-completions path always required. The old Responses path appended `/v1` itself, so a bare-host `base_url` that worked there only now needs the suffix.
+
 ## [0.52.1] - 2026-08-30
 
 Documentation only. **Retracts a measurement claim published in 0.52.0.** No code changed; no behaviour changed.
