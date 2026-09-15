@@ -932,7 +932,8 @@ def _is_network_timeout(exc: BaseException) -> bool:
     timeout_types: list[type] = []
     try:
         import httpx
-        timeout_types += [httpx.ReadTimeout, httpx.ConnectTimeout]
+        # The base class: WriteTimeout and PoolTimeout are timeouts too.
+        timeout_types.append(httpx.TimeoutException)
     except ImportError:
         pass
     try:

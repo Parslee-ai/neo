@@ -218,6 +218,7 @@ def test_sdk_timeout_is_classified_as_a_network_timeout():
     request = httpx.Request("POST", "https://api.openai.com/v1/responses")
     assert _is_network_timeout(openai.APITimeoutError(request=request))
     assert _is_network_timeout(httpx.ReadTimeout("slow", request=request))
+    assert _is_network_timeout(httpx.PoolTimeout("pool", request=request))
     assert not _is_network_timeout(
         openai.APIConnectionError(message="dns", request=request))
     assert not _is_network_timeout(ValueError("API error 400"))
