@@ -1285,3 +1285,31 @@ class TestSweepStopsOnLMOutage:
         o = Observer(global_mode=True)
         assert o._ingest_transcripts(store=None, root="/tmp/x") == 0
         assert o._lm_unavailable is True
+
+
+class TestProviderEvidenceAcrossProjects:
+    def test_an_earlier_answer_this_cycle_is_passed_on_and_reset_next_cycle(
+            self, monkeypatch, fake_project_id):
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer
+        seen = []
+        answers = {"/a": 3, "/b": 0}
+
+        class _Ingester:
+            def __init__(self, codebase_root=None, **kw):
+                self.root = codebase_root
+
+            def ingest(self, provider_known_good=False, **kw):
+                seen.append((self.root, provider_known_good))
+                return {"facts_admitted": 0, "lm_answers": answers[self.root]}
+
+        monkeypatch.setattr("neo.memory.transcript.TranscriptIngester", _Ingester)
+        monkeypatch.setattr("neo.adapters.resolve_adapter", lambda cfg: object())
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b"])
+        monkeypatch.setattr("neo.memory.store.FactStore",
+                            lambda **kw: type("S", (), {"initialize": lambda self: None})())
+        monkeypatch.setattr("neo.memory.scope._compute_project_id", lambda r: r)
+        o = Observer(global_mode=True)
+        o._cycle()
+        o._cycle()
+        assert seen == [("/a", False), ("/b", True), ("/a", False), ("/b", True)]

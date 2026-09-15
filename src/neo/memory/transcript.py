@@ -302,12 +302,11 @@ _TRANSCRIPT_TAG = "transcript-derived"
 #: retry, so without a cap it is retried forever.
 MAX_EPISODE_LM_FAILURES = 3
 
-#: The same cap for TRANSIENT errors, deliberately much higher. An outage says
-#: nothing about the episode, so it must not burn one in a few cycles — but a
-#: "transient" error can also be the episode's own fault (a prompt that always
-#: times out), and uncapped, that episode would stop its source and the whole
-#: observer sweep every cycle, forever. At the observer's pace this is hours
-#: of retrying before one episode is given up.
+#: The same cap for TRANSIENT errors (timeouts, 429s, 5xx), deliberately much
+#: higher: they are only ever charged when the provider answered other calls in
+#: the same pass (see ``ingest``), which is partial rate-limiting or an episode
+#: whose own prompt always times out. Uncapped, that episode would cost a full
+#: timeout on every visit forever; capped, it costs hours of retries first.
 MAX_EPISODE_TRANSIENT_FAILURES = 20
 
 
@@ -351,9 +350,13 @@ def _is_transient_lm_error(exc: BaseException) -> bool:
         seen.add(id(cur))
         if isinstance(cur, (ConnectionError, TimeoutError)):
             return True
-        status = getattr(cur, "status_code", None)
-        if isinstance(status, int) and status in _TRANSIENT_STATUSES:
-            return True
+        # openai/anthropic carry `status_code`; google-genai's APIError carries
+        # `code`, and the Google adapter re-raises it as ValueError("Rate limit
+        # exceeded: ...") from inside the except block, so it is on the chain.
+        for attr in ("status_code", "code"):
+            status = getattr(cur, attr, None)
+            if isinstance(status, int) and status in _TRANSIENT_STATUSES:
+                return True
         if isinstance(cur, socket.gaierror):
             return True
         # Looked up in sys.modules rather than imported: an exception can only
@@ -377,24 +380,27 @@ def _source_root_key(source) -> str:
     return str(getattr(source, "codebase_root", None) or "")
 
 
-def _episode_epoch(timestamp: str) -> Optional[float]:
-    """Epoch seconds for an episode timestamp, or None when unparseable.
+def _aware_epoch(timestamp: str) -> Optional[float]:
+    """``_episode_epoch``, but None for an ISO time without a zone.
 
-    Claude Code and Codex records carry ISO 8601 (``...Z``); CAR sessions an
-    epoch float."""
-    if not timestamp:
-        return None
+    ``_episode_epoch`` reads a naive time as LOCAL, which is fine for the
+    outcome window it was written for and wrong for a drain mark: a naive UTC
+    stamp read as local on a UTC-4 machine lands the mark four hours late —
+    past the one-hour skew margin — and skips files still holding unconsumed
+    episodes. Claude Code and Codex write ``Z`` stamps today; a mark must not
+    depend on that staying true.
+    """
     try:
-        return float(timestamp)
+        float(timestamp)
+        return _episode_epoch(timestamp)  # epoch floats name an instant
     except (TypeError, ValueError):
         pass
     try:
-        dt = datetime.datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        aware = datetime.datetime.fromisoformat(
+            str(timestamp).replace("Z", "+00:00")).tzinfo is not None
     except ValueError:
         return None
-    if dt.tzinfo is None:
-        return None  # a naive time names no instant; do not guess a zone
-    return dt.timestamp()
+    return _episode_epoch(timestamp) if aware else None
 
 
 def _drain_mark(collect_started: float, pending: list) -> Optional[float]:
@@ -412,7 +418,7 @@ def _drain_mark(collect_started: float, pending: list) -> Optional[float]:
     mark already admits it."""
     mark = collect_started
     for ep in pending:
-        ts = _episode_epoch(ep.timestamp)
+        ts = _aware_epoch(ep.timestamp)
         if ts is None:
             return None
         mark = min(mark, ts)
@@ -1106,6 +1112,8 @@ class TranscriptIngester:
                  sources: Optional[list] = None, peer_roots: Optional[list[str]] = None):
         self._store = store
         self._lm = lm_adapter
+        # Successful LM responses so far; see `ingest` for why it is counted.
+        self._lm_answers = 0
         self.codebase_root = codebase_root or getattr(store, "codebase_root", None)
         # Default source set; add new tool adapters here as they land. No env
         # toggles: GitHubPRSource self-disables (returns []) when the repo has no
@@ -1217,17 +1225,20 @@ class TranscriptIngester:
     # -- incremental ingest with per-source watermark --------------------
     def ingest(self, max_episodes: Optional[int] = None,
                max_seconds: Optional[float] = None,
-               should_stop: Optional[Callable[[], bool]] = None) -> dict:
+               should_stop: Optional[Callable[[], bool]] = None,
+               provider_known_good: bool = False) -> dict:
         """Mine all configured sources, advancing each source's watermark per
         episode.
 
         Idempotent per source: an episode's ``anchor_uuid`` is recorded as
         consumed only *after* its facts are durably written, so a re-run skips it
         and a crash mid-episode reprocesses it. An LM failure is NOT "no
-        lessons": a transient one (outage) leaves the episode unconsumed and
-        stops the whole pass (``stats["lm_unavailable"]``, which the observer
-        uses to stop its sweep); any other is retried on later passes. Each kind
-        has its own per-episode cap (``MAX_EPISODE_LM_FAILURES``,
+        lessons", and it is charged to the episode only when the provider is
+        known to be answering — it answered another call in this pass, or the
+        caller says so via ``provider_known_good``. Two failures with no answer
+        stop the pass with nothing charged (``stats["lm_unavailable"]``, which
+        the observer uses to stop its sweep). Each kind has its own per-episode
+        cap (``MAX_EPISODE_LM_FAILURES``,
         ``MAX_EPISODE_TRANSIENT_FAILURES``) so neither a poison episode nor an
         always-timing-out one can wedge its source. A source's drain mark — what
         lets unchanged transcripts be skipped — never passes the earliest
@@ -1258,6 +1269,10 @@ class TranscriptIngester:
 
         all_episodes: list[Episode] = []
         outage = False
+        # Failures not yet attributable to their episode (see the except).
+        held: list[tuple] = []
+        unanswered = 0
+        answers_at_start = self._lm_answers
         for source in self.sources:
             if outage or stop_now():
                 break
@@ -1288,17 +1303,52 @@ class TranscriptIngester:
                 except LMUnavailable as e:
                     stats["episodes_processed"] += 1  # it spent LM calls
                     stats["episodes_failed"] += 1
-                    if self._record_lm_failure(source, state, ep, e):
-                        stats["episodes_abandoned"] += 1
-                    if not self._persist_watermark(source, state) or e.transient:
-                        # An outage is global: stop rather than fail the same
-                        # call once per remaining episode. An unwritable
-                        # watermark stops too — mining on would re-mine
-                        # episodes whose consumption cannot be recorded.
-                        stats["lm_unavailable"] = stats["lm_unavailable"] or e.transient
+                    if self._lm_answers > answers_at_start:
+                        # The provider has answered in this pass, so the
+                        # failure is this episode's — and so is any held one.
+                        unanswered = 0
+                        held.append((source, state, ep, e))
+                        if not all([self._charge(*h, stats) for h in held]):
+                            outage = True  # watermark unwritable
+                            break
+                        held.clear()
+                        continue
+                    unanswered += 1
+                    if unanswered >= 2:
+                        # Two failures and not one answer: the provider is not
+                        # serving us, WHATEVER the error class says — a 401,
+                        # 403 or quota 429 fails every episode alike, and
+                        # charging them would write off the backlog one cap at
+                        # a time. Nothing further is charged.
+                        logger.warning(
+                            "transcript: LM unavailable (%s); stopping the pass", e)
+                        stats["lm_unavailable"] = True
                         outage = True
                         break
+                    if provider_known_good:
+                        # The caller saw this provider answer recently (an
+                        # earlier project this cycle), so a lone failure is the
+                        # episode's. Without this a poison episode that is the
+                        # only one left in its project would never be charged
+                        # and would be retried on every visit forever.
+                        if not self._charge(source, state, ep, e, stats):
+                            outage = True
+                            break
+                    else:
+                        # One failure proves nothing: an unreachable provider,
+                        # a revoked key and a bad episode look the same. Hold
+                        # it and try one more episode.
+                        held.append((source, state, ep, e))
                     continue
+                if self._lm_answers > answers_at_start:
+                    # An answer: the provider works, so any held failure was
+                    # that episode's after all. (A non-substantive episode
+                    # "succeeds" with no LM call and proves nothing — hence
+                    # the answer count, not success.)
+                    unanswered = 0
+                    for h in held:
+                        self._charge(*h, stats)
+                    held.clear()
                 consumed.add(ep.anchor_uuid)
                 state["failures"].pop(ep.anchor_uuid, None)
                 state["transient_failures"].pop(ep.anchor_uuid, None)
@@ -1321,6 +1371,7 @@ class TranscriptIngester:
             logger.warning("transcript: suggestion-outcome mining failed: %s", e)
             stats["outcomes_mined"] = 0
 
+        stats["lm_answers"] = self._lm_answers - answers_at_start
         if stats["episodes_processed"] or stats.get("outcomes_mined"):
             metrics_record("transcript_ingest", **stats)
         return stats
@@ -1519,6 +1570,14 @@ class TranscriptIngester:
     def _load_failures(self, source) -> dict:
         return self._load_watermark(source)["failures"]
 
+    def _charge(self, source, state: dict, ep: Episode, error: LMUnavailable,
+                stats: dict) -> bool:
+        """Charge a failure to ``ep`` and persist. False when the watermark
+        could not be written."""
+        if self._record_lm_failure(source, state, ep, error):
+            stats["episodes_abandoned"] += 1
+        return self._persist_watermark(source, state)
+
     def _record_lm_failure(self, source, state: dict, ep: Episode,
                            error: LMUnavailable) -> bool:
         """Count a failed attempt at ``ep``; give it up at its cap.
@@ -1586,9 +1645,11 @@ class TranscriptIngester:
                 temperature=0.2,
             )
         except Exception as e:
-            # Not logged here: the caller knows which episode this was, and an
-            # outage now stops the pass instead of logging once per episode.
+            # Not logged here: the caller knows which episode this was.
             raise LMUnavailable(e) from e
+        # The provider answered, even if what it said is unusable: this is the
+        # evidence `ingest` needs before blaming an episode for a failure.
+        self._lm_answers += 1
         data = _parse_json(out)
         if data is None:
             # Truncated or non-JSON output is not "no lessons" either: consumed

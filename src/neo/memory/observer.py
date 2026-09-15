@@ -356,6 +356,7 @@ class Observer:
         # the cycle record so a failing LM key isn't invisible.
         self._last_ingest_error: Optional[str] = None
         self._lm_unavailable = False
+        self._lm_answered_this_cycle = False
         # Surface manager (async). Created in run() since it needs an
         # event loop.
         self._surface = None
@@ -537,6 +538,7 @@ class Observer:
         from neo.memory.scope import clear_remote_url_cache
 
         t0 = time.time()
+        self._lm_answered_this_cycle = False
         # Fresh view of every project's git remote once per cycle; within the
         # cycle the memo removes ~3 redundant forks per project.
         clear_remote_url_cache()
@@ -593,13 +595,14 @@ class Observer:
                 if self._lm_unavailable:
                     # An outage is not per-project. Sweeping on would load up
                     # to two dozen more fact stores to fail the same first LM
-                    # call in each. The offset already moved past this whole
-                    # batch, so rewind it: the deferred projects go first next
-                    # cycle instead of waiting a rotation, and the ones already
-                    # swept cost next to nothing to revisit (unchanged
-                    # transcripts are skipped). `batch` was regrouped by
-                    # project id, so `i` does not map back to `roots` — the
-                    # batch's start does.
+                    # calls in each. The offset already moved past this whole
+                    # batch, so rewind it to the batch's start: the whole batch
+                    # — the failing project first — re-runs next cycle, rather
+                    # than the deferred projects waiting a full rotation. The
+                    # projects already swept cost next to nothing to revisit
+                    # (unchanged transcripts are skipped), and nothing mines
+                    # during an outage anyway. `batch` was regrouped by project
+                    # id, so `i` does not map back to `roots`; `start` does.
                     self._sweep_offset = start
                     deferred = n - i
                     print(
@@ -675,8 +678,15 @@ class Observer:
                 max_episodes=self.config.ingest_budget,
                 max_seconds=self.config.ingest_deadline_seconds,
                 should_stop=lambda: self._stop,  # honor SIGTERM between episodes
+                # An earlier project's answer this cycle is what lets a lone
+                # failing episode be charged (see TranscriptIngester.ingest).
+                provider_known_good=self._lm_answered_this_cycle,
             )
             self._lm_unavailable = bool(stats.get("lm_unavailable"))
+            if stats.get("lm_answers"):
+                self._lm_answered_this_cycle = True
+            elif self._lm_unavailable:
+                self._lm_answered_this_cycle = False
             return int(stats.get("facts_admitted", 0))
         except Exception as e:
             self._last_ingest_error = type(e).__name__
