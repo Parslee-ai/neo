@@ -445,6 +445,23 @@
   object and never reloads, which is how a suite thorough about attribution
   stayed silent about persistence. **Any new credit path needs its own save,
   and a test that reads the fact back off disk.**
+- **Legacy per-suggestion facts are INVALIDATED on every cold start**
+  (`store.retire_legacy_suggestion_facts`, `invalidation_reason=legacy_unverified_suggestion`).
+  Before episodes replaced immediate fact-writing (`412a174`), every feature suggestion was
+  written straight to the store as an unverified DECISION — a stable kind that bypasses recall
+  decay and that `update_recall` never stamps — and the since-bounded protection ratchet had
+  already lifted them to 0.9–1.0. **Measured on a live install: 238 such facts were 49% of all
+  memory injected into prompts over 30 days (1,217 of 2,477 inclusions), ~4% of those used in
+  reasoning**, the most-injected being drill prompts. Transcript-mined lessons were 1.6%.
+  The match is structural, not a date (first tag `feature`, subject `feature: `, body
+  `Reasoning: `, no `canonical_signature`), because installs kept minting the shape until they
+  upgraded. **Reclassifying them to a decaying kind was built first and is WRONG — do not
+  reintroduce it.** The stale prune skips confidence >= `STALE_MAX_CONFIDENCE` (0.4) and any
+  fact with a success, so 232 of 239 would have sat hidden on disk forever; and a decayed
+  fact's similarity term goes to ~0 while `success_bonus` is similarity-independent, so the 93
+  with a recorded success became constant-score fillers taking the same slots on every query.
+  **That second half is a live ranking hazard for ANY decaying fact with successes**, not just
+  these — today no other fact has one, which is the only reason it is not biting.
 - **A re-accepted durable pattern is reinforced in place, not re-minted.**
   `_promote_repeatedly_supported_candidate` looks for an existing valid PROJECT
   fact at the target signature before calling `add_fact`, and on a hit folds in
