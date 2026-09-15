@@ -3761,10 +3761,20 @@ class TestRetireLegacySuggestionFacts:
         assert all(f.is_valid for f in store._facts)
 
     def test_idempotent_and_runs_on_cold_start(self, store, tmp_path):
-        store._facts.append(self._legacy())
+        """With a REAL stale last_accessed: every live match was last touched
+        58-206 days ago, and purge_dead_facts runs later in the same cold start.
+        The default last_accessed (now) is what let the first version of this
+        test pass while the tombstone was being hard-deleted."""
+        stale = time.time() - 120 * 86400
+        store._facts.append(self._legacy(metadata=FactMetadata(
+            confidence=1.0, created_at=stale, last_accessed=stale)))
         store.save()
         from neo.memory.store import FactStore
         fresh = FactStore(codebase_root=store.codebase_root)  # cold start runs the chain
         [fact] = [f for f in fresh._facts if f.id == "legacy"]
         assert fact.is_valid is False
+        assert fact.invalidation_reason == "legacy_unverified_suggestion"
+        fresh.load()
+        assert [f.invalidation_reason for f in fresh._facts if f.id == "legacy"] == [
+            "legacy_unverified_suggestion"], "the tombstone must reach disk"
         assert fresh.retire_legacy_suggestion_facts() == 0

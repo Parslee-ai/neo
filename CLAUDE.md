@@ -447,6 +447,10 @@
   and a test that reads the fact back off disk.**
 - **Legacy per-suggestion facts are INVALIDATED on every cold start**
   (`store.retire_legacy_suggestion_facts`, `invalidation_reason=legacy_unverified_suggestion`).
+  It stamps `last_accessed` before invalidating: `purge_dead_facts` runs later in the same cold
+  start and hard-deletes tombstones untouched 30+ days, and every live match was 58–206 days
+  stale, so without the stamp the audit tombstone never reached disk. It is kept 30 days, then
+  purged like any other.
   Before episodes replaced immediate fact-writing (`412a174`), every feature suggestion was
   written straight to the store as an unverified DECISION — a stable kind that bypasses recall
   decay and that `update_recall` never stamps — and the since-bounded protection ratchet had

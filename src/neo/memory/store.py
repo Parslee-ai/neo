@@ -3078,6 +3078,12 @@ class FactStore:
             if not self._is_legacy_suggestion_fact(fact):
                 continue
             fact.invalidation_reason = LEGACY_SUGGESTION_REASON
+            # Stamp access so the tombstone survives `purge_dead_facts`, which
+            # runs two steps later in this same cold start and physically
+            # deletes invalid facts untouched for 30+ days. Every live match was
+            # last accessed 58-206 days ago, so without this the "tombstone"
+            # never reached disk and installs kept no record of why it died.
+            fact.metadata.last_accessed = time.time()
             self._invalidate(fact)
             retired += 1
         if retired:
