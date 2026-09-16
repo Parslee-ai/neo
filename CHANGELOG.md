@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Neo upgraded itself while its CAR binding stayed behind.** `pipx upgrade neo-reasoner` does not move `car-runtime`: pip leaves a dependency that already satisfies its specifier alone, and the `[car]` extra's specifier is a range (`>=0.27.0,<1.0`). So the binding stayed at whatever version first satisfied that range while CAR shipped a release a week, and neo spoke an older protocol to the daemon it was talking to. Measured on a live install: neo auto-upgraded 0.46 → 0.52 with its binding two CAR releases behind the running daemon. The periodic update check now also refreshes the binding — on its own interval, because the drift accumulates *between* neo releases, so a refresh tied to a neo upgrade would have missed exactly this case. It runs only where the `[car]` extra is installed and only on installs neo owns (pipx, pip-venv; brew and external are skipped for the same reason neo's own pip-override is, #81/#89), never crosses the extra's `<1.0` ceiling, and confirms the result by reading the installed version from disk in a fresh interpreter rather than trusting an exit code. `neo update` refreshes it immediately.
+
 ## [0.53.0] - 2026-09-15
 
 The one learning path that works — transcript mining by the background observer — was silently losing episodes, the observer's own status was wrong, and half of the memory neo put into prompts was stale suggestion residue. All found by auditing a live install; all fixed in [#239](https://github.com/Parslee-ai/neo/pull/239).
