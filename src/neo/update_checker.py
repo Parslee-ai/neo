@@ -18,6 +18,7 @@ _detect_install_method below.
 """
 
 import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
@@ -43,6 +44,14 @@ PYPI_API_URL = f"https://pypi.org/pypi/{PYPI_PACKAGE_NAME}/json"
 REQUEST_TIMEOUT = 3  # seconds
 
 # Install-method tags returned by _detect_install_method().
+#: The CAR Python binding, installed by the ``[car]`` extra. Neo talks to a
+#: CAR daemon through it, and CAR ships far more often than neo does.
+CAR_PACKAGE_NAME = "car-runtime"
+CAR_PYPI_API_URL = "https://pypi.org/pypi/car-runtime/json"
+#: Upper bound from pyproject's ``[car]`` extra (``>=0.27.0,<1.0``). CAR is
+#: pre-1.0, so a 1.x is a deliberate decision, never an automatic upgrade.
+CAR_VERSION_CEILING = "1.0"
+
 INSTALL_PIPX = "pipx"
 INSTALL_PIP_VENV = "pip-venv"
 INSTALL_BREW = "brew"
@@ -193,8 +202,8 @@ def _version_reaches(installed: str, target: str) -> bool:
         return installed == target
 
 
-def _get_installed_version_fresh() -> str:
-    """Read the ON-DISK installed version, from a NEW interpreter.
+def _get_installed_version_fresh(package: str = PYPI_PACKAGE_NAME) -> str:
+    """Read `package`'s ON-DISK installed version, from a NEW interpreter.
 
     `_get_current_version()` is not a safe way to confirm an upgrade.
     `importlib.metadata` resolves through an mtime-keyed directory cache, so
@@ -222,7 +231,7 @@ def _get_installed_version_fresh() -> str:
                 # failure class this function exists to remove.
                 sys.executable, "-E", "-c",
                 "import importlib.metadata as m;"
-                f"print(m.version({PYPI_PACKAGE_NAME!r}))",
+                f"print(m.version({package!r}))",
             ],
             capture_output=True,
             text=True,
@@ -241,11 +250,14 @@ def _get_installed_version_fresh() -> str:
     return lines[-1] if lines else "unknown"
 
 
-def _fetch_latest_version_from_pypi() -> Optional[str]:
-    """Fetch the latest version from PyPI API."""
+def _fetch_latest_version_from_pypi(
+    url: str = PYPI_API_URL, package: str = PYPI_PACKAGE_NAME,
+) -> Optional[str]:
+    """Fetch the latest version of `package` from the PyPI API."""
+    del package  # named for call-site clarity; the URL selects the project
     try:
         request = Request(
-            PYPI_API_URL,
+            url,
             headers={"User-Agent": f"{PYPI_PACKAGE_NAME}/{_get_current_version()}"}
         )
 
@@ -377,6 +389,12 @@ def check_for_updates(suppress_output: bool = False, auto_install: bool = False)
             cache_age = time.time() - cache.get("last_check", 0)
             if cache_age >= UPDATE_CHECK_INTERVAL:
                 _refresh_in_background(current_version)
+
+        # The CAR binding drifts on its own schedule, so this is not inside
+        # the neo-update branch below: neo can be current while its binding is
+        # two CAR releases behind.
+        if auto_install:
+            refresh_car_runtime()
 
         # Act on whatever's in the cache (just-fetched, fresh, or stale).
         new_version = cache.get("new_version")
@@ -558,6 +576,132 @@ def _perform_upgrade_and_verify(
     return UpgradeOutcome.NOOP, installed
 
 
+def _car_cache_file() -> Path:
+    """Throttle state for the CAR-binding check, separate from the neo one.
+
+    `_write_cache` rewrites the whole update_check.json document, so a key
+    added there would be dropped by the next background refresh.
+    """
+    cache_dir = Path.home() / ".neo"
+    cache_dir.mkdir(exist_ok=True, parents=True)
+    return cache_dir / "car_runtime_check.json"
+
+
+def _car_check_is_due() -> bool:
+    try:
+        last = json.loads(_car_cache_file().read_text()).get("last_check", 0)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return True
+    return (time.time() - last) >= UPDATE_CHECK_INTERVAL
+
+
+def _record_car_check() -> None:
+    """Stamp the attempt, before knowing whether it succeeded.
+
+    A PyPI outage or a failing install must cost one attempt per interval, not
+    one per neo invocation — neo runs from editor hooks many times a minute.
+    """
+    try:
+        cache_file = _car_cache_file()
+        tmp = cache_file.with_suffix(cache_file.suffix + ".tmp")
+        tmp.write_text(json.dumps({"last_check": time.time()}, indent=2))
+        tmp.replace(cache_file)
+    except OSError as e:
+        logger.debug(f"Failed to write CAR check cache: {e}")
+
+
+def _car_runtime_is_installed() -> bool:
+    """Whether the `[car]` extra is present. Never install it on demand."""
+    return importlib.util.find_spec("car_runtime") is not None
+
+
+def _below_car_ceiling(candidate: str) -> bool:
+    try:
+        from packaging import version
+        try:
+            return version.parse(candidate) < version.parse(CAR_VERSION_CEILING)
+        except version.InvalidVersion:
+            return False
+    except ImportError:
+        return candidate.split(".", 1)[0] == "0"
+
+
+def _run_car_runtime_upgrade(method: str, quiet: bool = True) -> tuple[bool, str]:
+    """Upgrade the CAR binding inside the environment that owns neo."""
+    requirement = f"{CAR_PACKAGE_NAME}<{CAR_VERSION_CEILING}"
+    if method == INSTALL_PIPX:
+        # `pipx upgrade` only moves neo itself, and `pipx inject` refuses a
+        # package that is already installed. runpip reaches the venv's pip.
+        cmd = ["pipx", "runpip", PYPI_PACKAGE_NAME, "install", "--upgrade", requirement]
+        if quiet:
+            cmd.append("--quiet")
+    else:  # INSTALL_PIP_VENV
+        cmd = _pip_install_cmd(requirement, quiet=quiet)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return result.returncode == 0, result.stderr
+    except FileNotFoundError:
+        return False, "pipx not found on PATH"
+    except subprocess.TimeoutExpired:
+        return False, f"{CAR_PACKAGE_NAME} upgrade timed out after 120s"
+
+
+def refresh_car_runtime(*, force: bool = False, quiet: bool = True) -> Optional[str]:
+    """Keep the CAR binding in step with CAR's releases. Returns the new version.
+
+    Upgrading neo does NOT do this, which is the defect: pip leaves a
+    dependency that already satisfies its specifier alone
+    (`--upgrade-strategy only-if-needed`), and the `[car]` extra's specifier is
+    a range. So the binding stays at whatever version first satisfied it while
+    CAR ships a release a week, and neo then speaks an older protocol to the
+    daemon it is talking to. Measured on a live install: neo auto-upgraded
+    itself 0.46 -> 0.52 while its binding sat two CAR releases behind.
+
+    Tying this to the periodic check rather than to a neo upgrade is
+    deliberate: the drift accumulates BETWEEN neo releases, so a refresh that
+    only runs when neo moves would have missed the case that prompted it.
+
+    Verification follows this module's invariant — the version that confirms
+    the upgrade is read from the disk by a new interpreter, never from an exit
+    code. Brew and external installs are skipped for the reason pip-overriding
+    is skipped for neo itself (#81, #89): it corrupts the metadata the owning
+    manager reads.
+    """
+    if not _car_runtime_is_installed():
+        return None
+    if not force and not _car_check_is_due():
+        return None
+    method = _detect_install_method()
+    if method not in (INSTALL_PIPX, INSTALL_PIP_VENV):
+        return None
+
+    # Stamped BEFORE the network call, so a failure that never returns a
+    # version still costs one attempt per interval rather than one per neo
+    # invocation — neo runs from editor hooks many times a minute.
+    _record_car_check()
+    try:
+        latest = _fetch_latest_version_from_pypi(CAR_PYPI_API_URL, CAR_PACKAGE_NAME)
+    except Exception as e:  # urllib's stack raises more than it documents
+        logger.debug(f"CAR binding version check failed: {e}")
+        return None
+    if latest is None or not _below_car_ceiling(latest):
+        return None
+    installed = _get_installed_version_fresh(CAR_PACKAGE_NAME)
+    if installed == "unknown" or _version_reaches(installed, latest):
+        return None
+
+    ok, err = _run_car_runtime_upgrade(method, quiet=quiet)
+    after = _get_installed_version_fresh(CAR_PACKAGE_NAME)
+    if ok and _version_reaches(after, latest):
+        _append_log(f"Upgraded {CAR_PACKAGE_NAME} from {installed} to {after}")
+        return after
+    _append_log(
+        f"{CAR_PACKAGE_NAME} upgrade did not reach {latest} "
+        f"(installed {after}){': ' + err.strip() if err.strip() else ''}"
+    )
+    return None
+
+
 def _manual_upgrade_hint(method: str) -> str:
     return (
         f"pipx upgrade {PYPI_PACKAGE_NAME}" if method == INSTALL_PIPX
@@ -690,6 +834,11 @@ def perform_update() -> bool:
 
     print("Checking for updates...")
     new_version = check_for_updates(suppress_output=True)
+
+    # Deliberate user action: check the binding now, not on the next interval.
+    car_version = refresh_car_runtime(force=True, quiet=False)
+    if car_version:
+        print(f"✓ Updated {CAR_PACKAGE_NAME} to {car_version}")
 
     if not new_version:
         print(f"✓ Neo is already up to date (version {current_version})")
