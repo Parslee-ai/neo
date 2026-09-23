@@ -77,7 +77,10 @@ def test_claude_components_live_at_the_plugin_root():
     """Claude Code reads components from the plugin root and manifests from
     `.claude-plugin/`. Nested inside `.claude-plugin/` they are simply not
     found — the plugin installs, `claude plugin validate` passes, and it loads
-    nothing. `claude plugin details` is the check that proves otherwise."""
+    nothing. `claude plugin details` reports the component inventory it finds
+    on disk and says nothing about whether the plugin loaded; it prints a full
+    inventory for a plugin that failed. `claude plugin list` is the only
+    command that reports load state, and it is the one to verify against."""
     assert (CLAUDE_ROOT / "agents" / "neo.md").is_file()
     assert (CLAUDE_ROOT / "commands").is_dir()
 
@@ -101,6 +104,54 @@ def test_the_manifest_directory_holds_no_components():
         "directories (agents/, commands/, skills/, hooks/) belong at the "
         "plugin root, which is the repository root."
     )
+
+
+def test_the_manifest_does_not_redeclare_the_auto_loaded_hooks_file():
+    """`hooks/hooks.json` at the plugin root is loaded automatically, and
+    naming it again in the manifest is fatal rather than redundant.
+
+    Claude Code loads the standard path first and records its realpath, then
+    walks `manifest.hooks`. An entry resolving to a file already loaded is a
+    `hook-load-failed`, and that fails the WHOLE plugin — all six commands and
+    the agent, not just the hook. `manifest.hooks` is for *additional* hook
+    files; the standard one is implicit.
+
+    This shipped in every release from 0.47.0 to 0.53.0. It arrived in the
+    commit that fixed the component layout (#221): that change correctly
+    deleted the redundant `agents` / `commands` path arrays and added a
+    redundant `hooks` path in the same diff. The two are the same mistake —
+    the difference is that a wrong `agents` path is ignored while a
+    *right* `hooks` path is load-breaking, so the one that looked harmless
+    was the one that broke.
+
+    It survived because nothing in the toolchain reports load state:
+    `claude plugin install` exits 0 with a success message,
+    `claude plugin validate` passes, and `claude plugin details` prints the
+    full component inventory for a plugin that did not load. Only
+    `claude plugin list` shows it. Pinned here because the manifest is the
+    one place the mistake is cheap to catch.
+    """
+    manifest = json.loads((CLAUDE_MANIFEST / "plugin.json").read_text())
+
+    auto_loaded = (CLAUDE_ROOT / "hooks" / "hooks.json").resolve()
+    assert auto_loaded.is_file(), (
+        "hooks/hooks.json must ship at the plugin root — it is the path "
+        "Claude Code loads automatically, and the only one that registers "
+        "the edit-recording hook now that the manifest cannot name it."
+    )
+
+    declared = manifest.get("hooks")
+    entries = declared if isinstance(declared, list) else [declared]
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        resolved = (CLAUDE_ROOT / entry).resolve()
+        assert resolved != auto_loaded, (
+            f"plugin.json declares hooks={entry!r}, which resolves to the "
+            "auto-loaded hooks/hooks.json. Claude Code rejects the duplicate "
+            "and the entire plugin fails to load. Drop the key; the hook "
+            "still registers from the standard path."
+        )
 
 
 @pytest.mark.parametrize("name", CAPABILITIES)
