@@ -1,10 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## [0.53.1] - 2026-09-23
+
+Two fixes for neo's own plumbing: the Claude Code plugin failed to load on Claude Code 2.1.278 and earlier, and the CAR binding fell further behind with every CAR release. The plugin fix reaches existing installs only through this version bump.
 
 ### Fixed
 
-- **Neo upgraded itself while its CAR binding stayed behind.** `pipx upgrade neo-reasoner` does not move `car-runtime`: pip leaves a dependency that already satisfies its specifier alone, and the `[car]` extra's specifier is a range (`>=0.27.0,<1.0`). So the binding stayed at whatever version first satisfied that range while CAR shipped a release a week, and neo spoke an older protocol to the daemon it was talking to. Measured on a live install: neo auto-upgraded 0.46 → 0.52 with its binding two CAR releases behind the running daemon. The periodic update check now also refreshes the binding — on its own interval, because the drift accumulates *between* neo releases, so a refresh tied to a neo upgrade would have missed exactly this case. It runs only where the `[car]` extra is installed and only on installs neo owns (pipx, pip-venv; brew and external are skipped for the same reason neo's own pip-override is, #81/#89), never crosses the extra's `<1.0` ceiling, and confirms the result by reading the installed version from disk in a fresh interpreter rather than trusting an exit code. `neo update` refreshes it immediately.
+- **Neo upgraded itself while its CAR binding stayed behind.** `pipx upgrade neo-reasoner` does not move `car-runtime`: pip leaves a dependency that already satisfies its specifier alone, and the `[car]` extra's specifier is a range (`>=0.27.0,<1.0`). So the binding stayed at whatever version first satisfied that range while CAR shipped a release a week, and neo spoke an older protocol to the daemon it was talking to. Measured on a live install: neo auto-upgraded 0.46 → 0.52 with its binding two CAR releases behind the running daemon. The periodic update check now also refreshes the binding — on its own interval, because the drift accumulates *between* neo releases, so a refresh tied to a neo upgrade would have missed exactly this case. It runs only where the `[car]` extra is installed and only on installs neo owns (pipx, pip-venv; brew and external are skipped for the same reason neo's own pip-override is, #81/#89), never crosses the extra's `<1.0` ceiling, and confirms the result by reading the installed version from disk in a fresh interpreter rather than trusting an exit code. `neo update` refreshes it immediately. ([#241](https://github.com/Parslee-ai/neo/pull/241))
+
+- **The Claude Code plugin failed to load on Claude Code 2.1.278 and earlier.** `.claude-plugin/plugin.json` declared `"hooks": "./hooks/hooks.json"`, a path Claude Code already loads automatically. On Claude Code 2.1.278 and earlier (verified in the 2.1.277 and 2.1.278 binaries) that duplicate is a `hook-load-failed`, and `claude plugin list` shows the plugin as `✘ failed to load` — taking all six commands and the agent down with the hook. Claude Code 2.1.280 and later tolerate the duplicate and load the file once (verified in the 2.1.280 and 2.1.281 binaries). The key has been there since 0.47.0 ([#221](https://github.com/Parslee-ai/neo/pull/221)). It is now removed, and the hook still registers from the standard path. ([#243](https://github.com/Parslee-ai/neo/pull/243))
+
+  **Existing installs pick this up only through this version bump.** Claude Code caches plugins by version, so run `/plugin update` (or `claude plugin update neo@<marketplace>`) to move to 0.53.1.
+
+  **A correction to the 0.47.0 entry's guidance:** `claude plugin details` reports the components on disk, not whether the plugin loaded — it printed the full inventory for a plugin that had failed. `claude plugin list` (or the `/plugin` view) is the check that reports load state.
 
 ## [0.53.0] - 2026-09-15
 
