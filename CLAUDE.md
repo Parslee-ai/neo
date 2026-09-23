@@ -1561,12 +1561,23 @@
   Claude Code discovers `agents/`, `commands/`, `skills/` and `hooks/` at the
   plugin root and reads only manifests (`plugin.json`, `marketplace.json`) out
   of `.claude-plugin/`. Nested there they are silently not loaded: the plugin
-  installs, `claude plugin validate` passes, and nothing fires — `claude plugin
-  details` is the only check that proves a component loaded. This repo shipped
+  installs, `claude plugin validate` passes, and nothing fires. This repo shipped
   the wrong layout, and so did CAR, which is why
   `test_the_manifest_directory_holds_no_components` fails on any non-manifest
   entry rather than merely asserting the components exist at the root (a stray
   copy left behind keeps every other assertion green).
+  **`claude plugin list` is the check, and `claude plugin details` is NOT.**
+  `details` reports the inventory it finds on disk and says nothing about load
+  state — it prints all six skills, the agent and the hook for a plugin that
+  failed to load, verified directly. Only `list` reports load state. This
+  distinction is not pedantic: #221 verified the layout fix with `details`,
+  read `Skills (6) Agents (1)` as success, and shipped a manifest that made
+  the plugin fail to load in every release from 0.47.0 to 0.53.0 (#242).
+  A second rule falls out of that one — **`manifest.hooks` must never name
+  `hooks/hooks.json`**. Claude Code loads that path automatically and rejects
+  the duplicate, failing the WHOLE plugin; the key is for *additional* hook
+  files only. Pinned by
+  `test_the_manifest_does_not_redeclare_the_auto_loaded_hooks_file`.
 - **The edit-recording hook (`neo hook record`, `neo/hook.py`)** is a
   `PostToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit` that appends one
   line to `~/.neo/sessions/host_events.jsonl`: tool, path, host cwd, and HEAD at

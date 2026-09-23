@@ -71,8 +71,10 @@ empirically before any code reads them.
 ## Shape, as shipped
 
 `hooks/hooks.json` at the **plugin root** (not `.claude-plugin/` — see
-`tests/test_host_adapter_parity.py`), declared as `"hooks": "./hooks/hooks.json"`
-in `.claude-plugin/plugin.json`:
+`tests/test_host_adapter_parity.py`), and **not declared in
+`.claude-plugin/plugin.json`**: Claude Code loads that path automatically, and
+naming it in `manifest.hooks` is a duplicate it rejects by failing the whole
+plugin (#242). The key is for *additional* hook files only.
 
 ```json
 {
@@ -145,11 +147,17 @@ with more force, since this one writes to disk.
 
 ## Status
 
-**Shipped (recording half):** `neo hook record`, `hooks/hooks.json`, the
-`"hooks"` declaration in `.claude-plugin/plugin.json`, and `tests/test_hook.py`.
-Verified end to end at **0.06 s** per invocation against `neo --version`'s
-0.36 s, exit 0 on every path, `claude plugin details` reporting
+**Shipped (recording half):** `neo hook record`, `hooks/hooks.json` and
+`tests/test_hook.py`. Verified end to end at **0.06 s** per invocation against
+`neo --version`'s 0.36 s, exit 0 on every path, `claude plugin list` reporting
+`✔ enabled` and `claude plugin details` reporting
 `Hooks (1) PostToolUse (harness-only — no model context cost)`.
+
+The `"hooks"` declaration that shipped alongside these in #221 has been
+**removed** (#242) — it named the auto-loaded path and failed the whole plugin.
+Note which command proves what: `details` printed that `Hooks (1)` line for a
+plugin that was not loading at all, so it is evidence the file was FOUND, not
+that the plugin started. `claude plugin list` is the load-state check.
 
 **Not shipped (consuming half):** nothing reads `host_events.jsonl` yet.
 `collect_outcomes` still infers acceptance from a repo-wide git diff.
