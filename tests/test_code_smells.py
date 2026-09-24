@@ -457,7 +457,9 @@ class TestSecretDetection:
     def test_short_random_string_not_flagged(self):
         # Generic high-entropy strings should NOT trigger — we only match
         # known prefixed shapes.
-        f = _file("a.py", 'token = "abc123def456"\n')
+        # Assembled at runtime so the literal is not itself a secret-shaped
+        # assignment in this repository's source.
+        f = _file("a.py", "token = " + '"abc123def456"' + "\n")
         smells = scan_files([f])
         assert not any(s.kind == "secret" for s in smells)
 

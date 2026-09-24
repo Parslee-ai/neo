@@ -288,11 +288,11 @@ def test_adapter_kwargs_passes_base_url_to_ollama():
 def test_adapter_kwargs_maps_azure_base_url_to_endpoint():
     class Config:
         provider = "azure"
-        api_key = "azure-key"
+        api_key = "example-azure-key"
         base_url = "https://example.openai.azure.com"
 
     assert _adapter_kwargs_for_config(Config()) == {
-        "api_key": "azure-key",
+        "api_key": "example-azure-key",
         "endpoint": "https://example.openai.azure.com",
     }
 

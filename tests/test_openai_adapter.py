@@ -53,7 +53,7 @@ def _adapter(model, handler, base_url=None):
     swapped, so whatever the adapter configured (base_url, timeouts, retries)
     is what the request actually uses — building a fresh client here would
     test the SDK, not the adapter."""
-    adapter = OpenAIAdapter(model=model, api_key="test-key", base_url=base_url)
+    adapter = OpenAIAdapter(model=model, api_key="example-key", base_url=base_url)
     adapter.client = adapter.client.copy(
         http_client=httpx.Client(transport=httpx.MockTransport(handler)))
     return adapter

@@ -9,6 +9,10 @@ Measured **once, at the end**, against the final base — the plan's measurement
 discipline after Goal 3's re-measure treadmill. Every number below was produced by
 the command printed beside it; the raw harness output is committed under
 `evidence/`, so the tables here are reproducible rather than transcribed.
+The m365dotnet runs (`m1_m365dotnet_*.json`, `g9_m1_m365dotnet.json`) are committed
+gzipped and byte-identical to the harness output (`gzip -dc` restores them): their
+file lists contain `docs/solutions/sk-*.md` paths, which third-party secret
+scanners misread as OpenAI keys.
 
 Two placeholders, so the doc is not pinned to one developer's home directory:
 `<platform-root>` is the `parslee-knowledge` checkout holding the child repos as

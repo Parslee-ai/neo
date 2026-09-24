@@ -314,6 +314,6 @@ if __name__ == '__main__':
             match = re.search(r'def\\s+(\\w+)\\s*\\(', {repr(function_code)})
             if match:
                 func_name = match.group(1)
-                result = eval(f'{{func_name}}(line)')
+                result = globals()[func_name](line)
                 print(result)
 """

@@ -1198,7 +1198,7 @@ def test_a_real_openai_503_outage_stops_without_charging(temp_store, tmp_path, m
     from neo.adapters import OpenAIAdapter
     monkeypatch.setattr("neo.memory.transcript.SESSIONS_DIR", tmp_path / "sessions")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-    adapter = OpenAIAdapter(model="gpt-5.6", api_key="test-key")
+    adapter = OpenAIAdapter(model="gpt-5.6", api_key="example-key")
     adapter.client = adapter.client.copy(http_client=httpx.Client(transport=httpx.MockTransport(
         lambda request: httpx.Response(503, json={"error": {"message": "overloaded"}}))))
     src = _StaticSource([_ep("e1", "ask one"), _ep("e2", "ask two")])

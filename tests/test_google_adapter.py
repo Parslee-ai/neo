@@ -58,11 +58,11 @@ class TestGoogleAdapterInitialization:
         from neo.adapters import GoogleAdapter
 
         # Test with explicit API key
-        adapter = GoogleAdapter(api_key="test-api-key")
+        adapter = GoogleAdapter(api_key="example-api-key")
 
         # Verify Client was called with correct API key
-        mock_google_genai['genai'].Client.assert_called_once_with(api_key="test-api-key")
-        assert adapter.api_key == "test-api-key"
+        mock_google_genai['genai'].Client.assert_called_once_with(api_key="example-api-key")
+        assert adapter.api_key == "example-api-key"
         assert adapter.model == "gemini-2.0-flash"
         assert adapter.client == mock_client
 
@@ -100,7 +100,7 @@ class TestGoogleAdapterInitialization:
 
         adapter = GoogleAdapter(
             model="gemini-2.0-flash",
-            api_key="test-key"
+            api_key="example-key"
         )
 
         assert adapter.name() == "google/gemini-2.0-flash"
@@ -132,7 +132,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key", model="gemini-2.0-flash")
+        adapter = GoogleAdapter(api_key="example-key", model="gemini-2.0-flash")
 
         # Test messages
         messages = [
@@ -196,7 +196,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key")
+        adapter = GoogleAdapter(api_key="example-key")
 
         # Call generate
         result = adapter.generate(
@@ -228,7 +228,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key")
+        adapter = GoogleAdapter(api_key="example-key")
 
         # Call generate - should raise ValueError
         with pytest.raises(ValueError, match="API returned empty response"):
@@ -257,7 +257,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key", model="gemini-2.0-flash")
+        adapter = GoogleAdapter(api_key="example-key", model="gemini-2.0-flash")
 
         # Test 401 unauthorized error
         mock_client.models.generate_content.side_effect = Exception("401 Unauthorized")
