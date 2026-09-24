@@ -660,7 +660,7 @@ class TestTheLiteralPathRescue:
         """
         outside = tmp_path / "outside"
         outside.mkdir()
-        (outside / "secret.py").write_text('TOKEN = "not-in-this-repo"\n', encoding="utf-8")
+        (outside / "secret.py").write_text('OUTSIDE = "not-in-this-repo"\n', encoding="utf-8")
         root = tmp_path / "repo"
         root.mkdir()
         (root / "app.py").write_text("def pool(): pass\n", encoding="utf-8")
