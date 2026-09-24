@@ -345,7 +345,9 @@ def _refresh_in_background(current_version: str) -> threading.Thread:
     return thread
 
 
-def check_for_updates(suppress_output: bool = False, auto_install: bool = False) -> Optional[str]:
+def check_for_updates(
+    suppress_output: bool = False, auto_install: bool = False, *, force: bool = False,
+) -> Optional[str]:
     """
     Check PyPI for a newer version of neo-reasoner.
 
@@ -355,9 +357,16 @@ def check_for_updates(suppress_output: bool = False, auto_install: bool = False)
         background refresh whose result will be available next call.
       - Cache miss: synchronous fetch (one-time tax for fresh installs).
 
+    `force=True` skips all of that and asks PyPI synchronously, rewriting the
+    cache with the answer. It is for a DELIBERATE user action (`neo update`),
+    where a cache up to UPDATE_CHECK_INTERVAL old would report "already up to
+    date" for a release that is already on PyPI (#245). If the fetch fails it
+    falls back to the cached answer, and to None when there is no cache.
+
     Args:
         suppress_output: If True, don't print update notifications
         auto_install: If True, automatically install updates when found
+        force: If True, fetch from PyPI now instead of trusting the cache
 
     Returns:
         The new version string if an update is available, None otherwise
@@ -373,8 +382,18 @@ def check_for_updates(suppress_output: bool = False, auto_install: bool = False)
 
         cache = _read_cache()
 
+        if force:
+            # Deliberate check: ask PyPI now. Act on the fetched answer
+            # directly rather than re-reading the cache, so an unwritable
+            # ~/.neo cannot turn a fresh fetch back into the stale answer.
+            latest_version = _fetch_latest_version_from_pypi()
+            if latest_version is not None:
+                _write_cache(current_version, latest_version)
+                cache = {"new_version": latest_version}
+            elif cache is None:
+                return None
         # Cache miss: do a synchronous fetch so first-ever run isn't blind.
-        if cache is None:
+        elif cache is None:
             latest_version = _fetch_latest_version_from_pypi()
             if latest_version is None:
                 return None
@@ -833,7 +852,9 @@ def perform_update() -> bool:
     current_version = _get_current_version()
 
     print("Checking for updates...")
-    new_version = check_for_updates(suppress_output=True)
+    # Deliberate user action: ask PyPI now. The cached answer can be up to
+    # UPDATE_CHECK_INTERVAL old and would miss a release made since (#245).
+    new_version = check_for_updates(suppress_output=True, force=True)
 
     # Deliberate user action: check the binding now, not on the next interval.
     car_version = refresh_car_runtime(force=True, quiet=False)
