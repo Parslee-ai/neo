@@ -629,6 +629,108 @@ class TestPerformUpdate:
             assert result is False
 
 
+
+class TestPerformUpdateForcesFreshCheck:
+    """`neo update` must ask PyPI now, not trust a cache up to an hour old.
+
+    Regression for #245: a fresh cache saying "up to date" made `neo update`
+    report "already up to date" for a release that was already on PyPI.
+    """
+
+    def _fresh_cache(self, cache_file: Path, *, latest: str, current: str = "0.9.0") -> None:
+        cache_file.write_text(json.dumps({
+            "last_check": time.time() - 10,  # well inside UPDATE_CHECK_INTERVAL
+            "current_version": current,
+            "latest_version": latest,
+            "new_version": latest if latest != current else None,
+        }))
+
+    def test_neo_update_sees_a_release_the_fresh_cache_does_not(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value="0.10.0"), \
+                 patch.object(update_checker, "_refresh_in_background") as bg, \
+                 patch.object(update_checker, "refresh_car_runtime", return_value=None), \
+                 patch.object(update_checker, "_detect_install_method",
+                              return_value=INSTALL_PIP_VENV), \
+                 patch.object(update_checker, "_perform_upgrade_and_verify",
+                              return_value=(update_checker.UpgradeOutcome.UPGRADED,
+                                            "0.10.0")) as upgrade:
+                result = perform_update()
+
+            assert result is True
+            upgrade.assert_called_once_with(INSTALL_PIP_VENV, "0.10.0", quiet=False)
+            bg.assert_not_called()
+
+    def test_forced_check_rewrites_the_cache(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value="0.10.0") as fetch:
+                result = check_for_updates(suppress_output=True, force=True)
+
+            assert result == "0.10.0"
+            fetch.assert_called_once()
+            written = json.loads(cache_file.read_text())
+            assert written["latest_version"] == "0.10.0"
+            assert written["new_version"] == "0.10.0"
+
+    def test_forced_check_falls_back_to_cache_when_pypi_fails(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.5")
+            before = cache_file.read_text()
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value=None) as fetch:
+                result = check_for_updates(suppress_output=True, force=True)
+
+            fetch.assert_called_once()
+            assert result == "0.9.5"
+            assert cache_file.read_text() == before
+
+    def test_forced_check_with_no_cache_and_failed_fetch_returns_none(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value=None):
+                assert check_for_updates(suppress_output=True, force=True) is None
+
+    def test_passive_check_with_fresh_cache_still_skips_pypi(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_refresh_in_background") as bg, \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value="0.10.0") as fetch:
+                result = check_for_updates(suppress_output=True)
+
+            assert result is None
+            fetch.assert_not_called()
+            bg.assert_not_called()
+
 class TestGetCurrentVersion:
     """Test _get_current_version() function."""
 
