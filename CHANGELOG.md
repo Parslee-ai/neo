@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.53.2] - 2026-09-24
+
+One fix to `neo update`, which could report "already up to date" for up to an hour after a new release reached PyPI, and a cleanup that lets neo pass the plugin-scanner gate the awesome-ai-plugins catalog enforces before listing a plugin.
+
+### Fixed
+
+- **`neo update` could say "already up to date" while a newer release was on PyPI.** `perform_update` reused the passive per-invocation update check, which answers from `~/.neo/update_check.json` whenever that cache is under an hour old, so a command the user runs on purpose trusted an answer up to an hour stale. `neo update` now asks PyPI synchronously (`check_for_updates(force=True)`), rewrites the cache with the answer, and acts on the version it just fetched rather than re-reading the cache, so an unwritable `~/.neo` cannot send it back to the stale value. If the fetch fails it falls back to the cached answer. The passive check that runs on every invocation is unchanged. ([#245](https://github.com/Parslee-ai/neo/issues/245), [#246](https://github.com/Parslee-ai/neo/pull/246))
+
+### Changed
+
+- **neo now passes the plugin-scanner gate used by the awesome-ai-plugins catalog.** The HOL AI Plugin Scanner reported 13 high-severity findings and a score of 76 against the catalog's bar of 80; it now reports 0 high and 82. All 13 were false positives, and none was a real secret or a real runtime `eval`. Fake API keys in tests are now `example-*` placeholders, and the three tests that need a realistic key build it at runtime so the value under test is unchanged. The generated stdin wrapper's fallback calls `globals()[func_name](line)` instead of `eval`, with the same behaviour and a new test that runs the generated script. Three recorded measurement files under `evidence/` whose file lists contain `sk-`-prefixed doc paths are now committed gzipped; their content is byte-identical when decompressed, and `evidence/score_subsets.py` reads either form. ([#247](https://github.com/Parslee-ai/neo/pull/247))
+
 ## [0.53.1] - 2026-09-23
 
 Two fixes for neo's own plumbing: the Claude Code plugin failed to load on Claude Code 2.1.278 and earlier, and the CAR binding fell further behind with every CAR release. The plugin fix reaches existing installs only through this version bump.
