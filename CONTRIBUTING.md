@@ -169,6 +169,8 @@ neo/
 ├── construct/                      # Curated design pattern library
 ├── .claude-plugin/                 # Claude Code plugin sources (manifest, agent, slash commands)
 ├── plugins/neo/                    # Codex plugin sources (manifest, skills)
+├── plugins/cursor-neo/             # Cursor plugin sources (manifest, agent, skills)
+├── .cursor-plugin/                 # Cursor marketplace catalog (points at plugins/cursor-neo)
 ├── .agents/                        # Portable skill packages (shared release commands)
 └── pyproject.toml                  # Package configuration
 ```
@@ -207,16 +209,28 @@ neo/
 4. **New Claude Code Slash Command** (`.claude-plugin/commands/`)
    - Add `<name>.md` defining the command's intent and arguments
    - Update `.claude-plugin/plugin.json` so the marketplace surfaces it
-   - Mirror the command's purpose in the **Codex skill** below (same six skills are exposed in both plugins)
+   - Mirror the command's purpose in the **Codex skill** and **Cursor skill**
+     below (the same six capabilities are exposed on all three plugins)
    - Document it in the README's Claude Code Plugin section
 
 5. **New Codex Skill** (`plugins/neo/`)
    - Add a SKILL file under the appropriate subdirectory
    - Register it in the plugin's manifest
-   - Mirror it as a Claude Code slash command (see #4) — the two plugin surfaces are kept symmetric on purpose
+   - Mirror it as a Claude Code slash command and a Cursor skill — the three
+     plugin surfaces are kept symmetric on purpose
    - Document it in the README's Codex Plugin section
 
-6. **New CAR / A2A Tool** (`src/neo/car_host.py` + `car_tool_schema.py`)
+6. **New Cursor Skill** (`plugins/cursor-neo/`)
+   - Add a SKILL file under `skills/<name>/SKILL.md`
+   - Keep `plugins/cursor-neo/.cursor-plugin/plugin.json` and
+     `.cursor-plugin/marketplace.json` in sync with the package
+   - Mirror it as a Claude Code slash command and a Codex skill
+   - Document it in the README's Cursor Plugin section
+   - If the capability needs a visible-boundary path, also update
+     `plugins/cursor-neo/agents/neo.md` (and Claude's `agents/neo.md`) so the
+     dual role stays coherent
+
+7. **New CAR / A2A Tool** (`src/neo/car_host.py` + `car_tool_schema.py`)
    - Define the tool schema in `car_tool_schema.py` (mirrors the typed JSON contract other agents see over A2A)
    - Register the handler in `car_host.py` alongside `neo.process`
    - Add a smoke test in `tests/test_car_host_smoke.py` and schema test in `tests/test_car_tool_schema.py`
@@ -371,7 +385,13 @@ See existing patterns for reference:
 - Update `QUICKSTART.md` if the 5-minute setup flow changes
 - Update `INSTALL.md` for setup changes (extras, dependencies, integration surfaces)
 - Update `CLAUDE.md` and `AGENTS.md` together. `CLAUDE.md` is the long-form source of truth; `AGENTS.md` is a **condensed** mirror for AGENTS.md-spec tools (Codex, etc.). They are not byte-identical, but they must never contradict each other — `neo memory rules` flags exactly that kind of drift
-- When touching plugin sources, update the relevant plugin manifest and keep the **Claude Code** (`.claude-plugin/`) and **Codex** (`plugins/neo/`) surfaces in sync — the same six commands are exposed on both
+- When touching plugin sources, update the relevant plugin manifest and keep the
+  **Claude Code** (`.claude-plugin/`), **Codex** (`plugins/neo/`), and **Cursor**
+  (`plugins/cursor-neo/`) surfaces in sync — the same six capabilities are
+  exposed on all three. Cursor also ships `agents/neo.md` (Claude-parity
+  delegated path) alongside mid-loop skills (Codex-parity privacy defaults).
+  Version bumps edit `pyproject.toml` then `make sync-version` (never hand-edit
+  the derived manifests).
 - When touching CAR (`src/neo/car_*.py`), document any schema or behavior change in the README's "Run as an Agent (CAR / A2A)" section
 - Add docstrings to new functions
 

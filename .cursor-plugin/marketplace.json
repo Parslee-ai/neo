@@ -1,0 +1,19 @@
+{
+  "name": "neo-cursor",
+  "owner": {
+    "name": "Parslee AI",
+    "email": "hello@parslee.ai",
+    "url": "https://parslee.ai"
+  },
+  "metadata": {
+    "description": "Neo Cursor plugins — semantic reasoning with persistent memory",
+    "version": "0.52.1"
+  },
+  "plugins": [
+    {
+      "name": "neo",
+      "source": "./plugins/cursor-neo",
+      "description": "Semantic reasoning with persistent memory (skills + Neo agent)"
+    }
+  ]
+}

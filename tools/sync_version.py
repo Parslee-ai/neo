@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Propagate the version in pyproject.toml to every file that restates it.
 
-One release version is written down in four places:
+One release version is written down in five places:
 
-    pyproject.toml                          <- the source of truth (the build reads it)
-    src/neo/__init__.py                     <- __version__
-    .claude-plugin/plugin.json              <- Claude Code plugin manifest
-    plugins/neo/.codex-plugin/plugin.json   <- Codex CLI plugin manifest
+    pyproject.toml                                <- the source of truth (the build reads it)
+    src/neo/__init__.py                           <- __version__
+    .claude-plugin/plugin.json                    <- Claude Code plugin manifest
+    plugins/neo/.codex-plugin/plugin.json         <- Codex CLI plugin manifest
+    plugins/cursor-neo/.cursor-plugin/plugin.json <- Cursor plugin manifest
 
-`prepare-release` used to ask a human to edit all four by hand. That is a
-documented step with no enforcement, and it got skipped: the package, the
+`prepare-release` used to ask a human to edit the derived files by hand. That
+is a documented step with no enforcement, and it got skipped: the package, the
 Claude manifest and the Codex manifest reached 0.41.0 / 0.37.0 / 0.19.0 before
 anyone noticed. `tests/test_host_adapter_parity.py` now catches the drift, but
 catching it after the fact is worse than not creating it.
@@ -41,6 +42,8 @@ DERIVED: list[tuple[Path, re.Pattern[str]]] = [
     (REPO / ".claude-plugin" / "plugin.json",
      re.compile(r'^(\s*"version"\s*:\s*")([^"]+)(")', re.MULTILINE)),
     (REPO / "plugins" / "neo" / ".codex-plugin" / "plugin.json",
+     re.compile(r'^(\s*"version"\s*:\s*")([^"]+)(")', re.MULTILINE)),
+    (REPO / "plugins" / "cursor-neo" / ".cursor-plugin" / "plugin.json",
      re.compile(r'^(\s*"version"\s*:\s*")([^"]+)(")', re.MULTILINE)),
 ]
 

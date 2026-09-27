@@ -168,10 +168,24 @@ Installs from Parslee's marketplace inside OpenAI Codex CLI:
 
 ```bash
 codex plugin marketplace add Parslee-ai/neo
-# then install "Neo" from Codex's plugin directory
+codex plugin add neo@neo-local
 ```
 
 Requires the `neo` CLI installed and an API key set per the steps above.
+
+### Cursor Plugin
+
+From a checkout of this repo:
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+ln -s "$(pwd)/plugins/cursor-neo" ~/.cursor/plugins/local/neo
+# Developer: Reload Window in Cursor
+```
+
+Or import the repo as a Cursor team marketplace (`.cursor-plugin/marketplace.json`,
+name `neo-cursor`) and install the `neo` plugin. Requires the `neo` CLI and an
+API key per the steps above.
 
 ## Verification
 
