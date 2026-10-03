@@ -168,6 +168,19 @@ class TestSplitDiff:
                 '--- "a/caf\\303\\251.py"\n+++ "b/caf\\303\\251.py"\n@@ -1 +1 @@\n-a\n+b\n')
         assert [p for p, _ in split_unified_diff(diff)] == ["café.py"]
 
+    def test_an_overstated_hunk_count_does_not_swallow_the_next_file(self):
+        # Hand-edited and model-written diffs miscount routinely.
+        diff = ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,5 +1,5 @@\n-a\n+b\n c\n"
+                "diff --git a/y.py b/y.py\n--- a/y.py\n+++ b/y.py\n@@ -1 +1 @@\n-d\n+e\n")
+        pairs = split_unified_diff(diff)
+        assert [p for p, _ in pairs] == ["x.py", "y.py"]
+        assert "y.py" not in pairs[0][1]
+
+    def test_an_overstated_count_before_a_headerless_next_file(self):
+        diff = ("--- a/x.py\n+++ b/x.py\n@@ -1,9 +1,9 @@\n-a\n+b\n"
+                "--- a/y.py\n+++ b/y.py\n@@ -1 +1 @@\n-d\n+e\n")
+        assert [p for p, _ in split_unified_diff(diff)] == ["x.py", "y.py"]
+
     def test_text_without_headers_yields_nothing(self):
         assert split_unified_diff("@@ -1 +1 @@\n-a\n+b\n") == []
 
@@ -557,6 +570,69 @@ async def test_a_failed_auth_leaves_the_client_where_the_run_loop_closes_it():
     assert node.client is daemon
 
 
+@pytest.mark.asyncio
+async def test_a_timed_out_reply_is_not_resent():
+    # The daemon may have delivered it; resending would duplicate the answer.
+    daemon = _Daemon()
+    daemon.fail["agents.message"] = asyncio.TimeoutError()
+    node = await _started(daemon)
+    await asyncio.wait_for(node._reply(req("q"), "text"), timeout=2)
+    assert len(daemon.sent("agents.message")) == 1
+
+
+@pytest.mark.asyncio
+async def test_answering_marks_the_node_as_in_use(monkeypatch):
+    # A node serving only peers is in use even if nobody runs the neo CLI.
+    touched = []
+    monkeypatch.setattr(lattice, "touch_seen", touched.append)
+    daemon = _Daemon()
+    node = await _started(daemon)
+    await _serve(node, msg("q", "why?"))
+    assert touched == ["neo-lattice-abc"]
+
+
+@pytest.mark.asyncio
+async def test_a_decline_does_not_flap_the_status():
+    daemon = _Daemon()
+    node = await _started(daemon)
+    await _serve(node, msg("h", "do it", kind="handoff"))
+    assert [p["status"] for p in daemon.sent("players.join")] == ["available"]
+
+
+@pytest.mark.asyncio
+async def test_a_turned_away_request_gets_its_budget_slot_back():
+    daemon = _Daemon()
+    node = await _started(daemon, maxsize=1)
+    await node.client.deliver(**msg("1", "one", sender="x"))
+    await node.client.deliver(**msg("2", "two", sender="x"))  # busy
+    assert len(node._spend["x"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stop_interrupts_the_reconnect_backoff(monkeypatch):
+    daemon = _Daemon()
+    daemon.auth_error = ConnectionError("daemon down")
+    node = _node(daemon)
+    monkeypatch.setattr(lattice, "RECONNECT_MIN_SECS", 30.0)
+    run = asyncio.create_task(node.run())
+    await asyncio.sleep(0.1)  # first connect failed; now in a 30 s backoff
+    node._stop.set()
+    await asyncio.wait_for(run, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_clean_stop_is_not_reported_as_a_dead_worker(monkeypatch):
+    daemon = _Daemon()
+    node = _node(daemon)
+    monkeypatch.setattr(lattice, "POLL_SECS", 0.05)
+
+    async def finishing_worker():
+        node._stop.set()  # the worker finishes because it was told to stop
+
+    node.worker = finishing_worker
+    await asyncio.wait_for(node.run(), timeout=2)  # no WorkerDied
+
+
 class TestBudgets:
     def test_a_sender_is_cut_off_after_the_hourly_budget(self):
         node = _node(_Daemon())
@@ -725,6 +801,14 @@ class TestAutojoin:
         assert lattice.maybe_autojoin(root) == agent_id
         assert car.ops == [("upsert", agent_id), ("start", agent_id)]
 
+    def test_a_record_missing_fields_is_unknown_not_broken(self, tmp_path, car):
+        # Both "broken" answers are destructive (restart this node, reap the
+        # others), so a listing that omits fields must trigger neither.
+        root = _git_init(tmp_path / "repo")
+        car.agents = [{"id": lattice.agent_id_for(root), "status": "running"},
+                      {"id": "neo-lattice-other", "status": "running"}]
+        assert lattice.maybe_autojoin(root) is None and car.ops == []
+
     def test_a_failed_listing_registers_nothing(self, tmp_path, car):
         root = _git_init(tmp_path / "repo")
         car.list_error = RuntimeError("handshake failed")
@@ -782,14 +866,32 @@ def test_status_does_not_trust_car_over_a_live_node(tmp_path, car):
     root = _git_init(tmp_path / "repo")
     agent_id = lattice.agent_id_for(root)
     car.agents = [{"id": agent_id, "args": ["--cwd", root], "command": sys.executable, "status": "stopped"}]
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "neo.lattice"])
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
+                                "neo.lattice", "--cwd", root])
     try:
         pid_file = lattice._pid_file(agent_id)
         pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(f"{sleeper.pid}\n")
+        pid_file.write_text(f"{sleeper.pid}\n{root}\n")
         assert lattice.status(root)["status"] == "unverified"
         assert lattice.join(root)["status"] == "error"
         assert car.ops == []
+    finally:
+        sleeper.kill()
+
+
+def test_a_reused_pid_serving_another_repository_is_not_this_node(tmp_path, car):
+    # A pid file outlives a SIGKILL; its pid can come back as a different
+    # repository's node, which must not pin this one as "unverified".
+    root = _git_init(tmp_path / "repo")
+    other = _git_init(tmp_path / "other")
+    agent_id = lattice.agent_id_for(root)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
+                                "neo.lattice", "--cwd", other])
+    try:
+        pid_file = lattice._pid_file(agent_id)
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(f"{sleeper.pid}\n{root}\n")
+        assert lattice.status(root)["status"] == "not_joined"
     finally:
         sleeper.kill()
 

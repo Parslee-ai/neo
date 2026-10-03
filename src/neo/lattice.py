@@ -366,6 +366,12 @@ def split_unified_diff(diff: str) -> list[tuple[str, str]]:
     while i < len(lines):
         line = lines[i]
         in_hunk = old_left > 0 or new_left > 0
+        if in_hunk and _ends_hunk(lines, i):
+            # The header overstated its line count, which hand-edited and
+            # model-written diffs do routinely. Trusting the count would
+            # swallow the next file's headers into this file's chunk.
+            old_left = new_left = 0
+            in_hunk = False
         if in_hunk:
             if line.startswith("-"):
                 old_left -= 1
@@ -412,6 +418,19 @@ def split_unified_diff(diff: str) -> list[tuple[str, str]]:
             text = "\n".join(section).rstrip("\n") + "\n"
             pairs.append((path, text))
     return pairs
+
+
+def _ends_hunk(lines: list[str], i: int) -> bool:
+    """Whether line `i` cannot be content of the hunk still being read."""
+    line = lines[i]
+    if line.startswith(("diff --git ", "@@ ")):
+        return True
+    if line and line[0] not in " -+\\":
+        return True
+    # `--- x` / `+++ y` / `@@` is the next file's header, not a removed line
+    # followed by an added one: a hunk line cannot be followed by `@@`.
+    return (line.startswith("--- ") and i + 2 < len(lines)
+            and lines[i + 1].startswith("+++ ") and lines[i + 2].startswith("@@ "))
 
 
 def _header_path(line: str) -> str:
@@ -777,9 +796,15 @@ class LatticeNode:
             raise ConnectionError("not connected")
         try:
             return await client.call(method, params, timeout=RPC_TIMEOUT_SECS)
-        except (ConnectionError, asyncio.TimeoutError) as e:
-            await self._lose(client, f"{method}: {type(e).__name__}: {e}")
-            raise ConnectionError(str(e)) from e
+        except ConnectionError as e:
+            await self._lose(client, f"{method}: {e}")
+            raise
+        except asyncio.TimeoutError:
+            # Not raised as ConnectionError: a timed-out request may still
+            # have been carried out, which matters to a caller deciding
+            # whether to resend it.
+            await self._lose(client, f"{method}: no reply in {RPC_TIMEOUT_SECS:.0f}s")
+            raise
         except RuntimeError as e:
             if "superseded" in str(e):
                 # The binding moved to another connection; this socket stays
@@ -826,6 +851,7 @@ class LatticeNode:
         try:
             self.queue.put_nowait((req, task))
         except asyncio.QueueFull:
+            self._refund(req, task)
             # Bounded like the queue: under a flood the overflow notices must
             # not become their own unbounded backlog.
             if len(self._tasks) < MAX_QUEUE:
@@ -835,6 +861,11 @@ class LatticeNode:
                 )))
             return {"received": True, "action": "busy"}
         return {"received": True, "action": "queued", "queued": self.queue.qsize()}
+
+    def _refund(self, req: PeerRequest, task: Task) -> None:
+        """Return the budget slot of a request that was turned away unanswered."""
+        if task.op in {"reason", "review"} and self._spend.get(req.sender):
+            self._spend[req.sender].pop()
 
     def admit(self, req: PeerRequest, task: Task, now: Optional[float] = None) -> Task:
         """Apply the follow-up depth cap and the per-sender budget."""
@@ -871,9 +902,14 @@ class LatticeNode:
         for attempt in range(2):
             try:
                 sent = await self._rpc("agents.message", params)
+            except asyncio.TimeoutError:
+                # The daemon may have delivered it and been slow to say so;
+                # resending could hand the peer the same answer twice.
+                logger.warning("reply to %s unconfirmed (timeout); not resending", req.sender)
+                return
             except ConnectionError as e:
-                # Transport, not refusal: one retry once re-attached, so a
-                # daemon restart mid-answer does not lose a finished answer.
+                # Not sent at all: one retry once re-attached, so a daemon
+                # restart mid-answer does not lose a finished answer.
                 logger.warning("reply to %s not sent (attempt %d): %s", req.sender, attempt + 1, e)
                 try:
                     await asyncio.wait_for(self._connected.wait(), timeout=60)
@@ -896,11 +932,13 @@ class LatticeNode:
             req, task = await self.queue.get()
             self.last_activity = time.monotonic()
             self.working = True
+            advertised_busy = False
             try:
                 if task.op == "decline":
                     await self._reply(req, task.reason)
                     continue
                 await self.set_status("busy", f"answering a {req.kind or 'message'} from {req.sender}")
+                advertised_busy = True
                 try:
                     text = await loop.run_in_executor(self._executor, self.answerer.answer, task)
                 except Exception as e:  # noqa: BLE001 — the asker gets told
@@ -908,11 +946,14 @@ class LatticeNode:
                     text = f"Neo failed to answer: {type(e).__name__}: {e}"
                 await self._reply(req, text, depth=task.depth)
                 self.answered += 1
+                # Serving peers is use: a node nobody runs the neo CLI beside
+                # but that answers every day must not be reaped as unused.
+                touch_seen(self.config.agent_id)
             finally:
                 self.working = False
                 self.last_activity = time.monotonic()
                 self.queue.task_done()
-                if self.queue.empty() and self.client is not None:
+                if advertised_busy and self.queue.empty() and self.client is not None:
                     await self.set_status("available")
 
     # -- connection -----------------------------------------------------------
@@ -948,7 +989,8 @@ class LatticeNode:
         try:
             while not self._stop.is_set():
                 try:
-                    await self.connect_once()
+                    if not await self._unless_stopped(self.connect_once()):
+                        break
                     delay = RECONNECT_MIN_SECS
                     while self.client.connected and not self._stop.is_set():
                         await asyncio.sleep(POLL_SECS)
@@ -960,7 +1002,7 @@ class LatticeNode:
                             self._stop.set()
                 except Exception as e:  # noqa: BLE001 — reconnect with backoff
                     logger.warning("lattice connection failed: %s", e)
-                if worker.done():
+                if worker.done() and not self._stop.is_set():
                     # Acking into a queue nothing drains looks healthy and
                     # answers no one; fail so the supervisor restarts us.
                     raise WorkerDied(repr(worker.exception()) if not worker.cancelled() else "cancelled")
@@ -970,11 +1012,27 @@ class LatticeNode:
                 if self._stop.is_set():
                     break
                 logger.warning("reconnecting in %.0fs", delay)
-                await asyncio.sleep(delay)
+                await self._unless_stopped(asyncio.sleep(delay))
                 delay = min(delay * 2, RECONNECT_MAX_SECS)
         finally:
             worker.cancel()
             self._executor.shutdown(wait=False, cancel_futures=True)
+
+    async def _unless_stopped(self, coro: Any) -> bool:
+        """Run `coro` unless a stop arrives first; True if it completed.
+
+        Reconnect waits (a 30 s backoff, three 20 s calls) would otherwise
+        outlast the supervisor's SIGTERM grace and end in a SIGKILL.
+        """
+        work = asyncio.ensure_future(coro)
+        stop = asyncio.ensure_future(self._stop.wait())
+        done, _ = await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+        if work in done:
+            stop.cancel()
+            work.result()  # re-raise its exception, if any
+            return True
+        work.cancel()
+        return False
 
     async def leave(self) -> None:
         self._stop.set()
@@ -1064,6 +1122,15 @@ def _seen_marker(agent_id: str) -> Path:
     return _state_dir() / f"seen-{agent_id}"
 
 
+def touch_seen(agent_id: str) -> None:
+    try:
+        marker = _seen_marker(agent_id)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError as e:
+        logger.debug("seen marker for %s: %s", agent_id, e)
+
+
 def repository_root(path: str) -> Optional[str]:
     """The MAIN checkout of the repository containing `path`, or None.
 
@@ -1113,9 +1180,15 @@ def _node_root(agent: dict) -> Optional[str]:
 
 
 def _node_is_broken(agent: dict) -> bool:
-    """Its repository or its interpreter is gone, so it can only crash-loop."""
-    root, command = _node_root(agent), agent.get("command") or ""
-    return not (root and os.path.isdir(root)) or not (command and os.path.exists(command))
+    """Its repository or its interpreter is gone, so it can only crash-loop.
+
+    Only evidence counts: a record WITHOUT `args` or `command` is unknown,
+    not broken. Both answers here are destructive (re-register and restart
+    this node, stop and remove other ones), so a listing that merely omits
+    a field must not trigger them.
+    """
+    root, command = _node_root(agent), agent.get("command")
+    return bool((root and not os.path.isdir(root)) or (command and not os.path.exists(command)))
 
 
 def _reap_stale_nodes(car: Any, agents: list[dict], keep: str, now: float) -> list[str]:
@@ -1174,9 +1247,7 @@ def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
         if agents is None:
             return None
         agent_id = agent_id_for(root)
-        seen = _seen_marker(agent_id)
-        seen.parent.mkdir(parents=True, exist_ok=True)
-        seen.touch()
+        touch_seen(agent_id)
         _reap_stale_nodes(car, agents, keep=agent_id, now=time.time())
         existing = next((a for a in agents if a.get("id") == agent_id), None)
         if existing is not None and not _node_is_broken(existing):
@@ -1206,7 +1277,8 @@ def _live_node_pid(agent_id: str) -> Optional[int]:
     start a second copy of a running node.
     """
     try:
-        pid = int(_pid_file(agent_id).read_text().strip())
+        pid_text, _, recorded_root = _pid_file(agent_id).read_text().partition("\n")
+        pid = int(pid_text.strip())
     except (OSError, ValueError):
         return None
     try:
@@ -1215,8 +1287,11 @@ def _live_node_pid(agent_id: str) -> Optional[int]:
         return None
     from neo.memory.observer import _pid_cmdline
 
+    # A stale file's pid can be reused by ANOTHER repository's node, so the
+    # command line must name this node's repository, not just be a node.
     cmd = _pid_cmdline(pid) or ""
-    return pid if "neo.lattice" in cmd else None
+    root = recorded_root.strip()
+    return pid if "neo.lattice" in cmd and root and f"--cwd {root}" in cmd else None
 
 
 def _skew_message(agent_id: str, managed: Optional[dict]) -> Optional[str]:
@@ -1258,9 +1333,7 @@ def join(root: str, project: Optional[str] = None) -> dict:
             state = "started"
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "message": f"registering {agent_id} failed: {e}"}
-    seen = _seen_marker(agent_id)
-    seen.parent.mkdir(parents=True, exist_ok=True)
-    seen.touch()
+    touch_seen(agent_id)
     return {"status": state, "agent_id": agent_id, "project": project, "root": root,
             "pid": managed.get("pid") if isinstance(managed, dict) else None}
 
@@ -1349,7 +1422,8 @@ def _run_foreground(root: str, project: str) -> int:
     node = LatticeNode(config)
     pid_file = _pid_file(agent_id)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(f"{os.getpid()}\n")
+    pid_file.write_text(f"{os.getpid()}\n{root}\n")
+    touch_seen(agent_id)
 
     async def _main() -> None:
         import signal
