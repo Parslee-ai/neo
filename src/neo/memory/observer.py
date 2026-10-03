@@ -1085,9 +1085,19 @@ def _pid_cmdline(pid: int) -> Optional[str]:
             return None
     except ImportError:
         pass
+    # /proc first where it exists: exact, and no column limit.
     try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if raw:
+            return raw.rstrip(b"\0").replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        pass
+    try:
+        # `-ww`: without it, Linux procps cuts the line to 80 columns when
+        # stdout is not a terminal, dropping exactly the trailing arguments
+        # (`--cwd <root>`) an identity check needs.
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()
         return out or None

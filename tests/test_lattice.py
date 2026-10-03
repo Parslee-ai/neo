@@ -710,6 +710,18 @@ async def test_a_dead_worker_fails_the_process_instead_of_acking_forever(monkeyp
 
 
 class TestForeground:
+    @pytest.fixture(autouse=True)
+    def websockets_present(self, monkeypatch):
+        # The [car] extra is not part of the test install; the check itself
+        # is covered by test_missing_websockets_exits_for_the_supervisor.
+        monkeypatch.setattr(lattice, "_websockets_available", lambda: True)
+
+    def test_missing_websockets_exits_for_the_supervisor(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(lattice, "_websockets_available", lambda: False)
+        monkeypatch.setenv("CAR_AGENT_ID", "neo-lattice-1")
+        monkeypatch.setenv("CAR_AGENT_TOKEN", "secret")
+        assert lattice._run_foreground(str(tmp_path), "p") == 3
+
     def test_agent_credentials_leave_the_environment(self, monkeypatch, tmp_path):
         # car_runtime reads these too; left in place, any CAR use inside the
         # process attaches as this agent and supersedes the node's connection.

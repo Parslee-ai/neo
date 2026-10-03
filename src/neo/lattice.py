@@ -1445,6 +1445,14 @@ def status(root: str) -> dict:
             "pid": managed.get("pid"), "root": _node_root(managed)}
 
 
+def _websockets_available() -> bool:
+    try:
+        import websockets  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _run_foreground(root: str, project: str) -> int:
     # Taken OUT of the environment, not just read. The car_runtime bindings
     # also read these, so anything in this process that touches CAR (the
@@ -1460,9 +1468,7 @@ def _run_foreground(root: str, project: str) -> int:
             file=sys.stderr,
         )
         return 2
-    try:
-        import websockets  # noqa: F401
-    except ImportError:
+    if not _websockets_available():
         # Exit non-zero so the supervisor marks the agent errored. Retrying a
         # connection that can never be made would look alive and answer no one.
         print("neo lattice needs the `websockets` package: pip install 'neo-reasoner[car]'",
