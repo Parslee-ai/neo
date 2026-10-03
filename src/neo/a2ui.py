@@ -147,12 +147,25 @@ class DaemonClient:
         if auth:
             # session.auth must be the first frame on every connection
             # when the daemon has auth enabled (the default since 2026-05).
-            return await self._call("session.auth", auth)
+            try:
+                return await self._call("session.auth", auth)
+            except BaseException:
+                # The socket and receive task are already live; a caller that
+                # retries auth would otherwise leak one of each per attempt.
+                await self.close()
+                raise
         return None
 
-    async def call(self, method: str, params: dict) -> Any:
-        """Issue one JSON-RPC request and return its result (raises on error)."""
-        return await self._call(method, params)
+    async def call(self, method: str, params: dict, timeout: Optional[float] = None) -> Any:
+        """Issue one JSON-RPC request and return its result.
+
+        Raises ``RuntimeError`` for a JSON-RPC error reply (the daemon
+        answered: no), ``ConnectionError`` when the request could not be
+        sent or the socket closed, and ``asyncio.TimeoutError`` when no reply
+        arrived within ``timeout`` seconds. The last two say nothing about
+        the request itself, so a caller may retry them on a new connection.
+        """
+        return await self._call(method, params, timeout=timeout)
 
     def on_request(
         self, method: str, handler: Callable[[dict], Awaitable[Any]]
@@ -191,17 +204,25 @@ class DaemonClient:
         """
         self._notif_handlers[method] = handler
 
-    async def _call(self, method: str, params: dict) -> Any:
+    async def _call(self, method: str, params: dict, timeout: Optional[float] = None) -> Any:
         if not self._ws:
-            raise RuntimeError("daemon client not connected")
+            raise ConnectionError("daemon client not connected")
         self._next_id += 1
         req_id = self._next_id
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
 
         msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-        await self._ws.send(json.dumps(msg))
-        response = await fut
+        try:
+            await self._ws.send(json.dumps(msg))
+        except Exception as e:  # noqa: BLE001 — any send failure is a dead socket
+            self._pending.pop(req_id, None)
+            raise ConnectionError(f"sending {method} failed: {e}") from e
+        try:
+            response = await asyncio.wait_for(fut, timeout) if timeout else await fut
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise
 
         if "error" in response:
             raise RuntimeError(

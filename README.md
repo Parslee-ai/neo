@@ -337,11 +337,13 @@ Other players find it with `player_find` / `players.find` (for example "code rev
 | Send (`kind`) | Neo does |
 |---|---|
 | `question` | Answers in prose from the repository, using Neo's normal pipeline. |
-| `question` whose body starts `memory:` | Looks the query up in Neo's project memory, with no model call. That memory is mined from Claude Code, Codex, CAR and GitHub-PR history, so a Codex session can draw on lessons learned in a Claude Code session. |
+| `question` whose body starts `memory:` | Looks the query up in this repository's Neo memory, with no model call. That memory is mined from Claude Code, Codex, CAR and GitHub-PR history, so a Codex session can draw on lessons learned in a Claude Code session. Only project facts are returned, never other repositories' facts, and a lookup does not age the facts it reads. |
 | `review_request` with a unified diff | Runs deterministic checks on the change (no model call), then reviews it. |
 | `handoff` | Declines. Neo writes no files and never claims work, so it points the sender at `players.find` instead. |
 
-Answers come back as `kind: answer` with `in_reply_to` set to your message id. Neo never answers an `answer`, so two auto-responders cannot loop. The player shows `busy` while it is answering.
+Answers come back as `kind: answer` with `in_reply_to` set to your message id. Neo answers only `question` and `review_request`. Every other kind, and any untyped message that is itself a reply, is acknowledged and dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one answer stops after 4, so two auto-responders cannot run up a bill. The player shows `busy` while it is answering.
+
+The node is registered for the repository's main checkout, even when neo runs inside a linked worktree, so deleting an agent worktree cannot break it. Nodes whose repository has gone, or that neo has not run beside in 14 days, are removed automatically.
 
 ```bash
 neo lattice status   # this repository's node

@@ -822,6 +822,12 @@ def _find_managed_agent(car, agent_id: str) -> Optional[dict]:
     return None
 
 
+def _observer_cwd() -> str:
+    path = os.path.expanduser("~/.neo")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _build_global_spec() -> dict:
     """Spec for the single global observer that sweeps all projects."""
     return {
@@ -829,7 +835,10 @@ def _build_global_spec() -> dict:
         "name": "Neo observer (all projects)",
         "command": sys.executable,
         "args": ["-m", "neo.memory.observer", "--daemon", "--all"],
-        "cwd": os.path.expanduser("~"),
+        # Not `~`: `python -m` puts the cwd first on sys.path, so a stray
+        # `~/json.py` or `~/neo/` would be imported by a supervised process.
+        # Neo's own state dir holds nothing importable.
+        "cwd": _observer_cwd(),
         "env": {
             k: os.environ[k]
             for k in (

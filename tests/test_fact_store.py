@@ -219,6 +219,20 @@ class TestRetrieveRelevant:
         store.retrieve_relevant("test", k=1)
         assert fact.metadata.access_count == 1
 
+    def test_record_access_false_leaves_the_fact_untouched(self, store):
+        # A lookup no reasoning run consumes (a Lattice peer's `memory:`)
+        # must not move a fact toward probation exit or demotion.
+        fact = Fact(
+            subject="Looked up",
+            body="Body",
+            metadata=FactMetadata(confidence=0.8, access_count=0),
+        )
+        store._facts.append(fact)
+        before = fact.metadata.last_accessed
+        assert store.retrieve_relevant("test", k=1, record_access=False) == [fact]
+        assert fact.metadata.access_count == 0
+        assert fact.metadata.last_accessed == before
+
     def test_domain_filter_excludes_other_domains(self, store):
         store._facts.append(Fact(
             subject="Testing fact",

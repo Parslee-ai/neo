@@ -57,6 +57,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -78,8 +79,10 @@ BASE_CAPABILITIES: tuple[str, ...] = (
     "architecture",
     "debugging",
     "root-cause-analysis",
-    "performance-optimization",
-    "refactoring",
+    # Qualified: Neo advises on these and writes nothing, so a need for
+    # someone to DO the refactor must not match it.
+    "performance-analysis",
+    "refactoring-advice",
     "design-patterns",
     "project-memory",
     "past-solutions",
@@ -102,11 +105,25 @@ MEMORY_BODY_BUDGET = 700
 # several hundred MB) that CPython does not return to the OS. After this long
 # with nothing to do, the node re-execs itself back to its ~35 MB idle size.
 IDLE_RECYCLE_SECS = 600.0
+# Model-backed answers one sender may ask for per hour. MAX_QUEUE bounds how
+# many run at once, not how much a chatty auto-responder can spend on the
+# operator's API key.
+SENDER_BUDGET_PER_HOUR = 12
+# Follow-ups to a Neo answer, chained by `in_reply_to`, before Neo stops.
+# Ignoring kind=answer stops the obvious loop; a peer that replies to every
+# answer with a new question is the less obvious one.
+MAX_FOLLOWUP_DEPTH = 4
 QUESTION_OUTPUT = (
     "answer for another agent: answer the question directly in prose, citing "
     "files and lines; propose a code change only if the question asks for one"
 )
 RECONNECT_MIN_SECS = 1.0
+# Every daemon call times out; a daemon that stops replying on an open socket
+# is a lost connection, not a reason to wait forever.
+RPC_TIMEOUT_SECS = 20.0
+POLL_SECS = 1.0
+# A node is reaped once neo has not run in its repository for this long.
+STALE_NODE_DAYS = 14
 RECONNECT_MAX_SECS = 30.0
 # A peer name is 1-128 of [A-Za-z0-9._-], not starting with `.` or `-`.
 _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -247,28 +264,45 @@ class Task:
     diff: str = ""
     error_trace: Optional[str] = None
     reason: str = ""  # why a request was declined or ignored
+    depth: int = 0  # follow-ups deep in a chain started by a Neo answer
 
 
-_DIFF_START_RE = re.compile(r"^(diff --git |--- \S)", re.M)
+# Kinds Neo acts on. Everything else (`answer`, and any kind a newer peer
+# invents: ack, status, result, error, ...) is acknowledged and dropped. An
+# allowlist, not a denylist, because the failure of a denylist is an unbounded
+# conversation between two auto-responders, billed per round trip.
+_ANSWERED_KINDS = {"", "question", "review_request"}
+
+# A file header pair, `--- x` then `+++ y`, at the start of a line. Both lines
+# are required: a lone `--- Summary` in prose is not a diff.
+_HEADER_PAIR_RE = re.compile(r"^--- \S[^\n]*\n\+\+\+ \S", re.M)
+_GIT_HEADER_RE = re.compile(r"^diff --git a/\S", re.M)
+
+
+def _diff_start(text: str) -> Optional[int]:
+    """Offset where a unified diff begins in `text`, or None."""
+    hits = [m.start() for m in (_GIT_HEADER_RE.search(text), _HEADER_PAIR_RE.search(text)) if m]
+    return min(hits) if hits else None
 
 
 def looks_like_diff(text: str) -> bool:
-    return bool(re.search(r"^--- \S.*\n\+\+\+ \S", text, re.M)) or (
-        "diff --git " in text
-    )
+    return _diff_start(text) is not None
 
 
 def plan_task(req: PeerRequest) -> Task:
     """Decide what to do with a request. Pure: no I/O, no model."""
-    if req.kind == "answer":
-        # Never answer an answer: two auto-responders would loop forever.
-        return Task(op="ignore", reason="answers are not answered")
     if req.kind == "handoff":
         return Task(op="decline", reason=(
             "Neo is read-only and does not take work. Use players.find with "
             "the capability you need to reach a player that writes code. "
             "Ask me a question or send a review_request instead.\n\n" + USAGE
         ))
+    if req.kind not in _ANSWERED_KINDS:
+        return Task(op="ignore", reason=f"kind `{req.kind}` is not answered")
+    if not req.kind and req.in_reply_to:
+        # An untyped message that answers something ("received, thanks") is
+        # a reply, not a request, whatever its kind field says.
+        return Task(op="ignore", reason="replies are not answered")
 
     body = req.body.strip()
     op = "review" if req.kind == "review_request" else "reason"
@@ -277,27 +311,23 @@ def plan_task(req: PeerRequest) -> Task:
     data = _json_object(body)
     if data is not None:
         requested = str(data.get("op") or "").strip().lower()
-        if requested in {"reason", "memory", "review"}:
+        # Under review_request the body may narrow to a memory lookup but not
+        # widen to `reason`: that runs the learning path, and the peer's diff
+        # would enter it as if it were Neo's suggestion.
+        allowed = {"review", "memory"} if req.kind == "review_request" else {"reason", "memory", "review"}
+        if requested in allowed:
             op = requested
-        prompt = str(
-            data.get("prompt") or data.get("query") or data.get("question") or ""
-        ).strip()
+        prompt = str(data.get("prompt") or "").strip()
         diff = str(data.get("diff") or "")
         trace = data.get("error_trace")
         error_trace = str(trace) if trace else None
-    else:
-        lowered = body.lower()
-        for prefix in ("memory:", "/memory"):
-            if lowered.startswith(prefix):
-                op, prompt = "memory", body[len(prefix):].strip()
-                break
-        if op == "review":
-            match = _DIFF_START_RE.search(body)
-            if match and looks_like_diff(body[match.start():]):
-                prompt, diff = body[:match.start()].strip(), body[match.start():]
+    elif body.lower().startswith("memory:"):
+        op, prompt = "memory", body[len("memory:"):].strip()
+    elif op == "review":
+        at = _diff_start(body)
+        if at is not None:
+            prompt, diff = body[:at].strip(), body[at:]
 
-    if op == "review" and not diff and looks_like_diff(prompt):
-        diff, prompt = prompt, ""
     if not prompt and not diff:
         return Task(op="decline", reason="Empty request.\n\n" + USAGE)
     return Task(op=op, prompt=prompt, diff=diff, error_trace=error_trace)
@@ -313,38 +343,88 @@ def _json_object(text: str) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
 def split_unified_diff(diff: str) -> list[tuple[str, str]]:
     """Split a multi-file unified diff into `(file_path, file_diff)` pairs.
 
-    The path comes from the `+++` header (`b/` stripped), or from `---` when
-    the file is deleted. Timestamps after a tab are dropped. Text that has no
-    file header yields nothing — VERIFY needs a path to check against.
+    Lines are split on `\\n` only: `str.splitlines` also breaks on form feeds
+    and other separators that occur inside real source, which cuts a hunk
+    line in two. Inside a hunk the `@@` line counts are tracked, so a diff OF
+    a patch file, whose hunk lines read `--- x` / `+++ y`, is not taken for a
+    new file. Every `diff --git` line starts a section; a section with no
+    hunks (rename, mode change, binary) carries no content to verify and is
+    skipped. The path is the `+++` side, or `---` for a deletion; C-quoted
+    paths are unquoted. Text with no file header yields nothing.
     """
-    lines = diff.splitlines(keepends=True)
-    starts: list[int] = []
-    for i, line in enumerate(lines):
-        if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-            start = i - 1 if i > 0 and lines[i - 1].startswith("diff --git ") else i
-            starts.append(start)
+    lines = diff.split("\n")
+    sections: list[list[str]] = []
+    current: Optional[list[str]] = None
+    old_left = new_left = 0  # hunk lines still expected on each side
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        in_hunk = old_left > 0 or new_left > 0
+        if in_hunk:
+            if line.startswith("-"):
+                old_left -= 1
+            elif line.startswith("+"):
+                new_left -= 1
+            elif line.startswith("\\"):
+                pass  # "\ No newline at end of file"
+            else:
+                old_left -= 1
+                new_left -= 1
+            if current is not None:
+                current.append(line)
+            i += 1
+            continue
+        if line.startswith("diff --git "):
+            current = [line]
+            sections.append(current)
+        elif line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            if current is None or any(x.startswith("--- ") for x in current):
+                current = []
+                sections.append(current)
+            current.extend([line, lines[i + 1]])
+            i += 2
+            continue
+        else:
+            hunk = _HUNK_RE.match(line)
+            if hunk and current is not None:
+                old_left = int(hunk.group(1)) if hunk.group(1) is not None else 1
+                new_left = int(hunk.group(2)) if hunk.group(2) is not None else 1
+            if current is not None:
+                current.append(line)
+        i += 1
+
     pairs: list[tuple[str, str]] = []
-    for n, start in enumerate(starts):
-        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
-        chunk = lines[start:end]
-        minus = next(line for line in chunk if line.startswith("--- "))
-        plus = next(line for line in chunk if line.startswith("+++ "))
+    for section in sections:
+        minus = next((x for x in section if x.startswith("--- ")), None)
+        plus = next((x for x in section if x.startswith("+++ ")), None)
+        if minus is None or plus is None or not any(_HUNK_RE.match(x) for x in section):
+            continue
         path = _header_path(plus)
         if path == "/dev/null":
             path = _header_path(minus)
         if path and path != "/dev/null":
-            pairs.append((path, "".join(chunk)))
+            text = "\n".join(section).rstrip("\n") + "\n"
+            pairs.append((path, text))
     return pairs
 
 
 def _header_path(line: str) -> str:
-    path = line[4:].split("\t", 1)[0].strip()
-    if path.startswith(("a/", "b/")):
-        path = path[2:]
-    return path
+    raw = line[4:].split("\t", 1)[0].strip()
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        # git C-quotes paths with special bytes: "b/caf\303\251.py"
+        try:
+            raw = raw[1:-1].encode("latin-1").decode("unicode_escape").encode("latin-1").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            raw = raw[1:-1]
+    if raw.startswith(("a/", "b/")):
+        raw = raw[2:]
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -380,13 +460,17 @@ class Answerer:
         )
 
     @property
-    def engine_loaded(self) -> bool:
-        return self._engine is not None
+    def loaded(self) -> bool:
+        """Holding an engine or a fact store: the memory a recycle releases."""
+        return self._engine is not None or self._store is not None
 
     @property
     def engine(self) -> Any:
         if self._engine is None:
             self._engine = self._engine_factory()
+            # From here on the engine's store answers memory lookups; keeping
+            # the standalone one would hold two copies of the same facts.
+            self._store = None
         return self._engine
 
     def answer(self, task: Task) -> str:
@@ -415,13 +499,23 @@ class Answerer:
         from neo.config import NeoConfig
         from neo.memory.store import FactStore
 
-        return FactStore(codebase_root=self.root, config=NeoConfig.load())
+        # read_only: a lookup must not run the prune/demote chain and save.
+        return FactStore(codebase_root=self.root, config=NeoConfig.load(), read_only=True)
 
     def memory(self, query: str) -> str:
         store = self._memory_store()
         if store is None:
             return "Neo's project memory is not available on this node."
-        facts = _distinct(store.retrieve_relevant(query, k=MEMORY_RESULTS))
+        from neo.memory.models import FactScope
+
+        # No access stamps (a lookup cannot earn the success that offsets
+        # one), and PROJECT scope only: global and org facts are mined from
+        # every repository on this machine, and any peer on the daemon can
+        # send this query.
+        facts = _distinct([
+            f for f in store.retrieve_relevant(query, k=MEMORY_RESULTS * 3, record_access=False)
+            if f.scope is FactScope.PROJECT
+        ])[:MEMORY_RESULTS]
         if not facts:
             return f"Neo's memory has nothing on: {query}"
         lines = [
@@ -454,10 +548,20 @@ class Answerer:
     def reason(self, task: Task) -> str:
         from neo.models import NeoInput
 
+        from neo.models import TaskType, classify_task_type
+        from neo.operating_mode import OperatingMode
+
+        # Only a bugfix/algorithm suggestion can ever be promoted by a later
+        # git-verified acceptance; anything else would just leave an episode
+        # pending forever. Those run in ADVISE and record nothing.
+        promotable = classify_task_type(task.prompt, task.error_trace) in {
+            TaskType.BUGFIX, TaskType.ALGORITHM,
+        }
         output = self.engine.process(NeoInput(
             prompt=task.prompt,
             error_trace=task.error_trace,
             working_directory=self.root,
+            operating_mode=OperatingMode.LEARN if promotable else OperatingMode.ADVISE,
             # A peer's question wants an answer it can act on. Left at the
             # default `next_action`, an explanatory question came back as a
             # "change" whose diff created a file holding the prose answer.
@@ -549,11 +653,15 @@ def render_verification(output: Any) -> str:
 def render_output(output: Any) -> str:
     """Plain-text rendering of a NeoOutput for a peer to read.
 
-    An answer leads with the answer. Cautions are always kept: a caution
-    exists so a confident-sounding answer cannot bury it.
+    Cautions come FIRST: a caution exists so a confident-sounding answer
+    cannot bury it, and the reply is cut from the tail when it is too long.
+    Then the answer, which leads everything else.
     """
     orch = getattr(output, "orchestrator", None)
     parts: list[str] = []
+    cautions = getattr(orch, "cautions", []) if orch else []
+    if cautions:
+        parts.append("Cautions:\n" + "\n".join(f"- {c}" for c in cautions))
     suggestions = getattr(output, "code_suggestions", []) or []
     answers = [s for s in suggestions if _is_answer(s)]
     changes = [s for s in suggestions if not _is_answer(s)]
@@ -567,9 +675,6 @@ def render_output(output: Any) -> str:
     # The summary counts "changes"; with only an answer it would misdescribe it.
     if summary and (changes or not answers):
         parts.append(summary)
-    cautions = getattr(orch, "cautions", []) if orch else []
-    if cautions:
-        parts.append("Cautions:\n" + "\n".join(f"- {c}" for c in cautions))
     plan = getattr(output, "plan", []) or []
     if plan and not answers:
         parts.append("Plan:\n" + "\n".join(
@@ -619,9 +724,14 @@ class LatticeNode:
     """Neo's presence on the Lattice for one repository.
 
     Acknowledges each pushed `agent.peer_message` immediately, queues it, and
-    answers from one worker so the engine sees one request at a time. Status
-    reads `busy` while answering, so `players.find` routes elsewhere unless
-    the asker opts into unavailable players.
+    answers from one worker thread so the engine sees one request at a time.
+    Status reads `busy` while answering, so `players.find` routes elsewhere
+    unless the asker opts into unavailable players.
+
+    Every daemon call has a timeout, and a timeout, a send failure or a
+    superseded binding is treated as a lost connection: the socket is closed
+    and the run loop re-attaches and re-joins. A daemon that stops answering
+    on an open socket would otherwise wedge the node with nothing to notice.
     """
 
     def __init__(self, config: NodeConfig, answerer: Optional[Answerer] = None,
@@ -636,15 +746,52 @@ class LatticeNode:
         self.answered = 0
         self.last_activity = time.monotonic()
         self.recycle = False
+        self.signalled = False
         self.working = False
+        self._spend: dict[str, list[float]] = {}
+        # Ids of answers Neo sent -> how many follow-ups deep each is.
+        self._answer_depth: dict[str, int] = {}
+        # Strong references: the loop holds tasks weakly, so an unreferenced
+        # fire-and-forget task can be collected mid-flight.
+        self._tasks: set[asyncio.Task] = set()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo-lattice")
 
     def should_recycle(self, now: Optional[float] = None) -> bool:
-        """True once a loaded engine has sat idle past `IDLE_RECYCLE_SECS`."""
-        if not self.answerer.engine_loaded:
+        """True once a loaded engine or store has sat idle past `IDLE_RECYCLE_SECS`."""
+        if not self.answerer.loaded:
             return False
         if self.working or (self.queue is not None and self.queue.qsize()):
             return False
         return ((now or time.monotonic()) - self.last_activity) >= IDLE_RECYCLE_SECS
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    # -- daemon calls ---------------------------------------------------------
+
+    async def _rpc(self, method: str, params: dict) -> Any:
+        client = self.client
+        if client is None:
+            raise ConnectionError("not connected")
+        try:
+            return await client.call(method, params, timeout=RPC_TIMEOUT_SECS)
+        except (ConnectionError, asyncio.TimeoutError) as e:
+            await self._lose(client, f"{method}: {type(e).__name__}: {e}")
+            raise ConnectionError(str(e)) from e
+        except RuntimeError as e:
+            if "superseded" in str(e):
+                # The binding moved to another connection; this socket stays
+                # open and refuses everything, so close it and re-attach.
+                await self._lose(client, f"{method}: {e}")
+                raise ConnectionError(str(e)) from e
+            raise
+
+    async def _lose(self, client: Any, why: str) -> None:
+        logger.warning("dropping daemon connection (%s)", why)
+        self._connected.clear()
+        await client.close()
 
     # -- profile --------------------------------------------------------------
 
@@ -657,51 +804,65 @@ class LatticeNode:
             "status": status,
         }
         params["note"] = (note or "Read-only: ask a question, look up project "
-                          "memory, or send a review_request.")[:280]
+                          "memory (body `memory: ...`), or send a review_request "
+                          "with a diff.")[:280]
         return params
 
     async def set_status(self, status: str, note: str = "") -> None:
         try:
-            await self.client.call("players.join", self.profile(status, note))
+            await self._rpc("players.join", self.profile(status, note))
         except Exception as e:  # noqa: BLE001 — status is advisory
             logger.warning("players.join (%s) failed: %s", status, e)
-            await self._drop_if_superseded(e)
-
-    async def _drop_if_superseded(self, error: Exception) -> None:
-        """A superseded binding answers every call with an error while the
-        socket stays open, so nothing else would ever notice. Closing it sends
-        the run loop through a fresh attach and join."""
-        if "superseded" in str(error) and self.client is not None:
-            logger.warning("agent binding superseded; re-attaching")
-            await self.client.close()
 
     # -- inbound --------------------------------------------------------------
 
     async def on_peer_message(self, params: dict) -> dict:
         """Acknowledge a push. Never blocks: answering happens in the worker."""
         req = PeerRequest.from_params(params)
-        task = plan_task(req)
+        task = self.admit(req, plan_task(req))
         if task.op == "ignore":
             return {"received": True, "action": "ignored", "reason": task.reason}
         assert self.queue is not None
         try:
             self.queue.put_nowait((req, task))
         except asyncio.QueueFull:
-            asyncio.create_task(self._reply(req, (
-                f"Neo is answering {MAX_QUEUE + 1} requests already. "
-                "Try again in a few minutes."
-            )))
+            # Bounded like the queue: under a flood the overflow notices must
+            # not become their own unbounded backlog.
+            if len(self._tasks) < MAX_QUEUE:
+                self._spawn(self._reply(req, (
+                    f"Neo is answering {MAX_QUEUE + 1} requests already. "
+                    "Try again in a few minutes."
+                )))
             return {"received": True, "action": "busy"}
         return {"received": True, "action": "queued", "queued": self.queue.qsize()}
 
+    def admit(self, req: PeerRequest, task: Task, now: Optional[float] = None) -> Task:
+        """Apply the follow-up depth cap and the per-sender budget."""
+        if task.op not in {"reason", "review"}:
+            return task  # memory lookups and declines cost no model call
+        depth = self._answer_depth.get(req.in_reply_to, 0) + 1 if req.in_reply_to else 0
+        if depth > MAX_FOLLOWUP_DEPTH:
+            return Task(op="ignore", reason=f"follow-up chain deeper than {MAX_FOLLOWUP_DEPTH}")
+        now = now if now is not None else time.monotonic()
+        recent = [t for t in self._spend.get(req.sender, []) if now - t < 3600]
+        if len(recent) >= SENDER_BUDGET_PER_HOUR:
+            self._spend[req.sender] = recent
+            return Task(op="decline", reason=(
+                f"Neo has answered {SENDER_BUDGET_PER_HOUR} model-backed requests from you "
+                "in the last hour. memory: lookups still work; try again later."
+            ))
+        recent.append(now)
+        self._spend[req.sender] = recent
+        task.depth = depth
+        return task
+
     # -- outbound -------------------------------------------------------------
 
-    async def _reply(self, req: PeerRequest, text: str) -> None:
+    async def _reply(self, req: PeerRequest, text: str, depth: int = 0) -> None:
         if req.no_reply or not req.sender:
             return
         params: dict[str, Any] = {
             "to": req.sender, "kind": "answer", "body": format_reply(req, text),
-            "summary": f"neo answer to {req.message_id or req.sender}",
         }
         if req.message_id:
             # The daemon's correlation field; the `re:` line in the body
@@ -709,22 +870,24 @@ class LatticeNode:
             params["in_reply_to"] = req.message_id
         for attempt in range(2):
             try:
-                await self.client.call("agents.message", params)
-                return
-            except Exception as e:  # noqa: BLE001
-                logger.warning("reply to %s failed (attempt %d): %s", req.sender, attempt + 1, e)
-                await self._drop_if_superseded(e)
-                if self.client is not None and self.client.connected:
-                    # The daemon refused it on a live connection (guard,
-                    # policy, recipient gone): a retry would be refused too.
-                    return
-                # One retry after a reconnect, so a daemon restart mid-answer
-                # does not lose the answer the user waited for.
-                self._connected.clear()
+                sent = await self._rpc("agents.message", params)
+            except ConnectionError as e:
+                # Transport, not refusal: one retry once re-attached, so a
+                # daemon restart mid-answer does not lose a finished answer.
+                logger.warning("reply to %s not sent (attempt %d): %s", req.sender, attempt + 1, e)
                 try:
                     await asyncio.wait_for(self._connected.wait(), timeout=60)
                 except asyncio.TimeoutError:
                     return
+                continue
+            except Exception as e:  # noqa: BLE001 — refused (guard, policy, recipient gone)
+                logger.warning("reply to %s refused: %s", req.sender, e)
+                return
+            if isinstance(sent, dict) and sent.get("id"):
+                if len(self._answer_depth) >= 1024:
+                    self._answer_depth.clear()  # bounded; worst case a chain restarts its count
+                self._answer_depth[str(sent["id"])] = depth
+            return
 
     async def worker(self) -> None:
         assert self.queue is not None
@@ -739,11 +902,11 @@ class LatticeNode:
                     continue
                 await self.set_status("busy", f"answering a {req.kind or 'message'} from {req.sender}")
                 try:
-                    text = await loop.run_in_executor(None, self.answerer.answer, task)
+                    text = await loop.run_in_executor(self._executor, self.answerer.answer, task)
                 except Exception as e:  # noqa: BLE001 — the asker gets told
                     logger.exception("answering %s failed", req.message_id)
                     text = f"Neo failed to answer: {type(e).__name__}: {e}"
-                await self._reply(req, text)
+                await self._reply(req, text, depth=task.depth)
                 self.answered += 1
             finally:
                 self.working = False
@@ -757,21 +920,28 @@ class LatticeNode:
     async def connect_once(self) -> None:
         client = self._client_factory(self.config.url)
         client.on_request("agent.peer_message", self.on_peer_message)
-        await client.connect({"token": self.config.token, "agent_id": self.config.agent_id})
+        # Assigned before connecting, so a failed auth is closed by the run
+        # loop instead of leaking a socket and a receive task per retry.
         self.client = client
+        await asyncio.wait_for(
+            client.connect({"token": self.config.token, "agent_id": self.config.agent_id}),
+            RPC_TIMEOUT_SECS,
+        )
         try:
             from neo import __version__
             await client.call("server.handshake", {
                 "protocol_version": 3, "client_version": f"neo-{__version__}",
                 "required_capabilities": [], "optional_capabilities": [],
-            })
+            }, timeout=RPC_TIMEOUT_SECS)
         except Exception as e:  # noqa: BLE001 — players.* does not need it
             logger.info("server.handshake not negotiated: %s", e)
-        await client.call("players.join", self.profile("available"))
+        await client.call("players.join", self.profile("available"), timeout=RPC_TIMEOUT_SECS)
         self._connected.set()
         logger.info("joined project %s as %s", self.config.project, self.config.agent_id)
 
     async def run(self) -> None:
+        """Serve until stopped. Raises `WorkerDied` if the answering worker
+        exits, so the process fails and CAR's supervisor restarts it."""
         self.queue = asyncio.Queue(maxsize=MAX_QUEUE)
         worker = asyncio.create_task(self.worker())
         delay = RECONNECT_MIN_SECS
@@ -781,32 +951,42 @@ class LatticeNode:
                     await self.connect_once()
                     delay = RECONNECT_MIN_SECS
                     while self.client.connected and not self._stop.is_set():
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(POLL_SECS)
+                        if worker.done():
+                            break
                         if self.should_recycle():
-                            logger.info("idle with a loaded engine; recycling")
+                            logger.info("idle with memory loaded; recycling")
                             self.recycle = True
                             self._stop.set()
-                    if not self._stop.is_set():
-                        logger.warning("daemon connection lost; reconnecting")
                 except Exception as e:  # noqa: BLE001 — reconnect with backoff
                     logger.warning("lattice connection failed: %s", e)
+                if worker.done():
+                    # Acking into a queue nothing drains looks healthy and
+                    # answers no one; fail so the supervisor restarts us.
+                    raise WorkerDied(repr(worker.exception()) if not worker.cancelled() else "cancelled")
                 self._connected.clear()
                 if self.client is not None:
                     await self.client.close()
                 if self._stop.is_set():
                     break
+                logger.warning("reconnecting in %.0fs", delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, RECONNECT_MAX_SECS)
         finally:
             worker.cancel()
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def leave(self) -> None:
         self._stop.set()
         if self.client is not None and self.client.connected:
             try:
-                await self.client.call("players.leave", {})
+                await self.client.call("players.leave", {}, timeout=5)
             except Exception:  # noqa: BLE001
                 pass
+
+
+class WorkerDied(RuntimeError):
+    """The answering worker exited; the node must not keep acknowledging."""
 
 
 def _default_client(url: str) -> Any:
@@ -829,14 +1009,36 @@ def daemon_url() -> str:
 _FORWARDED_ENV = ("CAR_DAEMON_URL", "NEO_PROFILE", "NEO_METRICS", "NEO_LOG_LEVEL")
 
 
+def _state_dir() -> Path:
+    """`~/.neo/lattice`, resolved at call time so it follows `Path.home()`."""
+    return Path.home() / ".neo" / "lattice"
+
+
+def node_argv(root: str, project: str) -> list[str]:
+    """Interpreter arguments for the node, shared by the spec and the recycle.
+
+    `-P` (3.11+) keeps the working directory off `sys.path`; the spec's cwd
+    is Neo's own state dir for the same reason on older interpreters. The
+    repository is passed as `--cwd`, never as the process cwd: `python -m`
+    puts the cwd first on `sys.path`, so a node started IN a repository
+    would import that repository's `json.py` or `neo/` package instead of
+    the real ones, while holding an agent token, merely because neo was
+    once run there.
+    """
+    safe = ["-P"] if sys.version_info >= (3, 11) else []
+    return [*safe, "-m", "neo.lattice", "run", "--cwd", root, "--project", project]
+
+
 def build_spec(root: str, project: str) -> dict:
     agent_id = agent_id_for(root)
+    home = Path.home() / ".neo"
+    home.mkdir(parents=True, exist_ok=True)
     return {
         "id": agent_id,
         "name": f"Neo ({project})",
         "command": sys.executable,
-        "args": ["-m", "neo.lattice", "run", "--cwd", root, "--project", project],
-        "cwd": root,
+        "args": node_argv(root, project),
+        "cwd": str(home),
         "env": {k: os.environ[k] for k in _FORWARDED_ENV if k in os.environ},
         "restart": "on_failure",
         "max_restarts": 10,
@@ -845,31 +1047,101 @@ def build_spec(root: str, project: str) -> dict:
     }
 
 
-def _left_marker(root: str) -> Path:
-    """Records that the user took this repo off the Lattice.
-
-    Resolved at call time (not import time) so it follows `Path.home()`.
-    """
+def _project_key(root: str) -> str:
     from neo.memory.scope import _compute_project_id
 
-    return Path.home() / ".neo" / "lattice" / f"left-{_compute_project_id(root)[:16]}"
+    return _compute_project_id(root)[:16]
+
+
+def _left_marker(root: str) -> Path:
+    """Records that the user took this repo off the Lattice."""
+    return _state_dir() / f"left-{_project_key(root)}"
+
+
+def _seen_marker(agent_id: str) -> Path:
+    """Touched whenever neo runs in the node's repository; its age decides
+    when an unused node is reaped."""
+    return _state_dir() / f"seen-{agent_id}"
 
 
 def repository_root(path: str) -> Optional[str]:
-    """The git top-level containing `path`, or None outside a repository.
+    """The MAIN checkout of the repository containing `path`, or None.
+
+    Not `--show-toplevel`: inside a linked worktree that names the worktree,
+    and the node's agent id is keyed on the remote, so whichever checkout neo
+    ran in first would own the node, and deleting that worktree (agent
+    worktrees are deleted routinely) would leave a node restart-looping on a
+    missing directory. The main checkout is the parent of the common git dir.
 
     Auto-join requires a repository: a session started from `$HOME` or `/`
     must not mint a player whose "project" is the whole machine.
     """
+    def git(*args: str) -> Optional[str]:
+        try:
+            out = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = out.stdout.strip()
+        return value if out.returncode == 0 and value else None
+
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common and Path(common).name == ".git":
+        return str(Path(common).parent)
+    return git("rev-parse", "--show-toplevel")
+
+
+def _list_agents(car: Any) -> Optional[list[dict]]:
+    """The supervisor's agents, or None when the call failed.
+
+    None is not "none registered": treating a failed listing as empty would
+    re-register the node on every CLI run.
+    """
     try:
-        out = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+        agents = json.loads(car.agents_list())
+    except Exception as e:  # noqa: BLE001
+        logger.debug("agents_list failed: %s", e)
         return None
-    top = out.stdout.strip()
-    return top if out.returncode == 0 and top else None
+    return agents if isinstance(agents, list) else None
+
+
+def _node_root(agent: dict) -> Optional[str]:
+    args = agent.get("args") or []
+    for i, arg in enumerate(args[:-1]):
+        if arg == "--cwd":
+            return args[i + 1]
+    return None
+
+
+def _node_is_broken(agent: dict) -> bool:
+    """Its repository or its interpreter is gone, so it can only crash-loop."""
+    root, command = _node_root(agent), agent.get("command") or ""
+    return not (root and os.path.isdir(root)) or not (command and os.path.exists(command))
+
+
+def _reap_stale_nodes(car: Any, agents: list[dict], keep: str, now: float) -> list[str]:
+    """Remove nodes whose repository is gone or that neo has not run beside
+    in `STALE_NODE_DAYS`. Each node is an auto-started process; without this,
+    every repository neo ever touched would hold one forever."""
+    reaped: list[str] = []
+    for agent in agents:
+        agent_id = str(agent.get("id") or "")
+        if not agent_id.startswith(AGENT_PREFIX) or agent_id == keep:
+            continue
+        seen = _seen_marker(agent_id)
+        try:
+            stale = now - seen.stat().st_mtime > STALE_NODE_DAYS * 86400
+        except FileNotFoundError:
+            stale = False  # never stamped (registered by hand): leave it
+        if not (stale or _node_is_broken(agent)):
+            continue
+        for op in (car.agents_stop, car.agents_remove):
+            try:
+                op(agent_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("%s(%s): %s", op.__name__, agent_id, e)
+        seen.unlink(missing_ok=True)
+        reaped.append(agent_id)
+    return reaped
 
 
 def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
@@ -878,9 +1150,10 @@ def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
     Called once per neo CLI run, beside the observer autostart: when neo and
     CAR are installed together, every repository neo is used in gets a
     supervised, read-only neo player. No-op outside a git repository, when
-    the daemon is unreachable, when the node is already registered, or when
-    the user ran `neo lattice leave` here. Never raises. Returns the agent id
-    it registered, else None.
+    the daemon is unreachable, or when the user ran `neo lattice leave` here.
+    A registered node whose repository or interpreter has disappeared is
+    re-registered; nodes for vanished or long-unused repositories are reaped.
+    Never raises. Returns the agent id it (re)registered, else None.
 
     `NEO_OBSERVER_AUTOSTART=0` turns this off too: it is the one existing
     switch for "neo registers no CAR agents on its own", and a second switch
@@ -889,11 +1162,7 @@ def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
     try:
         if os.getenv("NEO_OBSERVER_AUTOSTART", "").strip() == "0":
             return None
-        from neo.memory.observer import (
-            _car_server_reachable,
-            _find_managed_agent,
-            _require_car_runtime,
-        )
+        from neo.memory.observer import _car_server_reachable, _require_car_runtime
 
         root = repository_root(cwd or os.getcwd())
         if root is None or _left_marker(root).exists():
@@ -901,12 +1170,22 @@ def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
         if not _car_server_reachable():
             return None
         car = _require_car_runtime()
+        agents = _list_agents(car)
+        if agents is None:
+            return None
         agent_id = agent_id_for(root)
-        if _find_managed_agent(car, agent_id) is not None:
-            return None  # registered; the supervisor owns its lifecycle
-        spec = build_spec(root, derive_project_name(root))
-        car.agents_upsert(json.dumps(spec))
-        car.agents_start(agent_id)
+        seen = _seen_marker(agent_id)
+        seen.parent.mkdir(parents=True, exist_ok=True)
+        seen.touch()
+        _reap_stale_nodes(car, agents, keep=agent_id, now=time.time())
+        existing = next((a for a in agents if a.get("id") == agent_id), None)
+        if existing is not None and not _node_is_broken(existing):
+            return None  # registered and viable; the supervisor owns it
+        car.agents_upsert(json.dumps(build_spec(root, derive_project_name(root))))
+        if existing is not None and existing.get("status") == "running":
+            car.agents_restart(agent_id)
+        else:
+            car.agents_start(agent_id)
         logger.debug("auto-joined %s to the lattice as %s", root, agent_id)
         return agent_id
     except Exception as e:  # noqa: BLE001 — must never break a neo command
@@ -914,55 +1193,99 @@ def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
         return None
 
 
+def _pid_file(agent_id: str) -> Path:
+    return _state_dir() / f"{agent_id}.pid"
+
+
+def _live_node_pid(agent_id: str) -> Optional[int]:
+    """The pid the node itself recorded, if that process is still a node.
+
+    The one liveness signal that does not route through CAR: under a
+    client/daemon protocol skew `agents_list` falls back to the manifest and
+    reports every agent `stopped`, which would make `status` lie and `join`
+    start a second copy of a running node.
+    """
+    try:
+        pid = int(_pid_file(agent_id).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    from neo.memory.observer import _pid_cmdline
+
+    cmd = _pid_cmdline(pid) or ""
+    return pid if "neo.lattice" in cmd else None
+
+
+def _skew_message(agent_id: str, managed: Optional[dict]) -> Optional[str]:
+    pid = _live_node_pid(agent_id)
+    if pid is not None and (managed is None or managed.get("status") != "running"):
+        return (f"CAR reports {agent_id} as "
+                f"{managed.get('status') if managed else 'unregistered'}, but node pid {pid} "
+                "is alive. The CAR client and daemon probably disagree on protocol "
+                "version (update car-runtime or CarHost); refusing to act on CAR's view.")
+    return None
+
+
 def join(root: str, project: Optional[str] = None) -> dict:
-    from neo.memory.observer import _find_managed_agent, _require_car_runtime
+    from neo.memory.observer import _require_car_runtime
 
     try:
         car = _require_car_runtime()
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
-    try:
-        _left_marker(root).unlink()
-    except FileNotFoundError:
-        pass
+    root = repository_root(root) or root
+    agents = _list_agents(car)
+    if agents is None:
+        return {"status": "error", "message": "could not list CAR's agents"}
+    agent_id = agent_id_for(root)
+    existing = next((a for a in agents if a.get("id") == agent_id), None)
+    skew = _skew_message(agent_id, existing)
+    if skew:
+        return {"status": "error", "agent_id": agent_id, "message": skew}
+    _left_marker(root).unlink(missing_ok=True)
     project = project or derive_project_name(root)
-    spec = build_spec(root, project)
-    agent_id = spec["id"]
     try:
-        car.agents_upsert(json.dumps(spec))
-    except Exception as e:  # noqa: BLE001
-        return {"status": "error", "message": f"agents_upsert failed: {e}"}
-    existing = _find_managed_agent(car, agent_id)
-    if existing and existing.get("status") == "running":
-        try:
+        car.agents_upsert(json.dumps(build_spec(root, project)))
+        if existing and existing.get("status") == "running":
             # Restart so a changed spec (project, capabilities) takes effect.
             managed = json.loads(car.agents_restart(agent_id))
-        except Exception as e:  # noqa: BLE001
-            return {"status": "error", "message": f"agents_restart failed: {e}"}
-        return {"status": "restarted", "agent_id": agent_id, "project": project,
-                "pid": managed.get("pid")}
-    try:
-        managed = json.loads(car.agents_start(agent_id))
+            state = "restarted"
+        else:
+            managed = json.loads(car.agents_start(agent_id))
+            state = "started"
     except Exception as e:  # noqa: BLE001
-        return {"status": "error", "message": f"agents_start failed: {e}"}
-    return {"status": "started", "agent_id": agent_id, "project": project,
-            "pid": managed.get("pid"),
-            "log": f"~/.car/logs/{agent_id}.stderr.log"}
+        return {"status": "error", "message": f"registering {agent_id} failed: {e}"}
+    seen = _seen_marker(agent_id)
+    seen.parent.mkdir(parents=True, exist_ok=True)
+    seen.touch()
+    return {"status": state, "agent_id": agent_id, "project": project, "root": root,
+            "pid": managed.get("pid") if isinstance(managed, dict) else None}
 
 
 def leave(root: str) -> dict:
-    from neo.memory.observer import _find_managed_agent, _require_car_runtime
+    from neo.memory.observer import _require_car_runtime
 
-    try:
-        car = _require_car_runtime()
-    except RuntimeError as e:
-        return {"status": "error", "message": str(e)}
+    root = repository_root(root) or root
     agent_id = agent_id_for(root)
     # Recorded first, so autostart honours the choice even if CAR is down.
     marker = _left_marker(root)
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(f"{root}\n")
-    if _find_managed_agent(car, agent_id) is None:
+    try:
+        car = _require_car_runtime()
+    except RuntimeError as e:
+        return {"status": "error", "message": f"opt-out recorded; {e}"}
+    agents = _list_agents(car)
+    if agents is None:
+        return {"status": "error", "message": "opt-out recorded; could not list CAR's agents"}
+    existing = next((a for a in agents if a.get("id") == agent_id), None)
+    skew = _skew_message(agent_id, existing)
+    if skew:
+        return {"status": "error", "agent_id": agent_id, "message": "opt-out recorded; " + skew}
+    if existing is None:
         return {"status": "not_joined", "agent_id": agent_id}
     for op in (car.agents_stop, car.agents_remove):
         try:
@@ -973,18 +1296,26 @@ def leave(root: str) -> dict:
 
 
 def status(root: str) -> dict:
-    from neo.memory.observer import _find_managed_agent, _require_car_runtime
+    from neo.memory.observer import _require_car_runtime
 
     try:
         car = _require_car_runtime()
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
+    root = repository_root(root) or root
     agent_id = agent_id_for(root)
-    managed = _find_managed_agent(car, agent_id)
+    agents = _list_agents(car)
+    if agents is None:
+        return {"status": "error", "agent_id": agent_id, "message": "could not list CAR's agents"}
+    managed = next((a for a in agents if a.get("id") == agent_id), None)
+    skew = _skew_message(agent_id, managed)
+    if skew:
+        return {"status": "unverified", "agent_id": agent_id, "message": skew}
     if managed is None:
-        return {"status": "not_joined", "agent_id": agent_id}
+        state = "left" if _left_marker(root).exists() else "not_joined"
+        return {"status": state, "agent_id": agent_id}
     return {"status": managed.get("status", "unknown"), "agent_id": agent_id,
-            "pid": managed.get("pid")}
+            "pid": managed.get("pid"), "root": _node_root(managed)}
 
 
 def _run_foreground(root: str, project: str) -> int:
@@ -1002,38 +1333,65 @@ def _run_foreground(root: str, project: str) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        import websockets  # noqa: F401
+    except ImportError:
+        # Exit non-zero so the supervisor marks the agent errored. Retrying a
+        # connection that can never be made would look alive and answer no one.
+        print("neo lattice needs the `websockets` package: pip install 'neo-reasoner[car]'",
+              file=sys.stderr)
+        return 3
     config = NodeConfig(
         root=root, project=project, agent_id=agent_id, token=token,
         url=daemon_url(), display_name=f"neo-{project}",
         capabilities=capabilities_for(root),
     )
     node = LatticeNode(config)
+    pid_file = _pid_file(agent_id)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(f"{os.getpid()}\n")
 
     async def _main() -> None:
         import signal
 
         loop = asyncio.get_running_loop()
+
+        def _on_signal() -> None:
+            node.signalled = True
+            node._spawn(node.leave())
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, lambda: asyncio.ensure_future(node.leave()))
+                loop.add_signal_handler(sig, _on_signal)
             except (NotImplementedError, RuntimeError):
                 pass
         await node.run()
 
     started = time.monotonic()
-    asyncio.run(_main())
+    code = 0
+    try:
+        asyncio.run(_main())
+    except WorkerDied as e:
+        logger.error("answering worker died (%s); exiting for a supervised restart", e)
+        code = 1
     logger.info("lattice node exiting after %.0fs, %d answered",
                 time.monotonic() - started, node.answered)
+    sys.stdout.flush()
+    sys.stderr.flush()
     if node.recycle:
-        # exec keeps the pid and CAR_AGENT_ID/CAR_AGENT_TOKEN, so the
-        # supervisor sees the same agent; the old socket closes with the old
-        # image and the new one re-attaches and re-joins.
-        sys.stdout.flush()
-        sys.stderr.flush()
+        # exec keeps the pid, so the supervisor sees the same agent; the old
+        # socket closes with the old image and the new one re-attaches. The
+        # credentials go back into the NEW image's environment only.
         env = dict(os.environ, CAR_AGENT_ID=agent_id, CAR_AGENT_TOKEN=token)
-        os.execve(sys.executable, [sys.executable, "-m", "neo.lattice", "run",
-                                   "--cwd", root, "--project", project], env)
-    return 0
+        os.execve(sys.executable, [sys.executable, *node_argv(root, project)], env)
+    if node.signalled:
+        # A signal mid-answer leaves the engine thread inside a model call;
+        # a normal exit would join it and outlast the supervisor's SIGTERM
+        # grace. The answer is abandoned either way.
+        pid_file.unlink(missing_ok=True)
+        os._exit(code)
+    pid_file.unlink(missing_ok=True)
+    return code
 
 
 def cli_main(argv: list[str]) -> int:
