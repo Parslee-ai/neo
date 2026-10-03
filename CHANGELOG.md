@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Neo joins the CAR Lattice as a read-only player.** With `car-server` running, every repository Neo is used in gets a CAR-supervised `neo-lattice-<id>` agent. Like the observer, it is registered automatically. The agent joins the repository's project with capability tags (`code-review`, `debugging`, `architecture`, `project-memory`, `past-solutions`, …, plus the repository's main languages), so Claude Code, Codex and CAR Coder sessions find it with `players.find` rather than by address. Because it is a supervised agent, the daemon pushes each `agent.peer_message` to it. MCP coding sessions only see mail when they poll, so Neo answers while the asker keeps working.
+  - A `question` runs Neo's pipeline in the repository and asks for a prose answer rather than a patch.
+  - A `memory:` lookup answers from Neo's cross-runtime fact store with no model call.
+  - A `review_request` with a diff runs the deterministic VERIFY checks, then a review in ADVISE mode, so a peer's patch never enters Neo's learning loop as a Neo suggestion.
+  - A `handoff` is declined: Neo writes no files and never claims work.
+  - An `answer` is acknowledged and dropped, so two auto-responders cannot loop.
+
+  Replies carry `kind: answer` and `in_reply_to`. Status reads `busy` while Neo is answering. An idle node uses about 35 MB; once it has answered, it re-execs itself after 10 idle minutes to release the engine. `neo lattice leave` takes a repository off and records the choice so autostart does not re-add it, and `neo lattice join` reverses that. `NEO_OBSERVER_AUTOSTART=0` turns off this agent along with the observer.
+- `DaemonClient` (`neo.a2ui`) answers daemon-to-client JSON-RPC requests (`on_request`) and accepts an agent-bound `session.auth`. Previously it treated a request with an `id` as a notification and never replied, so the daemon waited out its acknowledgement timeout.
+
 ## [0.53.2] - 2026-09-24
 
 One fix to `neo update`, which could report "already up to date" for up to an hour after a new release reached PyPI, and a cleanup that lets neo pass the plugin-scanner gate the awesome-ai-plugins catalog enforces before listing a plugin.
