@@ -18,7 +18,8 @@
     - A dead worker exits the process so CAR restarts it.
     - A signal mid-answer exits immediately instead of waiting for the model call.
   - **Lifecycle:**
-    - Nodes whose repository has gone, or that neo has not run beside in 14 days, are reaped. A node whose checkout vanished is re-registered.
+    - **Inert on a daemon without the Lattice API.** Autojoin probes the daemon before registering: a plain `players.list` is refused either way, and only `unknown method` means the API is missing. Today's CarHost gets no node, and Neo joins automatically once CAR is updated. A node that meets a daemon without the API exits cleanly instead of reconnecting forever.
+    - Nodes whose repository has gone, or that have neither answered a peer nor seen neo run beside them in 14 days, are reaped. A node whose checkout vanished is re-registered.
     - `neo lattice status` and `join` cross-check CAR's answer against the node's own pid file, so client/daemon protocol skew cannot make them report a running node as stopped.
     - An idle node uses about 35 MB. Once it has loaded memory, it re-execs itself after 10 idle minutes.
     - `neo lattice leave` takes a repository off and records the choice; `neo lattice join` reverses it. `NEO_OBSERVER_AUTOSTART=0` turns this agent off along with the observer.

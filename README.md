@@ -341,9 +341,9 @@ Other players find it with `player_find` / `players.find` (for example "code rev
 | `review_request` with a unified diff | Runs deterministic checks on the change (no model call), then reviews it. |
 | `handoff` | Declines. Neo writes no files and never claims work, so it points the sender at `players.find` instead. |
 
-Answers come back as `kind: answer` with `in_reply_to` set to your message id. Neo answers only `question` and `review_request`. Every other kind, and any untyped message that is itself a reply, is acknowledged and dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one answer stops after 4, so two auto-responders cannot run up a bill. The player shows `busy` while it is answering.
+Answers come back as `kind: answer` with `in_reply_to` set to your message id. Neo answers only `question` and `review_request`. Every other kind, and any untyped message that is itself a reply, is acknowledged and dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one answer stops after 4, so two auto-responders cannot run up a bill. Both limits are held in the node's memory, so they reset when the node restarts or recycles. The player shows `busy` while it is answering.
 
-The node is registered for the repository's main checkout, even when neo runs inside a linked worktree, so deleting an agent worktree cannot break it. Nodes whose repository has gone, or that neo has not run beside in 14 days, are removed automatically.
+The node is registered for the repository's main checkout, even when neo runs inside a linked worktree, so deleting an agent worktree cannot break it. Nodes whose repository has gone, or that have neither answered a peer nor seen neo run beside them in 14 days, are removed automatically. If the CAR daemon does not have the Lattice API yet (CarHost releases before it ships), no node is registered. Neo joins automatically once CAR is updated.
 
 ```bash
 neo lattice status   # this repository's node

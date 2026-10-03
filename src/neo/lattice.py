@@ -766,6 +766,7 @@ class LatticeNode:
         self.last_activity = time.monotonic()
         self.recycle = False
         self.signalled = False
+        self.unavailable = False
         self.working = False
         self._spend: dict[str, list[float]] = {}
         # Ids of answers Neo sent -> how many follow-ups deep each is.
@@ -976,7 +977,12 @@ class LatticeNode:
             }, timeout=RPC_TIMEOUT_SECS)
         except Exception as e:  # noqa: BLE001 — players.* does not need it
             logger.info("server.handshake not negotiated: %s", e)
-        await client.call("players.join", self.profile("available"), timeout=RPC_TIMEOUT_SECS)
+        try:
+            await client.call("players.join", self.profile("available"), timeout=RPC_TIMEOUT_SECS)
+        except RuntimeError as e:
+            if getattr(e, "unknown_method", False):
+                raise LatticeUnavailable(str(e)) from e
+            raise
         self._connected.set()
         logger.info("joined project %s as %s", self.config.project, self.config.agent_id)
 
@@ -1000,6 +1006,13 @@ class LatticeNode:
                             logger.info("idle with memory loaded; recycling")
                             self.recycle = True
                             self._stop.set()
+                except LatticeUnavailable as e:
+                    # This daemon predates the Lattice. Retrying cannot help;
+                    # a clean exit is not restarted under `on_failure`, and the
+                    # next daemon start (an upgraded one) tries again.
+                    logger.warning("this CAR daemon has no Lattice (%s); exiting", e)
+                    self.unavailable = True
+                    self._stop.set()
                 except Exception as e:  # noqa: BLE001 — reconnect with backoff
                     logger.warning("lattice connection failed: %s", e)
                 if worker.done() and not self._stop.is_set():
@@ -1045,6 +1058,38 @@ class LatticeNode:
 
 class WorkerDied(RuntimeError):
     """The answering worker exited; the node must not keep acknowledging."""
+
+
+class LatticeUnavailable(RuntimeError):
+    """The daemon does not implement `players.*`."""
+
+
+def daemon_has_lattice(url: str, timeout: float = 5.0) -> Optional[bool]:
+    """Whether the daemon at `url` implements the Lattice's `players.*`.
+
+    True or False when the daemon answered; None when it could not be asked.
+    A plain client calling `players.list` is refused either way. A daemon
+    WITH the API refuses it for lacking a peer address; one without it says
+    "unknown method", and that is the only answer that means "no".
+    """
+    async def probe() -> Optional[bool]:
+        from neo.a2ui import DaemonClient
+
+        client = DaemonClient(url)
+        try:
+            await asyncio.wait_for(client.connect(), timeout)
+            await client.call("players.list", {}, timeout=timeout)
+            return True
+        except RuntimeError as e:
+            return not getattr(e, "unknown_method", False)
+        finally:
+            await client.close()
+
+    try:
+        return asyncio.run(probe())
+    except Exception as e:  # noqa: BLE001 — unreachable, no websockets, auth
+        logger.debug("lattice probe failed: %s", e)
+        return None
 
 
 def _default_client(url: str) -> Any:
@@ -1252,6 +1297,11 @@ def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
         existing = next((a for a in agents if a.get("id") == agent_id), None)
         if existing is not None and not _node_is_broken(existing):
             return None  # registered and viable; the supervisor owns it
+        # Only when about to register, so a registered node costs nothing
+        # here. Against a daemon without the API, registering would leave a
+        # process that can never join: autojoin waits until the daemon has it.
+        if daemon_has_lattice(daemon_url()) is not True:
+            return None
         car.agents_upsert(json.dumps(build_spec(root, derive_project_name(root))))
         if existing is not None and existing.get("status") == "running":
             car.agents_restart(agent_id)
@@ -1321,6 +1371,10 @@ def join(root: str, project: Optional[str] = None) -> dict:
     if skew:
         return {"status": "error", "agent_id": agent_id, "message": skew}
     _left_marker(root).unlink(missing_ok=True)
+    if daemon_has_lattice(daemon_url()) is False:
+        return {"status": "error", "agent_id": agent_id, "message": (
+            "this CAR daemon has no Lattice (players.*) yet; neo will join "
+            "automatically once CAR is updated")}
     project = project or derive_project_name(root)
     try:
         car.agents_upsert(json.dumps(build_spec(root, project)))

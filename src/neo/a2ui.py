@@ -106,6 +106,20 @@ def _read_auth_token() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+class RpcError(RuntimeError):
+    """The daemon answered a request with a JSON-RPC error."""
+
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def unknown_method(self) -> bool:
+        # The daemon reports an unknown method as text; -32601 alone is
+        # ambiguous because it also means "not allowed for this agent".
+        return "unknown method" in str(self)
+
+
 class DaemonClient:
     """Single-purpose JSON-RPC WS client for the a2ui surface.
 
@@ -225,9 +239,10 @@ class DaemonClient:
             raise
 
         if "error" in response:
-            raise RuntimeError(
-                f"jsonrpc {method} failed: "
-                f"{response['error'].get('message', response['error'])}"
+            error = response["error"]
+            raise RpcError(
+                f"jsonrpc {method} failed: {error.get('message', error)}",
+                code=error.get("code") if isinstance(error, dict) else None,
             )
         return response.get("result")
 

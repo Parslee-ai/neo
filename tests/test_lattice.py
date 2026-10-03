@@ -621,6 +621,18 @@ async def test_a_stop_interrupts_the_reconnect_backoff(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_daemon_without_the_lattice_ends_the_node_cleanly():
+    from neo.a2ui import RpcError
+
+    daemon = _Daemon()
+    daemon.fail["players.join"] = RpcError("jsonrpc players.join failed: unknown method: players.join")
+    node = _node(daemon)
+    await asyncio.wait_for(node.run(), timeout=5)  # returns; no reconnect loop
+    assert node.unavailable is True
+    assert len(daemon.sent("players.join")) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_clean_stop_is_not_reported_as_a_dead_worker(monkeypatch):
     daemon = _Daemon()
     node = _node(daemon)
@@ -738,6 +750,7 @@ class _Car:
         self.list_error: BaseException | None = None
         self.ops: list[tuple[str, str]] = []
         self.spec: dict = {}
+        self.has_lattice: bool | None = True
 
     def agents_list(self):
         if self.list_error:
@@ -771,6 +784,8 @@ def car(monkeypatch):
     monkeypatch.delenv("NEO_OBSERVER_AUTOSTART", raising=False)
     monkeypatch.setattr(observer, "_car_server_reachable", lambda *a, **k: True)
     monkeypatch.setattr(observer, "_require_car_runtime", lambda: fake)
+    # The daemon is the boundary: never let a test probe the machine's real one.
+    monkeypatch.setattr(lattice, "daemon_has_lattice", lambda url, **k: fake.has_lattice)
     return fake
 
 
@@ -808,6 +823,21 @@ class TestAutojoin:
         car.agents = [{"id": lattice.agent_id_for(root), "status": "running"},
                       {"id": "neo-lattice-other", "status": "running"}]
         assert lattice.maybe_autojoin(root) is None and car.ops == []
+
+    @pytest.mark.parametrize("answer", [False, None])
+    def test_a_daemon_without_the_lattice_gets_no_node(self, tmp_path, car, answer):
+        # Today's CarHost has no players.*: a node registered there could
+        # never join and would reconnect forever.
+        root = _git_init(tmp_path / "repo")
+        car.has_lattice = answer
+        assert lattice.maybe_autojoin(root) is None and car.ops == []
+
+    def test_explicit_join_says_why_on_a_daemon_without_the_lattice(self, tmp_path, car):
+        root = _git_init(tmp_path / "repo")
+        car.has_lattice = False
+        result = lattice.join(root)
+        assert result["status"] == "error" and "no Lattice" in result["message"]
+        assert car.ops == []
 
     def test_a_failed_listing_registers_nothing(self, tmp_path, car):
         root = _git_init(tmp_path / "repo")
@@ -966,3 +996,45 @@ async def test_daemon_client_times_out_a_silent_daemon_and_closes_on_failed_auth
         with pytest.raises(RuntimeError):
             await bad.connect({"token": "bad"})
         assert not bad.connected
+
+
+@pytest.mark.parametrize("refusal,expected", [
+    ("unknown method: players.list", False),  # today's CarHost
+    ("players and work claims need a peer address: connect as an attached agent", True),
+])
+def test_the_lattice_probe_reads_the_refusal(refusal, expected):
+    websockets = pytest.importorskip("websockets")
+    import threading
+
+    ready = threading.Event()
+    port: list[int] = []
+    stop: list = []
+
+    async def daemon(ws):
+        async for raw in ws:
+            frame = json.loads(raw)
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": frame["id"],
+                                      "error": {"code": -32603, "message": refusal}}))
+
+    async def serve():
+        async with websockets.serve(daemon, "127.0.0.1", 0) as server:
+            port.append(server.sockets[0].getsockname()[1])
+            loop = asyncio.get_running_loop()
+            done = loop.create_future()
+            stop.append((loop, done))
+            ready.set()
+            await done
+
+    thread = threading.Thread(target=asyncio.run, args=(serve(),), daemon=True)
+    thread.start()
+    ready.wait(5)
+    try:
+        assert lattice.daemon_has_lattice(f"ws://127.0.0.1:{port[0]}/") is expected
+    finally:
+        loop, done = stop[0]
+        loop.call_soon_threadsafe(done.set_result, None)
+        thread.join(5)
+
+
+def test_an_unreachable_daemon_is_unknown_not_absent():
+    assert lattice.daemon_has_lattice("ws://127.0.0.1:9/", timeout=1) is None
