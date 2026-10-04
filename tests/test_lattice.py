@@ -87,7 +87,7 @@ class TestPlanTask:
     def test_handoff_is_declined_with_a_pointer(self):
         task = plan_task(req("please implement the parser", kind="handoff"))
         assert task.op == "decline"
-        assert "players.find" in task.reason
+        assert "lattice.find" in task.reason
 
     def test_plain_message_kind_is_a_question(self):
         # The daemon sends kind=message for an untyped message.
@@ -464,7 +464,7 @@ async def test_node_binds_agent_identity_and_joins():
     daemon = _Daemon()
     await _started(daemon)
     assert daemon.calls[0] == ("session.auth", {"token": "t", "agent_id": "neo-lattice-abc"})
-    join = daemon.sent("players.join")[0]
+    join = daemon.sent("lattice.join")[0]
     assert join["project"] == "car" and join["runtime"] == "neo" and join["status"] == "available"
 
 
@@ -478,7 +478,7 @@ async def test_question_is_acked_then_answered_with_correlation():
     assert reply["to"] == "mcp:abc" and reply["kind"] == "answer"
     assert reply["in_reply_to"] == "m-7"
     assert reply["body"].startswith("re: m-7\n") and "answer to why?" in reply["body"]
-    assert [p["status"] for p in daemon.sent("players.join")] == ["available", "busy", "available"]
+    assert [p["status"] for p in daemon.sent("lattice.join")] == ["available", "busy", "available"]
 
 
 @pytest.mark.asyncio
@@ -553,7 +553,7 @@ async def test_a_silent_or_superseded_daemon_drops_the_connection(error):
     # Either way the socket stays open and nothing else would notice.
     daemon = _Daemon()
     node = await _started(daemon)
-    daemon.fail["players.join"] = error
+    daemon.fail["lattice.join"] = error
     await node.set_status("busy")
     assert daemon.connected is False
 
@@ -596,7 +596,7 @@ async def test_a_decline_does_not_flap_the_status():
     daemon = _Daemon()
     node = await _started(daemon)
     await _serve(node, msg("h", "do it", kind="handoff"))
-    assert [p["status"] for p in daemon.sent("players.join")] == ["available"]
+    assert [p["status"] for p in daemon.sent("lattice.join")] == ["available"]
 
 
 @pytest.mark.asyncio
@@ -625,11 +625,11 @@ async def test_a_daemon_without_the_lattice_ends_the_node_cleanly():
     from neo.a2ui import RpcError
 
     daemon = _Daemon()
-    daemon.fail["players.join"] = RpcError("jsonrpc players.join failed: unknown method: players.join")
+    daemon.fail["lattice.join"] = RpcError("jsonrpc lattice.join failed: unknown method: lattice.join")
     node = _node(daemon)
     await asyncio.wait_for(node.run(), timeout=5)  # returns; no reconnect loop
     assert node.unavailable is True
-    assert len(daemon.sent("players.join")) == 1
+    assert len(daemon.sent("lattice.join")) == 1
 
 
 @pytest.mark.asyncio
@@ -838,7 +838,7 @@ class TestAutojoin:
 
     @pytest.mark.parametrize("answer", [False, None])
     def test_a_daemon_without_the_lattice_gets_no_node(self, tmp_path, car, answer):
-        # Today's CarHost has no players.*: a node registered there could
+        # Today's CarHost has no lattice.*: a node registered there could
         # never join and would reconnect forever.
         root = _git_init(tmp_path / "repo")
         car.has_lattice = answer
@@ -1000,7 +1000,7 @@ async def test_daemon_client_times_out_a_silent_daemon_and_closes_on_failed_auth
         client = DaemonClient(url)
         await client.connect({"token": "ok"})
         with pytest.raises(asyncio.TimeoutError):
-            await client.call("players.join", {}, timeout=0.2)
+            await client.call("lattice.join", {}, timeout=0.2)
         assert client._pending == {}
         await client.close()
 
@@ -1011,8 +1011,8 @@ async def test_daemon_client_times_out_a_silent_daemon_and_closes_on_failed_auth
 
 
 @pytest.mark.parametrize("refusal,expected", [
-    ("unknown method: players.list", False),  # today's CarHost
-    ("players and work claims need a peer address: connect as an attached agent", True),
+    ("unknown method: lattice.nodes", False),  # today's CarHost
+    ("the Lattice needs a peer address: connect as an attached agent (session.auth with agent_id), or use the daemon's /mcp endpoint", True),
 ])
 def test_the_lattice_probe_reads_the_refusal(refusal, expected):
     websockets = pytest.importorskip("websockets")

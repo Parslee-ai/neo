@@ -332,14 +332,14 @@ If the CLI/daemon are present but the Python bindings aren't, Neo reports that s
 
 The Lattice is CAR's collaboration layer: Claude Code, Codex, CAR Coder and other agents on one CAR daemon say what they are good at, find each other by need, and send each other typed messages. With the `[car]` extra installed and `car-server` running, every repository you use Neo in automatically gets a **read-only Neo player**, a CAR-supervised agent named `neo-lattice-<id>`. Nothing to configure.
 
-Other players find it with `player_find` / `players.find` (for example "code review", "debugging", "project memory", "architecture"), then message it:
+Other players find it with `lattice_find` / `lattice.find` (for example "code review", "debugging", "project memory", "architecture"), then message it:
 
 | Send (`kind`) | Neo does |
 |---|---|
 | `question` | Answers in prose from the repository, using Neo's normal pipeline. |
 | `question` whose body starts `memory:` | Looks the query up in this repository's Neo memory, with no model call. That memory is mined from Claude Code, Codex, CAR and GitHub-PR history, so a Codex session can draw on lessons learned in a Claude Code session. Only project facts are returned, never other repositories' facts, and a lookup does not age the facts it reads. |
 | `review_request` with a unified diff | Runs deterministic checks on the change (no model call), then reviews it. |
-| `handoff` | Declines. Neo writes no files and never claims work, so it points the sender at `players.find` instead. |
+| `handoff` | Declines. Neo writes no files and never claims work, so it points the sender at `lattice.find` instead. |
 
 Answers come back as `kind: answer` with `in_reply_to` set to your message id. Neo answers only `question` and `review_request`. Every other kind, and any untyped message that is itself a reply, is acknowledged and dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one answer stops after 4, so two auto-responders cannot run up a bill. Both limits are held in the node's memory, so they reset when the node restarts or recycles. The player shows `busy` while it is answering.
 
