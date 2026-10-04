@@ -1,9 +1,9 @@
 """Neo as a player on the CAR Lattice.
 
 The Lattice is CAR's collaboration layer: Claude Code, Codex, CAR Coder and
-humans on one daemon declare what they are good at (``players.join``), find
-each other by need (``players.find``), coordinate with expiring work claims
-(``work.claim``), and talk with typed peer messages (``agents.message`` with a
+humans on one daemon declare what they are good at (``lattice.join``), find
+each other by need (``lattice.find``), coordinate with expiring work claims
+(``lattice.claim``), and talk with typed peer messages (``agents.message`` with a
 ``kind`` of ``question``, ``answer``, ``review_request`` or ``handoff``).
 
 Neo joins as a **read-only** player. What it brings that nobody else on the
@@ -23,8 +23,8 @@ Lattice has:
 
 What Neo deliberately does not do:
 
-- **Claim or take work.** It writes no files, so it never ``work.claim``\\ s
-  and declines ``handoff`` with a pointer to ``players.find``.
+- **Claim or take work.** It writes no files, so it never ``lattice.claim``\\ s
+  and declines ``handoff`` with a pointer to ``lattice.find``.
 - **Route.** Matching needs to players is the daemon's deterministic job;
   intelligence stays at the nodes.
 - **Answer an answer.** Two auto-responders replying to each other form a loop
@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 AGENT_PREFIX = "neo-lattice-"
 RUNTIME = "neo"
 
-# Tags a `players.find` need is matched against. The daemon scores a tag only
+# Tags a `lattice.find` need is matched against. The daemon scores a tag only
 # when EVERY word in it appears in the need, so multi-word tags are precise and
 # single words are broad; both shapes are here on purpose.
 BASE_CAPABILITIES: tuple[str, ...] = (
@@ -293,7 +293,7 @@ def plan_task(req: PeerRequest) -> Task:
     """Decide what to do with a request. Pure: no I/O, no model."""
     if req.kind == "handoff":
         return Task(op="decline", reason=(
-            "Neo is read-only and does not take work. Use players.find with "
+            "Neo is read-only and does not take work. Use lattice.find with "
             "the capability you need to reach a player that writes code. "
             "Ask me a question or send a review_request instead.\n\n" + USAGE
         ))
@@ -744,7 +744,7 @@ class LatticeNode:
 
     Acknowledges each pushed `agent.peer_message` immediately, queues it, and
     answers from one worker thread so the engine sees one request at a time.
-    Status reads `busy` while answering, so `players.find` routes elsewhere
+    Status reads `busy` while answering, so `lattice.find` routes elsewhere
     unless the asker opts into unavailable players.
 
     Every daemon call has a timeout, and a timeout, a send failure or a
@@ -836,9 +836,9 @@ class LatticeNode:
 
     async def set_status(self, status: str, note: str = "") -> None:
         try:
-            await self._rpc("players.join", self.profile(status, note))
+            await self._rpc("lattice.join", self.profile(status, note))
         except Exception as e:  # noqa: BLE001 — status is advisory
-            logger.warning("players.join (%s) failed: %s", status, e)
+            logger.warning("lattice.join (%s) failed: %s", status, e)
 
     # -- inbound --------------------------------------------------------------
 
@@ -975,10 +975,10 @@ class LatticeNode:
                 "protocol_version": 3, "client_version": f"neo-{__version__}",
                 "required_capabilities": [], "optional_capabilities": [],
             }, timeout=RPC_TIMEOUT_SECS)
-        except Exception as e:  # noqa: BLE001 — players.* does not need it
+        except Exception as e:  # noqa: BLE001 — lattice.* does not need it
             logger.info("server.handshake not negotiated: %s", e)
         try:
-            await client.call("players.join", self.profile("available"), timeout=RPC_TIMEOUT_SECS)
+            await client.call("lattice.join", self.profile("available"), timeout=RPC_TIMEOUT_SECS)
         except RuntimeError as e:
             if getattr(e, "unknown_method", False):
                 raise LatticeUnavailable(str(e)) from e
@@ -1051,7 +1051,7 @@ class LatticeNode:
         self._stop.set()
         if self.client is not None and self.client.connected:
             try:
-                await self.client.call("players.leave", {}, timeout=5)
+                await self.client.call("lattice.leave", {}, timeout=5)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1061,14 +1061,14 @@ class WorkerDied(RuntimeError):
 
 
 class LatticeUnavailable(RuntimeError):
-    """The daemon does not implement `players.*`."""
+    """The daemon does not implement `lattice.*`."""
 
 
 def daemon_has_lattice(url: str, timeout: float = 5.0) -> Optional[bool]:
-    """Whether the daemon at `url` implements the Lattice's `players.*`.
+    """Whether the daemon at `url` implements the Lattice's `lattice.*`.
 
     True or False when the daemon answered; None when it could not be asked.
-    A plain client calling `players.list` is refused either way. A daemon
+    A plain client calling `lattice.nodes` is refused either way. A daemon
     WITH the API refuses it for lacking a peer address; one without it says
     "unknown method", and that is the only answer that means "no".
     """
@@ -1078,7 +1078,7 @@ def daemon_has_lattice(url: str, timeout: float = 5.0) -> Optional[bool]:
         client = DaemonClient(url)
         try:
             await asyncio.wait_for(client.connect(), timeout)
-            await client.call("players.list", {}, timeout=timeout)
+            await client.call("lattice.nodes", {}, timeout=timeout)
             return True
         except RuntimeError as e:
             return not getattr(e, "unknown_method", False)
@@ -1373,7 +1373,7 @@ def join(root: str, project: Optional[str] = None) -> dict:
     _left_marker(root).unlink(missing_ok=True)
     if daemon_has_lattice(daemon_url()) is False:
         return {"status": "error", "agent_id": agent_id, "message": (
-            "this CAR daemon has no Lattice (players.*) yet; neo will join "
+            "this CAR daemon has no Lattice (lattice.*) yet; neo will join "
             "automatically once CAR is updated")}
     project = project or derive_project_name(root)
     try:
