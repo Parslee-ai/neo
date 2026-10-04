@@ -654,6 +654,20 @@ class TestBudgets:
         assert node.admit(req("q", sender="other"), plan_task(req("q")), now=100.0).op == "reason"
         assert node.admit(req("q", sender="loop"), plan_task(req("q")), now=100.0 + 3601).op == "reason"
 
+    def test_a_remote_car_cannot_rotate_node_names_past_the_budget(self):
+        # The `<node>` part of `<node>@<car>` is chosen by the other CAR (#251).
+        node = _node(_Daemon())
+        ops = [node.admit(req("q", sender=f"n{i}@acme"), plan_task(req("q")), now=100.0).op
+               for i in range(lattice.SENDER_BUDGET_PER_HOUR + 1)]
+        assert ops[-1] == "decline" and set(ops[:-1]) == {"reason"}
+        assert node.admit(req("q", sender="n0@other"), plan_task(req("q")), now=100.0).op == "reason"
+        assert node.admit(req("q", sender="acme"), plan_task(req("q")), now=100.0).op == "reason"
+
+    def test_budget_key(self):
+        assert lattice.budget_key("agent:abc") == "agent:abc"
+        assert lattice.budget_key("neo-x@laptop") == "@laptop"
+        assert lattice.budget_key("a@b@car") == "@car"
+
     def test_memory_lookups_are_not_charged(self):
         node = _node(_Daemon())
         for _ in range(lattice.SENDER_BUDGET_PER_HOUR * 2):
