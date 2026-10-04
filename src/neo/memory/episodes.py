@@ -278,6 +278,25 @@ class LearningEpisode:
     memory_mutations: list[MemoryMutationEvidence] = field(default_factory=list)
     memory_candidates: list[MemoryCandidateEvidence] = field(default_factory=list)
 
+    def acceptance_revision(self) -> str:
+        """The snapshot this episode's suggestion was accepted in.
+
+        Read from the first passed `user_acceptance` verification, which
+        records where the change landed (`Outcome.acceptance_revision`), and
+        falling back to `repository_revision` — HEAD when the advice was asked
+        for — for older records and acceptances whose landing could not be
+        found. Promotion's distinct-revision gate and `learning-stats` both read
+        it through here so the two cannot disagree.
+        """
+        for evidence in self.verification:
+            if (
+                evidence.kind == "user_acceptance"
+                and evidence.status == "passed"
+                and evidence.repository_revision
+            ):
+                return evidence.repository_revision
+        return self.repository_revision
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

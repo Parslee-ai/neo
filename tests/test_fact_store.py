@@ -1092,7 +1092,7 @@ class TestOutcomeLinkage:
         assert "probation" not in promoted[0].tags
 
     def _accept_episode(self, store, ep_id, subject, body, kind="pattern",
-                        revision=None):
+                        revision=None, acceptance_revision=""):
         """Record one ACCEPTED outcome for a fresh episode (drives the real
         detect_implicit_feedback promotion path).
 
@@ -1120,6 +1120,8 @@ class TestOutcomeLinkage:
             suggestion_id=f"{ep_id}-sug", learning_episode_id=ep_id,
             candidate_id=cand_id, candidate_subject=subject,
             candidate_body=body, candidate_kind=kind,
+            repository_revision=revision,
+            acceptance_revision=acceptance_revision,
         )
         with patch.object(store._outcome_tracker, "detect_outcomes",
                           return_value=([outcome], {})):
@@ -1263,6 +1265,31 @@ class TestOutcomeLinkage:
         promoted = [f for f in store.entries if "episode-derived" in f.tags]
         assert len(promoted) == 1
         assert "durable" in promoted[0].tags
+
+    def test_acceptances_landing_in_distinct_commits_promote(self, store):
+        """#254: a Lattice node's main checkout sits still while peers commit
+        on their own branches, so every episode BEGINS at one HEAD. Where the
+        change LANDED is what distinguishes two acceptances."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        idle_head = "d83659cea51676124f2488f6629e0957302e1c1f"
+        self._accept_episode(store, "landed-0", subject, "Reasoning: catch OSError.",
+                             revision=idle_head, acceptance_revision="a" * 40)
+        self._accept_episode(store, "landed-1", subject, "Reasoning: catch OSError.",
+                             revision=idle_head, acceptance_revision="b" * 40)
+
+        promoted = [f for f in store.entries if "episode-derived" in f.tags]
+        assert len(promoted) == 1
+
+    def test_acceptances_landing_in_one_commit_do_not_promote(self, store):
+        """The converse: advice asked at two HEADs and applied in ONE commit is
+        one sitting, not recurrence."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "onecommit-0", subject, "Reasoning: catch OSError.",
+                             revision="1" * 40, acceptance_revision="c" * 40)
+        self._accept_episode(store, "onecommit-1", subject, "Reasoning: catch OSError.",
+                             revision="2" * 40, acceptance_revision="c" * 40)
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
 
     def test_missing_revisions_fail_closed(self, store):
         """No revision recorded is no independence evidence. There is

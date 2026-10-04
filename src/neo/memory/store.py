@@ -1251,7 +1251,12 @@ class FactStore:
                         else "git_diff_attribution"
                     ),
                     summary=outcome.outcome_type.value,
-                    repository_revision=outcome.repository_revision,
+                    # Where the change landed when known, so the promotion
+                    # gate compares acceptances rather than ask-time HEADs.
+                    repository_revision=(
+                        getattr(outcome, "acceptance_revision", "")
+                        or outcome.repository_revision
+                    ),
                 ))
             # Strongest signal wins. One neo invocation commonly suggests both a
             # code edit and a review/docs path, and `_dedup_outcomes` keys by
@@ -1726,19 +1731,18 @@ class FactStore:
         Two honest limits, chosen deliberately rather than papered over:
 
         * This tests "not the same repository snapshot", which is narrower than
-          independence. The revision is captured when the episode BEGINS — HEAD
-          when the advice was asked for, not the commit the fix landed in — so
-          committing between two attempts satisfies it even though committing
-          only shows that time passed. Keying on the acceptance-carrying sha
-          (already walked by `_get_changed_files_since`) would be strictly
-          better and is the obvious next move.
+          independence. The revisions compared are where each acceptance LANDED
+          (`LearningEpisode.acceptance_revision`: the commit carrying the
+          change, or HEAD of the checkout holding it uncommitted), falling back
+          to HEAD when the advice was asked for on older records. Ask-time HEAD
+          alone measured the wrong thing: a CAR Lattice node's main checkout
+          sits still while peers commit on their own branches, so every episode
+          shared one revision and promotion could never fire (#254).
         * It blocks a real flow: applying the same lesson across several files
-          in one sitting and committing once records ONE revision and promotes
-          nothing. 40% of revision-bearing episodes on a live ledger share a HEAD
-          with another, so this is the common shape, not an edge case. Accepted
-          because a delayed durable fact is recoverable and a wrong one needs a
-          contradiction to retract — the same fail-safe direction as the kind
-          gate.
+          in one sitting and committing once lands in ONE revision and promotes
+          nothing. Accepted because a delayed durable fact is recoverable and a
+          wrong one needs a contradiction to retract — the same fail-safe
+          direction as the kind gate.
         """
         return len({revision for revision in revisions if revision}) >= 2
 
@@ -1765,7 +1769,7 @@ class FactStore:
                     signature = self._episode_signature(candidate.subject)
                     if signature == target_signature:
                         supporting.setdefault(
-                            episode.episode_id, episode.repository_revision
+                            episode.episode_id, episode.acceptance_revision()
                         )
                         break
 
