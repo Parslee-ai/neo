@@ -328,6 +328,31 @@ neo --version
 
 If the CLI/daemon are present but the Python bindings aren't, Neo reports that state cleanly. CAR install options live at [Parslee-ai/car-releases](https://github.com/Parslee-ai/car-releases).
 
+### Join the CAR Lattice
+
+The Lattice is CAR's collaboration layer: Claude Code, Codex, CAR Coder and other agents on one CAR daemon say what they are good at, find each other by need, and send each other typed messages. With the `[car]` extra installed and `car-server` running, every repository you use Neo in automatically gets a **read-only Neo player**, a CAR-supervised agent named `neo-lattice-<id>`. Nothing to configure.
+
+Other players find it with `player_find` / `players.find` (for example "code review", "debugging", "project memory", "architecture"), then message it:
+
+| Send (`kind`) | Neo does |
+|---|---|
+| `question` | Answers in prose from the repository, using Neo's normal pipeline. |
+| `question` whose body starts `memory:` | Looks the query up in this repository's Neo memory, with no model call. That memory is mined from Claude Code, Codex, CAR and GitHub-PR history, so a Codex session can draw on lessons learned in a Claude Code session. Only project facts are returned, never other repositories' facts, and a lookup does not age the facts it reads. |
+| `review_request` with a unified diff | Runs deterministic checks on the change (no model call), then reviews it. |
+| `handoff` | Declines. Neo writes no files and never claims work, so it points the sender at `players.find` instead. |
+
+Answers come back as `kind: answer` with `in_reply_to` set to your message id. Neo answers only `question` and `review_request`. Every other kind, and any untyped message that is itself a reply, is acknowledged and dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one answer stops after 4, so two auto-responders cannot run up a bill. Both limits are held in the node's memory, so they reset when the node restarts or recycles. The player shows `busy` while it is answering.
+
+The node is registered for the repository's main checkout, even when neo runs inside a linked worktree, so deleting an agent worktree cannot break it. Nodes whose repository has gone, or that have neither answered a peer nor seen neo run beside them in 14 days, are removed automatically. If the CAR daemon does not have the Lattice API yet (CarHost releases before it ships), no node is registered. Neo joins automatically once CAR is updated.
+
+```bash
+neo lattice status   # this repository's node
+neo lattice leave    # take this repository off the Lattice (autostart remembers)
+neo lattice join     # put it back
+```
+
+`NEO_OBSERVER_AUTOSTART=0` turns off every agent Neo registers on its own, this one included. An idle node uses about 35 MB of memory; one that has answered re-execs itself after 10 idle minutes to release the engine.
+
 ### Why use the CAR surfaces
 
 - **Real inference path both ways** — inbound, callers see Neo as a typed A2A tool; outbound, Neo gets local-first inference with automatic remote fallback through one provider-agnostic protocol

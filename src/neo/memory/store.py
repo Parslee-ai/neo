@@ -632,6 +632,8 @@ class FactStore:
         query: str,
         k: int = 30,
         domain: Optional[str] = None,
+        *,
+        record_access: bool = True,
     ) -> list[Fact]:
         """Retrieve the most relevant valid facts for a query.
 
@@ -651,17 +653,25 @@ class FactStore:
         If ``domain`` is given, only facts whose ``Fact.domain`` matches
         exactly are considered. See ``SUGGESTED_DOMAINS`` for the
         recommended vocabulary.
+
+        ``record_access=False`` retrieves without stamping access metadata.
+        A stamp is not neutral: ``access_count`` lifts probation at 2 and,
+        with no success, gets a fact demoted and then invalidated. A lookup
+        that no reasoning run consumes (a Lattice peer's ``memory:`` query)
+        must not age facts it can never earn a success for.
         """
         shape, sub_queries = _decompose_query(query)
         if shape is QueryShape.DIRECT or len(sub_queries) <= 1:
-            return self._retrieve_single(query, k, domain=domain)
+            return self._retrieve_single(query, k, domain=domain,
+                                         record_access=record_access)
 
         # Multi-hop / multi-entity: per-branch retrieve, merge, dedup,
         # then take top-k by best per-fact rank_score across branches.
         per_branch_k = max(5, k // max(1, len(sub_queries)))
         merged: dict[str, tuple[Fact, float]] = {}
         for sq in sub_queries:
-            for fact in self._retrieve_single(sq, per_branch_k, domain=domain):
+            for fact in self._retrieve_single(sq, per_branch_k, domain=domain,
+                                              record_access=record_access):
                 prev = merged.get(fact.id)
                 if prev is None or fact.metadata.confidence > prev[1]:
                     merged[fact.id] = (fact, fact.metadata.confidence)
@@ -728,7 +738,8 @@ class FactStore:
         return expanded
 
     def _retrieve_single(
-        self, query: str, k: int, *, domain: Optional[str] = None
+        self, query: str, k: int, *, domain: Optional[str] = None,
+        record_access: bool = True,
     ) -> list[Fact]:
         """Single-pass retrieval — what retrieve_relevant used to be.
 
@@ -798,7 +809,8 @@ class FactStore:
 
             results: list[Fact] = []
             for fact, _sim, _score in chosen:
-                self._mark_retrieved(fact, now)
+                if record_access:
+                    self._mark_retrieved(fact, now)
                 results.append(fact)
 
         # Nucleus expansion: when any retrieved fact is an EPISODE, pull

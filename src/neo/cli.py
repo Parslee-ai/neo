@@ -955,6 +955,12 @@ def main():
         from neo.hook import run_hook
         return run_hook(sys.argv[2:])
 
+    # The lattice node is a long-running CAR-supervised process; like the
+    # hook, it must not trigger the update check or the observer autostart.
+    if len(sys.argv) > 1 and sys.argv[1] == "lattice":
+        from neo.lattice import cli_main
+        return cli_main(sys.argv[2:])
+
     # Parse arguments
     args = parse_args()
 
@@ -1007,6 +1013,13 @@ def main():
             maybe_autostart_observer()
         except Exception as e:
             logger.debug(f"Observer autostart failed: {e}")
+        # Same condition, same contract: with CAR present, the repository
+        # neo is being used in gets a read-only neo player on the Lattice.
+        try:
+            from neo.lattice import maybe_autojoin
+            maybe_autojoin()
+        except Exception as e:
+            logger.debug(f"Lattice autojoin failed: {e}")
 
     # Handle global flags first (exist on all parsers, must check before subcommand-specific attributes)
 

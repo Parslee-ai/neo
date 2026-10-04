@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Neo joins the CAR Lattice as a read-only player.** With `car-server` running, every repository Neo is used in gets a CAR-supervised `neo-lattice-<id>` agent. Like the observer, it is registered automatically. The agent joins the repository's project with capability tags (`code-review`, `debugging`, `architecture`, `project-memory`, `past-solutions`, …, plus the repository's main languages), so Claude Code, Codex and CAR Coder sessions find it with `players.find` rather than by address. Because it is a supervised agent, the daemon pushes each `agent.peer_message` to it. MCP coding sessions only see mail when they poll, so Neo answers while the asker keeps working.
+  - **`question`:** Neo answers in prose. Only bugfix and algorithm questions, the kinds a later git-verified acceptance can promote, run in LEARN mode. Everything else runs in ADVISE and records no episode that could never be confirmed.
+  - **`memory:` lookup:** answered from this repository's facts with no model call. Retrieval runs with the new `retrieve_relevant(record_access=False)`, so a lookup cannot lift a fact out of probation or push it toward demotion without git evidence. Global and org facts, which are mined from every repository on the machine, are never returned to a peer.
+  - **`review_request` with a diff:** runs the deterministic VERIFY checks, then a review in ADVISE mode, so a peer's patch never enters Neo's learning loop as a Neo suggestion. A JSON body cannot widen a review request into the learning path. The diff splitter handles renames, binary sections, form feeds inside hunks, diffs of patch files, and C-quoted paths.
+  - **Other kinds:** a `handoff` is declined, because Neo writes no files and never claims work. Neo answers only `question` and `review_request`; every other kind, and an untyped reply, is dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one Neo answer stops after 4, so auto-responders cannot loop or run up a bill.
+  - **Answers:** replies carry `kind: answer` and `in_reply_to`, and cautions come first so truncation cannot cut them.
+  - **Supervised process:**
+    - It starts in `~/.neo` with `-P`, not in the repository. `python -m` puts the cwd first on `sys.path`, so a node started inside an untrusted clone would have imported that clone's `json.py` or `neo/` while holding an agent token.
+    - It is registered for the repository's main checkout, not a linked worktree that may later be deleted.
+    - Its agent credentials are removed from the environment once read, so in-process CAR use cannot supersede its binding.
+    - Every daemon call has a timeout. A silent or superseded daemon is treated as a lost connection.
+    - A dead worker exits the process so CAR restarts it.
+    - A signal mid-answer exits immediately instead of waiting for the model call.
+  - **Lifecycle:**
+    - **Inert on a daemon without the Lattice API.** Autojoin probes the daemon before registering: a plain `players.list` is refused either way, and only `unknown method` means the API is missing. Today's CarHost gets no node, and Neo joins automatically once CAR is updated. A node that meets a daemon without the API exits cleanly instead of reconnecting forever.
+    - Nodes whose repository has gone, or that have neither answered a peer nor seen neo run beside them in 14 days, are reaped. A node whose checkout vanished is re-registered.
+    - `neo lattice status` and `join` cross-check CAR's answer against the node's own pid file, so client/daemon protocol skew cannot make them report a running node as stopped.
+    - An idle node uses about 35 MB. Once it has loaded memory, it re-execs itself after 10 idle minutes.
+    - `neo lattice leave` takes a repository off and records the choice; `neo lattice join` reverses it. `NEO_OBSERVER_AUTOSTART=0` turns this agent off along with the observer.
+- `DaemonClient` (`neo.a2ui`) answers daemon-to-client JSON-RPC requests (`on_request`) and accepts an agent-bound `session.auth`. Previously it treated a request with an `id` as a notification and never replied, so the daemon waited out its acknowledgement timeout. `call()` takes a `timeout` and distinguishes a refusal (`RuntimeError`) from a dead transport (`ConnectionError`). A failed `session.auth` now closes the socket it opened.
+
+### Fixed
+
+- **The observer's supervised process imported from `~`.** Its CAR spec used `cwd: ~`, and `python -m` puts the cwd first on `sys.path`, so a stray `~/json.py` or `~/neo/` would have been imported. It now starts in `~/.neo`. The fix applies to new registrations.
+
 ## [0.53.2] - 2026-09-24
 
 One fix to `neo update`, which could report "already up to date" for up to an hour after a new release reached PyPI, and a cleanup that lets neo pass the plugin-scanner gate the awesome-ai-plugins catalog enforces before listing a plugin.
