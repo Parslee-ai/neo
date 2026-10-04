@@ -232,11 +232,11 @@ class Outcome:
     suggestion_id: str = ""
     learning_episode_id: str = ""
     repository_revision: str = ""
-    # The snapshot the change itself landed in: the newest local-branch commit
-    # touching the path, or HEAD of the checkout holding it uncommitted. Set for
-    # ACCEPTED only; "" means unknown, and readers fall back to
-    # `repository_revision` (HEAD when the advice was asked for).
-    acceptance_revision: str = ""
+    # The revision the applied change was made ON TOP OF: HEAD of the checkout
+    # holding it uncommitted, or the parent of the first commit touching the
+    # path since the suggestion. Set for ACCEPTED only; "" means it could not be
+    # found, which promotion treats as no evidence (fail closed).
+    applied_on_revision: str = ""
     retrieved_fact_ids: list[str] = field(default_factory=list)
     used_fact_ids: list[str] = field(default_factory=list)
     candidate_id: str = ""
@@ -254,18 +254,32 @@ def _resolved(path: Path) -> Optional[Path]:
 
 
 def _locate(edited: Path, roots: list[tuple[Path, bool]]) -> Optional[tuple[str, bool]]:
-    """``(path relative to the first root holding it, that root's own flag)``."""
-    forms = [edited]
-    resolved = _resolved(edited)
-    if resolved is not None and resolved != edited:
-        forms.append(resolved)
-    for root, own in roots:
-        for form in forms:
+    """``(path relative to the first root holding it, that root's own flag)``.
+
+    The path as recorded is tried first; it is resolved only on a miss,
+    because the ledger is shared by every project and resolving each line
+    costs several `lstat`s for records that mostly belong elsewhere.
+    """
+    forms: list[Optional[Path]] = [edited]
+    for form in forms:
+        for root, own in roots:
             try:
                 return str(form.relative_to(root)), own
             except ValueError:
                 continue
+        if len(forms) == 1:
+            resolved = _resolved(edited)
+            if resolved is not None and resolved != edited:
+                forms.append(resolved)
     return None
+
+
+def _modified_since(path: Path, since_timestamp: float) -> bool:
+    """Was ``path`` written at or after ``since_timestamp``? False when unknown."""
+    try:
+        return path.stat().st_mtime >= since_timestamp
+    except OSError:
+        return False
 
 
 def normalize_suggestion_path(path: str, codebase_root: Optional[str]) -> str:
@@ -672,11 +686,15 @@ class OutcomeTracker:
         # request hot path, growing linearly.
         self._checkout_roots = self._list_checkout_roots()
         working_tree = self._get_working_tree_changes()
-        # Dirty files in the repository's OTHER checkouts (linked worktrees).
-        # Like everything gathered "elsewhere" below, this only resolves paths
-        # Neo suggested; it never feeds INDEPENDENT detection — see
-        # `_get_changed_elsewhere_since`.
+        # Dirty files in the repository's OTHER checkouts (linked worktrees),
+        # path -> the checkout holding it. Like everything gathered "elsewhere"
+        # below, this only resolves paths Neo suggested; it never feeds
+        # INDEPENDENT detection — see `_get_changed_elsewhere_since`.
         linked_dirty = self._get_linked_worktree_changes()
+        # Where each dirty path lives, own checkout first: what
+        # `_applied_on_revision` reads instead of re-asking git per checkout.
+        dirty_roots = dict(linked_dirty)
+        dirty_roots.update({path: self.codebase_root for path in working_tree})
         # Host-recorded edits, loaded once and filtered per session below —
         # hoisted for the same reason `working_tree` is.
         host_edits = self._load_host_edit_events()
@@ -717,7 +735,16 @@ class OutcomeTracker:
             changed_files |= {
                 path for ts, path, own in host_edits if own and ts >= since
             }
-            elsewhere = self._get_changed_elsewhere_since(since, linked_dirty)
+            elsewhere = self._get_changed_elsewhere_since(since)
+            # A linked worktree's dirty file counts only if it was written
+            # after the suggestion. Agents keep work in progress uncommitted,
+            # often in the very file they asked about; read as-is, that
+            # pre-existing edit resolved the suggestion at once (usually as
+            # MODIFIED) and the real acceptance that followed was lost.
+            elsewhere |= {
+                path for path, root in linked_dirty.items()
+                if _modified_since(Path(root) / path, prev.timestamp)
+            }
             elsewhere |= {
                 path for ts, path, own in host_edits if not own and ts >= since
             }
@@ -750,7 +777,9 @@ class OutcomeTracker:
             )
 
             all_outcomes.extend(
-                self._match_to_suggestions(changed_files, prev, elsewhere=elsewhere)
+                self._match_to_suggestions(
+                    changed_files, prev, elsewhere=elsewhere, dirty_roots=dirty_roots
+                )
             )
 
         # Also check for non-git outcomes (weak implicit acceptance for paths the
@@ -1348,17 +1377,19 @@ class OutcomeTracker:
             roots.append(str(path))
         return roots
 
-    def _get_linked_worktree_changes(self) -> set[str]:
-        """Files dirty in this repository's OTHER checkouts right now."""
-        changed: set[str] = set()
+    def _get_linked_worktree_changes(self) -> dict[str, str]:
+        """Files dirty in this repository's OTHER checkouts, path -> checkout.
+
+        The first checkout listed wins a path dirty in several.
+        """
+        changed: dict[str, str] = {}
         for root in (self._checkout_roots or [])[1:]:
-            changed |= self._get_working_tree_changes(root)
+            for path in self._get_working_tree_changes(root):
+                changed.setdefault(path, root)
         return changed
 
-    def _get_changed_elsewhere_since(
-        self, since_timestamp: float, linked_dirty: set[str]
-    ) -> set[str]:
-        """Files changed since a timestamp on ANY local branch or other checkout.
+    def _get_changed_elsewhere_since(self, since_timestamp: float) -> set[str]:
+        """Files committed since a timestamp on ANY local branch.
 
         Used only to resolve paths Neo itself suggested, never to detect
         INDEPENDENT changes: every agent worktree's work would otherwise become
@@ -1368,7 +1399,7 @@ class OutcomeTracker:
         suggestion.
         """
         if not self.codebase_root:
-            return set(linked_dirty)
+            return set()
         since_iso = datetime.datetime.fromtimestamp(
             since_timestamp, tz=datetime.timezone.utc
         ).isoformat()
@@ -1383,62 +1414,72 @@ class OutcomeTracker:
             )
         except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
             logger.debug(f"git log --branches failed (non-fatal): {e}")
-            return set(linked_dirty)
-        committed = set()
-        if result.returncode == 0:
-            committed = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-        return committed | linked_dirty
+            return set()
+        if result.returncode != 0:
+            return set()
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
-    def _acceptance_revision(self, file_path: str, since_timestamp: float) -> str:
-        """The repository snapshot an applied change landed in.
+    def _applied_on_revision(
+        self, file_path: str, since_timestamp: float, dirty_roots: dict[str, str]
+    ) -> str:
+        """The revision an applied change was made ON TOP OF.
 
-        The newest commit on any local branch touching ``file_path`` since the
-        suggestion; failing that, HEAD of the checkout where it sits uncommitted.
-        "" when neither can be found, and the caller falls back to the revision
-        recorded when the advice was asked for.
+        Committed: the parent of the FIRST commit on any local branch touching
+        ``file_path`` since the suggestion. Uncommitted: HEAD of the checkout
+        holding it. "" when neither can be found — never HEAD at ask time,
+        because promotion fails closed on "" and must not be handed a guess.
 
-        This is what promotion's distinct-revision gate compares. HEAD at ask
-        time measured the wrong thing: a Lattice node's main checkout often sits
-        still while peers commit on their own branches, so every episode carried
-        one revision and promotion could never fire.
+        This is what promotion's distinct-revision gate compares, and the base
+        is the right thing to compare rather than the landing commit. Landing
+        shas are unique per commit, so they made one sitting look like two:
+        apply at H and let a run see it dirty (H), apply again and commit as C
+        (C) — two "revisions" for one operator minutes apart, the exact case
+        the gate exists to block. By base, both are H. Two agent worktrees
+        branched from M that commit the same fix in parallel both read M. What
+        still separates is a lesson recurring after the repository moved on,
+        which is what promotion claims.
+
+        HEAD at ask time could not be used either: a Lattice node's main
+        checkout sits still while peers commit on their own branches, so every
+        episode carried one revision and promotion could never fire (#254).
         """
         if not self.codebase_root:
             return ""
         since_iso = datetime.datetime.fromtimestamp(
             since_timestamp, tz=datetime.timezone.utc
         ).isoformat()
-        try:
+
+        def git(root: str, *args: str) -> Optional[str]:
             result = subprocess.run(
-                ["git", "log", "--branches", "HEAD", "--since", since_iso,
-                 "-n", "1", "--format=%H", "--", file_path],
-                cwd=self.codebase_root,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                timeout=10,
+                ["git", *args], cwd=root, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=10,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-            for root in self._checkout_roots or [self.codebase_root]:
-                dirty = subprocess.run(
-                    ["git", "diff", "--quiet", "HEAD", "--", file_path],
-                    cwd=root, capture_output=True, timeout=10,
+            return result.stdout.strip() if result.returncode == 0 else None
+
+        try:
+            commits = git(
+                self.codebase_root, "log", "--branches", "HEAD", "--since", since_iso,
+                "--format=%H", "--", file_path,
+            )
+            if commits:
+                first = commits.splitlines()[-1].strip()
+                return git(self.codebase_root, "rev-parse", "--verify", "-q", f"{first}^") or ""
+            root = dirty_roots.get(file_path)
+            if root is None:
+                # Untracked files are not in any dirty set; a new file Neo
+                # suggested lives in whichever checkout holds it.
+                root = next(
+                    (r for r in self._checkout_roots or [self.codebase_root]
+                     if (Path(r) / file_path).is_file()
+                     and self._is_untracked(file_path, root=r)),
+                    None,
                 )
-                untracked = (
-                    (Path(root) / file_path).is_file()
-                    and self._is_untracked(file_path, root=root)
-                )
-                if dirty.returncode == 1 or untracked:
-                    head = subprocess.run(
-                        ["git", "rev-parse", "HEAD"],
-                        cwd=root,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                        timeout=10,
-                    )
-                    return head.stdout.strip() if head.returncode == 0 else ""
+            if root is None:
+                return ""
+            return git(root, "rev-parse", "HEAD") or ""
         except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
-            logger.debug(f"acceptance revision lookup failed for {file_path} (non-fatal): {e}")
-        return ""
+            logger.debug(f"applied-on revision lookup failed for {file_path} (non-fatal): {e}")
+            return ""
 
     def _get_changed_files_since(
         self, since_timestamp: float, working_tree: Optional[set[str]] = None
@@ -1487,6 +1528,7 @@ class OutcomeTracker:
     def _match_to_suggestions(
         self, changed_files: set[str], session: SessionRecord,
         elsewhere: Optional[set[str]] = None,
+        dirty_roots: Optional[dict[str, str]] = None,
     ) -> list[Outcome]:
         """Match changed files against previous suggestions to determine outcomes.
 
@@ -1542,8 +1584,10 @@ class OutcomeTracker:
                     # Missing suggested_diff or actual diff — can't verify
                     outcome_type = OutcomeType.UNVERIFIED
 
-                acceptance_revision = (
-                    self._acceptance_revision(normalized, session.timestamp)
+                applied_on_revision = (
+                    self._applied_on_revision(
+                        normalized, session.timestamp, dirty_roots or {}
+                    )
                     if outcome_type == OutcomeType.ACCEPTED else ""
                 )
 
@@ -1556,7 +1600,7 @@ class OutcomeTracker:
                     suggestion_id=sugg.get("suggestion_id", ""),
                     learning_episode_id=session.learning_episode_id,
                     repository_revision=session.repository_revision,
-                    acceptance_revision=acceptance_revision,
+                    applied_on_revision=applied_on_revision,
                     retrieved_fact_ids=list(session.retrieved_fact_ids),
                     used_fact_ids=list(session.used_fact_ids),
                     candidate_id=sugg.get("candidate_id", ""),
@@ -1656,8 +1700,14 @@ class OutcomeTracker:
             if result.returncode == 0 and result.stdout.strip():
                 diff = result.stdout.strip()
 
-            # Also check working tree changes
+            # Also check working tree changes: this checkout, then the FIRST
+            # other checkout holding a diff. Concatenating every worktree's
+            # diff skewed classification both ways — extra lines dilute the
+            # diff-overlap ratio and inflate the code-overlap one.
+            working_diff_found = False
             for root in roots:
+                if working_diff_found and root != self.codebase_root:
+                    break
                 result2 = subprocess.run(
                     ["git", "diff", "HEAD", "--", file_path],
                     cwd=root,
@@ -1666,6 +1716,7 @@ class OutcomeTracker:
                     timeout=10,
                 )
                 if result2.returncode == 0 and result2.stdout.strip():
+                    working_diff_found = True
                     if diff:
                         diff += "\n" + result2.stdout.strip()
                     else:

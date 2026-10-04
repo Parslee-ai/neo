@@ -47,20 +47,31 @@
     anyway. Its only reachable trigger was a transient `rev-parse` failure, which
     made BOTH failing promote while ONE failing blocked — load-dependent
     non-determinism in the durable memory path. It now fails closed on a blank
-    revision. **The revision compared is where the acceptance LANDED** (#254):
-    `Outcome.acceptance_revision` — the newest local-branch commit touching the
-    path, else HEAD of the checkout holding it uncommitted — is written onto the
+    revision. **The revision compared is what the accepted change was APPLIED
+    ON TOP OF** (#254): `Outcome.applied_on_revision` — HEAD of the checkout
+    holding it uncommitted, or the parent of the FIRST local-branch commit
+    touching the path since the suggestion — is written onto the
     `user_acceptance` verification, and both the promote path and
-    `learning-stats` read it through `LearningEpisode.acceptance_revision()`,
-    falling back to the episode's begin revision for older records. Ask-time
-    HEAD was the wrong measure: a CAR Lattice node answers from a main checkout
-    that sits still while peers commit on their own branches, so every episode
-    shared one revision and nothing could promote. Accepted cost: one lesson
-    applied across several files and committed once lands in ONE revision and
-    promotes nothing. **Acceptance detection also reads other checkouts**:
-    every local branch (`--branches`, never `--all` — a fetched teammate commit
-    is not an acceptance) and every linked worktree's dirty set, untracked files
-    and host-ledger edits (attributed to the deepest checkout holding the
+    `learning-stats` read it through `LearningEpisode.applied_on_revision()`,
+    which returns "" (fail closed) when there is none and never falls back to
+    ask-time HEAD. Ask-time HEAD was wrong: a CAR Lattice node answers from a
+    main checkout that sits still while peers commit on their own branches, so
+    every episode shared one revision and nothing could promote. **The landing
+    commit is ALSO wrong, and was tried first**: shas are unique per commit, so
+    one sitting seen dirty by one run (H) and committed before the next (C)
+    read as two revisions and promoted — the exact same-operator case the gate
+    exists for. By base both are H, and parallel worktrees branched from one
+    base committing one fix both read that base. Pre-#254 verifications hold
+    ask-time HEAD in the same field, which equals the base for a change applied
+    in place, so no migration. `evaluation.py` sets the field explicitly; any
+    new producer of ACCEPTED outcomes must too, or it silently never promotes.
+    Accepted cost: one lesson applied across several files in one sitting
+    lands on ONE base and promotes nothing. **Acceptance detection also reads
+    other checkouts**: every local branch (`--branches`, never `--all` — a
+    fetched teammate commit is not an acceptance), every linked worktree's
+    dirty files (only those written after the suggestion, since agents keep
+    work in progress uncommitted in the very file they asked about), untracked
+    files and host-ledger edits (attributed to the deepest checkout holding the
     path). That wider evidence only resolves paths Neo SUGGESTED; INDEPENDENT
     detection stays on the checkout's own HEAD and tree, or every agent
     worktree's edits would become candidates, each costing a diff fork. Separate

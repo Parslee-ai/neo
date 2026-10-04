@@ -5,7 +5,9 @@ Lattice node answers from the main checkout while the asking agent works in a
 linked worktree on its own branch. Detection used to read only the main
 checkout's HEAD and working tree, so that acceptance was invisible until merged;
 and promotion's distinct-revision gate compared HEAD at ask time, which on an
-idle main checkout is one value forever.
+idle main checkout is one value forever. It now compares the revision each
+change was APPLIED ON TOP OF — and the straddle and fan-out cases below are why
+that, not the landing commit, is the thing to compare.
 
 Every test runs against real git repositories with real linked worktrees, and
 the main checkout is left DIRTY with something unrelated, as it is in use.
@@ -20,6 +22,7 @@ from neo.memory.outcomes import OutcomeTracker, OutcomeType
 
 TICK = 2
 SUGGESTED_DIFF = "--- a/src/foo.py\n+++ b/src/foo.py\n@@\n-    return 1\n+    return 2\n"
+SECOND_DIFF = "--- a/src/foo.py\n+++ b/src/foo.py\n@@\n-    return 2\n+    return 3\n"
 
 
 def _git(root, *args):
@@ -46,18 +49,18 @@ def repo(tmp_path):
 
 
 class _Suggestion:
-    def __init__(self, file_path="src/foo.py"):
+    def __init__(self, file_path="src/foo.py", diff=SUGGESTED_DIFF):
         self.file_path = file_path
-        self.unified_diff = SUGGESTED_DIFF
+        self.unified_diff = diff
         self.description = "return 2"
         self.confidence = 0.9
         self.suggestion_id = "sug-1"
         self.code_block = ""
 
 
-def _suggest(repo, request):
+def _suggest(repo, request, diff=SUGGESTED_DIFF):
     tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
-    tracker.save_session([_Suggestion()], "make f return 2", {})
+    tracker.save_session([_Suggestion(diff=diff)], "make f return 2", {})
     time.sleep(TICK)
     return tracker
 
@@ -67,8 +70,8 @@ def _worktree(repo, path, branch):
     return path
 
 
-def _apply(checkout):
-    (checkout / "src" / "foo.py").write_text("def f():\n    return 2\n")
+def _apply(checkout, value=2):
+    (checkout / "src" / "foo.py").write_text(f"def f():\n    return {value}\n")
 
 
 def _accepted(outcomes):
@@ -78,15 +81,15 @@ def _accepted(outcomes):
 def test_a_commit_on_a_linked_worktree_branch_is_an_acceptance(repo, tmp_path, request):
     tracker = _suggest(repo, request)
     wt = _worktree(repo, tmp_path / "agent-wt", "agent")
+    base = _git(wt, "rev-parse", "HEAD")
     _apply(wt)
     _git(wt, "commit", "-qam", "apply")
-    sha = _git(wt, "rev-parse", "HEAD")
 
     outcomes, _ = tracker.detect_outcomes()
 
     accepted = _accepted(outcomes)
     assert [o.file_path for o in accepted] == ["src/foo.py"], outcomes
-    assert accepted[0].acceptance_revision == sha
+    assert accepted[0].applied_on_revision == base
 
 
 def test_an_uncommitted_edit_in_a_linked_worktree_is_an_acceptance(repo, tmp_path, request):
@@ -98,8 +101,26 @@ def test_an_uncommitted_edit_in_a_linked_worktree_is_an_acceptance(repo, tmp_pat
 
     accepted = _accepted(outcomes)
     assert [o.file_path for o in accepted] == ["src/foo.py"], outcomes
-    # Uncommitted: the snapshot is the HEAD of the checkout holding the change.
-    assert accepted[0].acceptance_revision == _git(wt, "rev-parse", "HEAD")
+    # Uncommitted: applied on top of HEAD of the checkout holding it.
+    assert accepted[0].applied_on_revision == _git(wt, "rev-parse", "HEAD")
+
+
+def test_work_in_progress_from_before_the_suggestion_does_not_resolve_it(
+        repo, tmp_path, request):
+    """An agent keeps its work uncommitted, often in the very file it asks
+    about. That edit predates the suggestion and is not a response to it;
+    resolving on it would record MODIFIED and drop the real acceptance."""
+    wt = _worktree(repo, tmp_path / "agent-wt", "agent")
+    (wt / "src" / "foo.py").write_text("def f():\n    return 1  # wip\n")
+    time.sleep(TICK)
+    tracker = _suggest(repo, request)
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    assert [o for o in outcomes if o.file_path == "src/foo.py"] == [], outcomes
+    _apply(wt)  # now the suggestion is applied
+    outcomes, _ = tracker.detect_outcomes()
+    assert [o.file_path for o in _accepted(outcomes)] == ["src/foo.py"], outcomes
 
 
 def test_another_checkouts_work_is_not_read_as_independent_change(repo, tmp_path, request):
@@ -147,19 +168,78 @@ def test_a_fetched_remote_branch_is_not_an_acceptance(repo, request):
     assert _accepted(outcomes) == [], outcomes
 
 
-def test_a_main_checkout_commit_records_its_own_sha(repo, request):
-    """The single-player path: the acceptance revision is the commit the
-    change landed in, not HEAD when the advice was asked for."""
+def test_a_main_checkout_commit_is_applied_on_its_parent(repo, request):
+    """The single-player path keeps its old answer: applied right away in the
+    checkout Neo ran in, the base IS HEAD when the advice was asked for."""
     tracker = _suggest(repo, request)
     asked_at = _git(repo, "rev-parse", "HEAD")
     _apply(repo)
     _git(repo, "commit", "-qm", "apply", "--", "src/foo.py")
-    landed = _git(repo, "rev-parse", "HEAD")
 
     outcomes, _ = tracker.detect_outcomes()
 
     accepted = _accepted(outcomes)
-    assert accepted and accepted[0].acceptance_revision == landed != asked_at
+    assert accepted and accepted[0].applied_on_revision == asked_at
+
+
+def test_one_sitting_straddling_a_commit_reads_as_one_base(repo, request):
+    """Linus's sequence: ask at H and apply; a later run sees it DIRTY; ask
+    again and commit as C; the next run sees it COMMITTED. Landing revisions
+    (H, C) differ and would promote one operator's one sitting. Both were
+    applied on H."""
+    first = _suggest(repo, request)
+    _apply(repo)
+    seen_dirty = _accepted(first.detect_outcomes()[0])
+
+    second = OutcomeTracker(codebase_root=str(repo),
+                            project_id=f"wt2-{request.node.name}")
+    second.save_session([_Suggestion()], "make f return 2", {})
+    time.sleep(TICK)
+    _git(repo, "commit", "-qm", "apply", "--", "src/foo.py")
+    seen_committed = _accepted(second.detect_outcomes()[0])
+
+    assert seen_dirty and seen_committed
+    assert seen_dirty[0].applied_on_revision == seen_committed[0].applied_on_revision
+
+
+def test_parallel_worktrees_committing_one_fix_read_as_one_base(repo, tmp_path, request):
+    """Best-of-N: two agents branched from one base land the same fix as two
+    commits. That is one lesson applied twice at once, not recurrence."""
+    a = _suggest(repo, request)
+    b = OutcomeTracker(codebase_root=str(repo), project_id=f"wt2-{request.node.name}")
+    b.save_session([_Suggestion()], "make f return 2", {})
+    time.sleep(TICK)
+    for name in ("a", "b"):
+        wt = _worktree(repo, tmp_path / f"wt-{name}", f"agent-{name}")
+        _apply(wt)
+        _git(wt, "commit", "-qam", f"apply {name}")
+
+    seen_a = _accepted(a.detect_outcomes()[0])
+    seen_b = _accepted(b.detect_outcomes()[0])
+
+    assert seen_a and seen_b
+    assert seen_a[0].applied_on_revision == seen_b[0].applied_on_revision
+
+
+def test_a_lesson_recurring_after_the_repo_moved_on_reads_as_two_bases(repo, request):
+    """What promotion claims: the lesson came up again after the first
+    application had already landed."""
+    first = _suggest(repo, request)
+    _apply(repo)
+    _git(repo, "commit", "-qm", "first", "--", "src/foo.py")
+    seen_first = _accepted(first.detect_outcomes()[0])
+    time.sleep(TICK)  # `--since` is second-granular; keep "first" out of it
+
+    second = OutcomeTracker(codebase_root=str(repo),
+                            project_id=f"wt2-{request.node.name}")
+    second.save_session([_Suggestion(diff=SECOND_DIFF)], "make f return 3", {})
+    time.sleep(TICK)
+    _apply(repo, 3)
+    _git(repo, "commit", "-qm", "second", "--", "src/foo.py")
+    seen_second = _accepted(second.detect_outcomes()[0])
+
+    assert seen_first and seen_second
+    assert seen_first[0].applied_on_revision != seen_second[0].applied_on_revision
 
 
 def test_ledger_edits_in_a_nested_worktree_attribute_to_the_repo_path(repo, request):

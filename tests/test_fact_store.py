@@ -1072,6 +1072,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=suggestion_id,
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: validate input [src/api.py]",
                 candidate_body="Suggestion: validate input before processing",
@@ -1092,7 +1093,7 @@ class TestOutcomeLinkage:
         assert "probation" not in promoted[0].tags
 
     def _accept_episode(self, store, ep_id, subject, body, kind="pattern",
-                        revision=None, acceptance_revision=""):
+                        revision=None, applied_on_revision=None):
         """Record one ACCEPTED outcome for a fresh episode (drives the real
         detect_implicit_feedback promotion path).
 
@@ -1103,6 +1104,10 @@ class TestOutcomeLinkage:
         """
         if revision is None:
             revision = f"rev-{ep_id}"
+        if applied_on_revision is None:
+            # The ordinary shape: applied in the checkout Neo ran in, right
+            # away, so the base IS the ask-time HEAD.
+            applied_on_revision = revision
         from neo.memory.episodes import (
             LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
         )
@@ -1121,7 +1126,7 @@ class TestOutcomeLinkage:
             candidate_id=cand_id, candidate_subject=subject,
             candidate_body=body, candidate_kind=kind,
             repository_revision=revision,
-            acceptance_revision=acceptance_revision,
+            applied_on_revision=applied_on_revision,
         )
         with patch.object(store._outcome_tracker, "detect_outcomes",
                           return_value=([outcome], {})):
@@ -1266,28 +1271,39 @@ class TestOutcomeLinkage:
         assert len(promoted) == 1
         assert "durable" in promoted[0].tags
 
-    def test_acceptances_landing_in_distinct_commits_promote(self, store):
-        """#254: a Lattice node's main checkout sits still while peers commit
-        on their own branches, so every episode BEGINS at one HEAD. Where the
-        change LANDED is what distinguishes two acceptances."""
+    def test_acceptances_applied_on_distinct_bases_promote(self, store):
+        """#254: a Lattice node's main checkout sits still while peers work on
+        their own branches, so every episode BEGINS at one HEAD. What the
+        change was applied on top of is what distinguishes two acceptances."""
         subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
         idle_head = "d83659cea51676124f2488f6629e0957302e1c1f"
-        self._accept_episode(store, "landed-0", subject, "Reasoning: catch OSError.",
-                             revision=idle_head, acceptance_revision="a" * 40)
-        self._accept_episode(store, "landed-1", subject, "Reasoning: catch OSError.",
-                             revision=idle_head, acceptance_revision="b" * 40)
+        self._accept_episode(store, "base-0", subject, "Reasoning: catch OSError.",
+                             revision=idle_head, applied_on_revision="a" * 40)
+        self._accept_episode(store, "base-1", subject, "Reasoning: catch OSError.",
+                             revision=idle_head, applied_on_revision="b" * 40)
 
         promoted = [f for f in store.entries if "episode-derived" in f.tags]
         assert len(promoted) == 1
 
-    def test_acceptances_landing_in_one_commit_do_not_promote(self, store):
-        """The converse: advice asked at two HEADs and applied in ONE commit is
-        one sitting, not recurrence."""
+    def test_acceptances_applied_on_one_base_do_not_promote(self, store):
+        """The converse: advice asked at two HEADs but applied on one base is
+        one sitting (or one fan-out), not recurrence."""
         subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
-        self._accept_episode(store, "onecommit-0", subject, "Reasoning: catch OSError.",
-                             revision="1" * 40, acceptance_revision="c" * 40)
-        self._accept_episode(store, "onecommit-1", subject, "Reasoning: catch OSError.",
-                             revision="2" * 40, acceptance_revision="c" * 40)
+        self._accept_episode(store, "onebase-0", subject, "Reasoning: catch OSError.",
+                             revision="1" * 40, applied_on_revision="c" * 40)
+        self._accept_episode(store, "onebase-1", subject, "Reasoning: catch OSError.",
+                             revision="2" * 40, applied_on_revision="c" * 40)
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_an_unknown_base_is_not_replaced_by_the_ask_time_head(self, store):
+        """A failed lookup records "". Falling back to HEAD at ask time would
+        mix two kinds of revision in one comparison and let them differ."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "unknown-0", subject, "Reasoning: catch OSError.",
+                             revision="1" * 40, applied_on_revision="c" * 40)
+        self._accept_episode(store, "unknown-1", subject, "Reasoning: catch OSError.",
+                             revision="2" * 40, applied_on_revision="")
 
         assert [f for f in store.entries if "episode-derived" in f.tags] == []
 
@@ -1386,6 +1402,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=suggestion_id,
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: validate input [src/api.py]",
                 candidate_body="Suggestion: validate input before processing",
@@ -1458,7 +1475,7 @@ class TestOutcomeLinkage:
             episode_store.save(episode)
             outcome = Outcome(
                 outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
-                suggestion_id=f"{prefix}-sug-{index}", learning_episode_id=ep_id,
+                suggestion_id=f"{prefix}-sug-{index}", learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}",
                 candidate_id=cand_id, candidate_subject=subject,
                 candidate_body=body, candidate_kind="pattern",
             )
@@ -1761,7 +1778,7 @@ class TestOutcomeLinkage:
             episode_store.save(ep)
             return Outcome(
                 outcome_type=OutcomeType.ACCEPTED, file_path="a.py",
-                suggestion_id=sug_id, learning_episode_id=ep_id, candidate_id=cand_id,
+                suggestion_id=sug_id, learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}", candidate_id=cand_id,
                 candidate_subject=subject, candidate_body=body, candidate_kind="pattern")
 
         # First acceptance: not enough to promote -> no cross-project scan.
@@ -1814,6 +1831,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=suggestion_id,
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: validate input [src/api.py]",
                 candidate_body="Suggestion: validate input before processing",
@@ -1889,6 +1907,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=f"failed-suggestion-{index}",
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: skip validation [src/api.py]",
                 candidate_body="Suggestion: remove the required validation",
@@ -1932,6 +1951,7 @@ class TestOutcomeLinkage:
                 outcome_type=OutcomeType.ACCEPTED,
                 file_path="src/service.py",
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="architecture: split the service",
                 candidate_body="Suggestion: introduce a new service boundary",
@@ -1973,7 +1993,7 @@ class TestOutcomeLinkage:
                 es.save(ep)
                 outcome = Outcome(
                     outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
-                    suggestion_id=sid, learning_episode_id=ep_id, candidate_id=cid,
+                    suggestion_id=sid, learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}", candidate_id=cid,
                     candidate_subject=subject, candidate_body=body, candidate_kind="pattern")
                 with patch.object(st._outcome_tracker, "detect_outcomes",
                                   return_value=([outcome], {})):
@@ -2043,6 +2063,7 @@ class TestOutcomeLinkage:
                 outcome = Outcome(
                     outcome_type=otype, file_path="src/sh.py",
                     suggestion_id=f"{prefix}s{i}", learning_episode_id=f"{prefix}-{i}",
+                    applied_on_revision=f"rev-{prefix}-{i}",
                     candidate_id=f"{prefix}c{i}", candidate_subject=subject,
                     candidate_body=body, candidate_kind="pattern")
                 with patch.object(st._outcome_tracker, "detect_outcomes",
@@ -2096,6 +2117,7 @@ class TestOutcomeLinkage:
                 outcome = Outcome(
                     outcome_type=otype, file_path="src/sh.py",
                     suggestion_id=f"{prefix}s{i}", learning_episode_id=f"{prefix}-{i}",
+                    applied_on_revision=f"rev-{prefix}-{i}",
                     candidate_id=f"{prefix}c{i}", candidate_subject=subject,
                     candidate_body=body, candidate_kind="pattern")
                 with patch.object(st._outcome_tracker, "detect_outcomes",
@@ -2169,6 +2191,7 @@ class TestOutcomeLinkage:
                     file_path="src/private.py",
                     suggestion_id=suggestion_id,
                     learning_episode_id=episode_id,
+                    applied_on_revision=f"rev-{episode_id}",
                     candidate_id=candidate_id,
                     candidate_subject=subject,
                     candidate_body=body,
@@ -2255,7 +2278,7 @@ class TestOutcomeLinkage:
                 episode_store.save(episode)
                 outcome = Outcome(
                     outcome_type=OutcomeType.ACCEPTED, file_path="x.py",
-                    suggestion_id=f"sug-{project}-{index}", learning_episode_id=ep_id,
+                    suggestion_id=f"sug-{project}-{index}", learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}",
                     candidate_id=cand_id, candidate_subject=subject,
                     candidate_body=body, candidate_kind="pattern",
                 )

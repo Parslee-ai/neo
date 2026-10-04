@@ -1099,7 +1099,7 @@ def _handle_learning_stats(args) -> None:
                         continue
                     signature = FactStore._episode_signature(candidate.subject)
                     groups.setdefault(signature, {}).setdefault(
-                        episode.episode_id, episode.acceptance_revision()
+                        episode.episode_id, episode.applied_on_revision()
                     )
                     if candidate.status == "durable":
                         durable_signatures.add(signature)

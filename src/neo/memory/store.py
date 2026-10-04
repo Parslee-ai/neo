@@ -1251,11 +1251,13 @@ class FactStore:
                         else "git_diff_attribution"
                     ),
                     summary=outcome.outcome_type.value,
-                    # Where the change landed when known, so the promotion
-                    # gate compares acceptances rather than ask-time HEADs.
+                    # An acceptance records the revision the change was applied
+                    # on top of, which is what promotion's distinct-revision
+                    # gate compares (#254); "" stays "" and fails closed.
                     repository_revision=(
-                        getattr(outcome, "acceptance_revision", "")
-                        or outcome.repository_revision
+                        outcome.applied_on_revision
+                        if outcome.outcome_type == OutcomeType.ACCEPTED
+                        else outcome.repository_revision
                     ),
                 ))
             # Strongest signal wins. One neo invocation commonly suggests both a
@@ -1731,16 +1733,18 @@ class FactStore:
         Two honest limits, chosen deliberately rather than papered over:
 
         * This tests "not the same repository snapshot", which is narrower than
-          independence. The revisions compared are where each acceptance LANDED
-          (`LearningEpisode.acceptance_revision`: the commit carrying the
-          change, or HEAD of the checkout holding it uncommitted), falling back
-          to HEAD when the advice was asked for on older records. Ask-time HEAD
-          alone measured the wrong thing: a CAR Lattice node's main checkout
-          sits still while peers commit on their own branches, so every episode
-          shared one revision and promotion could never fire (#254).
+          independence. The revisions compared are what each accepted change
+          was APPLIED ON TOP OF (`LearningEpisode.applied_on_revision`: HEAD of
+          the checkout holding it uncommitted, or the parent of the first
+          commit carrying it). Not HEAD at ask time — a CAR Lattice node's main
+          checkout sits still while peers commit on their own branches, so
+          every episode shared one revision and nothing could promote (#254).
+          And not the landing commit — landing shas are unique per commit, so
+          one sitting seen dirty by one run and committed before the next
+          looked like two revisions, and parallel agent worktrees committing
+          the same fix promoted; by base both are one revision.
         * It blocks a real flow: applying the same lesson across several files
-          in one sitting and committing once lands in ONE revision and promotes
-          nothing. Accepted because a delayed durable fact is recoverable and a
+          in one sitting lands on ONE base and promotes nothing. Accepted because a delayed durable fact is recoverable and a
           wrong one needs a contradiction to retract — the same fail-safe
           direction as the kind gate.
         """
@@ -1769,7 +1773,7 @@ class FactStore:
                     signature = self._episode_signature(candidate.subject)
                     if signature == target_signature:
                         supporting.setdefault(
-                            episode.episode_id, episode.acceptance_revision()
+                            episode.episode_id, episode.applied_on_revision()
                         )
                         break
 
