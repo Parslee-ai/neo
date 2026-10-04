@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-10-04
+
+Neo joins the CAR Lattice as a read-only player: other agents on the same CAR daemon can find it by capability and ask it questions, look up project memory, or request reviews. It stays inert until the daemon ships the Lattice API.
+
 ### Added
 
 - **Neo joins the CAR Lattice as a read-only player.** With `car-server` running, every repository Neo is used in gets a CAR-supervised `neo-lattice-<id>` agent. Like the observer, it is registered automatically. The agent joins the repository's project with capability tags (`code-review`, `debugging`, `architecture`, `project-memory`, `past-solutions`, …, plus the repository's main languages), so Claude Code, Codex and CAR Coder sessions find it with `lattice.find` rather than by address. Because it is a supervised agent, the daemon pushes each `agent.peer_message` to it. MCP coding sessions only see mail when they poll, so Neo answers while the asker keeps working.
@@ -28,6 +32,7 @@
 ### Fixed
 
 - **The observer's supervised process imported from `~`.** Its CAR spec used `cwd: ~`, and `python -m` puts the cwd first on `sys.path`, so a stray `~/json.py` or `~/neo/` would have been imported. It now starts in `~/.neo`. The fix applies to new registrations.
+- **A remote CAR could rotate node names past a Neo node's hourly answer budget.** On a Lattice that spans daemons, a node on another CAR is addressed `<node>@<car>`, and that CAR chooses the `<node>` part. The per-sender budget was keyed on the full address, so each new name got a fresh 12 answers an hour on the operator's API key. A remote sender is now charged to its CAR (`@<car>`), which cannot collide with a local node of the same name. The follow-up depth cap was never affected: it is keyed on `in_reply_to`, not on the sender. ([#251](https://github.com/Parslee-ai/neo/issues/251), [#252](https://github.com/Parslee-ai/neo/pull/252))
 
 ## [0.53.2] - 2026-09-24
 

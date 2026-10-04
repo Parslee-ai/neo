@@ -2,6 +2,6 @@
 
 from neo.cli import CodeSuggestion, PlanStep, SimulationTrace, StaticCheckResult
 
-__version__ = "0.53.2"
+__version__ = "0.54.0"
 
 __all__ = ["__version__", "CodeSuggestion", "PlanStep", "SimulationTrace", "StaticCheckResult"]
