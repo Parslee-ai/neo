@@ -739,6 +739,18 @@ class NodeConfig:
     capabilities: list[str] = field(default_factory=list)
 
 
+def budget_key(sender: str) -> str:
+    """The identity a sender's model budget is charged to.
+
+    A node on another CAR arrives as `<node>@<car>`, and the `<node>` part is
+    chosen by that CAR, so keying on the full address would let it rotate
+    names past `SENDER_BUDGET_PER_HOUR`. Charge the CAR instead, as `@<car>`
+    so it cannot share a budget with a local node of the same name. Local names
+    cannot contain `@`, so they are their own key.
+    """
+    return "@" + sender.rpartition("@")[2] if "@" in sender else sender
+
+
 class LatticeNode:
     """Neo's presence on the Lattice for one repository.
 
@@ -865,8 +877,9 @@ class LatticeNode:
 
     def _refund(self, req: PeerRequest, task: Task) -> None:
         """Return the budget slot of a request that was turned away unanswered."""
-        if task.op in {"reason", "review"} and self._spend.get(req.sender):
-            self._spend[req.sender].pop()
+        key = budget_key(req.sender)
+        if task.op in {"reason", "review"} and self._spend.get(key):
+            self._spend[key].pop()
 
     def admit(self, req: PeerRequest, task: Task, now: Optional[float] = None) -> Task:
         """Apply the follow-up depth cap and the per-sender budget."""
@@ -876,15 +889,16 @@ class LatticeNode:
         if depth > MAX_FOLLOWUP_DEPTH:
             return Task(op="ignore", reason=f"follow-up chain deeper than {MAX_FOLLOWUP_DEPTH}")
         now = now if now is not None else time.monotonic()
-        recent = [t for t in self._spend.get(req.sender, []) if now - t < 3600]
+        key = budget_key(req.sender)
+        recent = [t for t in self._spend.get(key, []) if now - t < 3600]
         if len(recent) >= SENDER_BUDGET_PER_HOUR:
-            self._spend[req.sender] = recent
+            self._spend[key] = recent
             return Task(op="decline", reason=(
                 f"Neo has answered {SENDER_BUDGET_PER_HOUR} model-backed requests from you "
                 "in the last hour. memory: lookups still work; try again later."
             ))
         recent.append(now)
-        self._spend[req.sender] = recent
+        self._spend[key] = recent
         task.depth = depth
         return task
 
