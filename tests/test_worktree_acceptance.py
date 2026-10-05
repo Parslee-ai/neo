@@ -11,40 +11,95 @@ that, not the landing commit, is the thing to compare.
 
 Every test runs against real git repositories with real linked worktrees, and
 the main checkout is left DIRTY with something unrelated, as it is in use.
+
+Time is a fake clock, not `sleep`. `git log --since` is second-granular, so
+anything that must fall BEFORE a suggestion has to land in an earlier second;
+sleeping two seconds per ordering cost this file 76s and pushed CI's test jobs
+into their 10-minute timeout. Every event — session save, commit, file write —
+instead takes its own timestamp off one monotonic clock, ten seconds apart and
+in the past, so ordering is exact and costs nothing.
 """
 
+import os
 import subprocess
 import time
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import pytest
 
+from neo.memory import outcomes as outcomes_mod
 from neo.memory.outcomes import OutcomeTracker, OutcomeType
-
-TICK = 2
 SUGGESTED_DIFF = "--- a/src/foo.py\n+++ b/src/foo.py\n@@\n-    return 1\n+    return 2\n"
 SECOND_DIFF = "--- a/src/foo.py\n+++ b/src/foo.py\n@@\n-    return 2\n+    return 3\n"
 
 
+class _Clock:
+    """Monotonic fake time, ten seconds per event, ending well before now."""
+
+    def __init__(self):
+        self.now = time.time() - 3600
+
+    def tick(self) -> float:
+        self.now += 10
+        return self.now
+
+
+_clock = _Clock()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_clock():
+    global _clock
+    _clock = _Clock()
+
+
 def _git(root, *args):
-    return subprocess.run(["git", *args], cwd=root, check=True,
+    env = None
+    if args and args[0] == "commit":
+        stamp = f"@{int(_clock.tick())} +0000"
+        env = {**os.environ, "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+    return subprocess.run(["git", *args], cwd=root, check=True, env=env,
                           capture_output=True, text=True).stdout.strip()
+
+
+def _write(path, text):
+    path.write_text(text)
+    stamp = _clock.tick()
+    os.utime(path, (stamp, stamp))
+
+
+@contextmanager
+def _at_clock():
+    """Stamp a session save with the fake clock (it reads `time.time()`)."""
+    stamp = _clock.tick()
+
+    class _T:
+        @staticmethod
+        def time():
+            return stamp
+
+    with patch.object(outcomes_mod, "time", _T):
+        yield
+
+
+def _save(tracker, suggestions, prompt):
+    with _at_clock():
+        tracker.save_session(suggestions, prompt, {})
 
 
 @pytest.fixture
 def repo(tmp_path):
     root = tmp_path / "repo"
     (root / "src").mkdir(parents=True)
-    (root / "src" / "foo.py").write_text("def f():\n    return 1\n")
-    (root / "src" / "bar.py").write_text("def g():\n    return 1\n")
+    _write(root / "src" / "foo.py", "def f():\n    return 1\n")
+    _write(root / "src" / "bar.py", "def g():\n    return 1\n")
     _git(root, "init", "-q", "-b", "main", ".")
     _git(root, "config", "user.email", "t@t.t")
     _git(root, "config", "user.name", "T")
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "init")
     (root / "notes.txt").write_text("unrelated\n")
-    # `git log --since` is second-granular: a suggestion recorded in the same
-    # second as `init` would see that commit as a change made after it.
-    time.sleep(TICK)
     return root
 
 
@@ -60,8 +115,7 @@ class _Suggestion:
 
 def _suggest(repo, request, diff=SUGGESTED_DIFF):
     tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
-    tracker.save_session([_Suggestion(diff=diff)], "make f return 2", {})
-    time.sleep(TICK)
+    _save(tracker, [_Suggestion(diff=diff)], "make f return 2")
     return tracker
 
 
@@ -71,7 +125,7 @@ def _worktree(repo, path, branch):
 
 
 def _apply(checkout, value=2):
-    (checkout / "src" / "foo.py").write_text(f"def f():\n    return {value}\n")
+    _write(checkout / "src" / "foo.py", f"def f():\n    return {value}\n")
 
 
 def _accepted(outcomes):
@@ -111,8 +165,7 @@ def test_work_in_progress_from_before_the_suggestion_does_not_resolve_it(
     about. That edit predates the suggestion and is not a response to it;
     resolving on it would record MODIFIED and drop the real acceptance."""
     wt = _worktree(repo, tmp_path / "agent-wt", "agent")
-    (wt / "src" / "foo.py").write_text("def f():\n    return 1  # wip\n")
-    time.sleep(TICK)
+    _write(wt / "src" / "foo.py", "def f():\n    return 1  # wip\n")
     tracker = _suggest(repo, request)
 
     outcomes, _ = tracker.detect_outcomes()
@@ -128,10 +181,10 @@ def test_another_checkouts_work_is_not_read_as_independent_change(repo, tmp_path
     Otherwise every agent worktree's edits become INDEPENDENT candidates."""
     tracker = _suggest(repo, request)
     wt = _worktree(repo, tmp_path / "agent-wt", "agent")
-    (wt / "src" / "bar.py").write_text("def g():\n    return 99\n")
+    _write(wt / "src" / "bar.py", "def g():\n    return 99\n")
     _git(wt, "commit", "-qam", "unrelated work")
-    (wt / "src" / "baz.py").write_text("x = 1\n")  # dirty, untracked
-    (repo / "src" / "foo.py").write_text("def f():\n    return 2\n")  # the acceptance
+    _write(wt / "src" / "baz.py", "x = 1\n")  # dirty, untracked
+    _write(repo / "src" / "foo.py", "def f():\n    return 2\n")  # the acceptance
 
     diffed = []
     real_diff = tracker._get_file_diff_since
@@ -193,8 +246,7 @@ def test_one_sitting_straddling_a_commit_reads_as_one_base(repo, request):
 
     second = OutcomeTracker(codebase_root=str(repo),
                             project_id=f"wt2-{request.node.name}")
-    second.save_session([_Suggestion()], "make f return 2", {})
-    time.sleep(TICK)
+    _save(second, [_Suggestion()], "make f return 2")
     _git(repo, "commit", "-qm", "apply", "--", "src/foo.py")
     seen_committed = _accepted(second.detect_outcomes()[0])
 
@@ -207,8 +259,7 @@ def test_parallel_worktrees_committing_one_fix_read_as_one_base(repo, tmp_path, 
     commits. That is one lesson applied twice at once, not recurrence."""
     a = _suggest(repo, request)
     b = OutcomeTracker(codebase_root=str(repo), project_id=f"wt2-{request.node.name}")
-    b.save_session([_Suggestion()], "make f return 2", {})
-    time.sleep(TICK)
+    _save(b, [_Suggestion()], "make f return 2")
     for name in ("a", "b"):
         wt = _worktree(repo, tmp_path / f"wt-{name}", f"agent-{name}")
         _apply(wt)
@@ -230,12 +281,10 @@ def test_a_lesson_recurring_after_the_repo_moved_on_reads_as_two_bases(repo, req
     _apply(repo)
     _git(repo, "commit", "-qm", "first", "--", "src/foo.py")
     seen_first = _accepted(first.detect_outcomes()[0])
-    time.sleep(TICK)  # `--since` is second-granular; keep "first" out of it
 
     second = OutcomeTracker(codebase_root=str(repo),
                             project_id=f"wt2-{request.node.name}")
-    second.save_session([_Suggestion(diff=SECOND_DIFF)], "make f return 3", {})
-    time.sleep(TICK)
+    _save(second, [_Suggestion(diff=SECOND_DIFF)], "make f return 3")
     _apply(repo, 3)
     _git(repo, "commit", "-qm", "second", "--", "src/foo.py")
     seen_second = _accepted(second.detect_outcomes()[0])
@@ -276,14 +325,12 @@ def test_an_unrelated_commit_to_the_same_file_does_not_supply_the_base(
     bases. The base must come from the commit whose patch carries the
     suggestion."""
     sib = _worktree(repo, tmp_path / "sibling", "sibling")
-    (sib / "src" / "bar.py").write_text("def g():\n    return 7\n")
+    _write(sib / "src" / "bar.py", "def g():\n    return 7\n")
     _git(sib, "commit", "-qam", "sibling's own history")
-    time.sleep(TICK)
     tracker = _suggest(repo, request)
     asked_at = _git(repo, "rev-parse", "HEAD")
-    (sib / "src" / "foo.py").write_text("# sibling note\ndef f():\n    return 1\n")
+    _write(sib / "src" / "foo.py", "# sibling note\ndef f():\n    return 1\n")
     _git(sib, "commit", "-qam", "unrelated edit to foo")
-    time.sleep(TICK)
     _apply(repo)
     _git(repo, "commit", "-qm", "apply", "--", "src/foo.py")
 
@@ -303,11 +350,10 @@ def test_one_lesson_committed_file_by_file_collapses_to_one_base(repo, request):
     second = OutcomeTracker(codebase_root=str(repo),
                             project_id=f"wt2-{request.node.name}")
     bar = _Suggestion("src/bar.py", diff=SUGGESTED_DIFF.replace("foo", "bar"))
-    second.save_session([bar], "make g return 2", {})
-    time.sleep(TICK)
+    _save(second, [bar], "make g return 2")
     _apply(repo)
     _git(repo, "commit", "-qm", "foo", "--", "src/foo.py")
-    (repo / "src" / "bar.py").write_text("def g():\n    return 2\n")
+    _write(repo / "src" / "bar.py", "def g():\n    return 2\n")
     _git(repo, "commit", "-qm", "bar", "--", "src/bar.py")
 
     a = _accepted(first.detect_outcomes()[0])
@@ -332,14 +378,12 @@ def test_dirty_first_application_then_commit_collapses_to_one_base(repo, request
     _apply(repo)
     a = _accepted(first.detect_outcomes()[0])
     _git(repo, "commit", "-qm", "foo", "--", "src/foo.py")
-    time.sleep(TICK)
 
     second = OutcomeTracker(codebase_root=str(repo),
                             project_id=f"wt2-{request.node.name}")
     bar = _Suggestion("src/bar.py", diff=SUGGESTED_DIFF.replace("foo", "bar"))
-    second.save_session([bar], "make g return 2", {})
-    time.sleep(TICK)
-    (repo / "src" / "bar.py").write_text("def g():\n    return 2\n")
+    _save(second, [bar], "make g return 2")
+    _write(repo / "src" / "bar.py", "def g():\n    return 2\n")
     _git(repo, "commit", "-qm", "bar", "--", "src/bar.py")
     b = _accepted(second.detect_outcomes()[0])
 
