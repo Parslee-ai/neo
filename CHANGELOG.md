@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.54.3] - 2026-10-05
+
+Neo now asks CAR for a model by its exact catalog id whenever it has one, instead of by name.
+
+### Changed
+
+- **Catalog-id pins are sent to CAR as `model_id`.** CAR has two ways to pin a model. `model_id` is an exact catalog-id pin: CAR serves only that row and echoes it back as `requested_model_id`. `model` is a display-name or alias path, where a short name can resolve to some other row. A pin that is a full catalog id (`provider/name[:tag]`) now goes through `model_id`, using `infer_tracked_with_request`, since car-runtime's `infer_tracked` has no `model_id` keyword. It is accepted only if CAR echoes it exactly, with no name parsing. CAR's router hands the multi-agent panel a catalog id for every role, so all panel calls now take this path. A bare model name, or a car-runtime without `infer_tracked_with_request`, keeps the previous `model` path. A daemon too old to acknowledge `model_id` fails with an error saying CarHost needs updating, not one blaming the pin. A Hugging Face-style `Org/Model` pin is treated as a catalog id and fails loudly with `model not found` if it is not one. ([#261](https://github.com/Parslee-ai/neo/pull/261))
+
 ## [0.54.2] - 2026-10-05
 
 One fix that let the multi-agent panel run again on machines whose CAR router picks a local model, and a CI timing fix.
