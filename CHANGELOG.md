@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.54.2] - 2026-10-05
+
+One fix that let the multi-agent panel run again on machines whose CAR router picks a local model, and a CI timing fix.
+
+### Fixed
+
+- **The multi-agent panel rejected models CAR's own router had chosen.** `CarAdapter` refuses to run when CAR silently swaps a pinned model for another. It judged the pin against `model_used`, which is CAR's display name. For a local model, the router's choice `mlx/qwen3-0.6b:6bit` is served and reported as `Qwen3-0.6B-MLX`, and neither name contains the other. So the check refused the router's own pick, and every panel that drew it fell back to the single-model path (`deliberation failed: CAR did not honor pinned model`). The pin is now judged against `resolved_model_id`, the catalog id CAR reports in the pin's own namespace (`anthropic/claude-sonnet-4-6:latest`). The match is exact: the name must match, and the provider and tag only when the pin states them. This also closes an older hole where a `gpt-5` pin served as `gpt-5.5` passed the fuzzy match. A refusal now names both the resolved id and the display name. CAR builds that do not report `resolved_model_id` keep the previous check. ([#257](https://github.com/Parslee-ai/neo/pull/257))
+
+### Changed
+
+- The worktree-acceptance tests added in 0.54.1 order their events with a fake clock instead of two-second sleeps (76s to 4s). The sleeps had pushed CI's test jobs into their 10-minute timeout.
+
 ## [0.54.1] - 2026-10-05
 
 One fix to the learning loop. Before it, an acceptance made anywhere other than the checkout neo ran in could not count toward promotion, so CAR Lattice peers and worktree-based agent sessions could never teach neo anything durable.
