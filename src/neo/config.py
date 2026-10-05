@@ -219,7 +219,8 @@ class NeoConfig:
     default_temperature: float = 0.7
     default_max_tokens: int = 4096
 
-    # Reasoning effort (OpenAI gpt-5* only). Acts as an upper bound on the
+    # Reasoning effort (OpenAI adapter; sent to every model, which drops or
+    # lowers what it does not support). Acts as an upper bound on the
     # memory-driven effort selected per-query. None = no cap.
     # Valid: "none", "low", "medium", "high", "xhigh".
     reasoning_effort_cap: Optional[str] = None
