@@ -252,7 +252,7 @@ def test_a_catalog_id_pin_is_sent_as_model_id():
     pin = "mlx/qwen3-0.6b:6bit"
     rt = _ExactRuntime({"text": "ok", "model_used": "Qwen3-0.6B-MLX",
                         "requested_model_id": pin, "resolved_model_id": pin, "usage": {}})
-    adapter = CarAdapter(model=pin, runtime=rt)
+    adapter = CarAdapter(model=pin, runtime=rt, model_is_catalog_id=True)
     msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
     assert adapter.generate(msgs, max_tokens=64) == "ok"
     sent = rt.requests[0]
@@ -269,7 +269,7 @@ def test_a_model_id_pin_requires_an_exact_echo():
                         "requested_model_id": pin,
                         "resolved_model_id": "openai/gpt-5.5-2026-05-01"})
     with pytest.raises(RuntimeError, match="did not honor"):
-        CarAdapter(model=pin, runtime=rt).generate("hi")
+        CarAdapter(model=pin, runtime=rt, model_is_catalog_id=True).generate("hi")
 
 
 def test_an_older_daemon_without_model_id_is_named_as_the_cause():
@@ -280,7 +280,7 @@ def test_an_older_daemon_without_model_id_is_named_as_the_cause():
     rt = _ExactRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
                         "resolved_model_id": pin, "usage": {}})
     with pytest.raises(RuntimeError, match="predates `model_id`") as excinfo:
-        CarAdapter(model=pin, runtime=rt).generate("hi")
+        CarAdapter(model=pin, runtime=rt, model_is_catalog_id=True).generate("hi")
     assert "did not honor" not in str(excinfo.value)
 
 
@@ -288,7 +288,7 @@ def test_the_exact_path_sends_no_routing_intent():
     pin = "anthropic/claude-sonnet-4-6:latest"
     rt = _ExactRuntime({"text": "ok", "requested_model_id": pin,
                         "resolved_model_id": pin, "usage": {}})
-    CarAdapter(model=pin, runtime=rt).generate("hi")
+    CarAdapter(model=pin, runtime=rt, model_is_catalog_id=True).generate("hi")
     assert "intent_json" not in rt.requests[0] and "intent" not in rt.requests[0]
 
 
@@ -297,7 +297,7 @@ def test_a_catalog_id_on_a_runtime_without_the_request_call_uses_the_legacy_path
     pin = "anthropic/claude-sonnet-4-6:latest"
     rt = FakeRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
                       "resolved_model_id": pin, "usage": {}})
-    assert CarAdapter(model=pin, runtime=rt).generate("hi") == "ok"
+    assert CarAdapter(model=pin, runtime=rt, model_is_catalog_id=True).generate("hi") == "ok"
     _, kwargs = rt.calls[0]
     assert kwargs["model"] == pin
 
@@ -310,7 +310,7 @@ def test_a_failed_exact_call_names_the_pin():
 
     pin = "anthropic/claude-opus-4-8:latest"
     with pytest.raises(RuntimeError, match=r"anthropic/claude-opus-4-8:latest"):
-        CarAdapter(model=pin, runtime=_Failing({})).generate("hi")
+        CarAdapter(model=pin, runtime=_Failing({}), model_is_catalog_id=True).generate("hi")
 
 
 def test_a_bare_name_pin_keeps_the_legacy_model_path():
@@ -321,6 +321,29 @@ def test_a_bare_name_pin_keeps_the_legacy_model_path():
     assert adapter.generate("hi") == "ok"
     _, kwargs = rt.calls[0]
     assert kwargs["model"] == "claude-sonnet-4-6" and "model_id" not in kwargs
+
+
+def test_exactness_is_decided_by_provenance_not_shape():
+    """Only built-in ids follow `provider/name[:tag]`; gateway, discovered and
+    operator ids pass through verbatim. A router-provided id of ANY shape is
+    pinned exactly, and compared for equality, never parsed."""
+    for pin in ("parslee/openrouter/open-fast", "ollama/llama3:8b:latest", "operator-fast"):
+        rt = _ExactRuntime({"text": "ok", "requested_model_id": pin,
+                            "resolved_model_id": pin, "usage": {}})
+        assert CarAdapter(model=pin, runtime=rt, model_is_catalog_id=True).generate("hi") == "ok"
+        assert rt.requests[0]["model_id"] == pin, pin
+
+
+def test_a_typed_full_id_stays_on_the_model_path_and_matches_by_equality():
+    """A catalog id a human typed into config is a `model` request (CAR's
+    get(name) finds the row); it is honoured by equality, with no parsing —
+    including an id whose shape the built-in parser would misread."""
+    pin = "parslee/openrouter/open-fast"
+    rt = FakeRuntime({"text": "ok", "model_used": "Open Fast",
+                      "resolved_model_id": pin, "usage": {}})
+    assert CarAdapter(model=pin, runtime=rt).generate("hi") == "ok"
+    _, kwargs = rt.calls[0]
+    assert kwargs["model"] == pin
 
 
 def test_generate_router_mode_skips_substitution_guard():

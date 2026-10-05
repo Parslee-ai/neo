@@ -2343,7 +2343,13 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             logger.debug("role model planning failed: %s", e)
             role_models = {}
         from neo.adapters import create_adapter
-        return build_role_factory(role_models, lambda m: create_adapter("car", model=m), fallback)
+        # The router plan's ids are CAR catalog ids, so they are pinned
+        # exactly (`model_id`), whatever their shape.
+        return build_role_factory(
+            role_models,
+            lambda m: create_adapter("car", model=m, model_is_catalog_id=True),
+            fallback,
+        )
 
     _DELIBERATION_KEYS = (
         "execution_envelope_text", "past_learnings", "verifiable_constraints",
