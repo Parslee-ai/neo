@@ -446,7 +446,10 @@ class TestSecretDetection:
         assert "OpenAI" in secret.message
 
     def test_aws_access_key_flagged(self):
-        f = _file("a.txt", "AKIAIOSFODNN7EXAMPLE\n")
+        # AWS's documented placeholder, assembled at runtime like its
+        # neighbours so this file holds no key-shaped literal for a secret
+        # scanner to stop on.
+        f = _file("a.txt", "AKIA" + "IOSFODNN7EXAMPLE" + "\n")
         secret = next(s for s in scan_files([f]) if s.kind == "secret")
         assert "AWS" in secret.message
 
