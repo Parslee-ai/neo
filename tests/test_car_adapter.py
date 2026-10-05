@@ -231,6 +231,59 @@ def test_generate_rejects_a_prefix_substitution_by_resolved_id():
         adapter.generate([{"role": "user", "content": "hi"}])
 
 
+class _ExactRuntime:
+    """A runtime exposing `infer_tracked_with_request`, as car-runtime 0.55 does."""
+
+    def __init__(self, response):
+        self.response = response
+        self.requests: list = []
+
+    def infer_tracked(self, *a, **kw):  # pragma: no cover - must not be used
+        raise AssertionError("a catalog-id pin must not take the legacy path")
+
+    def infer_tracked_with_request(self, request_json):
+        self.requests.append(json.loads(request_json))
+        return json.dumps(self.response)
+
+
+def test_a_catalog_id_pin_is_sent_as_model_id():
+    """`provider/name[:tag]` goes through `model_id` — exact, echoed, no
+    alias resolution — never alongside `model` (CAR rejects both)."""
+    pin = "mlx/qwen3-0.6b:6bit"
+    rt = _ExactRuntime({"text": "ok", "model_used": "Qwen3-0.6B-MLX",
+                        "requested_model_id": pin, "resolved_model_id": pin, "usage": {}})
+    adapter = CarAdapter(model=pin, runtime=rt)
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+    assert adapter.generate(msgs, max_tokens=64) == "ok"
+    sent = rt.requests[0]
+    assert sent["model_id"] == pin and "model" not in sent
+    assert sent["messages"] == msgs and sent["prompt"] == "hi"
+    assert sent["params"] == {"max_tokens": 64}
+
+
+def test_a_model_id_pin_requires_an_exact_echo():
+    """Under `model_id` anything but `requested == resolved == pin` is a
+    substitution — including a resolved id the fuzzy rules would accept."""
+    pin = "openai/gpt-5.5-2026-04-23"
+    for response in (
+        {"requested_model_id": pin, "resolved_model_id": "openai/gpt-5.5-2026-05-01"},
+        {"requested_model_id": None, "resolved_model_id": pin},
+    ):
+        rt = _ExactRuntime({"text": "ok", "model_used": "gpt-5.5", "usage": {}, **response})
+        with pytest.raises(RuntimeError, match="did not honor"):
+            CarAdapter(model=pin, runtime=rt).generate("hi")
+
+
+def test_a_bare_name_pin_keeps_the_legacy_model_path():
+    """A short name is an alias request; it must not be sent as `model_id`."""
+    rt = FakeRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
+                      "resolved_model_id": "anthropic/claude-sonnet-4-6:latest", "usage": {}})
+    adapter = CarAdapter(model="claude-sonnet-4-6", runtime=rt)
+    assert adapter.generate("hi") == "ok"
+    _, kwargs = rt.calls[0]
+    assert kwargs["model"] == "claude-sonnet-4-6" and "model_id" not in kwargs
+
+
 def test_generate_router_mode_skips_substitution_guard():
     """Router mode (model=None) never enforces a pin, whatever CAR routes to."""
     rt = FakeRuntime({"text": "ok", "model_used": "apple-foundation", "usage": {}})

@@ -1184,7 +1184,18 @@ class CarAdapter(LMAdapter):
         # ["reasoning"] so CAR's router escalates accordingly (see
         # github.com/Parslee-ai/car-releases/issues/52).
         kwargs: dict = {"max_tokens": int(max_tokens)}
-        if self.model:
+        # A full catalog id (`provider/name[:tag]`, CAR's documented
+        # `resolved_model_id` contract) is pinned EXACTLY through `model_id`,
+        # which CAR serves only from that row and echoes back. A bare name
+        # takes the legacy `model` path, where CAR may resolve it as an alias.
+        # `infer_tracked` has no `model_id` keyword, so the exact pin goes
+        # through `infer_tracked_with_request`; a runtime without it keeps the
+        # legacy path.
+        exact_pin = (
+            bool(self.model) and "/" in self.model
+            and hasattr(self._rt, "infer_tracked_with_request")
+        )
+        if self.model and not exact_pin:
             kwargs["model"] = self.model
         if self.intent_hint is not None:
             # CAR expects intent_json as a JSON string, not a dict.
@@ -1207,7 +1218,22 @@ class CarAdapter(LMAdapter):
             intent_task=(self.intent_hint or {}).get("task") if self.intent_hint else None,
         ):
             try:
-                if isinstance(messages, str):
+                if exact_pin:
+                    request: dict = {
+                        "model_id": self.model,
+                        "params": {"max_tokens": int(max_tokens)},
+                    }
+                    if isinstance(messages, list):
+                        request["messages"] = messages
+                        request["prompt"] = next(
+                            (m.get("content", "") for m in messages
+                             if isinstance(m, dict) and m.get("role") == "user"),
+                            "",
+                        )
+                    else:
+                        request["prompt"] = str(messages)
+                    result_raw = self._rt.infer_tracked_with_request(json.dumps(request))
+                elif isinstance(messages, str):
                     result_raw = self._rt.infer_tracked(messages, **kwargs)
                 elif isinstance(messages, list):
                     kwargs["messages_json"] = json.dumps(messages)
@@ -1285,10 +1311,15 @@ class CarAdapter(LMAdapter):
         # the resolved id the match is exact (`_resolved_id_honors_pin`).
         model_used = result.get("model_used") or ""
         resolved = result.get("resolved_model_id") or ""
-        honored = (
-            _resolved_id_honors_pin(self.model, resolved) if resolved
-            else _model_pin_honored(self.model, model_used)
-        ) if self.model and (resolved or model_used) else True
+        if exact_pin:
+            # The `model_id` contract: CAR echoes the pin and serves that row.
+            # Nothing to parse — anything but an exact echo is a substitution.
+            honored = result.get("requested_model_id") == self.model == resolved
+        else:
+            honored = (
+                _resolved_id_honors_pin(self.model, resolved) if resolved
+                else _model_pin_honored(self.model, model_used)
+            ) if self.model and (resolved or model_used) else True
         if not honored:
             served = f"{resolved} ({model_used})" if resolved and model_used else (
                 resolved or model_used
