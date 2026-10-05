@@ -1054,6 +1054,34 @@ def _model_pin_honored(requested: str, used: str) -> bool:
     return r in u or u in r
 
 
+def _split_model_id(model_id: str) -> tuple[str, str, str]:
+    """``provider/name:tag`` -> (provider, name, tag), lowercased; parts may be ""."""
+    model_id = model_id.strip().lower()
+    provider, _, rest = model_id.rpartition("/")
+    name, _, tag = rest.partition(":")
+    return provider, name, tag
+
+
+def _resolved_id_honors_pin(requested: str, resolved: str) -> bool:
+    """Exact pin check against CAR's ``resolved_model_id``.
+
+    The resolved id is a catalog id in the pin's own namespace —
+    ``anthropic/claude-sonnet-4-6:latest``, ``mlx/qwen3-0.6b:6bit`` (captured
+    live from CAR 0.55) — so no fuzzy matching is needed, and the fuzzy rule
+    is unsound here: ``gpt-5`` "contains" into ``openai/gpt-5.5``, the very
+    substitution this guard exists to catch. The NAME must match exactly; the
+    provider and tag only when the pin states them, since a bare
+    ``claude-sonnet-4-6`` pin is legitimately served as ``...:latest``.
+    """
+    r_provider, r_name, r_tag = _split_model_id(requested)
+    u_provider, u_name, u_tag = _split_model_id(resolved)
+    if not r_name or r_name != u_name:
+        return False
+    if r_provider and r_provider != u_provider:
+        return False
+    return not r_tag or r_tag == u_tag
+
+
 def _names_model(message: str, model: str) -> bool:
     """Does ``message`` name ``model`` itself, not merely contain it as a prefix?
 
@@ -1253,13 +1281,21 @@ class CarAdapter(LMAdapter):
         # panel role `mlx/qwen3-0.6b:6bit`, served it as `Qwen3-0.6B-MLX`, and
         # this check rejected the model it had just been routed to, so the
         # whole panel fell back to the fast path. The display-name heuristic
-        # remains for CAR builds that do not report the resolved id.
+        # remains for CAR builds that do not report the resolved id; against
+        # the resolved id the match is exact (`_resolved_id_honors_pin`).
         model_used = result.get("model_used") or ""
-        served_by = result.get("resolved_model_id") or model_used
-        if self.model and served_by and not _model_pin_honored(self.model, served_by):
+        resolved = result.get("resolved_model_id") or ""
+        honored = (
+            _resolved_id_honors_pin(self.model, resolved) if resolved
+            else _model_pin_honored(self.model, model_used)
+        ) if self.model and (resolved or model_used) else True
+        if not honored:
+            served = f"{resolved} ({model_used})" if resolved and model_used else (
+                resolved or model_used
+            )
             raise RuntimeError(
                 f"CAR did not honor pinned model '{self.model}': it routed to "
-                f"'{served_by}' instead. Unknown or unavailable model ids "
+                f"'{served}' instead. Unknown or unavailable model ids "
                 f"silently fall back to a default — pin a model CAR knows, or "
                 f"use router mode (model=None)."
             )

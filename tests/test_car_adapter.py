@@ -209,6 +209,28 @@ def test_generate_rejects_a_resolved_id_that_is_not_the_pin():
         adapter.generate([{"role": "user", "content": "hi"}])
 
 
+def test_resolved_id_pin_check_is_exact():
+    """Against the resolved id the match is exact on the name; provider and
+    tag only when the pin states them. Shapes captured live from CAR 0.55."""
+    from neo.adapters import _resolved_id_honors_pin as ok
+
+    assert ok("claude-sonnet-4-6", "anthropic/claude-sonnet-4-6:latest")
+    assert ok("mlx/qwen3-0.6b:6bit", "mlx/qwen3-0.6b:6bit")
+    assert ok("anthropic/claude-opus-4-8", "anthropic/claude-opus-4-8:latest")
+    assert not ok("gpt-5", "openai/gpt-5.5:latest")       # the substitution the fuzzy rule let through
+    assert not ok("mlx/qwen3-0.6b:6bit", "mlx/qwen3-0.6b:4bit")
+    assert not ok("openai/gpt-5.5", "azure/gpt-5.5:latest")
+    assert not ok("", "openai/gpt-5.5")
+
+
+def test_generate_rejects_a_prefix_substitution_by_resolved_id():
+    rt = FakeRuntime({"text": "ok", "model_used": "gpt-5.5",
+                      "resolved_model_id": "openai/gpt-5.5:latest", "usage": {}})
+    adapter = CarAdapter(model="gpt-5", runtime=rt)
+    with pytest.raises(RuntimeError, match=r"openai/gpt-5\.5:latest \(gpt-5\.5\)"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
 def test_generate_router_mode_skips_substitution_guard():
     """Router mode (model=None) never enforces a pin, whatever CAR routes to."""
     rt = FakeRuntime({"text": "ok", "model_used": "apple-foundation", "usage": {}})
