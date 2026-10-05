@@ -1750,6 +1750,35 @@
   daemon means updating CarHost.app — there is no `car` CLI to run and nothing
   neo can do about it. Do not paper over it with `CAR_NO_VERSION_WARNING=1`; the
   warning is accurate.
+- **CAR model pins** (`CarAdapter`, #257/#261/#267): CAR has two pin fields.
+  `model_id` is an exact catalog-id pin — CAR serves only that row and echoes it
+  as `requested_model_id`; `model` is the display-name/alias path, where a short
+  name can resolve to another row and `requested_model_id` is null by design.
+  **Exactness is decided by PROVENANCE, never by the id's shape**: an id CAR's
+  router handed us is passed as `CarAdapter(model_is_catalog_id=True)` (the
+  panel's role factory does this for every router-plan id) and goes out as
+  top-level `model_id` through `infer_tracked_with_request` — car-runtime 0.55's
+  `infer_tracked` has no `model_id` keyword — and is accepted only when
+  `requested_model_id == resolved_model_id == pin`, by equality with no parsing.
+  CAR guarantees `provider/name[:tag]` only for BUILT-IN ids; discovered,
+  gateway and operator ids pass through verbatim (`parslee/openrouter/open-fast`,
+  `:` inside a bare id, possibly no `/`), which is why the first cut's
+  "contains `/`" test was replaced. A name typed into config stays on `model`,
+  with an equality-first check and then an exact NAME match against
+  `resolved_model_id` (`_resolved_id_honors_pin`: provider/tag only when the pin
+  states them). **`model_used` is a DISPLAY name and must never be the
+  evidence when an id is available**: the router's own choice
+  `mlx/qwen3-0.6b:6bit` is served as `Qwen3-0.6B-MLX`, the old fuzzy check
+  refused it, and every panel that drew it fell back to the fast path. The fuzzy
+  `model_used` rule survives only for CAR builds that report no
+  `resolved_model_id`. No echo at all on a `model_id` request means a daemon
+  that predates exact pinning, and fails closed with an "update CarHost" error
+  rather than blaming the pin. **No lenient fallback** (Matt's decision): the
+  `resolved_model_id` format is a CAR-side contract, and tolerating "close
+  enough" ids is how a `gpt-5` pin passed when served `gpt-5.5`. Sending `model`
+  and `model_id` together is rejected by CAR; an unknown either fails `model not
+  found` (CAR sets `strict_model`), never a silent default. Any new caller that
+  holds a router-provided id must pass `model_is_catalog_id=True`.
 - Provider param compatibility (`adapters.py`): providers reject optional request
   fields model by model — `temperature` (Anthropic Opus 4.7+/Sonnet 5/Fable 5;
   OpenAI o-series/gpt-5/gpt-6; Azure reasoning deployments; xAI Grok/DeepSeek
