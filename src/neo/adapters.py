@@ -1184,9 +1184,25 @@ class CarAdapter(LMAdapter):
         # ["reasoning"] so CAR's router escalates accordingly (see
         # github.com/Parslee-ai/car-releases/issues/52).
         kwargs: dict = {"max_tokens": int(max_tokens)}
-        if self.model:
+        # A full catalog id (`provider/name[:tag]`, CAR's documented
+        # `resolved_model_id` contract) is pinned EXACTLY through `model_id`,
+        # which CAR serves only from that row and echoes back. A bare name
+        # takes the legacy `model` path, where CAR may resolve it as an alias.
+        # `infer_tracked` has no `model_id` keyword, so the exact pin goes
+        # through `infer_tracked_with_request`; a runtime without it keeps the
+        # legacy path. The "/" test is the catalog contract's own shape, so a
+        # Hugging Face style name (`Qwen/Qwen3-4B`) is treated as a catalog id
+        # too and fails loudly as `model not found` if it is not one — which
+        # is the panel's case anyway, since CAR's router returns catalog ids.
+        exact_pin = (
+            bool(self.model) and "/" in self.model
+            and hasattr(self._rt, "infer_tracked_with_request")
+        )
+        if self.model and not exact_pin:
             kwargs["model"] = self.model
-        if self.intent_hint is not None:
+        # The intent only steers ROUTING, which an exact `model_id` pin
+        # bypasses, so the exact path does not send it.
+        if self.intent_hint is not None and not exact_pin:
             # CAR expects intent_json as a JSON string, not a dict.
             kwargs["intent_json"] = json.dumps(self.intent_hint)
 
@@ -1204,10 +1220,28 @@ class CarAdapter(LMAdapter):
             model=self.model or "router",
             input_shape=input_shape,
             max_tokens=int(max_tokens),
-            intent_task=(self.intent_hint or {}).get("task") if self.intent_hint else None,
+            intent_task=(
+                (self.intent_hint or {}).get("task")
+                if self.intent_hint and not exact_pin else None
+            ),
         ):
             try:
-                if isinstance(messages, str):
+                if exact_pin:
+                    request: dict = {
+                        "model_id": self.model,
+                        "params": {"max_tokens": int(max_tokens)},
+                    }
+                    if isinstance(messages, list):
+                        request["messages"] = messages
+                        request["prompt"] = next(
+                            (m.get("content", "") for m in messages
+                             if isinstance(m, dict) and m.get("role") == "user"),
+                            "",
+                        )
+                    else:
+                        request["prompt"] = str(messages)
+                    result_raw = self._rt.infer_tracked_with_request(json.dumps(request))
+                elif isinstance(messages, str):
                     result_raw = self._rt.infer_tracked(messages, **kwargs)
                 elif isinstance(messages, list):
                     kwargs["messages_json"] = json.dumps(messages)
@@ -1285,10 +1319,26 @@ class CarAdapter(LMAdapter):
         # the resolved id the match is exact (`_resolved_id_honors_pin`).
         model_used = result.get("model_used") or ""
         resolved = result.get("resolved_model_id") or ""
-        honored = (
-            _resolved_id_honors_pin(self.model, resolved) if resolved
-            else _model_pin_honored(self.model, model_used)
-        ) if self.model and (resolved or model_used) else True
+        if exact_pin:
+            # The `model_id` contract: CAR echoes the pin and serves that row.
+            # Nothing to parse — anything but an exact echo is a substitution.
+            # No echo at all means a daemon older than this binding, which
+            # ignored `model_id` and routed freely. Client/daemon skew is the
+            # normal state here (CarHost updates on its own schedule), so say
+            # THAT rather than blame the pin for a substitution it may not be.
+            if not result.get("requested_model_id"):
+                raise RuntimeError(
+                    f"CAR daemon did not acknowledge exact pin '{self.model}' "
+                    f"(no requested_model_id in its response; it served "
+                    f"'{resolved or model_used or 'unknown'}'). The daemon predates "
+                    f"`model_id` pinning — update CarHost."
+                )
+            honored = result.get("requested_model_id") == self.model == resolved
+        else:
+            honored = (
+                _resolved_id_honors_pin(self.model, resolved) if resolved
+                else _model_pin_honored(self.model, model_used)
+            ) if self.model and (resolved or model_used) else True
         if not honored:
             served = f"{resolved} ({model_used})" if resolved and model_used else (
                 resolved or model_used
