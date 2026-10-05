@@ -1766,7 +1766,15 @@
   persists the learning in `_ModelParamCompat` (`~/.neo/model_param_compat.json`,
   `"<provider>:<model>" → [flags]`) so the retry is paid once per model. Flags are
   `drop_<field>`, `rename_<field>`, `max_<field>:<level>`; the first two are the
-  pre-generalisation spellings, so an old file still loads. Never a blanket
+  pre-generalisation spellings, so an old file still loads. **Nothing is persisted
+  until the adapted call has SUCCEEDED**: learnings are collected during the retry
+  walk and written once at the end, because they used to be written before the
+  retry proved them, so a call that then failed (a context-length 400 whose text
+  mentioned temperature) left a false `drop_temperature` on disk. **When the 400
+  carries a structured `body.param`, only the field equal to it can match and the
+  message is not read** (message text is the fallback only when there is no
+  `param`: Anthropic, Google, client-side TypeError); a message that merely
+  mentions a field is not a rejection of it. Never a blanket
   strip-and-retry, and anything that is not a rejection of a sent field (auth,
   429, another 400, an unrelated TypeError) re-raises untouched. Bounded by
   construction: each recovery removes a field, renames it away or lowers a level,
@@ -1776,11 +1784,27 @@
   in its text); the SDK refusing the keyword at the signature (a client-side
   `TypeError`, which is what `anthropic` 1.x does to `temperature`, so a
   `BadRequestError`-only handler never sees it); and `code`, which separates "this
-  LEVEL is not offered" (`invalid_value` → step down `EFFORT_LEVELS` one rung,
-  persisted as `max_reasoning.effort:<level>`, dropped only once even `none` is
-  refused) from "this field is unsupported" (`unsupported_parameter` or None —
+  LEVEL is not offered" (`unsupported_value` is what a genuinely unsupported level
+  returns live; `invalid_value` is what a value outside the known vocabulary
+  returns; both → step down `EFFORT_LEVELS` one rung, persisted as
+  `max_reasoning.effort:<level>` only once the call succeeds) from "this field is unsupported" (`unsupported_parameter` or None —
   `temperature`'s code is None, so `code` alone can never recognise an unsupported
-  field). **`OpenAIAdapter` never calls chat completions**: every model goes
+  field). **A rejected level is never evidence that effort is unsupported, and only
+  a lower level that was ACCEPTED can prove a cap.** Live, `gpt-6.1-sol`, `gpt-5`
+  and `o3` refuse level `none` with `unsupported_value` while accepting `xhigh`;
+  the walk used to persist `drop_reasoning.effort` at the bottom, after which every
+  later `xhigh` request silently ran at the provider default. A walk that reaches
+  the bottom now removes effort for THAT call (`bottom_<field>` flag) and persists
+  no effort flag at all; only `unsupported_parameter` (what `gpt-4o-mini` returns)
+  persists `drop_reasoning.effort`, and only after the retry succeeds. Known
+  limit: a model that accepts a single level (say only `high`) asked for a lower
+  one walks to the bottom, runs at the provider default for that call, and pays
+  that discovery on every such call, because nothing false is ever written to
+  disk. `stop_sequences` is sent but not droppable: no provider is known to reject
+  it. **`provider=openai` with a custom `base_url` now requires a server that
+  implements the responses endpoint**; `provider=local` is the route for
+  OpenAI-compatible servers that speak only chat completions.
+  **`OpenAIAdapter` never calls chat completions**: every model goes
   through `client.responses.create`, which is the only endpoint carrying effort;
   `stop` is accepted and not sent (responses has no stop sequences). Azure and
   Local deliberately stay on chat completions (deployment API versions lag; most

@@ -415,3 +415,106 @@ def test_exhausted_retries_keep_the_status_code():
         _adapter("gpt-5.6", handler).generate([{"role": "user", "content": "hi"}])
     assert exc.value.status_code == 503
     assert len(attempts) == 3  # one call + the SDK's two retries
+
+
+# ---------------------------------------------------------------------------
+# Persist-after-success, structured `param`, and the effort-level rules
+# ---------------------------------------------------------------------------
+
+def _unsupported_level(value="none"):
+    """What gpt-6.1-sol, gpt-5 and o3 return live for a level they do not offer."""
+    return ("reasoning.effort", "unsupported_value",
+            f"Unsupported value: 'reasoning.effort' does not support '{value}' "
+            "with this model. Supported values are: 'low', 'medium', 'high', and 'xhigh'.")
+
+
+def _store_exists():
+    from pathlib import Path
+    return (Path.home() / ".neo" / "model_param_compat.json").exists()
+
+
+def test_unsupported_value_steps_down_and_persists_the_proven_cap():
+    handler = _recording_handler(
+        lambda p: _unsupported_level("xhigh") if p["reasoning"]["effort"] == "xhigh" else None)
+    _adapter("gpt-5.6", handler).generate(MSG, reasoning_effort="xhigh")
+    assert [p["reasoning"]["effort"] for _, p in handler.seen] == ["xhigh", "high"]
+    assert _learned() == {"openai:gpt-5.6": ["max_reasoning.effort:high"]}
+
+
+def test_bottom_of_ladder_removes_effort_for_this_call_only_and_persists_nothing():
+    """gpt-6.1-sol refuses `none` but accepts `xhigh`. Asking for `none` walks to
+    the bottom and runs without effort for that call; nothing is written, so a
+    following `xhigh` request still sends `xhigh`."""
+    offered = {"low", "medium", "high", "xhigh"}
+    handler = _recording_handler(
+        lambda p: None if p.get("reasoning", {}).get("effort") in offered or "reasoning" not in p
+        else _unsupported_level(p["reasoning"]["effort"]))
+
+    assert _adapter("gpt-6.1-sol", handler).generate(MSG, reasoning_effort="none") == "ok"
+    assert [p.get("reasoning") for _, p in handler.seen] == [{"effort": "none"}, None]
+    assert not _store_exists()
+
+    handler.seen.clear()
+    _adapter("gpt-6.1-sol", handler).generate(MSG, reasoning_effort="xhigh")
+    assert [p["reasoning"] for _, p in handler.seen] == [{"effort": "xhigh"}]
+
+
+def test_a_walk_that_ends_in_removal_discards_the_caps_found_on_the_way():
+    handler = _recording_handler(
+        lambda p: _unsupported_level(p["reasoning"]["effort"]) if "reasoning" in p else None)
+    _adapter("gpt-6.1-sol", handler).generate(MSG, reasoning_effort="medium")
+    assert [p.get("reasoning", {}).get("effort") for _, p in handler.seen] == [
+        "medium", "low", "none", None]
+    assert not _store_exists()
+
+
+def test_a_call_whose_retries_all_fail_persists_nothing():
+    """Temperature is dropped, then the retried call fails for another reason."""
+    def reject(p):
+        if "temperature" in p:
+            return _UNSUPPORTED_TEMP
+        return ("input", "invalid_value", "Invalid value for 'input': bad shape")
+    handler = _recording_handler(reject)
+    with pytest.raises(openai.BadRequestError):
+        _adapter("gpt-6.1-sol", handler).generate(MSG, temperature=0.7, reasoning_effort="low")
+    assert len(handler.seen) == 2
+    assert not _store_exists()
+
+
+@pytest.mark.parametrize("refusal", [
+    ("input", "invalid_value", "Invalid 'input': the temperature of this thing is wrong"),
+    ("input", "context_length_exceeded",
+     "Input is too long; lowering temperature will not help. Reduce the input."),
+    ("input", "invalid_value", "Invalid value for 'input': reasoning.effort is mentioned here"),
+])
+def test_message_text_is_not_consulted_when_param_is_structured(refusal):
+    """With a structured `param` a message that merely mentions a field is not
+    a rejection of it: re-raise after one request, learn nothing."""
+    handler = _recording_handler(lambda p: refusal)
+    with pytest.raises(openai.BadRequestError):
+        _adapter("gpt-6.1-sol", handler).generate(MSG, temperature=0.7, reasoning_effort="low")
+    assert len(handler.seen) == 1
+    assert not _store_exists()
+
+
+def test_out_of_range_temperature_that_still_fails_persists_nothing():
+    """Names the right field but is a value error. Dropping it is tolerated;
+    when the retry also fails nothing is persisted."""
+    def reject(p):
+        return ("temperature", "decimal_above_max_value",
+                "Invalid 'temperature': decimal above maximum value.") if "temperature" in p \
+            else ("input", "invalid_value", "bad")
+    handler = _recording_handler(reject)
+    with pytest.raises(openai.BadRequestError):
+        _adapter("gpt-6.1-sol", handler).generate(MSG, temperature=0.7)
+    assert not _store_exists()
+
+
+def test_context_length_error_without_param_persists_nothing_when_retries_fail():
+    """No structured param, so the message fallback may try dropping the field it
+    mentions; the retry fails too and nothing reaches disk."""
+    handler = _recording_handler(lambda p: (
+        None, "context_length_exceeded", "Context length exceeded; temperature unrelated."))
+    with pytest.raises(openai.BadRequestError):
+        _adapter("gpt-6.1-sol", handler).generate(MSG, temperature=0.7)
+    assert not _store_exists()

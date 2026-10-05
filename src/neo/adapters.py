@@ -204,7 +204,7 @@ def _apply_flag(kwargs: dict, flag: str, renames: dict, ladders: dict) -> bool:
     if not _is_sent(kwargs, path):
         return False
     node, key = _locate(kwargs, path)
-    if kind == "drop":
+    if kind in ("drop", "bottom"):  # "bottom": dropped to get an answer, never persisted
         del node[key]
         parent, _, _ = path.rpartition(".")
         if parent:  # don't leave an empty `reasoning: {}` behind
@@ -229,12 +229,17 @@ def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
     TypeError) and must re-raise untouched.
 
     A field is only ever named by the rejection itself: the SDK refusing the
-    keyword at the signature (TypeError), or an HTTP 400 whose message or
-    `param` names a field that was sent. `code` separates the two 400 shapes
-    that name the same field — `invalid_value` means the field exists but this
-    LEVEL is unacceptable (lower it); anything else means the field itself is
-    unsupported (drop it). `temperature`'s code is None, so `code` alone can
-    never recognise an unsupported field.
+    keyword at the signature (TypeError), or an HTTP 400. When the 400 carries
+    a structured `param` (OpenAI), only the field equal to it can match and the
+    message is never read, since a message that merely mentions a field is not
+    a rejection of it; the message is the fallback only when there is no
+    `param` (Anthropic, Google). `code` separates the two shapes that name the
+    same ladder field: `unsupported_value` (a level this model does not offer)
+    or `invalid_value` (a level outside the known vocabulary) means the field
+    exists and the LEVEL is the problem (step down); anything else means the
+    field itself is unsupported (drop it). A level rejected at the bottom rung
+    returns `bottom_<field>`: "rejected" does not mean "too high", so that
+    removal serves this call only and is never persisted.
     """
     present = [p for p in optional if _is_sent(kwargs, p)]
     if isinstance(exc, TypeError):
@@ -247,14 +252,15 @@ def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
     body = getattr(exc, "body", None)
     body = body if isinstance(body, dict) else {}
     code, param = body.get("code"), body.get("param")
-    text = f"{exc} {param or ''}".lower()
+    structured = param if isinstance(param, str) and param else None
+    text = str(exc).lower()
     for path in present:
-        if path.lower() not in text:
+        if (path != structured) if structured else (path.lower() not in text):
             continue
         if path in ladders and code in ("invalid_value", "unsupported_value"):
             node, key = _locate(kwargs, path)
             rung = _rank(ladders[path], node[key])
-            return f"drop_{path}" if rung == 0 else f"max_{path}:{ladders[path][rung - 1]}"
+            return f"bottom_{path}" if rung == 0 else f"max_{path}:{ladders[path][rung - 1]}"
         if code == "invalid_value":
             continue  # a bad value for a supported field, not an unsupported field
         if path in renames and not any(
@@ -274,26 +280,37 @@ def _create_resilient(create, kwargs: dict, provider: str, model: str, *,
     `optional` lists the dotted field paths Neo may send that a model might
     refuse; `renames` maps a field to its replacement name; `ladders` maps a
     field to its ordered levels, lowest first. Adaptations already learned for
-    ``provider``/``model`` are applied up front; a new rejection is applied,
-    persisted and retried. Anything that is not a rejection of a field Neo sent
-    re-raises. The loop is bounded by construction: every recovery removes a
-    field, renames it away, or lowers a level, and one that changes nothing
-    ends the loop. ``kwargs`` is copied, not mutated.
+    ``provider``/``model`` are applied up front; a new rejection is applied and
+    retried, and what was learned is persisted only once a call has SUCCEEDED
+    (a call that ends in an exception persists nothing). A cap on a ladder
+    field whose level walk ended in removal is not persisted either: nothing
+    proved it. Anything that is not a rejection of a field Neo sent re-raises.
+    The loop is bounded by construction: every recovery removes a field,
+    renames it away, or lowers a level, and one that changes nothing ends the
+    loop. ``kwargs`` is copied, not mutated.
     """
     renames, ladders = renames or {}, ladders or {}
     kwargs = {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
     for flag in _PARAM_COMPAT.flags(provider, model):
         _apply_flag(kwargs, flag, renames, ladders)
+    learned: list[str] = []
     while True:
         try:
-            return create(**kwargs)
+            response = create(**kwargs)
+            break
         except Exception as e:
             flag = _rejection(e, kwargs, optional, renames, ladders)
             if flag is None or not _apply_flag(kwargs, flag, renames, ladders):
                 raise
-            _PARAM_COMPAT.learn(provider, model, flag)
+            learned.append(flag)
             logger.debug("%s/%s rejected a field (%s); adapted and retrying",
                          provider, model, flag)
+    bottomed = {f.partition("_")[2] for f in learned if f.startswith("bottom_")}
+    for flag in learned:
+        path = flag.partition("_")[2].partition(":")[0]
+        if not flag.startswith("bottom_") and path not in bottomed:
+            _PARAM_COMPAT.learn(provider, model, flag)
+    return response
 
 
 # Chat-completions adapters (Azure, Local) share one field policy.
@@ -546,7 +563,7 @@ class AnthropicAdapter(LMAdapter):
             # `_create_resilient` handles both and remembers the model.
             response = _create_resilient(
                 self.client.messages.create, kwargs, "anthropic", self.model,
-                optional=("temperature", "stop_sequences"),
+                optional=("temperature",),
             )
             self._emit_usage_metric(response)
             return response.content[0].text
@@ -652,7 +669,7 @@ class GoogleAdapter(LMAdapter):
                 {"temperature": temperature, "max_output_tokens": max_tokens,
                  "stop_sequences": stop},
                 "google", self.model,
-                optional=("temperature", "stop_sequences"),
+                optional=("temperature",),
             )
 
             # Handle missing or None response text

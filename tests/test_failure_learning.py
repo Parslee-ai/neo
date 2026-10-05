@@ -9,6 +9,30 @@ import pytest
 from neo.persistent_reasoning import PersistentReasoningMemory
 
 
+class TestFailureExtractionLLM:
+    def test_uses_responses_endpoint_and_parses_bullets(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        memory = PersistentReasoningMemory()
+        client = MagicMock()
+        client.responses.create.return_value = SimpleNamespace(
+            output_text="Intro\n- Off-by-one in loop\n- Missing null check\nnoise"
+        )
+        memory.openai_client = client
+
+        causes = memory._extract_failure_root_cause(
+            {"error_trace": "IndexError: boom"}, "suggestion"
+        )
+
+        assert causes == ["Off-by-one in loop", "Missing null check"]
+        kw = client.responses.create.call_args.kwargs
+        assert kw["model"] == "gpt-3.5-turbo"
+        assert kw["max_output_tokens"] == 200
+        assert kw["temperature"] == 0.1
+        client.chat.completions.create.assert_not_called()
+
+
 class TestFailureExtraction:
     """Test failure root cause extraction (Phase 3.2)."""
 

@@ -1989,15 +1989,15 @@ class PersistentReasoningMemory:
         prompt = build_failure_analysis_prompt(error_trace, suggestion)
 
         try:
-            response = self.openai_client.chat.completions.create(
+            response = self.openai_client.responses.create(
                 model="gpt-3.5-turbo",  # Fast, cheap for extraction
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
+                input=[{"role": "user", "content": prompt}],
+                max_output_tokens=200,
                 temperature=0.1,
             )
 
             # Parse bullet points
-            content = response.choices[0].message.content
+            content = response.output_text
             causes = [
                 line.strip("- ").strip()
                 for line in content.split("\n")

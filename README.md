@@ -1404,8 +1404,10 @@ adapter = OpenAIAdapter(model="gpt-5.6", api_key="sk-...")
 Neo's configured default model is `gpt-5.6` (`NeoConfig.model`), which is what
 the CLI uses. Constructing an adapter directly without a `model` falls back to
 the adapter's own default of `gpt-4`, so pass the model explicitly when you
-bypass `NeoConfig`. GPT-5/Codex models use the `/v1/responses` endpoint
-automatically.
+bypass `NeoConfig`. Every OpenAI model uses the `/v1/responses`
+endpoint. `provider=openai` with a custom `base_url` therefore requires a server
+that implements the responses endpoint; for any other OpenAI-compatible server
+(chat completions only) use `provider=local`.
 
 ### Anthropic
 
