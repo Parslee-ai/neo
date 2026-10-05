@@ -1245,11 +1245,21 @@ class CarAdapter(LMAdapter):
         # falls back to a default instead of erroring — so a typo'd or retired
         # pin would run against the wrong model unnoticed. Router mode
         # (model=None) intentionally skips this.
+        #
+        # Judge against `resolved_model_id` whenever CAR reports it: that is
+        # the catalog id the request was served by, in the same namespace as
+        # the pin. `model_used` is a DISPLAY name, and for local models the
+        # two share no substring once normalized — CAR's own router assigned a
+        # panel role `mlx/qwen3-0.6b:6bit`, served it as `Qwen3-0.6B-MLX`, and
+        # this check rejected the model it had just been routed to, so the
+        # whole panel fell back to the fast path. The display-name heuristic
+        # remains for CAR builds that do not report the resolved id.
         model_used = result.get("model_used") or ""
-        if self.model and model_used and not _model_pin_honored(self.model, model_used):
+        served_by = result.get("resolved_model_id") or model_used
+        if self.model and served_by and not _model_pin_honored(self.model, served_by):
             raise RuntimeError(
                 f"CAR did not honor pinned model '{self.model}': it routed to "
-                f"'{model_used}' instead. Unknown or unavailable model ids "
+                f"'{served_by}' instead. Unknown or unavailable model ids "
                 f"silently fall back to a default — pin a model CAR knows, or "
                 f"use router mode (model=None)."
             )

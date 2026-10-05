@@ -189,6 +189,26 @@ def test_generate_raises_on_silent_model_substitution():
         adapter.generate([{"role": "user", "content": "hi"}])
 
 
+def test_generate_judges_the_pin_by_resolved_model_id():
+    """CAR reports a local model's DISPLAY name in `model_used`, which shares
+    no substring with its catalog id. The pin is judged by `resolved_model_id`,
+    or the router's own choice is rejected (measured: the panel never ran)."""
+    rt = FakeRuntime({"text": "ok", "model_used": "Qwen3-0.6B-MLX",
+                      "resolved_model_id": "mlx/qwen3-0.6b:6bit", "usage": {}})
+    adapter = CarAdapter(model="mlx/qwen3-0.6b:6bit", runtime=rt)
+    assert adapter.generate([{"role": "user", "content": "hi"}]) == "ok"
+
+
+def test_generate_rejects_a_resolved_id_that_is_not_the_pin():
+    """The resolved id is authoritative in both directions: a display name
+    that happens to resemble the pin cannot cover a substituted model."""
+    rt = FakeRuntime({"text": "ok", "model_used": "Qwen3-4B",
+                      "resolved_model_id": "apple/foundation", "usage": {}})
+    adapter = CarAdapter(model="Qwen3-4B", runtime=rt)
+    with pytest.raises(RuntimeError, match="apple/foundation"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
 def test_generate_router_mode_skips_substitution_guard():
     """Router mode (model=None) never enforces a pin, whatever CAR routes to."""
     rt = FakeRuntime({"text": "ok", "model_used": "apple-foundation", "usage": {}})
