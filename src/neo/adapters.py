@@ -1175,8 +1175,17 @@ class CarAdapter(LMAdapter):
         model: Optional[str] = None,
         intent_hint: Optional[dict] = None,
         runtime: Optional[object] = None,
+        model_is_catalog_id: bool = False,
     ):
         self.model = model
+        # True when `model` is a catalog id CAR handed us (the panel's router
+        # plan), so it is pinned exactly through `model_id`. Decided by WHERE
+        # the id came from, never by its shape: only built-in ids follow
+        # `provider/name[:tag]`; discovered, gateway and operator-registered
+        # ids pass through verbatim (`parslee/openrouter/open-fast`, bare ids
+        # containing `:`), so a shape test would send real catalog ids down
+        # the alias path. A name a human typed into config stays `model`.
+        self.model_is_catalog_id = model_is_catalog_id
         # Caller-supplied intent wins; otherwise default to the coding workload.
         self.intent_hint = dict(intent_hint) if intent_hint else dict(self.DEFAULT_INTENT_HINT)
         # Give large-context inference room to finish before CAR's FFI read
@@ -1221,18 +1230,14 @@ class CarAdapter(LMAdapter):
         # ["reasoning"] so CAR's router escalates accordingly (see
         # github.com/Parslee-ai/car-releases/issues/52).
         kwargs: dict = {"max_tokens": int(max_tokens)}
-        # A full catalog id (`provider/name[:tag]`, CAR's documented
-        # `resolved_model_id` contract) is pinned EXACTLY through `model_id`,
-        # which CAR serves only from that row and echoes back. A bare name
-        # takes the legacy `model` path, where CAR may resolve it as an alias.
+        # A catalog id CAR handed us is pinned EXACTLY through `model_id`,
+        # which CAR serves only from that row and echoes back; a name a human
+        # typed takes the legacy `model` path, where CAR may resolve an alias.
         # `infer_tracked` has no `model_id` keyword, so the exact pin goes
         # through `infer_tracked_with_request`; a runtime without it keeps the
-        # legacy path. The "/" test is the catalog contract's own shape, so a
-        # Hugging Face style name (`Qwen/Qwen3-4B`) is treated as a catalog id
-        # too and fails loudly as `model not found` if it is not one — which
-        # is the panel's case anyway, since CAR's router returns catalog ids.
+        # legacy path.
         exact_pin = (
-            bool(self.model) and "/" in self.model
+            bool(self.model) and self.model_is_catalog_id
             and hasattr(self._rt, "infer_tracked_with_request")
         )
         if self.model and not exact_pin:
@@ -1371,6 +1376,10 @@ class CarAdapter(LMAdapter):
                     f"`model_id` pinning — update CarHost."
                 )
             honored = result.get("requested_model_id") == self.model == resolved
+        elif self.model and resolved == self.model:
+            # Equality first: a full id typed into config resolves to itself,
+            # and comparing for equality needs no knowledge of the id's shape.
+            honored = True
         else:
             honored = (
                 _resolved_id_honors_pin(self.model, resolved) if resolved
