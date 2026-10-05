@@ -189,6 +189,140 @@ def test_generate_raises_on_silent_model_substitution():
         adapter.generate([{"role": "user", "content": "hi"}])
 
 
+def test_generate_judges_the_pin_by_resolved_model_id():
+    """CAR reports a local model's DISPLAY name in `model_used`, which shares
+    no substring with its catalog id. The pin is judged by `resolved_model_id`,
+    or the router's own choice is rejected (measured: the panel never ran)."""
+    rt = FakeRuntime({"text": "ok", "model_used": "Qwen3-0.6B-MLX",
+                      "resolved_model_id": "mlx/qwen3-0.6b:6bit", "usage": {}})
+    adapter = CarAdapter(model="mlx/qwen3-0.6b:6bit", runtime=rt)
+    assert adapter.generate([{"role": "user", "content": "hi"}]) == "ok"
+
+
+def test_generate_rejects_a_resolved_id_that_is_not_the_pin():
+    """The resolved id is authoritative in both directions: a display name
+    that happens to resemble the pin cannot cover a substituted model."""
+    rt = FakeRuntime({"text": "ok", "model_used": "Qwen3-4B",
+                      "resolved_model_id": "apple/foundation", "usage": {}})
+    adapter = CarAdapter(model="Qwen3-4B", runtime=rt)
+    with pytest.raises(RuntimeError, match="apple/foundation"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
+def test_resolved_id_pin_check_is_exact():
+    """Against the resolved id the match is exact on the name; provider and
+    tag only when the pin states them. Shapes captured live from CAR 0.55."""
+    from neo.adapters import _resolved_id_honors_pin as ok
+
+    assert ok("claude-sonnet-4-6", "anthropic/claude-sonnet-4-6:latest")
+    assert ok("mlx/qwen3-0.6b:6bit", "mlx/qwen3-0.6b:6bit")
+    assert ok("anthropic/claude-opus-4-8", "anthropic/claude-opus-4-8:latest")
+    assert not ok("gpt-5", "openai/gpt-5.5:latest")       # the substitution the fuzzy rule let through
+    assert not ok("mlx/qwen3-0.6b:6bit", "mlx/qwen3-0.6b:4bit")
+    assert not ok("openai/gpt-5.5", "azure/gpt-5.5:latest")
+    assert not ok("", "openai/gpt-5.5")
+
+
+def test_generate_rejects_a_prefix_substitution_by_resolved_id():
+    rt = FakeRuntime({"text": "ok", "model_used": "gpt-5.5",
+                      "resolved_model_id": "openai/gpt-5.5:latest", "usage": {}})
+    adapter = CarAdapter(model="gpt-5", runtime=rt)
+    with pytest.raises(RuntimeError, match=r"openai/gpt-5\.5:latest \(gpt-5\.5\)"):
+        adapter.generate([{"role": "user", "content": "hi"}])
+
+
+class _ExactRuntime:
+    """A runtime exposing `infer_tracked_with_request`, as car-runtime 0.55 does."""
+
+    def __init__(self, response):
+        self.response = response
+        self.requests: list = []
+
+    def infer_tracked(self, *a, **kw):  # pragma: no cover - must not be used
+        raise AssertionError("a catalog-id pin must not take the legacy path")
+
+    def infer_tracked_with_request(self, request_json):
+        self.requests.append(json.loads(request_json))
+        return json.dumps(self.response)
+
+
+def test_a_catalog_id_pin_is_sent_as_model_id():
+    """`provider/name[:tag]` goes through `model_id` — exact, echoed, no
+    alias resolution — never alongside `model` (CAR rejects both)."""
+    pin = "mlx/qwen3-0.6b:6bit"
+    rt = _ExactRuntime({"text": "ok", "model_used": "Qwen3-0.6B-MLX",
+                        "requested_model_id": pin, "resolved_model_id": pin, "usage": {}})
+    adapter = CarAdapter(model=pin, runtime=rt)
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+    assert adapter.generate(msgs, max_tokens=64) == "ok"
+    sent = rt.requests[0]
+    assert sent["model_id"] == pin and "model" not in sent
+    assert sent["messages"] == msgs and sent["prompt"] == "hi"
+    assert sent["params"] == {"max_tokens": 64}
+
+
+def test_a_model_id_pin_requires_an_exact_echo():
+    """Under `model_id` anything but `requested == resolved == pin` is a
+    substitution — including a resolved id the fuzzy rules would accept."""
+    pin = "openai/gpt-5.5-2026-04-23"
+    rt = _ExactRuntime({"text": "ok", "model_used": "gpt-5.5", "usage": {},
+                        "requested_model_id": pin,
+                        "resolved_model_id": "openai/gpt-5.5-2026-05-01"})
+    with pytest.raises(RuntimeError, match="did not honor"):
+        CarAdapter(model=pin, runtime=rt).generate("hi")
+
+
+def test_an_older_daemon_without_model_id_is_named_as_the_cause():
+    """A daemon that predates `model_id` returns no echo at all — the key is
+    absent, not None. That fails closed, but says the DAEMON is stale rather
+    than claiming the pin was substituted (it may have been served exactly)."""
+    pin = "anthropic/claude-sonnet-4-6:latest"
+    rt = _ExactRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
+                        "resolved_model_id": pin, "usage": {}})
+    with pytest.raises(RuntimeError, match="predates `model_id`") as excinfo:
+        CarAdapter(model=pin, runtime=rt).generate("hi")
+    assert "did not honor" not in str(excinfo.value)
+
+
+def test_the_exact_path_sends_no_routing_intent():
+    pin = "anthropic/claude-sonnet-4-6:latest"
+    rt = _ExactRuntime({"text": "ok", "requested_model_id": pin,
+                        "resolved_model_id": pin, "usage": {}})
+    CarAdapter(model=pin, runtime=rt).generate("hi")
+    assert "intent_json" not in rt.requests[0] and "intent" not in rt.requests[0]
+
+
+def test_a_catalog_id_on_a_runtime_without_the_request_call_uses_the_legacy_path():
+    """car-runtime builds without `infer_tracked_with_request` keep `model`."""
+    pin = "anthropic/claude-sonnet-4-6:latest"
+    rt = FakeRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
+                      "resolved_model_id": pin, "usage": {}})
+    assert CarAdapter(model=pin, runtime=rt).generate("hi") == "ok"
+    _, kwargs = rt.calls[0]
+    assert kwargs["model"] == pin
+
+
+def test_a_failed_exact_call_names_the_pin():
+    """Error decoration works on the exact path (`_names_model` escapes "/")."""
+    class _Failing(_ExactRuntime):
+        def infer_tracked_with_request(self, request_json):
+            raise RuntimeError("upstream 503 from some other backend")
+
+    pin = "anthropic/claude-opus-4-8:latest"
+    with pytest.raises(RuntimeError, match=r"anthropic/claude-opus-4-8:latest"):
+        CarAdapter(model=pin, runtime=_Failing({})).generate("hi")
+
+
+def test_a_bare_name_pin_keeps_the_legacy_model_path():
+    """A short name is an alias request; it must not be sent as `model_id`."""
+    rt = FakeRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
+                      "resolved_model_id": "anthropic/claude-sonnet-4-6:latest", "usage": {}})
+    adapter = CarAdapter(model="claude-sonnet-4-6", runtime=rt)
+    assert adapter.generate("hi") == "ok"
+    _, kwargs = rt.calls[0]
+    assert kwargs["model"] == "claude-sonnet-4-6" and "model_id" not in kwargs
+
+
 def test_generate_router_mode_skips_substitution_guard():
     """Router mode (model=None) never enforces a pin, whatever CAR routes to."""
     rt = FakeRuntime({"text": "ok", "model_used": "apple-foundation", "usage": {}})
