@@ -278,21 +278,35 @@ class LearningEpisode:
     memory_mutations: list[MemoryMutationEvidence] = field(default_factory=list)
     memory_candidates: list[MemoryCandidateEvidence] = field(default_factory=list)
 
-    def applied_on_revision(self) -> str:
-        """The revision this episode's accepted change was applied on top of.
+    def applied_on(self, suggestion_id: str) -> tuple[str, str]:
+        """``(base, carrier)`` for this episode's accepted suggestion.
 
-        Read from the first passed `user_acceptance` verification, which
-        records it (`Outcome.applied_on_revision`); "" when there is none, so
-        promotion fails closed rather than falling back to HEAD at ask time.
-        Records written before #254 hold that ask-time HEAD in the same field,
-        which for a change applied in the checkout Neo ran in is the same
-        revision. Promotion's distinct-revision gate and `learning-stats` both
-        read it through here so the two cannot disagree.
+        Base is the revision the change was applied ON TOP OF; carrier is the
+        commit that carried it, "" when it was seen uncommitted. Both "" when
+        unknown, and promotion fails closed on an empty base rather than
+        falling back to HEAD at ask time.
+
+        Recorded per suggestion in ``outcome_details["applied_on"]`` (#254),
+        because one episode can mint several candidates and the first
+        acceptance must not answer for another's. ``outcome_details`` is a
+        free-form dict, so older readers round-trip the key untouched and no
+        schema bump (which quarantines forward records) is needed. An episode
+        written before #254 has no such key; its first passed
+        `user_acceptance` holds HEAD at ask time, which is the base for a
+        change applied in place, and is read as the base with no carrier.
+        Promotion and `learning-stats` both read through here so the two
+        cannot disagree.
         """
+        recorded = self.outcome_details.get("applied_on")
+        if isinstance(recorded, dict):
+            entry = recorded.get(suggestion_id)
+            if isinstance(entry, dict):
+                return str(entry.get("base") or ""), str(entry.get("carrier") or "")
+            return "", ""
         for evidence in self.verification:
             if evidence.kind == "user_acceptance" and evidence.status == "passed":
-                return evidence.repository_revision
-        return ""
+                return evidence.repository_revision, ""
+        return "", ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

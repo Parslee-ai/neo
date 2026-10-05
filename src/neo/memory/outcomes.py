@@ -237,6 +237,10 @@ class Outcome:
     # path since the suggestion. Set for ACCEPTED only; "" means it could not be
     # found, which promotion treats as no evidence (fail closed).
     applied_on_revision: str = ""
+    # The commit that carried the change, when it was found committed; ""
+    # for a change seen uncommitted. Lets promotion recognise a second
+    # acceptance applied ON TOP OF the first one's commit as the same sitting.
+    carrier_revision: str = ""
     retrieved_fact_ids: list[str] = field(default_factory=list)
     used_fact_ids: list[str] = field(default_factory=list)
     candidate_id: str = ""
@@ -260,22 +264,33 @@ def _locate(edited: Path, roots: list[tuple[Path, bool]]) -> Optional[tuple[str,
     because the ledger is shared by every project and resolving each line
     costs several `lstat`s for records that mostly belong elsewhere.
     """
-    forms: list[Optional[Path]] = [edited]
-    for form in forms:
-        for root, own in roots:
-            try:
-                return str(form.relative_to(root)), own
-            except ValueError:
-                continue
-        if len(forms) == 1:
-            resolved = _resolved(edited)
-            if resolved is not None and resolved != edited:
-                forms.append(resolved)
+    found = _relative_to_first(edited, roots)
+    if found is not None:
+        return found
+    resolved = _resolved(edited)
+    if resolved is None or resolved == edited:
+        return None
+    return _relative_to_first(resolved, roots)
+
+
+def _relative_to_first(path: Path, roots: list[tuple[Path, bool]]) -> Optional[tuple[str, bool]]:
+    for root, own in roots:
+        try:
+            return str(path.relative_to(root)), own
+        except ValueError:
+            continue
     return None
 
 
 def _modified_since(path: Path, since_timestamp: float) -> bool:
-    """Was ``path`` written at or after ``since_timestamp``? False when unknown."""
+    """Was ``path`` written at or after ``since_timestamp``? False when unknown.
+
+    Two accepted limits. A file DELETED in a linked worktree has no mtime and
+    never counts, so a suggested deletion made there resolves only once it is
+    committed. A checkout or rebase inside a worktree rewrites mtimes, so a
+    file it touched can read as fresh; the diff-overlap test still has to call
+    it ACCEPTED, so that costs a wrong MODIFIED at worst.
+    """
     try:
         return path.stat().st_mtime >= since_timestamp
     except OSError:
@@ -1419,15 +1434,39 @@ class OutcomeTracker:
             return set()
         return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
-    def _applied_on_revision(
-        self, file_path: str, since_timestamp: float, dirty_roots: dict[str, str]
-    ) -> str:
-        """The revision an applied change was made ON TOP OF.
+    def _classify_applied(self, sugg: dict, diff: str) -> OutcomeType:
+        """ACCEPTED, MODIFIED or UNVERIFIED: does ``diff`` carry ``sugg``?"""
+        suggested_diff = sugg.get("suggested_diff", "")
+        suggested_code = sugg.get("suggested_code", "")
+        if suggested_diff and diff:
+            overlap = self._compute_diff_overlap(suggested_diff, diff)
+            return OutcomeType.ACCEPTED if overlap > 0.3 else OutcomeType.MODIFIED
+        if suggested_code and diff:
+            overlap = self._compute_code_overlap(suggested_code, diff)
+            return (
+                OutcomeType.ACCEPTED
+                if overlap >= CODE_OVERLAP_ACCEPTED_THRESHOLD
+                else OutcomeType.MODIFIED
+            )
+        # Missing suggested_diff or actual diff — can't verify
+        return OutcomeType.UNVERIFIED
 
-        Committed: the parent of the FIRST commit on any local branch touching
-        ``file_path`` since the suggestion. Uncommitted: HEAD of the checkout
-        holding it. "" when neither can be found — never HEAD at ask time,
-        because promotion fails closed on "" and must not be handed a guess.
+    def _applied_on_revision(
+        self, file_path: str, since_timestamp: float, dirty_roots: dict[str, str],
+        sugg: dict,
+    ) -> tuple[str, str]:
+        """``(base, carrier)``: the revision an applied change was made ON TOP
+        OF, and the commit that carried it ("" when seen uncommitted).
+
+        Committed: the parent of the FIRST commit on any local branch since the
+        suggestion whose patch to ``file_path`` CARRIES the suggestion, by the
+        same overlap test that classified it ACCEPTED. Merely touching the path
+        is not enough: an unrelated commit to the same file in the window —
+        likely with several agents on several branches — would otherwise supply
+        its own parent and split one sitting into two bases. Uncommitted: HEAD
+        of the checkout holding it. Base "" when neither can be found — never
+        HEAD at ask time, because promotion fails closed on "" and must not be
+        handed a guess.
 
         This is what promotion's distinct-revision gate compares, and the base
         is the right thing to compare rather than the landing commit. Landing
@@ -1444,7 +1483,7 @@ class OutcomeTracker:
         episode carried one revision and promotion could never fire (#254).
         """
         if not self.codebase_root:
-            return ""
+            return "", ""
         since_iso = datetime.datetime.fromtimestamp(
             since_timestamp, tz=datetime.timezone.utc
         ).isoformat()
@@ -1461,9 +1500,13 @@ class OutcomeTracker:
                 self.codebase_root, "log", "--branches", "HEAD", "--since", since_iso,
                 "--format=%H", "--", file_path,
             )
-            if commits:
-                first = commits.splitlines()[-1].strip()
-                return git(self.codebase_root, "rev-parse", "--verify", "-q", f"{first}^") or ""
+            for sha in reversed((commits or "").splitlines()):
+                patch = git(self.codebase_root, "show", "--format=", sha.strip(),
+                            "--", file_path)
+                if patch and self._classify_applied(sugg, patch) == OutcomeType.ACCEPTED:
+                    base = git(self.codebase_root, "rev-parse", "--verify", "-q",
+                               f"{sha.strip()}^") or ""
+                    return base, sha.strip()
             root = dirty_roots.get(file_path)
             if root is None:
                 # Untracked files are not in any dirty set; a new file Neo
@@ -1475,11 +1518,11 @@ class OutcomeTracker:
                     None,
                 )
             if root is None:
-                return ""
-            return git(root, "rev-parse", "HEAD") or ""
+                return "", ""
+            return git(root, "rev-parse", "HEAD") or "", ""
         except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
             logger.debug(f"applied-on revision lookup failed for {file_path} (non-fatal): {e}")
-            return ""
+            return "", ""
 
     def _get_changed_files_since(
         self, since_timestamp: float, working_tree: Optional[set[str]] = None
@@ -1566,29 +1609,15 @@ class OutcomeTracker:
                 diff = self._get_file_diff_since(
                     normalized, session.timestamp, everywhere=True
                 )
-                suggested_diff = sugg.get("suggested_diff", "")
-                suggested_code = sugg.get("suggested_code", "")
 
                 # Determine if user applied our suggestion or did something different
-                if suggested_diff and diff:
-                    overlap = self._compute_diff_overlap(suggested_diff, diff)
-                    outcome_type = OutcomeType.ACCEPTED if overlap > 0.3 else OutcomeType.MODIFIED
-                elif suggested_code and diff:
-                    overlap = self._compute_code_overlap(suggested_code, diff)
-                    outcome_type = (
-                        OutcomeType.ACCEPTED
-                        if overlap >= CODE_OVERLAP_ACCEPTED_THRESHOLD
-                        else OutcomeType.MODIFIED
-                    )
-                else:
-                    # Missing suggested_diff or actual diff — can't verify
-                    outcome_type = OutcomeType.UNVERIFIED
+                outcome_type = self._classify_applied(sugg, diff)
 
-                applied_on_revision = (
+                applied_on_revision, carrier_revision = (
                     self._applied_on_revision(
-                        normalized, session.timestamp, dirty_roots or {}
+                        normalized, session.timestamp, dirty_roots or {}, sugg
                     )
-                    if outcome_type == OutcomeType.ACCEPTED else ""
+                    if outcome_type == OutcomeType.ACCEPTED else ("", "")
                 )
 
                 outcomes.append(Outcome(
@@ -1601,6 +1630,7 @@ class OutcomeTracker:
                     learning_episode_id=session.learning_episode_id,
                     repository_revision=session.repository_revision,
                     applied_on_revision=applied_on_revision,
+                    carrier_revision=carrier_revision,
                     retrieved_fact_ids=list(session.retrieved_fact_ids),
                     used_fact_ids=list(session.used_fact_ids),
                     candidate_id=sugg.get("candidate_id", ""),

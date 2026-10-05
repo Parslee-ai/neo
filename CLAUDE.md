@@ -50,11 +50,19 @@
     revision. **The revision compared is what the accepted change was APPLIED
     ON TOP OF** (#254): `Outcome.applied_on_revision` — HEAD of the checkout
     holding it uncommitted, or the parent of the FIRST local-branch commit
-    touching the path since the suggestion — is written onto the
-    `user_acceptance` verification, and both the promote path and
-    `learning-stats` read it through `LearningEpisode.applied_on_revision()`,
-    which returns "" (fail closed) when there is none and never falls back to
-    ask-time HEAD. Ask-time HEAD was wrong: a CAR Lattice node answers from a
+    whose patch CARRIES the suggestion (same overlap test as ACCEPTED; merely
+    touching the path let an unrelated sibling commit supply its own parent) —
+    plus `carrier_revision`, that commit. Both are stored PER SUGGESTION in
+    `episode.outcome_details["applied_on"]` (one episode can mint several
+    candidates; a free-form dict, so no schema bump — a bump would make older
+    running neo processes quarantine new records), read through
+    `LearningEpisode.applied_on(suggestion_id)`, which returns "" (fail closed)
+    when absent and never falls back to ask-time HEAD; pre-#254 episodes read
+    their first passed `user_acceptance` revision. Before the span gate,
+    `FactStore._sitting_bases` replaces a base that IS another supporting
+    acceptance's carrier with that acceptance's base, transitively: one lesson
+    committed file by file (A as C1, then B on C1) is one sitting, not two
+    revisions. The promote path and `learning-stats` share it. Ask-time HEAD was wrong: a CAR Lattice node answers from a
     main checkout that sits still while peers commit on their own branches, so
     every episode shared one revision and nothing could promote. **The landing
     commit is ALSO wrong, and was tried first**: shas are unique per commit, so
@@ -65,8 +73,11 @@
     ask-time HEAD in the same field, which equals the base for a change applied
     in place, so no migration. `evaluation.py` sets the field explicitly; any
     new producer of ACCEPTED outcomes must too, or it silently never promotes.
-    Accepted cost: one lesson applied across several files in one sitting
-    lands on ONE base and promotes nothing. **Acceptance detection also reads
+    Accepted costs: one lesson applied across several files in one sitting
+    promotes nothing; and known limits — an uncommitted acceptance takes HEAD
+    at COLLECTION time, so one sitting collected either side of an unrelated
+    commit can still read as two bases, and a dirty-then-committed first
+    application has no carrier to collapse a second application onto. **Acceptance detection also reads
     other checkouts**: every local branch (`--branches`, never `--all` — a
     fetched teammate commit is not an acceptance), every linked worktree's
     dirty files (only those written after the suggestion, since agents keep

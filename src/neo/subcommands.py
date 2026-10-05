@@ -1084,7 +1084,7 @@ def _handle_learning_stats(args) -> None:
             store = LearningEpisodeStore(project_dir.name, base_dir=episodes_root)
             listed = store.list()
             counted_here = 0
-            groups: dict[str, dict[str, str]] = {}
+            applied: dict[str, dict[str, tuple[str, str]]] = {}
             durable_signatures: set[str] = set()
             for episode in listed:
                 if cutoff is not None and float(episode.started_at or 0) < cutoff:
@@ -1098,8 +1098,8 @@ def _handle_learning_stats(args) -> None:
                     if candidate.status not in {"supported_once", "durable"}:
                         continue
                     signature = FactStore._episode_signature(candidate.subject)
-                    groups.setdefault(signature, {}).setdefault(
-                        episode.episode_id, episode.applied_on_revision()
+                    applied.setdefault(signature, {}).setdefault(
+                        episode.episode_id, episode.applied_on(candidate.suggestion_id)
                     )
                     if candidate.status == "durable":
                         durable_signatures.add(signature)
@@ -1108,6 +1108,12 @@ def _handle_learning_stats(args) -> None:
             if counted_here:
                 projects += 1
                 episodes += counted_here
+            # Collapsed exactly as the promote path does, so a sitting it
+            # refuses to count twice is not reported as two revisions here.
+            groups = {
+                signature: FactStore._sitting_bases(by_episode)
+                for signature, by_episode in applied.items()
+            }
             if groups:
                 gate_groups.append((groups, durable_signatures))
 

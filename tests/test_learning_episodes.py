@@ -617,3 +617,21 @@ class TestSuggestionVerifiability:
         eng = self._engine(tmp_path)
         for bogus in ("", "/", "N/A"):
             assert eng._suggestion_is_verifiable(self._sugg(bogus)) is False
+
+
+def test_applied_on_is_per_suggestion_and_fails_closed():
+    """One episode can mint several candidates; the first acceptance must not
+    answer for another's, and a missing entry is unknown, not ask-time HEAD."""
+    from neo.memory.episodes import LearningEpisode, VerificationEvidence
+
+    episode = LearningEpisode(repository_revision="ask-head")
+    episode.verification.append(VerificationEvidence(
+        kind="user_acceptance", status="passed", repository_revision="legacy"))
+    assert episode.applied_on("anything") == ("legacy", "")  # pre-#254 record
+
+    episode.outcome_details["applied_on"] = {"sug-a": {"base": "B", "carrier": "C"}}
+    assert episode.applied_on("sug-a") == ("B", "C")
+    assert episode.applied_on("sug-b") == ("", "")
+
+    reloaded = LearningEpisode.from_dict(episode.to_dict())
+    assert reloaded.applied_on("sug-a") == ("B", "C")

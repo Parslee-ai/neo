@@ -1093,7 +1093,7 @@ class TestOutcomeLinkage:
         assert "probation" not in promoted[0].tags
 
     def _accept_episode(self, store, ep_id, subject, body, kind="pattern",
-                        revision=None, applied_on_revision=None):
+                        revision=None, applied_on_revision=None, carrier_revision=""):
         """Record one ACCEPTED outcome for a fresh episode (drives the real
         detect_implicit_feedback promotion path).
 
@@ -1127,6 +1127,7 @@ class TestOutcomeLinkage:
             candidate_body=body, candidate_kind=kind,
             repository_revision=revision,
             applied_on_revision=applied_on_revision,
+            carrier_revision=carrier_revision,
         )
         with patch.object(store._outcome_tracker, "detect_outcomes",
                           return_value=([outcome], {})):
@@ -1295,6 +1296,33 @@ class TestOutcomeLinkage:
                              revision="2" * 40, applied_on_revision="c" * 40)
 
         assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_a_base_that_is_another_acceptances_carrier_is_one_sitting(self, store):
+        """One lesson applied to file A and committed as C1, then to file B on
+        top of C1: bases H and C1 differ, but C1 is the first application, not
+        a later snapshot the lesson recurred in."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "chain-0", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="h" * 40,
+                             carrier_revision="1" * 40)
+        self._accept_episode(store, "chain-1", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="1" * 40,
+                             carrier_revision="2" * 40)
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_a_lesson_recurring_past_unrelated_work_still_promotes(self, store):
+        """The collapse follows carriers only. A base that moved past the first
+        application through unrelated work is the lesson recurring."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "later-0", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="h" * 40,
+                             carrier_revision="1" * 40)
+        self._accept_episode(store, "later-1", subject, "Reasoning: catch OSError.",
+                             revision="x" * 40, applied_on_revision="x" * 40,
+                             carrier_revision="2" * 40)
+
+        assert len([f for f in store.entries if "episode-derived" in f.tags]) == 1
 
     def test_an_unknown_base_is_not_replaced_by_the_ask_time_head(self, store):
         """A failed lookup records "". Falling back to HEAD at ask time would

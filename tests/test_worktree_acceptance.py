@@ -223,7 +223,9 @@ def test_parallel_worktrees_committing_one_fix_read_as_one_base(repo, tmp_path, 
 
 def test_a_lesson_recurring_after_the_repo_moved_on_reads_as_two_bases(repo, request):
     """What promotion claims: the lesson came up again after the first
-    application had already landed."""
+    application had already landed. Pins the REVISIONS only: the second fix is
+    a different diff, so whether the two correlate as one lesson is the
+    signature's business (test_fact_store), not this test's."""
     first = _suggest(repo, request)
     _apply(repo)
     _git(repo, "commit", "-qm", "first", "--", "src/foo.py")
@@ -264,3 +266,57 @@ def test_ledger_edits_in_a_nested_worktree_attribute_to_the_repo_path(repo, requ
     events = {(path, own) for _, path, own in tracker._load_host_edit_events()}
 
     assert events == {("src/foo.py", False), ("src/bar.py", True)}
+
+
+def test_an_unrelated_commit_to_the_same_file_does_not_supply_the_base(
+        repo, tmp_path, request):
+    """Touching the path is not carrying the fix. A sibling agent's unrelated
+    edit to the same file, on a branch with history of its own, lands between
+    the suggestion and the fix; taking ITS parent split one sitting into two
+    bases. The base must come from the commit whose patch carries the
+    suggestion."""
+    sib = _worktree(repo, tmp_path / "sibling", "sibling")
+    (sib / "src" / "bar.py").write_text("def g():\n    return 7\n")
+    _git(sib, "commit", "-qam", "sibling's own history")
+    time.sleep(TICK)
+    tracker = _suggest(repo, request)
+    asked_at = _git(repo, "rev-parse", "HEAD")
+    (sib / "src" / "foo.py").write_text("# sibling note\ndef f():\n    return 1\n")
+    _git(sib, "commit", "-qam", "unrelated edit to foo")
+    time.sleep(TICK)
+    _apply(repo)
+    _git(repo, "commit", "-qm", "apply", "--", "src/foo.py")
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    accepted = _accepted(outcomes)
+    assert accepted and accepted[0].applied_on_revision == asked_at
+
+
+def test_one_lesson_committed_file_by_file_collapses_to_one_base(repo, request):
+    """Two questions asked at H, the lesson applied to foo.py (C1) and then
+    to bar.py on top of it (C2). Bases H and C1 differ; the carrier links them
+    back into one sitting."""
+    from neo.memory.store import FactStore
+
+    first = _suggest(repo, request)
+    second = OutcomeTracker(codebase_root=str(repo),
+                            project_id=f"wt2-{request.node.name}")
+    bar = _Suggestion("src/bar.py", diff=SUGGESTED_DIFF.replace("foo", "bar"))
+    second.save_session([bar], "make g return 2", {})
+    time.sleep(TICK)
+    _apply(repo)
+    _git(repo, "commit", "-qm", "foo", "--", "src/foo.py")
+    (repo / "src" / "bar.py").write_text("def g():\n    return 2\n")
+    _git(repo, "commit", "-qm", "bar", "--", "src/bar.py")
+
+    a = _accepted(first.detect_outcomes()[0])
+    b = _accepted(second.detect_outcomes()[0])
+
+    assert a and b
+    assert a[0].applied_on_revision != b[0].applied_on_revision
+    bases = FactStore._sitting_bases({
+        "a": (a[0].applied_on_revision, a[0].carrier_revision),
+        "b": (b[0].applied_on_revision, b[0].carrier_revision),
+    })
+    assert bases["a"] == bases["b"]
