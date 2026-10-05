@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.54.1] - 2026-10-05
+
+One fix to the learning loop. Before it, an acceptance made anywhere other than the checkout neo ran in could not count toward promotion, so CAR Lattice peers and worktree-based agent sessions could never teach neo anything durable.
+
+### Fixed
+
+- **Acceptances made in other checkouts never reached promotion.** Neo promotes a suggested pattern to a durable fact only after two git-verified acceptances on two distinct revisions. Two links in that chain broke when the suggestion was applied somewhere other than where neo ran. That is the normal case for a Lattice node, which answers from the main checkout while the asking agent works in a linked worktree on its own branch. ([#254](https://github.com/Parslee-ai/neo/issues/254), [#255](https://github.com/Parslee-ai/neo/pull/255))
+  - **Detection only looked at the main checkout.** A suggested path is now also resolved against every local branch and every linked worktree. A worktree's uncommitted files count only if they were written after the suggestion, since agents keep work in progress uncommitted in the very file they asked about. Host-ledger edits are attributed to the checkout that holds them, so an edit under `.claude/worktrees/x/` matches `src/foo.py`. Remote-tracking branches are excluded, so a teammate's fetched commit is not read as an acceptance. The wider evidence only resolves paths neo suggested; independent-change detection keeps its old scope.
+  - **The distinct-revision gate compared HEAD at ask time.** On a main checkout that sits still while peers commit elsewhere, that is one value forever, so nothing could promote. The gate now compares the revision each accepted change was applied on top of, and acceptances that continue one another count as one sitting. Those are acceptances that share that revision, build on the other's commit, or were committed after being seen uncommitted. One lesson applied file by file, or by parallel agents, therefore still cannot promote itself. The evidence is stored per suggestion in a free-form field of the episode record, so no schema bump makes an older running neo process quarantine new records.
+
 ## [0.54.0] - 2026-10-04
 
 Neo joins the CAR Lattice as a read-only player: other agents on the same CAR daemon can find it by capability and ask it questions, look up project memory, or request reviews. It stays inert until the daemon ships the Lattice API.
