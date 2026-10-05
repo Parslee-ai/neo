@@ -1737,7 +1737,8 @@ class FactStore:
 
         One lesson applied file by file reads as several bases, and the
         distinct-revision gate would promote it. Acceptances are linked into
-        one sitting when one continues the other:
+        one sitting when they share a base (parallel worktrees branched from
+        one revision), or when one continues the other:
 
         * its base IS the other's CARRIER commit — A committed as C1, then B
           applied on C1;
@@ -1749,7 +1750,11 @@ class FactStore:
         Links are resolved as connected components (union-find), so the two
         kinds compose over any chain length and no visit order matters; two
         rounds of case-by-case folding each left a chain that escaped. Every
-        member is labelled with the smallest base in its component. An
+        member is labelled with the smallest base in its component. The
+        shared-base link is what keeps labelling monotonic: without it, two
+        parallel acceptances on H sat in separate components, and a third
+        continuing ONE of them relabelled that component alone, so adding
+        same-sitting evidence made the group promotable. An
         acceptance whose base is unknown ("") is never linked and keeps "",
         which the gate ignores — fail closed.
 
@@ -1773,8 +1778,10 @@ class FactStore:
                 if later == earlier:
                     continue
                 l_base, _, l_parent = applied[later]
-                if (e_carrier and l_base == e_carrier) or (
-                    not e_carrier and l_parent and l_parent == e_base
+                if (
+                    l_base == e_base
+                    or (e_carrier and l_base == e_carrier)
+                    or (not e_carrier and l_parent and l_parent == e_base)
                 ):
                     root[find(later)] = find(earlier)
 

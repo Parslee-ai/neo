@@ -65,8 +65,10 @@
     filled later ONLY from a found carrier (history), never from a dirty
     re-read (HEAD at replay time is a guess). Before the span gate,
     `FactStore._sitting_bases` groups supporting acceptances into SITTINGS as
-    connected components (union-find): linked when one's base IS the other's
-    carrier (A committed as C1, B applied on C1), or one's base's PARENT is
+    connected components (union-find): linked when they share a base (keeps
+    labelling monotonic — without it a third acceptance continuing one of two
+    parallel ones relabelled only its own component and promoted), when one's
+    base IS the other's carrier (A committed as C1, B applied on C1), or one's base's PARENT is
     the other's base and the other was seen uncommitted (A edited at H and
     seen dirty, committed as C1, B on C1 — the usual editor flow, which has no
     carrier; hence the stored `parent`). Each sitting counts as ONE revision.

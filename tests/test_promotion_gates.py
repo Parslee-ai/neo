@@ -156,6 +156,18 @@ class TestSittingBases:
         )
         assert len(set(bases.values())) == 1
 
+    def test_more_same_sitting_evidence_never_splits_a_sitting(self):
+        """Parallel A and B on H, then C continuing A's carrier. Without the
+        shared-base link A's component relabelled to min(H, C1) while B kept
+        H — adding evidence of ONE sitting made it read as two."""
+        for carrier in ("1111", "9999"):
+            bases = FactStore._sitting_bases({
+                "a": ("hhhh", carrier, "pppp"),
+                "b": ("hhhh", "2222", "pppp"),
+                "c": (carrier, "", "hhhh"),
+            })
+            assert len(set(bases.values())) == 1, (carrier, bases)
+
     def test_unrelated_bases_are_untouched(self):
         bases = FactStore._sitting_bases({"a": ("H", "C1", "G"), "b": ("X", "C2", "C1x")})
         assert bases == {"a": "H", "b": "X"}
