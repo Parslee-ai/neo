@@ -1324,6 +1324,26 @@ class TestOutcomeLinkage:
 
         assert len([f for f in store.entries if "episode-derived" in f.tags]) == 1
 
+    def test_a_recorded_base_is_not_overwritten_by_a_replay(self, store):
+        """Fill-once. A replay re-collects after a rebase (new carrier sha) or
+        with HEAD moved under a still-dirty change; overwriting would turn a
+        group the gate refused promotable with no new evidence."""
+        from neo.memory.episodes import LearningEpisodeStore
+
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "once-0", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="h" * 40)
+        replayed = Outcome(
+            outcome_type=OutcomeType.ACCEPTED, file_path="util.py",
+            suggestion_id="once-0-sug", learning_episode_id="once-0",
+            candidate_id="once-0-cand", candidate_subject=subject,
+            applied_on_revision="m" * 40,
+        )
+        store._record_attributed_episode_outcome(replayed)
+
+        episode = LearningEpisodeStore(store.project_id).load("once-0")
+        assert episode.applied_on("once-0-sug")[0] == "h" * 40
+
     def test_an_unknown_base_is_not_replaced_by_the_ask_time_head(self, store):
         """A failed lookup records "". Falling back to HEAD at ask time would
         mix two kinds of revision in one comparison and let them differ."""

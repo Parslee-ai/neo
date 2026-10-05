@@ -278,12 +278,12 @@ class LearningEpisode:
     memory_mutations: list[MemoryMutationEvidence] = field(default_factory=list)
     memory_candidates: list[MemoryCandidateEvidence] = field(default_factory=list)
 
-    def applied_on(self, suggestion_id: str) -> tuple[str, str]:
-        """``(base, carrier)`` for this episode's accepted suggestion.
+    def applied_on(self, suggestion_id: str) -> tuple[str, str, str]:
+        """``(base, carrier, parent)`` for this episode's accepted suggestion.
 
         Base is the revision the change was applied ON TOP OF; carrier is the
-        commit that carried it, "" when it was seen uncommitted. Both "" when
-        unknown, and promotion fails closed on an empty base rather than
+        commit that carried it, "" when it was seen uncommitted; parent is the
+        base's own parent. All "" when unknown, and promotion fails closed on an empty base rather than
         falling back to HEAD at ask time.
 
         Recorded per suggestion in ``outcome_details["applied_on"]`` (#254),
@@ -301,12 +301,16 @@ class LearningEpisode:
         if isinstance(recorded, dict):
             entry = recorded.get(suggestion_id)
             if isinstance(entry, dict):
-                return str(entry.get("base") or ""), str(entry.get("carrier") or "")
-            return "", ""
+                return (
+                    str(entry.get("base") or ""),
+                    str(entry.get("carrier") or ""),
+                    str(entry.get("parent") or ""),
+                )
+            return "", "", ""
         for evidence in self.verification:
             if evidence.kind == "user_acceptance" and evidence.status == "passed":
-                return evidence.repository_revision, ""
-        return "", ""
+                return evidence.repository_revision, "", ""
+        return "", "", ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

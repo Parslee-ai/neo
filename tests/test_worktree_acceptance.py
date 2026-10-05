@@ -316,7 +316,37 @@ def test_one_lesson_committed_file_by_file_collapses_to_one_base(repo, request):
     assert a and b
     assert a[0].applied_on_revision != b[0].applied_on_revision
     bases = FactStore._sitting_bases({
-        "a": (a[0].applied_on_revision, a[0].carrier_revision),
-        "b": (b[0].applied_on_revision, b[0].carrier_revision),
+        o: (x.applied_on_revision, x.carrier_revision, x.applied_on_parent)
+        for o, x in (("a", a[0]), ("b", b[0]))
+    })
+    assert bases["a"] == bases["b"]
+
+
+def test_dirty_first_application_then_commit_collapses_to_one_base(repo, request):
+    """The usual editor flow: A edited at H and seen DIRTY by a run (no
+    carrier), committed as C1, then B applied on top of C1. C1's parent is
+    A's base, which is what folds them into one sitting."""
+    from neo.memory.store import FactStore
+
+    first = _suggest(repo, request)
+    _apply(repo)
+    a = _accepted(first.detect_outcomes()[0])
+    _git(repo, "commit", "-qm", "foo", "--", "src/foo.py")
+    time.sleep(TICK)
+
+    second = OutcomeTracker(codebase_root=str(repo),
+                            project_id=f"wt2-{request.node.name}")
+    bar = _Suggestion("src/bar.py", diff=SUGGESTED_DIFF.replace("foo", "bar"))
+    second.save_session([bar], "make g return 2", {})
+    time.sleep(TICK)
+    (repo / "src" / "bar.py").write_text("def g():\n    return 2\n")
+    _git(repo, "commit", "-qm", "bar", "--", "src/bar.py")
+    b = _accepted(second.detect_outcomes()[0])
+
+    assert a and b and a[0].carrier_revision == ""
+    assert a[0].applied_on_revision != b[0].applied_on_revision
+    bases = FactStore._sitting_bases({
+        o: (x.applied_on_revision, x.carrier_revision, x.applied_on_parent)
+        for o, x in (("a", a[0]), ("b", b[0]))
     })
     assert bases["a"] == bases["b"]

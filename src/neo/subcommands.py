@@ -1084,7 +1084,7 @@ def _handle_learning_stats(args) -> None:
             store = LearningEpisodeStore(project_dir.name, base_dir=episodes_root)
             listed = store.list()
             counted_here = 0
-            applied: dict[str, dict[str, tuple[str, str]]] = {}
+            applied: dict[str, dict[str, tuple[str, str, str]]] = {}
             durable_signatures: set[str] = set()
             for episode in listed:
                 if cutoff is not None and float(episode.started_at or 0) < cutoff:

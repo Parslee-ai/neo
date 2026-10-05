@@ -58,11 +58,18 @@
     running neo processes quarantine new records), read through
     `LearningEpisode.applied_on(suggestion_id)`, which returns "" (fail closed)
     when absent and never falls back to ask-time HEAD; pre-#254 episodes read
-    their first passed `user_acceptance` revision. Before the span gate,
-    `FactStore._sitting_bases` replaces a base that IS another supporting
-    acceptance's carrier with that acceptance's base, transitively: one lesson
-    committed file by file (A as C1, then B on C1) is one sitting, not two
-    revisions. The promote path and `learning-stats` share it. Ask-time HEAD was wrong: a CAR Lattice node answers from a
+    their first passed `user_acceptance` revision. The entry is FILL-ONCE:
+    `replay_linked_feedback` re-collects, and after a rebase (new carrier) or
+    with HEAD moved under a still-dirty change an overwrite would turn a
+    refused group promotable with no new evidence. Before the span gate,
+    `FactStore._sitting_bases` folds a base that continues another supporting
+    acceptance's sitting onto that acceptance's base: a base that IS its
+    carrier (A committed as C1, B applied on C1; transitive), or a base whose
+    PARENT is its base when it was seen uncommitted (A edited at H and seen
+    dirty, committed as C1, B on C1 — the usual editor flow, which has no
+    carrier; hence the stored `parent`). Both fold fail-safe: a real second
+    sitting applied directly on the first's commit waits for a later
+    recurrence. The promote path and `learning-stats` share it. Ask-time HEAD was wrong: a CAR Lattice node answers from a
     main checkout that sits still while peers commit on their own branches, so
     every episode shared one revision and nothing could promote. **The landing
     commit is ALSO wrong, and was tried first**: shas are unique per commit, so
@@ -74,10 +81,9 @@
     in place, so no migration. `evaluation.py` sets the field explicitly; any
     new producer of ACCEPTED outcomes must too, or it silently never promotes.
     Accepted costs: one lesson applied across several files in one sitting
-    promotes nothing; and known limits — an uncommitted acceptance takes HEAD
+    promotes nothing; and a known limit — an uncommitted acceptance takes HEAD
     at COLLECTION time, so one sitting collected either side of an unrelated
-    commit can still read as two bases, and a dirty-then-committed first
-    application has no carrier to collapse a second application onto. **Acceptance detection also reads
+    commit can still read as two bases. **Acceptance detection also reads
     other checkouts**: every local branch (`--branches`, never `--all` — a
     fetched teammate commit is not an acceptance), every linked worktree's
     dirty files (only those written after the suggestion, since agents keep

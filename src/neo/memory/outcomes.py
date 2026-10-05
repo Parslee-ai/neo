@@ -241,6 +241,10 @@ class Outcome:
     # for a change seen uncommitted. Lets promotion recognise a second
     # acceptance applied ON TOP OF the first one's commit as the same sitting.
     carrier_revision: str = ""
+    # The base's own parent. Lets promotion recognise a change applied on top
+    # of a commit that holds an earlier acceptance seen only UNCOMMITTED,
+    # which has no carrier to link it by.
+    applied_on_parent: str = ""
     retrieved_fact_ids: list[str] = field(default_factory=list)
     used_fact_ids: list[str] = field(default_factory=list)
     candidate_id: str = ""
@@ -1454,9 +1458,10 @@ class OutcomeTracker:
     def _applied_on_revision(
         self, file_path: str, since_timestamp: float, dirty_roots: dict[str, str],
         sugg: dict,
-    ) -> tuple[str, str]:
-        """``(base, carrier)``: the revision an applied change was made ON TOP
-        OF, and the commit that carried it ("" when seen uncommitted).
+    ) -> tuple[str, str, str]:
+        """``(base, carrier, base's parent)``: the revision an applied change
+        was made ON TOP OF, the commit that carried it ("" when seen
+        uncommitted), and the base's own parent ("" for a root commit).
 
         Committed: the parent of the FIRST commit on any local branch since the
         suggestion whose patch to ``file_path`` CARRIES the suggestion, by the
@@ -1466,7 +1471,8 @@ class OutcomeTracker:
         its own parent and split one sitting into two bases. Uncommitted: HEAD
         of the checkout holding it. Base "" when neither can be found — never
         HEAD at ask time, because promotion fails closed on "" and must not be
-        handed a guess.
+        handed a guess. A fix spread over several commits, none of which
+        carries it alone, finds no carrier and also fails closed.
 
         This is what promotion's distinct-revision gate compares, and the base
         is the right thing to compare rather than the landing commit. Landing
@@ -1483,7 +1489,7 @@ class OutcomeTracker:
         episode carried one revision and promotion could never fire (#254).
         """
         if not self.codebase_root:
-            return "", ""
+            return "", "", ""
         since_iso = datetime.datetime.fromtimestamp(
             since_timestamp, tz=datetime.timezone.utc
         ).isoformat()
@@ -1494,6 +1500,11 @@ class OutcomeTracker:
                 text=True, encoding="utf-8", errors="replace", timeout=10,
             )
             return result.stdout.strip() if result.returncode == 0 else None
+
+        def with_parent(base: str, carrier: str) -> tuple[str, str, str]:
+            parent = git(self.codebase_root, "rev-parse", "--verify", "-q",
+                         f"{base}^") if base else None
+            return base, carrier, parent or ""
 
         try:
             commits = git(
@@ -1506,7 +1517,7 @@ class OutcomeTracker:
                 if patch and self._classify_applied(sugg, patch) == OutcomeType.ACCEPTED:
                     base = git(self.codebase_root, "rev-parse", "--verify", "-q",
                                f"{sha.strip()}^") or ""
-                    return base, sha.strip()
+                    return with_parent(base, sha.strip())
             root = dirty_roots.get(file_path)
             if root is None:
                 # Untracked files are not in any dirty set; a new file Neo
@@ -1518,11 +1529,11 @@ class OutcomeTracker:
                     None,
                 )
             if root is None:
-                return "", ""
-            return git(root, "rev-parse", "HEAD") or "", ""
+                return "", "", ""
+            return with_parent(git(root, "rev-parse", "HEAD") or "", "")
         except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
             logger.debug(f"applied-on revision lookup failed for {file_path} (non-fatal): {e}")
-            return "", ""
+            return "", "", ""
 
     def _get_changed_files_since(
         self, since_timestamp: float, working_tree: Optional[set[str]] = None
@@ -1613,11 +1624,11 @@ class OutcomeTracker:
                 # Determine if user applied our suggestion or did something different
                 outcome_type = self._classify_applied(sugg, diff)
 
-                applied_on_revision, carrier_revision = (
+                applied_on_revision, carrier_revision, applied_on_parent = (
                     self._applied_on_revision(
                         normalized, session.timestamp, dirty_roots or {}, sugg
                     )
-                    if outcome_type == OutcomeType.ACCEPTED else ("", "")
+                    if outcome_type == OutcomeType.ACCEPTED else ("", "", "")
                 )
 
                 outcomes.append(Outcome(
@@ -1631,6 +1642,7 @@ class OutcomeTracker:
                     repository_revision=session.repository_revision,
                     applied_on_revision=applied_on_revision,
                     carrier_revision=carrier_revision,
+                    applied_on_parent=applied_on_parent,
                     retrieved_fact_ids=list(session.retrieved_fact_ids),
                     used_fact_ids=list(session.used_fact_ids),
                     candidate_id=sugg.get("candidate_id", ""),

@@ -128,24 +128,29 @@ class TestSittingBases:
     """`FactStore._sitting_bases`, shared by the promote path and this report."""
 
     def test_a_base_on_another_carrier_collapses_to_that_base(self):
-        bases = FactStore._sitting_bases({"a": ("H", "C1"), "b": ("C1", "C2")})
+        bases = FactStore._sitting_bases({"a": ("H", "C1", "G"), "b": ("C1", "C2", "H")})
         assert bases == {"a": "H", "b": "H"}
 
     def test_chains_collapse_transitively(self):
         bases = FactStore._sitting_bases(
-            {"a": ("H", "C1"), "b": ("C1", "C2"), "c": ("C2", "C3")}
+            {"a": ("H", "C1", "G"), "b": ("C1", "C2", "H"), "c": ("C2", "C3", "C1")}
         )
         assert set(bases.values()) == {"H"}
 
+    def test_a_commit_on_top_of_a_dirty_acceptance_collapses(self):
+        """A seen dirty at H (no carrier), committed as C1, B applied on C1."""
+        bases = FactStore._sitting_bases({"a": ("H", "", "G"), "b": ("C1", "C2", "H")})
+        assert bases == {"a": "H", "b": "H"}
+
     def test_unrelated_bases_are_untouched(self):
-        bases = FactStore._sitting_bases({"a": ("H", "C1"), "b": ("X", "C2")})
+        bases = FactStore._sitting_bases({"a": ("H", "C1", "G"), "b": ("X", "C2", "C1x")})
         assert bases == {"a": "H", "b": "X"}
 
     def test_a_cycle_terminates(self):
-        bases = FactStore._sitting_bases({"a": ("P", "Q"), "b": ("Q", "P")})
+        bases = FactStore._sitting_bases({"a": ("P", "Q", ""), "b": ("Q", "P", "")})
         assert set(bases) == {"a", "b"}
 
     def test_uncommitted_and_unknown_entries_pass_through(self):
-        assert FactStore._sitting_bases({"a": ("H", ""), "b": ("", "")}) == {
+        assert FactStore._sitting_bases({"a": ("H", "", "G"), "b": ("", "", "")}) == {
             "a": "H", "b": "",
         }
