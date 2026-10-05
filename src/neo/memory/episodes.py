@@ -278,6 +278,40 @@ class LearningEpisode:
     memory_mutations: list[MemoryMutationEvidence] = field(default_factory=list)
     memory_candidates: list[MemoryCandidateEvidence] = field(default_factory=list)
 
+    def applied_on(self, suggestion_id: str) -> tuple[str, str, str]:
+        """``(base, carrier, parent)`` for this episode's accepted suggestion.
+
+        Base is the revision the change was applied ON TOP OF; carrier is the
+        commit that carried it, "" when it was seen uncommitted; parent is the
+        base's own parent. All "" when unknown, and promotion fails closed on an empty base rather than
+        falling back to HEAD at ask time.
+
+        Recorded per suggestion in ``outcome_details["applied_on"]`` (#254),
+        because one episode can mint several candidates and the first
+        acceptance must not answer for another's. ``outcome_details`` is a
+        free-form dict, so older readers round-trip the key untouched and no
+        schema bump (which quarantines forward records) is needed. An episode
+        written before #254 has no such key; its first passed
+        `user_acceptance` holds HEAD at ask time, which is the base for a
+        change applied in place, and is read as the base with no carrier.
+        Promotion and `learning-stats` both read through here so the two
+        cannot disagree.
+        """
+        recorded = self.outcome_details.get("applied_on")
+        if isinstance(recorded, dict):
+            entry = recorded.get(suggestion_id)
+            if isinstance(entry, dict):
+                return (
+                    str(entry.get("base") or ""),
+                    str(entry.get("carrier") or ""),
+                    str(entry.get("parent") or ""),
+                )
+            return "", "", ""
+        for evidence in self.verification:
+            if evidence.kind == "user_acceptance" and evidence.status == "passed":
+                return evidence.repository_revision, "", ""
+        return "", "", ""
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

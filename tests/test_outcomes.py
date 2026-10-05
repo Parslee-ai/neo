@@ -804,7 +804,7 @@ class TestModifiedOutcome:
 
         changed = {"src/bar.py", "src/foo.py"}
 
-        def fake_diff(path, ts):
+        def fake_diff(path, ts, **_):
             if path == "src/bar.py":
                 return ""  # No diff content
             return "+change"

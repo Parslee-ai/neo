@@ -1251,7 +1251,14 @@ class FactStore:
                         else "git_diff_attribution"
                     ),
                     summary=outcome.outcome_type.value,
-                    repository_revision=outcome.repository_revision,
+                    # An acceptance records the revision the change was applied
+                    # on top of, which is what promotion's distinct-revision
+                    # gate compares (#254); "" stays "" and fails closed.
+                    repository_revision=(
+                        outcome.applied_on_revision
+                        if outcome.outcome_type == OutcomeType.ACCEPTED
+                        else outcome.repository_revision
+                    ),
                 ))
             # Strongest signal wins. One neo invocation commonly suggests both a
             # code edit and a review/docs path, and `_dedup_outcomes` keys by
@@ -1292,6 +1299,28 @@ class FactStore:
                     "file_path": outcome.file_path,
                     "repository_revision": outcome.repository_revision,
                 })
+            if (
+                append_verification
+                and outcome.outcome_type == OutcomeType.ACCEPTED
+                and outcome.suggestion_id
+            ):
+                # Fill-once. `replay_linked_feedback` re-collects and records
+                # again; after a rebase the carrier sha changes, and a change
+                # still dirty re-reads a HEAD that has moved, so overwriting
+                # would let a group the gate refused turn promotable with no
+                # new evidence. A recorded UNKNOWN base may be filled later,
+                # but only from a found carrier: history does not move, while a
+                # dirty change's base read at replay time is HEAD then, a guess.
+                applied_on = episode.outcome_details.setdefault("applied_on", {})
+                existing = applied_on.get(outcome.suggestion_id)
+                if not isinstance(existing, dict) or (
+                    not existing.get("base") and outcome.carrier_revision
+                ):
+                    applied_on[outcome.suggestion_id] = {
+                        "base": outcome.applied_on_revision,
+                        "carrier": outcome.carrier_revision,
+                        "parent": outcome.applied_on_parent,
+                    }
             if outcome.outcome_type == OutcomeType.REGRESSION and outcome.diff_summary:
                 episode.outcome_details.update({
                     "evidence_summary": redact_sensitive_text(outcome.diff_summary)[:500],
@@ -1703,6 +1732,70 @@ class FactStore:
             return None
 
     @staticmethod
+    def _sitting_bases(applied: dict[str, tuple[str, str, str]]) -> dict[str, str]:
+        """episode_id -> one revision per SITTING, for the span gate.
+
+        One lesson applied file by file reads as several bases, and the
+        distinct-revision gate would promote it. Acceptances are linked into
+        one sitting when they share a base (parallel worktrees branched from
+        one revision), or when one continues the other:
+
+        * its base IS the other's CARRIER commit — A committed as C1, then B
+          applied on C1;
+        * its base's PARENT is the other's base and the other was seen
+          uncommitted (no carrier) — A edited at H and seen dirty, committed as
+          C1, then B applied on C1: the usual editor flow, where C1 is known
+          only through B.
+
+        Links are resolved as connected components (union-find), so the two
+        kinds compose over any chain length and no visit order matters; two
+        rounds of case-by-case folding each left a chain that escaped. Every
+        member is labelled with the smallest base in its component. The
+        shared-base link is what keeps labelling monotonic: without it, two
+        parallel acceptances on H sat in separate components, and a third
+        continuing ONE of them relabelled that component alone, so adding
+        same-sitting evidence made the group promotable. An
+        acceptance whose base is unknown ("") is never linked and keeps "",
+        which the gate ignores — fail closed.
+
+        Both links fold in the fail-safe direction: a genuine second sitting
+        applied directly on the first's commit — or on a single unrelated
+        commit made on top of a still-uncommitted first application — is
+        folded too, and waits for a later recurrence.
+        """
+        ids = [episode_id for episode_id, (base, _, _) in applied.items() if base]
+        root = {episode_id: episode_id for episode_id in ids}
+
+        def find(node: str) -> str:
+            while root[node] != node:
+                root[node] = root[root[node]]
+                node = root[node]
+            return node
+
+        for earlier in ids:
+            e_base, e_carrier, _ = applied[earlier]
+            for later in ids:
+                if later == earlier:
+                    continue
+                l_base, _, l_parent = applied[later]
+                if (
+                    l_base == e_base
+                    or (e_carrier and l_base == e_carrier)
+                    or (not e_carrier and l_parent and l_parent == e_base)
+                ):
+                    root[find(later)] = find(earlier)
+
+        label: dict[str, str] = {}
+        for episode_id in ids:
+            component = find(episode_id)
+            base = applied[episode_id][0]
+            label[component] = min(label.get(component, base), base)
+        return {
+            episode_id: label[find(episode_id)] if episode_id in root else ""
+            for episode_id in applied
+        }
+
+    @staticmethod
     def _supporting_episodes_span_distinct_revisions(revisions: list[str]) -> bool:
         """Do these supporting episodes come from at least two repo snapshots?
 
@@ -1726,19 +1819,23 @@ class FactStore:
         Two honest limits, chosen deliberately rather than papered over:
 
         * This tests "not the same repository snapshot", which is narrower than
-          independence. The revision is captured when the episode BEGINS — HEAD
-          when the advice was asked for, not the commit the fix landed in — so
-          committing between two attempts satisfies it even though committing
-          only shows that time passed. Keying on the acceptance-carrying sha
-          (already walked by `_get_changed_files_since`) would be strictly
-          better and is the obvious next move.
+          independence. The revisions compared are what each accepted change
+          was APPLIED ON TOP OF (`LearningEpisode.applied_on_revision`: HEAD of
+          the checkout holding it uncommitted, or the parent of the first
+          commit carrying it). Not HEAD at ask time — a CAR Lattice node's main
+          checkout sits still while peers commit on their own branches, so
+          every episode shared one revision and nothing could promote (#254).
+          And not the landing commit — landing shas are unique per commit, so
+          one sitting seen dirty by one run and committed before the next
+          looked like two revisions, and parallel agent worktrees committing
+          the same fix promoted; by base both are one revision.
+          A base that is another supporting acceptance's carrier commit is
+          first folded onto that acceptance's base (`_sitting_bases`), so one
+          lesson committed file by file is still one sitting.
         * It blocks a real flow: applying the same lesson across several files
-          in one sitting and committing once records ONE revision and promotes
-          nothing. 40% of revision-bearing episodes on a live ledger share a HEAD
-          with another, so this is the common shape, not an edge case. Accepted
-          because a delayed durable fact is recoverable and a wrong one needs a
-          contradiction to retract — the same fail-safe direction as the kind
-          gate.
+          in one sitting promotes nothing. Accepted because a delayed durable fact is recoverable and a
+          wrong one needs a contradiction to retract — the same fail-safe
+          direction as the kind gate.
         """
         return len({revision for revision in revisions if revision}) >= 2
 
@@ -1753,9 +1850,9 @@ class FactStore:
                 self.project_id or "unscoped", base_dir=self._episodes_dir
             )
             target_signature = self._episode_signature(outcome.candidate_subject)
-            # episode_id -> repository_revision. Keyed by episode so the
+            # episode_id -> (base, carrier, parent). Keyed by episode so the
             # independence evidence stays aligned with the deduped id list.
-            supporting: dict[str, str] = {}
+            supporting: dict[str, tuple[str, str, str]] = {}
             for episode in episode_store.list():
                 for candidate in episode.memory_candidates:
                     if candidate.kind != FactKind.PATTERN.value:
@@ -1765,7 +1862,8 @@ class FactStore:
                     signature = self._episode_signature(candidate.subject)
                     if signature == target_signature:
                         supporting.setdefault(
-                            episode.episode_id, episode.repository_revision
+                            episode.episode_id,
+                            episode.applied_on(candidate.suggestion_id),
                         )
                         break
 
@@ -1773,7 +1871,7 @@ class FactStore:
             if len(supporting_ids) < 2:
                 return None
             if not self._supporting_episodes_span_distinct_revisions(
-                list(supporting.values())
+                list(self._sitting_bases(supporting).values())
             ):
                 return None
 

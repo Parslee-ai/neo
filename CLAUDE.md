@@ -47,13 +47,60 @@
     anyway. Its only reachable trigger was a transient `rev-parse` failure, which
     made BOTH failing promote while ONE failing blocked — load-dependent
     non-determinism in the durable memory path. It now fails closed on a blank
-    revision. Two accepted costs, documented on the predicate: the revision is
-    captured when the episode BEGINS (HEAD when advice was asked for, not the
-    commit the fix landed in), and applying one lesson across several files in a
-    single sitting records ONE revision and promotes nothing (40% of
-    revision-bearing episodes share a HEAD with another). Keying on the
-    acceptance-carrying sha — already walked by `_get_changed_files_since` — is
-    the obvious improvement. That
+    revision. **The revision compared is what the accepted change was APPLIED
+    ON TOP OF** (#254): `Outcome.applied_on_revision` — HEAD of the checkout
+    holding it uncommitted, or the parent of the FIRST local-branch commit
+    whose patch CARRIES the suggestion (same overlap test as ACCEPTED; merely
+    touching the path let an unrelated sibling commit supply its own parent) —
+    plus `carrier_revision`, that commit. Both are stored PER SUGGESTION in
+    `episode.outcome_details["applied_on"]` (one episode can mint several
+    candidates; a free-form dict, so no schema bump — a bump would make older
+    running neo processes quarantine new records), read through
+    `LearningEpisode.applied_on(suggestion_id)`, which returns "" (fail closed)
+    when absent and never falls back to ask-time HEAD; pre-#254 episodes read
+    their first passed `user_acceptance` revision. The entry is FILL-ONCE:
+    `replay_linked_feedback` re-collects, and after a rebase (new carrier) or
+    with HEAD moved under a still-dirty change an overwrite would turn a
+    refused group promotable with no new evidence; a recorded "" base may be
+    filled later ONLY from a found carrier (history), never from a dirty
+    re-read (HEAD at replay time is a guess). Before the span gate,
+    `FactStore._sitting_bases` groups supporting acceptances into SITTINGS as
+    connected components (union-find): linked when they share a base (keeps
+    labelling monotonic — without it a third acceptance continuing one of two
+    parallel ones relabelled only its own component and promoted), when one's
+    base IS the other's carrier (A committed as C1, B applied on C1), or one's base's PARENT is
+    the other's base and the other was seen uncommitted (A edited at H and
+    seen dirty, committed as C1, B on C1 — the usual editor flow, which has no
+    carrier; hence the stored `parent`). Each sitting counts as ONE revision.
+    **Components, not case-by-case folding**: two rounds of ordered folds each
+    left a chain that escaped (a dirty B on a dirty A's commit; a parent link
+    followed by a carrier link). Folding is fail-safe: a real second sitting
+    applied directly on the first's commit, or on one unrelated commit atop a
+    still-uncommitted first application, is grouped too and waits for a later
+    recurrence. The promote path and `learning-stats` share it. Ask-time HEAD was wrong: a CAR Lattice node answers from a
+    main checkout that sits still while peers commit on their own branches, so
+    every episode shared one revision and nothing could promote. **The landing
+    commit is ALSO wrong, and was tried first**: shas are unique per commit, so
+    one sitting seen dirty by one run (H) and committed before the next (C)
+    read as two revisions and promoted — the exact same-operator case the gate
+    exists for. By base both are H, and parallel worktrees branched from one
+    base committing one fix both read that base. Pre-#254 verifications hold
+    ask-time HEAD in the same field, which equals the base for a change applied
+    in place, so no migration. `evaluation.py` sets the field explicitly; any
+    new producer of ACCEPTED outcomes must too, or it silently never promotes.
+    Accepted costs: one lesson applied across several files in one sitting
+    promotes nothing; and a known limit — an uncommitted acceptance takes HEAD
+    at COLLECTION time, so one sitting collected either side of an unrelated
+    commit can still read as two bases. **Acceptance detection also reads
+    other checkouts**: every local branch (`--branches`, never `--all` — a
+    fetched teammate commit is not an acceptance), every linked worktree's
+    dirty files (only those written after the suggestion, since agents keep
+    work in progress uncommitted in the very file they asked about), untracked
+    files and host-ledger edits (attributed to the deepest checkout holding the
+    path). That wider evidence only resolves paths Neo SUGGESTED; INDEPENDENT
+    detection stays on the checkout's own HEAD and tree, or every agent
+    worktree's edits would become candidates, each costing a diff fork. Separate
+    clones share no refs and stay invisible. That
     signature is keyed on the candidate SUBJECT, never the body — the body is the
     LM's run-varying Reasoning/Suggestion prose, and including it (the old
     `generalize(subject+body)`) gave two acceptances of one task different
