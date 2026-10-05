@@ -265,13 +265,52 @@ def test_a_model_id_pin_requires_an_exact_echo():
     """Under `model_id` anything but `requested == resolved == pin` is a
     substitution — including a resolved id the fuzzy rules would accept."""
     pin = "openai/gpt-5.5-2026-04-23"
-    for response in (
-        {"requested_model_id": pin, "resolved_model_id": "openai/gpt-5.5-2026-05-01"},
-        {"requested_model_id": None, "resolved_model_id": pin},
-    ):
-        rt = _ExactRuntime({"text": "ok", "model_used": "gpt-5.5", "usage": {}, **response})
-        with pytest.raises(RuntimeError, match="did not honor"):
-            CarAdapter(model=pin, runtime=rt).generate("hi")
+    rt = _ExactRuntime({"text": "ok", "model_used": "gpt-5.5", "usage": {},
+                        "requested_model_id": pin,
+                        "resolved_model_id": "openai/gpt-5.5-2026-05-01"})
+    with pytest.raises(RuntimeError, match="did not honor"):
+        CarAdapter(model=pin, runtime=rt).generate("hi")
+
+
+def test_an_older_daemon_without_model_id_is_named_as_the_cause():
+    """A daemon that predates `model_id` returns no echo at all — the key is
+    absent, not None. That fails closed, but says the DAEMON is stale rather
+    than claiming the pin was substituted (it may have been served exactly)."""
+    pin = "anthropic/claude-sonnet-4-6:latest"
+    rt = _ExactRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
+                        "resolved_model_id": pin, "usage": {}})
+    with pytest.raises(RuntimeError, match="predates `model_id`") as excinfo:
+        CarAdapter(model=pin, runtime=rt).generate("hi")
+    assert "did not honor" not in str(excinfo.value)
+
+
+def test_the_exact_path_sends_no_routing_intent():
+    pin = "anthropic/claude-sonnet-4-6:latest"
+    rt = _ExactRuntime({"text": "ok", "requested_model_id": pin,
+                        "resolved_model_id": pin, "usage": {}})
+    CarAdapter(model=pin, runtime=rt).generate("hi")
+    assert "intent_json" not in rt.requests[0] and "intent" not in rt.requests[0]
+
+
+def test_a_catalog_id_on_a_runtime_without_the_request_call_uses_the_legacy_path():
+    """car-runtime builds without `infer_tracked_with_request` keep `model`."""
+    pin = "anthropic/claude-sonnet-4-6:latest"
+    rt = FakeRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
+                      "resolved_model_id": pin, "usage": {}})
+    assert CarAdapter(model=pin, runtime=rt).generate("hi") == "ok"
+    _, kwargs = rt.calls[0]
+    assert kwargs["model"] == pin
+
+
+def test_a_failed_exact_call_names_the_pin():
+    """Error decoration works on the exact path (`_names_model` escapes "/")."""
+    class _Failing(_ExactRuntime):
+        def infer_tracked_with_request(self, request_json):
+            raise RuntimeError("upstream 503 from some other backend")
+
+    pin = "anthropic/claude-opus-4-8:latest"
+    with pytest.raises(RuntimeError, match=r"anthropic/claude-opus-4-8:latest"):
+        CarAdapter(model=pin, runtime=_Failing({})).generate("hi")
 
 
 def test_a_bare_name_pin_keeps_the_legacy_model_path():

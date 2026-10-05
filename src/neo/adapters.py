@@ -1190,14 +1190,19 @@ class CarAdapter(LMAdapter):
         # takes the legacy `model` path, where CAR may resolve it as an alias.
         # `infer_tracked` has no `model_id` keyword, so the exact pin goes
         # through `infer_tracked_with_request`; a runtime without it keeps the
-        # legacy path.
+        # legacy path. The "/" test is the catalog contract's own shape, so a
+        # Hugging Face style name (`Qwen/Qwen3-4B`) is treated as a catalog id
+        # too and fails loudly as `model not found` if it is not one — which
+        # is the panel's case anyway, since CAR's router returns catalog ids.
         exact_pin = (
             bool(self.model) and "/" in self.model
             and hasattr(self._rt, "infer_tracked_with_request")
         )
         if self.model and not exact_pin:
             kwargs["model"] = self.model
-        if self.intent_hint is not None:
+        # The intent only steers ROUTING, which an exact `model_id` pin
+        # bypasses, so the exact path does not send it.
+        if self.intent_hint is not None and not exact_pin:
             # CAR expects intent_json as a JSON string, not a dict.
             kwargs["intent_json"] = json.dumps(self.intent_hint)
 
@@ -1215,7 +1220,10 @@ class CarAdapter(LMAdapter):
             model=self.model or "router",
             input_shape=input_shape,
             max_tokens=int(max_tokens),
-            intent_task=(self.intent_hint or {}).get("task") if self.intent_hint else None,
+            intent_task=(
+                (self.intent_hint or {}).get("task")
+                if self.intent_hint and not exact_pin else None
+            ),
         ):
             try:
                 if exact_pin:
@@ -1314,6 +1322,17 @@ class CarAdapter(LMAdapter):
         if exact_pin:
             # The `model_id` contract: CAR echoes the pin and serves that row.
             # Nothing to parse — anything but an exact echo is a substitution.
+            # No echo at all means a daemon older than this binding, which
+            # ignored `model_id` and routed freely. Client/daemon skew is the
+            # normal state here (CarHost updates on its own schedule), so say
+            # THAT rather than blame the pin for a substitution it may not be.
+            if not result.get("requested_model_id"):
+                raise RuntimeError(
+                    f"CAR daemon did not acknowledge exact pin '{self.model}' "
+                    f"(no requested_model_id in its response; it served "
+                    f"'{resolved or model_used or 'unknown'}'). The daemon predates "
+                    f"`model_id` pinning — update CarHost."
+                )
             honored = result.get("requested_model_id") == self.model == resolved
         else:
             honored = (
