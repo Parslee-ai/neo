@@ -1772,9 +1772,10 @@
   retry proved them, so a call that then failed (a context-length 400 whose text
   mentioned temperature) left a false `drop_temperature` on disk. **When the 400
   carries a structured `body.param`, only the field equal to it can match and the
-  message is not read** (message text is the fallback only when there is no
-  `param`: Anthropic, Google, client-side TypeError); a message that merely
-  mentions a field is not a rejection of it. Never a blanket
+  message cannot match a different field** (message text is the fallback only
+  when there is no `param`: Anthropic, Google, client-side TypeError; for a
+  rename field it is still read after `param` matches, where it can only veto);
+  a message that merely mentions a field is not a rejection of it. Never a blanket
   strip-and-retry, and anything that is not a rejection of a sent field (auth,
   429, another 400, an unrelated TypeError) re-raises untouched. Bounded by
   construction: each recovery removes a field, renames it away or lowers a level,
@@ -1790,17 +1791,27 @@
   `max_reasoning.effort:<level>` only once the call succeeds) from "this field is unsupported" (`unsupported_parameter` or None —
   `temperature`'s code is None, so `code` alone can never recognise an unsupported
   field). **A rejected level is never evidence that effort is unsupported, and only
-  a lower level that was ACCEPTED can prove a cap.** Live, `gpt-6.1-sol`, `gpt-5`
-  and `o3` refuse level `none` with `unsupported_value` while accepting `xhigh`;
+  a lower level that was ACCEPTED can prove a cap.** Live, `gpt-6.1-sol` refuses
+  level `none` with `unsupported_value` while accepting `xhigh` (its range is
+  `low`..`xhigh`; `gpt-5` and `o3` also refuse `none` but top out at `high`);
   the walk used to persist `drop_reasoning.effort` at the bottom, after which every
   later `xhigh` request silently ran at the provider default. A walk that reaches
   the bottom now removes effort for THAT call (`bottom_<field>` flag) and persists
   no effort flag at all; only `unsupported_parameter` (what `gpt-4o-mini` returns)
   persists `drop_reasoning.effort`, and only after the retry succeeds. Known
-  limit: a model that accepts a single level (say only `high`) asked for a lower
-  one walks to the bottom, runs at the provider default for that call, and pays
-  that discovery on every such call, because nothing false is ever written to
-  disk. `stop_sequences` is sent but not droppable: no provider is known to reject
+  limit: a model whose FLOOR is above the requested level walks to the bottom,
+  runs at the provider default for that call, and pays that discovery on every
+  such call, because nothing false is ever written to disk. That is not only the
+  single-level case (`gpt-5-pro` accepts just `high`): `gpt-5.2-pro`,
+  `gpt-5.4-pro` and `gpt-5.5-pro` accept `medium`..`xhigh`, and the selector does
+  ask for `low` on familiar queries (measured: 3 requests per such call, run at
+  `medium`). A cap also assumes levels are contiguous, which held for all 30
+  models probed; a model with a gap could learn a cap that is too low. Two more
+  accepted limits, neither reachable from Neo's own callers: every `code` other
+  than the two level codes is read as "field unsupported", so an out-of-range
+  value Neo never sends (`temperature=5`) would be remembered as a drop if the
+  retry succeeds; and support that depends on another field is recorded as
+  unconditional (`gpt-5.1`/`gpt-5.2` accept `temperature` only at effort `none`). `stop_sequences` is sent but not droppable: no provider is known to reject
   it. **`provider=openai` with a custom `base_url` now requires a server that
   implements the responses endpoint**; `provider=local` is the route for
   OpenAI-compatible servers that speak only chat completions.

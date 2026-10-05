@@ -1246,7 +1246,10 @@ Cap with `NEO_REASONING_EFFORT={none,low,medium,high,xhigh}` for cost control.
 > without `reasoning.effort` has it dropped, and a model that tops out lower
 > (older `gpt-5-codex` stops at `high`) is stepped down one level at a time.
 > Either way the retry is paid once per model and remembered in
-> `~/.neo/model_param_compat.json`. `NEO_REASONING_EFFORT` still caps the
+> `~/.neo/model_param_compat.json`. The exception is a model whose lowest level
+> is above the one requested (some `-pro` models start at `medium`): nothing can
+> be learned safely from that, so the call runs at the provider default and the
+> extra rejected requests recur each time. `NEO_REASONING_EFFORT` still caps the
 > auto-selector if you want a lower ceiling for cost.
 
 ### Architectural Quality Feedback Loop

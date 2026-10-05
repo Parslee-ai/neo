@@ -230,10 +230,11 @@ def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
 
     A field is only ever named by the rejection itself: the SDK refusing the
     keyword at the signature (TypeError), or an HTTP 400. When the 400 carries
-    a structured `param` (OpenAI), only the field equal to it can match and the
-    message is never read, since a message that merely mentions a field is not
-    a rejection of it; the message is the fallback only when there is no
-    `param` (Anthropic, Google). `code` separates the two shapes that name the
+    a structured `param` (OpenAI), only the field equal to it can match, since
+    a message that merely mentions a field is not a rejection of it; the
+    message is the fallback only when there is no `param` (Anthropic, Google),
+    and for a rename field it is still read after `param` matches, where it
+    can only veto. `code` separates the two shapes that name the
     same ladder field: `unsupported_value` (a level this model does not offer)
     or `invalid_value` (a level outside the known vocabulary) means the field
     exists and the LEVEL is the problem (step down); anything else means the
