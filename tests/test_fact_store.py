@@ -1344,6 +1344,28 @@ class TestOutcomeLinkage:
         episode = LearningEpisodeStore(store.project_id).load("once-0")
         assert episode.applied_on("once-0-sug")[0] == "h" * 40
 
+    def test_an_unknown_base_is_filled_only_from_a_found_carrier(self, store):
+        """A replay may fill a recorded "" — but a dirty change's base read at
+        replay time is HEAD THEN, a guess; only a carrier commit is history."""
+        from neo.memory.episodes import LearningEpisodeStore
+
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "fill-0", subject, "R.",
+                             revision="h" * 40, applied_on_revision="")
+
+        def replay(base, carrier):
+            store._record_attributed_episode_outcome(Outcome(
+                outcome_type=OutcomeType.ACCEPTED, file_path="util.py",
+                suggestion_id="fill-0-sug", learning_episode_id="fill-0",
+                candidate_id="fill-0-cand", candidate_subject=subject,
+                applied_on_revision=base, carrier_revision=carrier,
+            ))
+            return LearningEpisodeStore(store.project_id).load("fill-0").applied_on(
+                "fill-0-sug")
+
+        assert replay("d" * 40, "")[0] == ""            # dirty guess refused
+        assert replay("b" * 40, "c" * 40)[:2] == ("b" * 40, "c" * 40)
+
     def test_an_unknown_base_is_not_replaced_by_the_ask_time_head(self, store):
         """A failed lookup records "". Falling back to HEAD at ask time would
         mix two kinds of revision in one comparison and let them differ."""

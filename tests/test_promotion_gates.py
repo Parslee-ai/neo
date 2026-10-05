@@ -129,18 +129,32 @@ class TestSittingBases:
 
     def test_a_base_on_another_carrier_collapses_to_that_base(self):
         bases = FactStore._sitting_bases({"a": ("H", "C1", "G"), "b": ("C1", "C2", "H")})
-        assert bases == {"a": "H", "b": "H"}
+        assert bases["a"] == bases["b"]
 
     def test_chains_collapse_transitively(self):
         bases = FactStore._sitting_bases(
             {"a": ("H", "C1", "G"), "b": ("C1", "C2", "H"), "c": ("C2", "C3", "C1")}
         )
-        assert set(bases.values()) == {"H"}
+        assert len(set(bases.values())) == 1
 
     def test_a_commit_on_top_of_a_dirty_acceptance_collapses(self):
         """A seen dirty at H (no carrier), committed as C1, B applied on C1."""
         bases = FactStore._sitting_bases({"a": ("H", "", "G"), "b": ("C1", "C2", "H")})
-        assert bases == {"a": "H", "b": "H"}
+        assert bases["a"] == bases["b"]
+
+    def test_a_dirty_second_application_on_a_dirty_firsts_commit_collapses(self):
+        """Both caught uncommitted: A dirty at H, committed as C1, B dirty on
+        C1. A guard that also tested B's own base let this through."""
+        bases = FactStore._sitting_bases({"a": ("H", "", "G"), "b": ("C1", "", "H")})
+        assert bases["a"] == bases["b"]
+
+    def test_parent_and_carrier_links_compose(self):
+        """A dirty at H; B on C1 (parent H) carried by C2; C on C2. Resolving
+        each link kind once, in order, left C on its own base."""
+        bases = FactStore._sitting_bases(
+            {"a": ("H", "", "G"), "b": ("C1", "C2", "H"), "c": ("C2", "C3", "C1")}
+        )
+        assert len(set(bases.values())) == 1
 
     def test_unrelated_bases_are_untouched(self):
         bases = FactStore._sitting_bases({"a": ("H", "C1", "G"), "b": ("X", "C2", "C1x")})
@@ -154,3 +168,9 @@ class TestSittingBases:
         assert FactStore._sitting_bases({"a": ("H", "", "G"), "b": ("", "", "")}) == {
             "a": "H", "b": "",
         }
+
+    def test_an_unknown_base_is_never_linked(self):
+        """"" must not join a component: an empty carrier on one side and an
+        empty parent on the other would otherwise match each other."""
+        bases = FactStore._sitting_bases({"a": ("", "", ""), "b": ("X", "", "")})
+        assert bases == {"a": "", "b": "X"}

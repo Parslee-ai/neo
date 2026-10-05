@@ -61,14 +61,20 @@
     their first passed `user_acceptance` revision. The entry is FILL-ONCE:
     `replay_linked_feedback` re-collects, and after a rebase (new carrier) or
     with HEAD moved under a still-dirty change an overwrite would turn a
-    refused group promotable with no new evidence. Before the span gate,
-    `FactStore._sitting_bases` folds a base that continues another supporting
-    acceptance's sitting onto that acceptance's base: a base that IS its
-    carrier (A committed as C1, B applied on C1; transitive), or a base whose
-    PARENT is its base when it was seen uncommitted (A edited at H and seen
-    dirty, committed as C1, B on C1 — the usual editor flow, which has no
-    carrier; hence the stored `parent`). Both fold fail-safe: a real second
-    sitting applied directly on the first's commit waits for a later
+    refused group promotable with no new evidence; a recorded "" base may be
+    filled later ONLY from a found carrier (history), never from a dirty
+    re-read (HEAD at replay time is a guess). Before the span gate,
+    `FactStore._sitting_bases` groups supporting acceptances into SITTINGS as
+    connected components (union-find): linked when one's base IS the other's
+    carrier (A committed as C1, B applied on C1), or one's base's PARENT is
+    the other's base and the other was seen uncommitted (A edited at H and
+    seen dirty, committed as C1, B on C1 — the usual editor flow, which has no
+    carrier; hence the stored `parent`). Each sitting counts as ONE revision.
+    **Components, not case-by-case folding**: two rounds of ordered folds each
+    left a chain that escaped (a dirty B on a dirty A's commit; a parent link
+    followed by a carrier link). Folding is fail-safe: a real second sitting
+    applied directly on the first's commit, or on one unrelated commit atop a
+    still-uncommitted first application, is grouped too and waits for a later
     recurrence. The promote path and `learning-stats` share it. Ask-time HEAD was wrong: a CAR Lattice node answers from a
     main checkout that sits still while peers commit on their own branches, so
     every episode shared one revision and nothing could promote. **The landing

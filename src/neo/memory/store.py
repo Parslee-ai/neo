@@ -1308,10 +1308,14 @@ class FactStore:
                 # again; after a rebase the carrier sha changes, and a change
                 # still dirty re-reads a HEAD that has moved, so overwriting
                 # would let a group the gate refused turn promotable with no
-                # new evidence. Only an unknown base may be filled later.
+                # new evidence. A recorded UNKNOWN base may be filled later,
+                # but only from a found carrier: history does not move, while a
+                # dirty change's base read at replay time is HEAD then, a guess.
                 applied_on = episode.outcome_details.setdefault("applied_on", {})
                 existing = applied_on.get(outcome.suggestion_id)
-                if not (isinstance(existing, dict) and existing.get("base")):
+                if not isinstance(existing, dict) or (
+                    not existing.get("base") and outcome.carrier_revision
+                ):
                     applied_on[outcome.suggestion_id] = {
                         "base": outcome.applied_on_revision,
                         "carrier": outcome.carrier_revision,
@@ -1729,41 +1733,60 @@ class FactStore:
 
     @staticmethod
     def _sitting_bases(applied: dict[str, tuple[str, str, str]]) -> dict[str, str]:
-        """episode_id -> base, with bases that continue another supporting
-        acceptance's sitting folded onto that acceptance's base.
+        """episode_id -> one revision per SITTING, for the span gate.
 
-        One lesson applied file by file reads as two bases unless folded, and
-        the distinct-revision gate would promote it. Two links are followed:
+        One lesson applied file by file reads as several bases, and the
+        distinct-revision gate would promote it. Acceptances are linked into
+        one sitting when one continues the other:
 
-        * A base that IS another acceptance's CARRIER commit: A committed as C1,
-          then B applied on C1. C1 is the first application, not a later
-          snapshot the lesson recurred in. Followed transitively, with a
-          visited set so a malformed cycle cannot loop.
-        * A base whose PARENT is another acceptance's base when that one was
-          seen uncommitted (no carrier): the usual editor flow — A edited at H
-          and seen dirty, committed as C1, B applied on C1. A's carrier is
-          unknown, so C1's parent H is what links them.
+        * its base IS the other's CARRIER commit — A committed as C1, then B
+          applied on C1;
+        * its base's PARENT is the other's base and the other was seen
+          uncommitted (no carrier) — A edited at H and seen dirty, committed as
+          C1, then B applied on C1: the usual editor flow, where C1 is known
+          only through B.
 
-        Both fold in the fail-safe direction. A genuine second sitting applied
-        directly on the first one's commit, with nothing in between, is folded
-        too and simply waits for a later recurrence. A base that moved past
-        the first application through unrelated work still counts as distinct:
-        that is the lesson recurring after the repository moved on.
+        Links are resolved as connected components (union-find), so the two
+        kinds compose over any chain length and no visit order matters; two
+        rounds of case-by-case folding each left a chain that escaped. Every
+        member is labelled with the smallest base in its component. An
+        acceptance whose base is unknown ("") is never linked and keeps "",
+        which the gate ignores — fail closed.
+
+        Both links fold in the fail-safe direction: a genuine second sitting
+        applied directly on the first's commit — or on a single unrelated
+        commit made on top of a still-uncommitted first application — is
+        folded too, and waits for a later recurrence.
         """
-        carried_from = {
-            carrier: base for base, carrier, _ in applied.values() if carrier and base
+        ids = [episode_id for episode_id, (base, _, _) in applied.items() if base]
+        root = {episode_id: episode_id for episode_id in ids}
+
+        def find(node: str) -> str:
+            while root[node] != node:
+                root[node] = root[root[node]]
+                node = root[node]
+            return node
+
+        for earlier in ids:
+            e_base, e_carrier, _ = applied[earlier]
+            for later in ids:
+                if later == earlier:
+                    continue
+                l_base, _, l_parent = applied[later]
+                if (e_carrier and l_base == e_carrier) or (
+                    not e_carrier and l_parent and l_parent == e_base
+                ):
+                    root[find(later)] = find(earlier)
+
+        label: dict[str, str] = {}
+        for episode_id in ids:
+            component = find(episode_id)
+            base = applied[episode_id][0]
+            label[component] = min(label.get(component, base), base)
+        return {
+            episode_id: label[find(episode_id)] if episode_id in root else ""
+            for episode_id in applied
         }
-        dirty_bases = {base for base, carrier, _ in applied.values() if base and not carrier}
-        bases: dict[str, str] = {}
-        for episode_id, (base, _carrier, parent) in applied.items():
-            if parent and parent in dirty_bases and base not in dirty_bases:
-                base = parent
-            seen: set[str] = set()
-            while base in carried_from and base not in seen:
-                seen.add(base)
-                base = carried_from[base]
-            bases[episode_id] = base
-        return bases
 
     @staticmethod
     def _supporting_episodes_span_distinct_revisions(revisions: list[str]) -> bool:
