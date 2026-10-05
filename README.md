@@ -1226,7 +1226,7 @@ After each Neo run, the next invocation diffs your repo against the suggestions 
 
 **Neo improves over time as it learns from experience.** Initial performance depends on available facts. Performance grows as the semantic memory builds up successful solutions, failure learnings, and architectural decisions.
 
-### Memory-Driven Reasoning Effort (gpt-5* models)
+### Memory-Driven Reasoning Effort (OpenAI models)
 
 Neo monetizes its learning into inference cost. Each query's `reasoning.effort`
 parameter is sized from the strength of the memory hit:
@@ -1241,10 +1241,16 @@ parameter is sized from the strength of the memory hit:
 Familiar queries get cheap thinking; novel-and-hard queries get max thinking.
 Cap with `NEO_REASONING_EFFORT={none,low,medium,high,xhigh}` for cost control.
 
-> **Model note:** the effort vocabulary differs by model. gpt-5.6 (the default)
-> accepts the full `none / low / medium / high / xhigh` range. Older
-> `gpt-5-codex` only accepts `low / medium / high` — if you switch back to
-> that model, set `NEO_REASONING_EFFORT=high` to cap the auto-selector.
+> **Model note:** the effort vocabulary differs by model. Neo sends the chosen
+> level to every OpenAI model and learns from the API's own rejection: a model
+> without `reasoning.effort` has it dropped, and a model that tops out lower
+> (older `gpt-5-codex` stops at `high`) is stepped down one level at a time.
+> Either way the retry is paid once per model and remembered in
+> `~/.neo/model_param_compat.json`. The exception is a model whose lowest level
+> is above the one requested (some `-pro` models start at `medium`): nothing can
+> be learned safely from that, so the call runs at the provider default and the
+> extra rejected requests recur each time. `NEO_REASONING_EFFORT` still caps the
+> auto-selector if you want a lower ceiling for cost.
 
 ### Architectural Quality Feedback Loop
 
@@ -1401,8 +1407,10 @@ adapter = OpenAIAdapter(model="gpt-5.6", api_key="sk-...")
 Neo's configured default model is `gpt-5.6` (`NeoConfig.model`), which is what
 the CLI uses. Constructing an adapter directly without a `model` falls back to
 the adapter's own default of `gpt-4`, so pass the model explicitly when you
-bypass `NeoConfig`. GPT-5/Codex models use the `/v1/responses` endpoint
-automatically.
+bypass `NeoConfig`. Every OpenAI model uses the `/v1/responses`
+endpoint. `provider=openai` with a custom `base_url` therefore requires a server
+that implements the responses endpoint; for any other OpenAI-compatible server
+(chat completions only) use `provider=local`.
 
 ### Anthropic
 

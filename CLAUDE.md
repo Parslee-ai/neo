@@ -1750,19 +1750,81 @@
   daemon means updating CarHost.app — there is no `car` CLI to run and nothing
   neo can do about it. Do not paper over it with `CAR_NO_VERSION_WARNING=1`; the
   warning is accurate.
-- Reasoning-model param compatibility (`adapters.py`): newer models reject standard
-  chat params — Anthropic Opus 4.7+/Sonnet 5/Fable 5 reject `temperature`; OpenAI
-  o-series/gpt-5, Azure reasoning deployments, and OpenAI-compatible reasoners (xAI
-  Grok, DeepSeek) reject `temperature`, and the OpenAI-family require
-  `max_completion_tokens` instead of `max_tokens`. There's no reliable model-string
+- Provider param compatibility (`adapters.py`): providers reject optional request
+  fields model by model — `temperature` (Anthropic Opus 4.7+/Sonnet 5/Fable 5;
+  OpenAI o-series/gpt-5/gpt-6; Azure reasoning deployments; xAI Grok/DeepSeek
+  reasoners), `reasoning.effort` (every non-reasoning model), `max_tokens` (chat
+  completions wants `max_completion_tokens`). There's no reliable model-string
   rule (opus-4-6 accepts `temperature`, opus-4-7 rejects it; Azure `model` is an
-  arbitrary deployment name), so adapters **learn reactively**: catch the 400, drop/
-  rename the param, retry, remember. The learnings persist in `_ModelParamCompat`
-  (`~/.neo/model_param_compat.json`, keyed `"<provider>:<model>" → [flags]`) so the
-  first-call retry penalty isn't re-paid every CLI invocation. Store is best-effort
-  (I/O failure → in-memory only, never breaks inference), merge-on-write + atomic
-  `os.replace`, path resolved at call time (per-test `Path.home()` stubs apply). The
-  OpenAI-family adapters share `_chat_completion_resilient(client, kwargs, provider)`;
-  Anthropic has its own inline learn-and-retry. **Footgun**: recovery keys on HTTP 400
-  (`BadRequestError`); a provider returning 422 for a param error won't be caught.
+  arbitrary deployment name), so **no adapter branches on a model name, and there
+  is no allow-list of reasoning models** — that is how `gpt-6.1-sol` silently lost
+  its effort: the endpoint and fields were picked by `"gpt-5" in model`, and the
+  new name missed the test. Instead ONE helper, `_create_resilient(create, kwargs,
+  provider, model, optional=, renames=, ladders=)`, serves OpenAI (responses),
+  Azure, Local, Anthropic and Google: it sends everything, and when a rejection
+  NAMES a field Neo sent it drops, renames or lowers that one field, retries, and
+  persists the learning in `_ModelParamCompat` (`~/.neo/model_param_compat.json`,
+  `"<provider>:<model>" → [flags]`) so the retry is paid once per model. Flags are
+  `drop_<field>`, `rename_<field>`, `max_<field>:<level>`; the first two are the
+  pre-generalisation spellings, so an old file still loads. **Nothing is persisted
+  until the adapted call has SUCCEEDED**: learnings are collected during the retry
+  walk and written once at the end, because they used to be written before the
+  retry proved them, so a call that then failed (a context-length 400 whose text
+  mentioned temperature) left a false `drop_temperature` on disk. **When the 400
+  carries a structured `body.param`, only the field equal to it can match and the
+  message cannot match a different field** (message text is the fallback only
+  when there is no `param`: Anthropic, Google, client-side TypeError; for a
+  rename field it is still read after `param` matches, where it can only veto);
+  a message that merely mentions a field is not a rejection of it. Never a blanket
+  strip-and-retry, and anything that is not a rejection of a sent field (auth,
+  429, another 400, an unrelated TypeError) re-raises untouched. Bounded by
+  construction: each recovery removes a field, renames it away or lowers a level,
+  and one that changes nothing ends the loop. Three rejection shapes, all handled
+  there: an HTTP 400 naming the field (read `body.param` as well as the message —
+  `Invalid value: 'ultra'. Supported values are…` never names `reasoning.effort`
+  in its text); the SDK refusing the keyword at the signature (a client-side
+  `TypeError`, which is what `anthropic` 1.x does to `temperature`, so a
+  `BadRequestError`-only handler never sees it); and `code`, which separates "this
+  LEVEL is not offered" (`unsupported_value` is what a genuinely unsupported level
+  returns live; `invalid_value` is what a value outside the known vocabulary
+  returns; both → step down `EFFORT_LEVELS` one rung, persisted as
+  `max_reasoning.effort:<level>` only once the call succeeds) from "this field is unsupported" (`unsupported_parameter` or None —
+  `temperature`'s code is None, so `code` alone can never recognise an unsupported
+  field). **A rejected level is never evidence that effort is unsupported, and only
+  a lower level that was ACCEPTED can prove a cap.** Live, `gpt-6.1-sol` refuses
+  level `none` with `unsupported_value` while accepting `xhigh` (its range is
+  `low`..`xhigh`; `gpt-5` and `o3` also refuse `none` but top out at `high`);
+  the walk used to persist `drop_reasoning.effort` at the bottom, after which every
+  later `xhigh` request silently ran at the provider default. A walk that reaches
+  the bottom now removes effort for THAT call (`bottom_<field>` flag) and persists
+  no effort flag at all; only `unsupported_parameter` (what `gpt-4o-mini` returns)
+  persists `drop_reasoning.effort`, and only after the retry succeeds. Known
+  limit: a model whose FLOOR is above the requested level walks to the bottom,
+  runs at the provider default for that call, and pays that discovery on every
+  such call, because nothing false is ever written to disk. That is not only the
+  single-level case (`gpt-5-pro` accepts just `high`): `gpt-5.2-pro`,
+  `gpt-5.4-pro` and `gpt-5.5-pro` accept `medium`..`xhigh`, and the selector does
+  ask for `low` on familiar queries (measured: 3 requests per such call, run at
+  `medium`). A cap also assumes levels are contiguous, which held for all 30
+  models probed; a model with a gap could learn a cap that is too low. Two more
+  accepted limits, neither reachable from Neo's own callers: every `code` other
+  than the two level codes is read as "field unsupported", so an out-of-range
+  value Neo never sends (`temperature=5`) would be remembered as a drop if the
+  retry succeeds; and support that depends on another field is recorded as
+  unconditional (`gpt-5.1`/`gpt-5.2` accept `temperature` only at effort `none`). `stop_sequences` is sent but not droppable: no provider is known to reject
+  it. **`provider=openai` with a custom `base_url` now requires a server that
+  implements the responses endpoint**; `provider=local` is the route for
+  OpenAI-compatible servers that speak only chat completions.
+  **`OpenAIAdapter` never calls chat completions**: every model goes
+  through `client.responses.create`, which is the only endpoint carrying effort;
+  `stop` is accepted and not sent (responses has no stop sequences). Azure and
+  Local deliberately stay on chat completions (deployment API versions lag; most
+  OpenAI-compatible servers speak only chat). Exempt: Ollama (raw HTTP with
+  `options`, which ignores unknown ones), ClaudeCode (shells out to the CLI), CAR
+  and Auto (CAR's `infer_tracked` exposes none of these fields; Auto delegates).
+  **Footguns**: the 400 test requires `status_code == 400` (google-genai reports
+  it as int `code`), so a fake exception in a test must carry one; and the store
+  is best-effort by design (I/O failure → in-memory only, never breaks inference),
+  merge-on-write + atomic `os.replace`, path resolved at call time. A provider
+  returning 422 for a param error won't be caught.
 - When creating a pull request, always use the PR template included in the repo.
