@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-10-05
+
+Every OpenAI model now uses the `/v1/responses` endpoint and receives the reasoning effort Neo chose. Before this, a model whose name did not contain `gpt-5` or `codex`, including `gpt-6.1-sol`, was sent to chat completions and had its effort silently dropped.
+
+### Fixed
+
+- **Reasoning effort never reached OpenAI models outside the gpt-5 family.** `OpenAIAdapter` picked the endpoint, and whether to send `reasoning.effort`, from a substring of the model's name. A new model name missed the test, so Neo computed an effort level and then did not send it, and the model ran at its default. The adapter now has one call path, `client.responses.create`, for every model, and no model name decides the endpoint or the fields. The failure-cause extraction in `persistent_reasoning.py`, the last other OpenAI chat-completions call, moved too. ([#263](https://github.com/Parslee-ai/neo/pull/263))
+
+### Changed
+
+- **One learn-and-retry helper for every provider.** Providers refuse optional fields model by model: `gpt-6.1-sol` refuses `temperature` and accepts effort `xhigh`, while `gpt-4o-mini` does the reverse. Neo now sends the field, and when the provider's rejection names it, drops that one field, retries, and remembers the result per model in `~/.neo/model_param_compat.json`, so the retry is paid once. `_create_resilient` replaces `_chat_completion_resilient` and the Anthropic adapter's separate copy, and Google gains the same recovery. Azure and Local stay on chat completions and use the same helper. Existing `model_param_compat.json` files load unchanged.
+  - **A refused effort level is lowered, not dropped.** `gpt-5` refuses `xhigh` and accepts `high`; Neo steps down one level at a time and remembers the cap. A cap is remembered only when a lower level was then accepted. A refusal at the bottom of the ladder is never treated as "this model has no effort": `gpt-6.1-sol` refuses `none` and accepts `xhigh`.
+  - **Nothing is remembered until the retried call succeeds**, and when the provider names the refused field in a structured `param`, only that field can match. An error that merely mentions a field name cannot teach Neo something false about a model.
+- **`temperature` is now sent to gpt-5-family models**, which never received it. Each such model refuses it once per machine, then Neo remembers.
+- **`stop` sequences are not sent on `/v1/responses`**, which has none. This was already true for gpt-5 models and now applies to older OpenAI chat models too.
+- **`provider=openai` with a custom `base_url` now needs a server that implements `/v1/responses`.** Use `provider=local` for OpenAI-compatible servers that speak only chat completions.
+
+### Known limits
+
+- A model whose lowest effort level is above the one Neo asks for (some `-pro` models start at `medium`) runs at the provider default for that call and pays the extra rejected requests each time, because nothing can be learned safely from that refusal.
+- The Anthropic, Google and Azure paths through the shared helper are covered by unit tests, not live calls.
+
 ## [0.54.3] - 2026-10-05
 
 Neo now asks CAR for a model by its exact catalog id whenever it has one, instead of by name.
