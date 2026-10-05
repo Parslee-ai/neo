@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.55.1] - 2026-10-05
+
+One fix to how neo decides that a model pin sent to CAR is an exact catalog id.
+
+### Fixed
+
+- **Router-provided model ids are pinned exactly whatever their shape.** 0.54.3 sent a pin through CAR's exact `model_id` path when the id contained `/`. CAR's catalog contract guarantees the `provider/name[:tag]` shape only for built-in ids. Discovered, gateway and operator-registered ids pass through verbatim, and an operator id need not contain `/` at all. Such an id would have fallen back to the alias path and lost the exact check. The multi-agent panel now marks every id CAR's router hands it as a catalog id (`CarAdapter(model_is_catalog_id=True)`), so the id is sent as `model_id` and must be echoed exactly. A model name typed into config stays on the `model` path, now with an equality-first check: a resolved id equal to the pin is honoured without parsing, so a typed full id of any shape works. ([#267](https://github.com/Parslee-ai/neo/pull/267))
+
 ## [0.55.0] - 2026-10-05
 
 Every OpenAI model now uses the `/v1/responses` endpoint and receives the reasoning effort Neo chose. Before this, a model whose name did not contain `gpt-5` or `codex`, including `gpt-6.1-sol`, was sent to chat completions and had its effort silently dropped.
