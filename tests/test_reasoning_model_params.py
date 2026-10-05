@@ -1,8 +1,8 @@
 """Tests for reasoning-model parameter compatibility across the OpenAI-SDK
-adapters (OpenAI chat path, Azure OpenAI, Local/OpenAI-compatible).
+adapters that stay on chat completions (Azure OpenAI, Local/OpenAI-compatible).
 
 Newer reasoning models reject `temperature` and require `max_completion_tokens`
-instead of `max_tokens`. `_chat_completion_resilient` learns each adaptation
+instead of `max_tokens`. `_create_resilient` learns each adaptation
 from the API's own 400 and remembers it via the persistent `_PARAM_COMPAT`
 store. On Azure the model is an arbitrary deployment name, so this reactive
 approach is the only reliable one.
@@ -21,7 +21,8 @@ import neo.memory.metrics  # noqa: E402,F401
 
 
 class _BadRequest(Exception):
-    """Stand-in for openai.BadRequestError."""
+    """Stand-in for openai.BadRequestError (an HTTP 400)."""
+    status_code = 400
 
 
 _TEMP_ERR = _BadRequest(
@@ -70,7 +71,9 @@ def _client_with(side_effect):
 
 
 def _call(adapters, client, kwargs, provider="openai"):
-    return adapters._chat_completion_resilient(client, kwargs, provider)
+    return adapters._create_resilient(
+        client.chat.completions.create, kwargs, provider, kwargs.get("model", ""),
+        **adapters._CHAT_FIELDS)
 
 
 # --- the shared helper directly -------------------------------------------
@@ -191,15 +194,3 @@ def test_azure_adapter_recovers_from_both_rejections(_fake_openai):
     assert calls[-1].kwargs["max_completion_tokens"] == 4096
     assert "temperature" not in calls[-1].kwargs
     assert _fake_openai._PARAM_COMPAT.has("azure", "my-o3-deploy", "rename_max_tokens")
-
-
-def test_openai_chat_path_recovers_for_o_series(_fake_openai):
-    """o-series slips past the gpt-5/codex responses-endpoint routing and lands
-    on the chat path, where the helper recovers it."""
-    adapter = _fake_openai.OpenAIAdapter(model="o3-mini", api_key="k")
-    adapter.client = _client_with([_TEMP_ERR, _ok("chat-ok")])
-
-    out = adapter.generate([{"role": "user", "content": "yo"}], temperature=0.9)
-
-    assert out == "chat-ok"
-    assert _fake_openai._PARAM_COMPAT.has("openai", "o3-mini", "drop_temperature")

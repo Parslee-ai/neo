@@ -22,7 +22,8 @@ from neo import adapters  # noqa: E402,F401
 
 
 class _BadRequestError(Exception):
-    """Stand-in for anthropic.BadRequestError."""
+    """Stand-in for anthropic.BadRequestError (an HTTP 400)."""
+    status_code = 400
 
 
 @pytest.fixture
