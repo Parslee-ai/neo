@@ -84,3 +84,18 @@ head-to-heads, has equal schema compliance, and routes no prompt to a small
 model. Plausible ways to get there are a router that weighs instruction
 adherence for `task=code`, or `intent_hint` steering. Either is a CAR-side or
 intent-design change, not a neo default flip.
+
+## Filed upstream
+
+The routing table behind this result: with `task=code` + `prefer_quality`,
+`openai/gpt-5.6-sol` ranks 36th of 44 (score 0.59, flat reliability 0.60).
+That is below `gpt-5.4-mini`, `o4-mini` and a local `qwen3-4b`. No GPT-6 row
+exists in CAR's catalog at all.
+
+- Parslee-ai/car-releases#105: `task=code` quality scores are miscalibrated, and
+  the routed model loses 0–6. A follow-up with `params.thinking="on"` on 2
+  prompts changed nothing (2 and 3 vs 9).
+- Parslee-ai/car-releases#106: the catalog has no GPT-6 family rows, so
+  `gpt-6.1-sol` cannot be routed or pinned.
+- Parslee-ai/car-releases#107: `GenerateParams` has no reasoning-effort level.
+  This is why the two arms cannot run at the same effort.
