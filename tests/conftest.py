@@ -152,8 +152,8 @@ _GIT_ENV_VARS = (
 )
 
 
-@pytest.fixture(autouse=True)
-def scrub_ambient_git_env(monkeypatch):
+@pytest.fixture(autouse=True, scope="session")
+def scrub_ambient_git_env():
     """Detach the suite from any git process that spawned it.
 
     Tests and production code both shell out to `git` with `cwd=` pointing at a
@@ -185,9 +185,18 @@ def scrub_ambient_git_env(monkeypatch):
     `GIT_AUTHOR_*` / `GIT_COMMITTER_*` are deliberately left alone: they only
     supply identity, which a temp repo needs anyway, and removing them would
     break commits on machines with no `user.email` configured.
+
+    SESSION-scoped, not function-scoped: pytest builds wider-scoped fixtures
+    first, so a function-scoped scrub ran AFTER every session/module fixture.
+    `test_selection_invariants.fixture_repos` (session) then ran `git add -A`
+    under the `GIT_INDEX_FILE` that `git commit -a` exports to hooks, from the
+    MAIN checkout too, and wrote its fixture files into the commit's index,
+    aborting the commit with "invalid object ... Error building trees".
     """
-    for name in _GIT_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
+    with pytest.MonkeyPatch.context() as mp:
+        for name in _GIT_ENV_VARS:
+            mp.delenv(name, raising=False)
+        yield
 
 
 @pytest.fixture(autouse=True)
