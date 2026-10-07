@@ -6,8 +6,10 @@ neo defaults to `inference_mode="static"` until a CAR release is shown not to
 lose quality through its router. The previous evaluation, against car-runtime
 0.23.0, found a routing defect: `task=code` cost-biased onto mini models
 (gpt-5.4-mini, gpt-4.1-mini) and lost ~70% of head-to-heads. That eval was run
-ad hoc and never committed. `tools/ab_car_router.py` is the reproducible
-replacement.
+ad hoc and never committed. `tools/ab_car_router.py` is the re-runnable
+replacement. Raw results are in `car-router-eval-2026-10-07.json`: routing,
+usage, schema and judge reasons for each prompt. That run predates the harness
+saving answer text.
 
 ## Setup
 
@@ -63,6 +65,14 @@ but the finding does not rest on it alone.
 - CAR drops `reasoning_effort` and `temperature`. This is production behavior,
   so it is included deliberately, but it means the comparison is
   "CAR's choice under CAR's defaults", not "Opus vs GPT at equal settings".
+- The judge scores correctness, not verifiable-suggestion yield. Every static
+  answer scored exactly 9 for planning an inspection instead of patching, and a
+  suggestion with no diff can never be git-verified (one stated reason the
+  learning loop starves). The CAR arm was penalized for attempting diffs and
+  getting them wrong; the static arm was never tested for being useful. Invented
+  APIs are still objectively worse than a plan, so the verdict holds.
+- Captured prompts are gitignored and depend on the repository's state, so a
+  re-run measures today's six prompts, not these.
 - The result describes the router's choice today. The router reroutes as its
   catalog changes, so re-run `python tools/ab_car_router.py` on each CAR
   release. `--probe` checks routing alone and costs no judge calls.
