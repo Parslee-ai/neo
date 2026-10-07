@@ -239,7 +239,7 @@ class _ExactRuntime:
         self.requests: list = []
 
     def infer_tracked(self, *a, **kw):  # pragma: no cover - must not be used
-        raise AssertionError("a catalog-id pin must not take the legacy path")
+        raise AssertionError("a runtime with the request call must not take the legacy path")
 
     def infer_tracked_with_request(self, request_json):
         self.requests.append(json.loads(request_json))
@@ -258,7 +258,7 @@ def test_a_catalog_id_pin_is_sent_as_model_id():
     sent = rt.requests[0]
     assert sent["model_id"] == pin and "model" not in sent
     assert sent["messages"] == msgs and sent["prompt"] == "hi"
-    assert sent["params"] == {"max_tokens": 64}
+    assert sent["params"] == {"max_tokens": 64, "temperature": 0.7}
 
 
 def test_a_model_id_pin_requires_an_exact_echo():
@@ -290,6 +290,46 @@ def test_the_exact_path_sends_no_routing_intent():
                         "resolved_model_id": pin, "usage": {}})
     CarAdapter(model=pin, runtime=rt, model_is_catalog_id=True).generate("hi")
     assert "intent_json" not in rt.requests[0] and "intent" not in rt.requests[0]
+
+
+def test_routing_goes_through_the_request_call_with_intent_and_temperature():
+    """Only the request-shaped call carries `params.temperature`; CAR was
+    measured to forward it (deterministic at 0.0, varied at 1.5+ on local and
+    hosted rows). Routing keeps its intent, as a dict this time."""
+    rt = _ExactRuntime({"text": "ok", "model_used": "claude-opus-4-8", "usage": {}})
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+    assert CarAdapter(runtime=rt).generate(msgs, max_tokens=64, temperature=0.3) == "ok"
+    sent = rt.requests[0]
+    assert "model" not in sent and "model_id" not in sent
+    assert sent["intent"] == {"task": "code", "prefer_quality": True}
+    assert sent["params"] == {"max_tokens": 64, "temperature": 0.3}
+    assert sent["messages"] == msgs and sent["prompt"] == "hi"
+
+
+def test_a_name_pin_on_the_request_call_is_sent_as_model_not_model_id():
+    rt = _ExactRuntime({"text": "ok", "model_used": "claude-sonnet-4-6",
+                        "resolved_model_id": "anthropic/claude-sonnet-4-6:latest", "usage": {}})
+    assert CarAdapter(model="claude-sonnet-4-6", runtime=rt).generate("hi") == "ok"
+    sent = rt.requests[0]
+    assert sent["model"] == "claude-sonnet-4-6" and "model_id" not in sent
+    assert "intent" in sent and sent["prompt"] == "hi"
+
+
+def test_temperature_zero_is_sent_not_dropped_as_falsy():
+    rt = _ExactRuntime({"text": "ok", "usage": {}})
+    CarAdapter(runtime=rt).generate("hi", temperature=0.0)
+    assert rt.requests[0]["params"]["temperature"] == 0.0
+
+
+def test_fields_the_daemon_discards_are_never_sent():
+    """`stop` is accepted and ignored by CAR 0.56.1 (the output still contains
+    the sequence) and `GenerateParams` has no effort level. Sending either would
+    make a request look configured while doing nothing (car-releases#107)."""
+    rt = _ExactRuntime({"text": "ok", "usage": {}})
+    CarAdapter(runtime=rt).generate("hi", stop=["END"], reasoning_effort="xhigh")
+    sent = rt.requests[0]
+    assert "stop" not in sent["params"] and "stop" not in sent
+    assert not any("effort" in k or k == "thinking" for k in (*sent, *sent["params"]))
 
 
 def test_a_catalog_id_on_a_runtime_without_the_request_call_uses_the_legacy_path():

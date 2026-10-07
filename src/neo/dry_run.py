@@ -148,7 +148,7 @@ def render(calls: list[dict[str, Any]], gathered: Any = None) -> str:
     )
     out.append(
         "  (providers drop what they do not accept -- Anthropic ignores "
-        "temperature on Opus 4.7+/Sonnet 5, CAR lets backend defaults win, "
+        "temperature on Opus 4.7+/Sonnet 5, CAR forwards temperature but not stop, "
         "and reasoning_effort reaches only the OpenAI-family adapters.)"
     )
     out.append(f"{len(call['messages'])} message(s), {total:,} chars total")
