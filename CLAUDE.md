@@ -1858,7 +1858,9 @@
   `infer_tracked_with_request` (the keyword `infer_tracked` has no sampling
   knobs), and CAR drops it per backend itself. Measured on 0.56.1 rather than
   assumed from "no error", since CAR silently ignores unknown fields: temperature
-  IS forwarded (local and hosted rows deterministic at 0.0, varied at 1.5+);
+  IS forwarded (raw-runtime probes: local and hosted rows deterministic at 0.0,
+  varied at 1.5+; through `CarAdapter` itself the recorded request carries it and
+  output matches the raw request 6/6);
   `stop` is accepted and NOT applied; there is no effort level and `thinking`
   has no observable effect. So neither of the last two is sent
   (car-releases#107/#108).
