@@ -108,6 +108,14 @@ def isolate_neo_home(tmp_path, monkeypatch):
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("HOME", str(fake_home))  # Also patch $HOME for expanduser()
+    # `cli.main` autostarts the observer whenever car-server is reachable, and
+    # a fake $HOME does not isolate the daemon: every `python -m neo` subprocess
+    # registered agents with the LIVE car-server, wrote `home/.car/*` into
+    # tmp_path (which a `--cwd tmp_path` test then indexes as repo files), and
+    # left an orphan observer running against the throwaway home. Invisible in
+    # CI and in any venv without car-runtime. Tests that exercise autostart
+    # re-enable it with their own monkeypatch.
+    monkeypatch.setenv("NEO_OBSERVER_AUTOSTART", "0")
 
     # Re-point every path constant captured at import time. Without this the
     # fixture's promise is false for any module already imported — which, at
