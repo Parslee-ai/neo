@@ -996,10 +996,14 @@ def main():
     # Auto-start the single global memory observer when CAR is present (no
     # per-project opt-in). Non-blocking, silent, never raises; opt out with
     # NEO_OBSERVER_AUTOSTART=0. Skipped for explicit `memory observer` commands
-    # (the handler manages the agent) and version/config short-circuits.
+    # (the handler manages the agent), version/config short-circuits, and
+    # `--dry-run`: an inspection must not register agents with the daemon or
+    # join the Lattice, and a test running `neo --dry-run` under a fake $HOME
+    # left an orphan observer bound to that throwaway home.
     if not (
         (hasattr(args, 'version') and args.version)
         or (hasattr(args, 'config') and args.config)
+        or getattr(args, 'dry_run', False)
         or (
             getattr(args, 'memory_action', None)
             in {

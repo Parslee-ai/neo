@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`neo --dry-run` no longer registers the memory observer or joins the Lattice.** Both run from `cli.main` whenever car-server is reachable, so an inspection command was upserting and starting the global observer agent and joining the repository's Lattice. Run under a different `$HOME`, as the test suite does, it left an orphan observer bound to that home. Dry runs now skip both, alongside `--version` and `--config`.
+
 ## [0.55.1] - 2026-10-05
 
 One fix to how neo decides that a model pin sent to CAR is an exact catalog id.
