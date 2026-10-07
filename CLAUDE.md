@@ -1853,7 +1853,15 @@
   Local deliberately stay on chat completions (deployment API versions lag; most
   OpenAI-compatible servers speak only chat). Exempt: Ollama (raw HTTP with
   `options`, which ignores unknown ones), ClaudeCode (shells out to the CLI), CAR
-  and Auto (CAR's `infer_tracked` exposes none of these fields; Auto delegates).
+  and Auto (Auto delegates). CAR is exempt from the RETRY helper, not from the
+  fields: `CarAdapter` sends `params.temperature` through
+  `infer_tracked_with_request` (the keyword `infer_tracked` has no sampling
+  knobs), and CAR drops it per backend itself. Measured on 0.56.1 rather than
+  assumed from "no error", since CAR silently ignores unknown fields: temperature
+  IS forwarded (local and hosted rows deterministic at 0.0, varied at 1.5+);
+  `stop` is accepted and NOT applied; there is no effort level and `thinking`
+  has no observable effect. So neither of the last two is sent
+  (car-releases#107/#108).
   **Footguns**: the 400 test requires `status_code == 400` (google-genai reports
   it as int `code`), so a fake exception in a test must carry one; and the store
   is best-effort by design (I/O failure → in-memory only, never breaks inference),

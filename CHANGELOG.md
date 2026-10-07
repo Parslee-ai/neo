@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- **The CAR inference path now honours the temperature Neo asks for.** `CarAdapter` called `infer_tracked`, which has no sampling parameters, so every CAR call ran at the backend's default temperature whatever the engine requested. It now uses the request-shaped `infer_tracked_with_request` for routed, name-pinned and exact-pinned calls alike, carrying `params.temperature` and the routing intent. CAR was measured to forward temperature to both local and hosted models, and to drop it itself for models that reject it. `stop` and reasoning effort are still not sent: CAR 0.56.1 accepts `stop` without applying it and has no effort field (Parslee-ai/car-releases#107, #108). Runtimes without the request call keep the old path.
 - **`neo --dry-run` no longer registers the memory observer or joins the Lattice.** Both run from `cli.main` whenever car-server is reachable, so an inspection command was upserting and starting the global observer agent and joining the repository's Lattice. Run under a different `$HOME`, as the test suite does, it left an orphan observer bound to that home. Dry runs now skip both, alongside `--version` and `--config`.
 
 ## [0.55.1] - 2026-10-05

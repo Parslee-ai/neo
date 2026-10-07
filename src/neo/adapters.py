@@ -1223,28 +1223,31 @@ class CarAdapter(LMAdapter):
         temperature: float = 0.7,
         reasoning_effort: Optional[str] = None,
     ) -> str:
-        # ``temperature``, ``stop``, ``reasoning_effort`` are accepted for
-        # LMAdapter ABC compatibility. CAR's infer_tracked does not expose
-        # them as kwargs — backend defaults win. Future: translate
-        # reasoning_effort∈{"high","xhigh"} to intent_hint["require"]=
-        # ["reasoning"] so CAR's router escalates accordingly (see
-        # github.com/Parslee-ai/car-releases/issues/52).
+        # Every call goes through the request-shaped `infer_tracked_with_request`
+        # when the runtime has it, because only that path carries
+        # `params.temperature`; the keyword `infer_tracked` exposes no sampling
+        # knobs at all. Measured on car-runtime 0.56.1: CAR FORWARDS temperature
+        # (local mlx/qwen3-4b and hosted openai/gpt-4.1-mini are deterministic at
+        # 0.0 and vary at 1.5+) and drops it without error for backends that
+        # reject it (Opus 4.8, gpt-5.6-sol), so sending it is safe.
+        # Deliberately NOT sent, because the daemon was measured to discard them
+        # and a request carrying them would look configured while doing nothing:
+        # `stop` (accepted, the output still contains the sequence) and any
+        # effort level (`GenerateParams` has none; `thinking` showed no token or
+        # latency delta and `usage` has no reasoning-token field) -- see
+        # Parslee-ai/car-releases#107 and #108.
+        request_path = hasattr(self._rt, "infer_tracked_with_request")
         kwargs: dict = {"max_tokens": int(max_tokens)}
         # A catalog id CAR handed us is pinned EXACTLY through `model_id`,
         # which CAR serves only from that row and echoes back; a name a human
-        # typed takes the legacy `model` path, where CAR may resolve an alias.
-        # `infer_tracked` has no `model_id` keyword, so the exact pin goes
-        # through `infer_tracked_with_request`; a runtime without it keeps the
-        # legacy path.
-        exact_pin = (
-            bool(self.model) and self.model_is_catalog_id
-            and hasattr(self._rt, "infer_tracked_with_request")
-        )
-        if self.model and not exact_pin:
+        # typed goes as `model`, where CAR may resolve an alias. `infer_tracked`
+        # has no `model_id` keyword, so a runtime without the request path keeps
+        # the keyword call and the `model` field for both.
+        exact_pin = bool(self.model) and self.model_is_catalog_id and request_path
+        # Keyword-call fields, for runtimes without the request path.
+        if self.model:
             kwargs["model"] = self.model
-        # The intent only steers ROUTING, which an exact `model_id` pin
-        # bypasses, so the exact path does not send it.
-        if self.intent_hint is not None and not exact_pin:
+        if self.intent_hint is not None:
             # CAR expects intent_json as a JSON string, not a dict.
             kwargs["intent_json"] = json.dumps(self.intent_hint)
 
@@ -1268,11 +1271,19 @@ class CarAdapter(LMAdapter):
             ),
         ):
             try:
-                if exact_pin:
-                    request: dict = {
-                        "model_id": self.model,
-                        "params": {"max_tokens": int(max_tokens)},
-                    }
+                if request_path:
+                    params: dict = {"max_tokens": int(max_tokens)}
+                    if temperature is not None:
+                        params["temperature"] = float(temperature)
+                    request: dict = {"params": params}
+                    if exact_pin:
+                        request["model_id"] = self.model
+                    elif self.model:
+                        request["model"] = self.model
+                    # The intent only steers ROUTING, which an exact
+                    # `model_id` pin bypasses.
+                    if self.intent_hint is not None and not exact_pin:
+                        request["intent"] = dict(self.intent_hint)
                     if isinstance(messages, list):
                         request["messages"] = messages
                         request["prompt"] = next(
