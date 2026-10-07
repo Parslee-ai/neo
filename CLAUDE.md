@@ -1731,8 +1731,8 @@
   (CAR's *default* profile without it is still latency/cost-biased). Rationale lives on
   `CarAdapter.DEFAULT_INTENT_HINT` in `adapters.py`. Observer floor is car-runtime ≥0.18.0,
   now enforced at runtime by `_require_car_runtime` (version check, not just the `agents_*`
-  attr); latest validated against car-runtime **0.40.0** (full `test_car_adapter`
-  suite including the live calls, against a car-server 0.37.0 daemon). Note the
+  attr); latest validated against car-runtime **0.56.1** (full `test_car_adapter`
+  suite including the live calls, plus every other CAR and observer suite, against a CarHost 0.56.1 daemon). Note the
   pin `car-runtime>=0.27.0,<1.0` lets the client drift from a daemon that ships
   inside CarHost.app, so a client/daemon **version skew is the normal state**,
   and it is harmless ONLY while both sides speak the same wire protocol. **It stopped being harmless at the v2→v3 protocol bump**: car-runtime 0.50.0 (v2)
