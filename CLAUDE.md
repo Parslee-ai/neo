@@ -873,6 +873,9 @@
   real adapters built. It is also the honest scope, since the panel's later prompts
   are built from earlier model responses and cannot be shown without making the calls
   the flag exists to avoid.
+  **A dry run never touches the CAR daemon**: `cli.main` skips observer
+  autostart and Lattice autojoin under `--dry-run` (pinned by
+  `TestNoDaemonSideEffects`, which has a control so it cannot pass vacuously).
   **A dry run does not modify the fact store**, which is narrower than "mutates
   nothing" and is the claim that survives measurement. The old implementation got it
   for free by never constructing a `FactStore`; `FactStore.initialize` runs
