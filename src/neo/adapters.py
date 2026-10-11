@@ -1003,11 +1003,14 @@ class ClaudeCodeAdapter(LMAdapter):
                     json.dumps(conversation_messages), timeout=self.timeout
                 )
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
+                self._reap(process)
                 raise RuntimeError(
                     f"Claude Code did not finish within {self.timeout}s"
                 )
+            except BaseException:
+                # Interrupted (Ctrl-C included): never leave the child running.
+                self._reap(process)
+                raise
 
             response_text = ""
             result_chunk: dict = {}
@@ -1033,20 +1036,29 @@ class ClaudeCodeAdapter(LMAdapter):
                 elif chunk.get("type") == "result":
                     result_chunk = chunk
 
-            # The CLI reports its own failures (max turns, auth, …) as the
-            # stream-json `result` line on stdout, with stderr empty.
-            if process.returncode != 0 or result_chunk.get("is_error"):
+            # The CLI reports its own failures (max turns, auth, unknown model)
+            # as the stream-json `result` line on stdout. `is_error` is the
+            # field to trust: an unknown model reports subtype "success" with
+            # is_error true.
+            failed = process.returncode != 0 or bool(result_chunk.get("is_error"))
+            if not failed and not result_chunk:
+                failed = True  # output ended without a result line: cut short
+            if failed:
+                subtype = str(result_chunk.get("subtype") or "")
                 detail = "; ".join(
                     part for part in (
-                        str(result_chunk.get("subtype") or ""),
+                        "" if subtype == "success" else subtype,
                         ", ".join(str(e) for e in result_chunk.get("errors") or []),
                         str(result_chunk.get("result") or "")
                         if result_chunk.get("is_error") else "",
                         (stderr or "").strip(),
+                        "" if result_chunk else "no result line in the output",
                     ) if part
                 ) or "no error detail"
+                if "unknown option" in (stderr or ""):
+                    detail += " (this Claude Code is too old for neo's isolation flags; upgrade it)"
                 raise RuntimeError(
-                    f"Claude Code exited with code {process.returncode}: {detail}"
+                    f"Claude Code failed (exit {process.returncode}): {detail}"
                 )
 
             # The CLI has no stop-sequence option; cut at the first one, as a
@@ -1063,6 +1075,16 @@ class ClaudeCodeAdapter(LMAdapter):
 
         finally:
             Path(system_prompt_file).unlink(missing_ok=True)
+
+    @staticmethod
+    def _reap(process) -> None:
+        """Kill the child and collect it, without waiting forever on pipes a
+        grandchild may still hold."""
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
     def name(self) -> str:
         return f"claude-code/{self.model}"

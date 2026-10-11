@@ -49,12 +49,12 @@ def run_with(monkeypatch, adapter, proc, **kwargs):
     return out, seen
 
 
-def assistant(text, stop=None):
+def assistant(text, stop=None):  # the real CLI sends stop_reason null on normal chunks
     return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}], "stop_reason": stop}}
 
 
 def test_runs_isolated_from_the_users_setup(monkeypatch, adapter):
-    proc = FakeProcess([assistant("ok", "end_turn"), {"type": "result", "is_error": False}])
+    proc = FakeProcess([assistant("ok"), {"type": "result", "subtype": "success", "is_error": False}])
     out, seen = run_with(monkeypatch, adapter, proc)
     assert out == "ok"
     args = seen["args"]
@@ -92,13 +92,44 @@ def test_the_timeout_covers_the_whole_call_and_kills_the_child(monkeypatch, adap
 
 
 def test_stop_sequences_cut_the_response(monkeypatch, adapter):
-    proc = FakeProcess([assistant("plan here</neo> trailing junk", "end_turn"), {"type": "result", "is_error": False}])
+    proc = FakeProcess([assistant("plan here</neo> trailing junk"), {"type": "result", "subtype": "success", "is_error": False}])
     out, _ = run_with(monkeypatch, adapter, proc, stop=["</neo>", "```"])
     assert out == "plan here"
 
 
 def test_messages_go_to_stdin_and_the_system_prompt_to_a_file(monkeypatch, adapter):
-    proc = FakeProcess([assistant("x", "end_turn")])
+    proc = FakeProcess([assistant("x"), {"type": "result", "subtype": "success", "is_error": False}])
     _, seen = run_with(monkeypatch, adapter, proc)
     assert json.loads(proc.input) == [{"role": "user", "content": "u"}]
     assert "--system-prompt-file" in seen["args"]
+
+
+def test_an_unknown_model_fails_with_the_cli_s_own_words(monkeypatch, adapter):
+    """Shape recorded from claude 2.1.296 with --model no-such-model-xyz:
+    exit 1, subtype "success" yet is_error true, text not starting "API Error"."""
+    proc = FakeProcess(
+        [assistant("There's an issue with the selected model (no-such-model-xyz).", "stop_sequence"),
+         {"type": "result", "subtype": "success", "is_error": True,
+          "result": "There's an issue with the selected model (no-such-model-xyz)."}],
+        returncode=1,
+        stderr="[claude-code:unrecognized_model] no-such-model-xyz",
+    )
+    with pytest.raises(RuntimeError) as err:
+        run_with(monkeypatch, adapter, proc)
+    message = str(err.value)
+    assert message.startswith("Claude Code failed (exit 1): ")
+    assert "issue with the selected model" in message
+    assert "unrecognized_model" in message
+    assert "success" not in message
+
+
+def test_output_without_a_result_line_is_an_error(monkeypatch, adapter):
+    proc = FakeProcess([assistant("partial ans")])  # cut short, exit 0
+    with pytest.raises(RuntimeError, match="no result line"):
+        run_with(monkeypatch, adapter, proc)
+
+
+def test_an_old_cli_says_to_upgrade(monkeypatch, adapter):
+    proc = FakeProcess([], returncode=1, stderr="error: unknown option '--setting-sources'")
+    with pytest.raises(RuntimeError, match="upgrade it"):
+        run_with(monkeypatch, adapter, proc)
