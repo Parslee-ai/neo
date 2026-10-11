@@ -13,14 +13,17 @@ const command = (command: string, args = "") => ({
   origin: { kind: "composer" } as const,
   presentation: { isFullscreen: false, columns: 80 },
 });
-function host(on: On) {
+function host(on: On, log: (text: string) => void = () => {}) {
   mock.env(on, {});
   const clock = mock.clock(on);
   on("session.id", () => ({ value: "session1" }));
   on("session.cwd", () => ({ value: "/work" }));
   on("session.start", (_$, e) => ({ cwd: e.cwd }));
   on("command.register", (_$, e) => ({ value: { command: e.name } }));
-  on("ui.log", () => ({ value: undefined }));
+  on("ui.log", (_$, e: any) => {
+    log(String(e?.text ?? e?.message ?? JSON.stringify(e)));
+    return { value: undefined };
+  });
   on("ui.open", () => ({ value: { isPlaced: true } }));
   return clock;
 }
@@ -522,5 +525,105 @@ test("typing context by hand clears the selection notice", async ($, on) => {
   const drawn = JSON.stringify(await ui.drawn());
   expect(drawn).not.toContain("No selection is visible");
   expect(drawn).toContain("Context attached · 13 characters");
+  await ui.unmount();
+});
+
+test("Follow up appears only once there is a result to follow", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  const payloads: any[] = [];
+  spawnHost(on, payloads);
+  await $.session.start(SESSION);
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  expect(await ui.find({ key: "neo-followup" })).toBeUndefined();
+  await $.command.run(command("neo-ask", "first"));
+  expect(await ui.find({ key: "neo-followup" })).toBeDefined();
+  await ui.unmount();
+});
+
+test("a refused Ask is reported in the pane, not the transcript", async ($, on) => {
+  const logged: string[] = [];
+  host(on, (t) => logged.push(t));
+  statusHost(on, 0);
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-run" });
+  expect(JSON.stringify(await ui.drawn())).toContain("Enter a question or target first.");
+  expect(logged.join(" ")).not.toContain("Enter a question");
+  await ui.unmount();
+});
+
+test("a running analysis shows elapsed time against the deadline", async ($, on) => {
+  const clock = host(on);
+  statusHost(on, 0);
+  on("process.spawn", async function* () {
+    while (true) {
+      yield { stream: "stderr", text: '{"type":"planning","message":"Planning"}\n' };
+      await clock.sleep(1000);
+    }
+  });
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  await $.command.run(command("neo-ask", "slow one"));
+  await clock.advance(3000);
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  expect(JSON.stringify(await ui.drawn())).toMatch(/running · 0:0[2-3] of 4:00 · Planning/);
+  await ui.unmount();
+  // End the run the way the deadline does, so the fake process's sleep resolves.
+  await clock.advance(241000);
+});
+
+test("Evidence is labelled rows, with raw JSON only on request", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  const payloads: any[] = [];
+  spawnHost(on, payloads);
+  await $.session.start(SESSION);
+  await $.command.run(command("neo-ask", "q"));
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-evidence" });
+  const drawn = JSON.stringify(await ui.drawn());
+  expect(drawn).toContain("Memory · 1 retrieved · 1 included · 0 hard cited");
+  expect(drawn).not.toContain('\\"memory\\":');
+  await ui.press({ key: "neo-details" });
+  expect(JSON.stringify(await ui.drawn())).toContain('\\"memory\\":');
+  await ui.unmount();
+});
+
+test("returning to Memory reuses the store read; Refresh re-reads it", async ($, on) => {
+  host(on);
+  let reads = 0;
+  on("process.run", () => {
+    reads++;
+    return {
+      value: {
+        exitCode: 0,
+        stdout: JSON.stringify({ schema_version: 1, fact_count: 0, probation_count: 0, facts: [] }),
+        stderr: "",
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    };
+  });
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-memory" });
+  await ui.press({ key: "neo-results" });
+  await ui.press({ key: "neo-memory" });
+  expect(reads).toBe(1);
+  await ui.press({ key: "neo-refresh" });
+  expect(reads).toBe(2);
+  await ui.unmount();
+});
+
+test("the question form is drawn before the findings", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  const payloads: any[] = [];
+  spawnHost(on, payloads);
+  await $.session.start(SESSION);
+  await $.command.run(command("neo-ask", "q"));
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  const drawn = JSON.stringify(await ui.drawn());
+  expect(drawn.indexOf("neo-question")).toBeLessThan(drawn.indexOf("Found an edge case"));
   await ui.unmount();
 });

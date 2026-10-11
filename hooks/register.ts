@@ -41,6 +41,14 @@ const INSTRUCTIONS: Record<string, string> = {
   optimize: "Find defensible performance improvements for:",
   pattern: "Identify existing or reusable patterns for:",
 };
+const DESCRIPTIONS: Record<string, string> = {
+  reason: "General reasoning about a question or code",
+  review: "Correctness, security, edge cases and maintainability",
+  debug: "Root cause and a proposed fix",
+  architect: "Architecture and concrete trade-offs",
+  optimize: "Defensible performance improvements",
+  pattern: "Existing or reusable patterns",
+};
 type Run = {
   id: string;
   session: string;
@@ -56,6 +64,7 @@ type Run = {
   error?: string;
   stream?: HookStream<ProcessSpawnChunk, ProcessSpawnResult>;
   timer?: Timer;
+  ticker?: Timer;
   started: number;
   elapsed?: number;
   stopped?: string;
@@ -82,6 +91,19 @@ let session = "",
   lastInvocation = "";
 const turns = new Map<string, string>();
 let generation = 0;
+/** The clock as of the last tick, so a drawing can show elapsed time. */
+let nowMs = 0;
+const clockText = (ms: number) => {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+};
+function progressLine(run: Run): string {
+  const active = run.status === "running" || run.status === "stopping";
+  const elapsed = active ? nowMs - run.started : (run.elapsed ?? 0);
+  return active
+    ? `${run.status} · ${clockText(elapsed)} of ${clockText(DEADLINE)} · ${run.parser.message}`
+    : `${run.status} · took ${clockText(elapsed)}`;
+}
 
 function redraw($: EngineInterface) {
   $.ui.invalidate("ui.render");
@@ -172,6 +194,10 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
     run.timer = $.clock.after(DEADLINE, () => {
       void stop($, "timed out after 4 minutes").catch(() => {});
     });
+    run.ticker = $.clock.every(1000, async () => {
+      nowMs = await $.clock.now();
+      redraw($);
+    });
     for await (const chunk of run.stream) {
       run.parser.push(chunk.stream, chunk.text);
       redraw($);
@@ -194,6 +220,7 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
     }
   } finally {
     run.timer?.cancel();
+    run.ticker?.cancel();
     run.elapsed = (await $.clock.now()) - run.started;
     if (run.stopped) {
       run.status = "cancelled";
@@ -247,6 +274,7 @@ async function start(
     parser: new NeoStream(),
     started: await $.clock.now(),
   };
+  nowMs = run.started;
   current = run;
   question = prompt;
   mode = selectedMode;
@@ -328,8 +356,8 @@ function render(
       flexDirection: "row",
       gap: 1,
       children: [
-        label("Neo · " + (current?.status ?? "ready"), "remember"),
-        label(current?.parser.message ?? ""),
+        label("Neo", "remember"),
+        label(current ? progressLine(current) : "ready"),
         button("neo-cancel", "Cancel"),
       ],
     });
@@ -352,10 +380,64 @@ function render(
     }),
   ];
   if (tab === "results") {
-    if (current?.error) children.push(label(current.error, "error"));
-    if (current?.status === "running" || current?.status === "stopping")
-      children.push(label(current.parser.message));
     const result = current?.result;
+    // The question form comes first: after a long answer it would otherwise
+    // be scrolled out of reach.
+    children.push(
+      Select({
+        key: "neo-mode",
+        label: "Mode",
+        value: mode,
+        options: MODES.map((value) => ({ value, label: value })),
+        onSelect: () => {},
+      }),
+      label(DESCRIPTIONS[mode] ?? "", "subtle"),
+      Input({
+        key: "neo-question",
+        label: "Question or target",
+        value: question,
+        onInput: () => {},
+        onSubmit: () => {},
+      }),
+      Input({
+        key: "neo-context",
+        label: "Selected context (optional)",
+        value: context,
+        onInput: () => {},
+        onSubmit: () => {},
+      }),
+    );
+    if (context)
+      children.push(
+        label(
+          `Context attached · ${context.length} characters · sent with the next question only`,
+          "subtle",
+        ),
+      );
+    children.push(
+      Box({
+        flexDirection: e.props.bodyColumns < 66 ? "column" : "row",
+        gap: 1,
+        children: [
+          button("neo-run", "Ask Neo", "a"),
+          // A follow-up needs a finished analysis to follow.
+          ...(result || previous?.result
+            ? [button("neo-followup", "Follow up", "f")]
+            : []),
+          button("neo-selection", "Use selection"),
+          ...(result ? [button("neo-share", "Share with Claude")] : []),
+        ],
+      }),
+    );
+    if (notice) children.push(label(notice, "warning"));
+    children.push(
+      label(
+        "Advisory · proposes changes; does not apply them or claim downstream acceptance.",
+        "subtle",
+      ),
+    );
+    if (current) children.push(label(progressLine(current)));
+    if (current?.error) children.push(label(current.error, "error"));
     if (result) {
       children.push(label(text(object(result.orchestrator).summary)));
       for (const caution of strings(object(result.orchestrator).cautions))
@@ -392,8 +474,8 @@ function render(
       );
       if (details)
         children.push(
-          label(
-            JSON.stringify(
+          Code({
+            source: JSON.stringify(
               {
                 plan: result.plan,
                 simulation_traces: result.simulation_traces,
@@ -403,7 +485,8 @@ function render(
               null,
               2,
             ),
-          ),
+            language: "json",
+          }),
         );
     } else if (!current)
       children.push(
@@ -411,50 +494,6 @@ function render(
           "Ask Neo for a second opinion. Findings, cautions and evidence appear here.",
         ),
       );
-    if (notice) children.push(label(notice, "warning"));
-    if (context)
-      children.push(
-        label(
-          `Context attached · ${context.length} characters · sent with the next question only`,
-          "subtle",
-        ),
-      );
-    children.push(
-      Select({
-        key: "neo-mode",
-        value: mode,
-        options: MODES.map((value) => ({ value, label: value })),
-        onSelect: () => {},
-      }),
-      Input({
-        key: "neo-question",
-        label: "Question or target",
-        value: question,
-        onInput: () => {},
-        onSubmit: () => {},
-      }),
-      Input({
-        key: "neo-context",
-        label: "Selected context (optional)",
-        value: context,
-        onInput: () => {},
-        onSubmit: () => {},
-      }),
-      Box({
-        flexDirection: e.props.bodyColumns < 66 ? "column" : "row",
-        gap: 1,
-        children: [
-          button("neo-run", "Ask Neo", "a"),
-          button("neo-followup", "Follow up", "f"),
-          button("neo-selection", "Use selection"),
-          ...(result ? [button("neo-share", "Share with Claude")] : []),
-        ],
-      }),
-      label(
-        "Advisory · proposes changes; does not apply them or claim downstream acceptance.",
-        "subtle",
-      ),
-    );
   } else if (tab === "memory") {
     children.push(
       label(
@@ -484,8 +523,9 @@ function render(
       );
       if (details)
         children.push(
-          label(
-            JSON.stringify(
+          Code({
+            language: "json",
+            source: JSON.stringify(
               {
                 fact: f,
                 supporting: explanation.supporting_evidence,
@@ -497,7 +537,7 @@ function render(
               null,
               2,
             ),
-          ),
+          }),
         );
       for (const c of strings(explanation.cautions))
         children.push(label(c, "warning"));
@@ -563,24 +603,56 @@ function render(
     children.push(
       label(
         "Analysis completion is separate from verified application and independent acceptance.",
+        "subtle",
       ),
     );
-    if (current?.result)
+    const result = current?.result;
+    if (result) {
+      const meta = object(result.metadata);
+      const scalars = Object.entries(meta).filter(
+        ([, v]) => ["string", "number", "boolean"].includes(typeof v) && v !== "",
+      );
+      children.push(label("Execution", "remember"));
+      for (const [k, v] of scalars) children.push(label(`${k} · ${String(v)}`));
+      children.push(label("Validation · " + validationText(result)));
+      const checks = rows(result.static_checks);
+      children.push(label(`Checks · ${checks.length}`, "remember"));
+      for (const c of checks)
+        children.push(
+          label(`${c.tool_name} · ${c.status || "status unavailable"} · ${text(c.summary)}`),
+        );
+      const memory = rows(result.memory_evidence);
+      const included = memory.filter((m) => m.included_in_context).length;
+      const cited = memory.filter((m) => m.hard_cited === true).length;
       children.push(
         label(
-          JSON.stringify(
-            {
-              execution: current.result.metadata,
-              validation: current.result.validation_assessment,
-              checks: current.result.static_checks,
-              memory: current.result.memory_evidence,
-            },
-            null,
-            2,
-          ),
+          `Memory · ${memory.length} retrieved · ${included} included · ${cited} hard cited`,
+          "remember",
         ),
       );
-    for (const event of current?.parser.events ?? [])
+      children.push(
+        button("neo-details", details ? "Hide raw evidence" : "Show raw evidence", "d"),
+      );
+      if (details)
+        children.push(
+          Code({
+            language: "json",
+            source: JSON.stringify(
+              {
+                execution: result.metadata,
+                validation: result.validation_assessment,
+                checks: result.static_checks,
+                memory: result.memory_evidence,
+              },
+              null,
+              2,
+            ),
+          }),
+        );
+    }
+    const events = current?.parser.events ?? [];
+    if (events.length) children.push(label("Progress", "remember"));
+    for (const event of events)
       children.push(label(`${event.type}: ${event.message ?? ""}`));
     if (current?.parser.malformed)
       children.push(
@@ -754,13 +826,19 @@ export const register: Register = (on, options) => {
     if (e.element === "neo-results") tab = "results";
     if (e.element === "neo-memory") {
       tab = "memory";
-      await inspect($);
+      // Status is a full read of the project store; Refresh re-reads it.
+      if (!snapshot.schema_version) await inspect($);
     }
     if (e.element === "neo-evidence") tab = "evidence";
     if (e.element === "neo-details") details = !details;
     if (e.element === "neo-refresh") await inspect($);
-    if (e.element === "neo-run" || e.element === "neo-followup")
-      $.ui.log(await start($, question, mode, e.element === "neo-followup"));
+    if (e.element === "neo-run" || e.element === "neo-followup") {
+      const before = current;
+      const answer = await start($, question, mode, e.element === "neo-followup");
+      // A refusal is shown where the button was pressed; a started run shows
+      // its own progress line.
+      notice = current === before ? answer : "";
+    }
     if (e.element === "neo-cancel") await stop($);
     if (e.element === "neo-selection") {
       const selected = (await $.ui.selection())?.text ?? "";

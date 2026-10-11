@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Mod pane: clearer and more responsive** ([#280](https://github.com/Parslee-ai/neo/issues/280)).
+  - **Form placement:** the question form now comes first, so it stays in reach after a long answer.
+  - **Mode descriptions:** each mode shows a one-line description.
+  - **In-pane feedback:** a refused **Ask** or **Follow up** is reported in the pane, where the button was pressed, instead of in the transcript.
+  - **Follow up** appears only once there is a finished analysis to follow.
+  - **Elapsed time:** a running analysis shows elapsed time against the four-minute deadline, in the pane and in the band above the prompt. A finished one shows how long it took.
+  - **Evidence tab:** shows labelled rows: execution fields, validation, each check with its status, and how much memory was retrieved, included and cited. **Show reasoning**, **Show provenance details** and the new **Show raw evidence** render JSON in the host's code view instead of as one long text.
+  - **Memory tab:** returning to it reuses the last store read. **Refresh** re-reads it.
+
 ### Fixed
 
 - **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
