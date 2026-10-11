@@ -7,6 +7,7 @@ before the update check, the observer autostart or the engine.
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -23,9 +24,10 @@ from neo.cli import bare_command_hint
         ("status", "neo workspace status"),
         ("index", "neo --index"),
         ("upgrade", "neo update"),
-        ("workspce", "neo workspace"),
-        ("memroy", "neo memory"),
-        ("lattic", "neo lattice"),
+        ("version?", "neo --version"),
+        ("Memory", "neo memory"),
+        ("Lattice", "neo lattice"),
+        ("hook", "neo hook"),
     ],
 )
 def test_command_words_and_near_misses_are_refused(prompt, hint):
@@ -39,6 +41,14 @@ def test_command_words_and_near_misses_are_refused(prompt, hint):
         "version handling in setup.py",
         "refactor",  # one word, but not a command
         "explain",
+        # Real words near a subcommand name: fuzzy matching refused these.
+        "server",
+        "service",
+        "updates",
+        "prompts",
+        "memo",
+        "cart",
+        "hooks",
         "",
         None,
     ],
@@ -48,11 +58,15 @@ def test_questions_and_other_words_pass(prompt):
 
 
 def test_neo_version_word_exits_without_inference(tmp_path):
+    # Isolated even if the guard regresses: no update check, no self-upgrade,
+    # no observer, a throwaway HOME, and src resolved from this file.
     env = {
         "HOME": str(tmp_path),
         "NEO_OBSERVER_AUTOSTART": "0",
+        "NEO_SKIP_UPDATE_CHECK": "1",
+        "NEO_AUTO_INSTALL_UPDATES": "0",
         "PATH": "/usr/bin:/bin",
-        "PYTHONPATH": "src",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
     }
     out = subprocess.run(
         [sys.executable, "-m", "neo", "version"],
@@ -63,4 +77,13 @@ def test_neo_version_word_exits_without_inference(tmp_path):
     )
     assert out.returncode == 2, out.stderr
     assert "neo --version" in out.stderr
-    assert "Adaptive limit" not in out.stderr  # context gathering never started
+
+
+def test_the_guard_runs_before_any_side_effect():
+    """The refusal must come before the update check and the observer
+    autostart, or a mistyped command still reaches the network."""
+    source = (Path(__file__).resolve().parents[1] / "src/neo/cli.py").read_text()
+    body = source.split("def main():", 1)[1]
+    guard = body.index("bare_command_hint(")
+    for later in ("check_for_updates", "maybe_autostart_observer", "_configure_logging(args)"):
+        assert later in body and body.index(later) > guard, later

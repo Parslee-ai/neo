@@ -967,21 +967,20 @@ def bare_command_hint(prompt):
     """The command a one-word prompt most likely meant, or None.
 
     `neo version` used to take "version" as a question and start a paid
-    reasoning run (#278). A single word that names a flag or is a near-miss of
-    a subcommand is refused with the right command instead. Only an argv
+    reasoning run (#278). A single word that exactly names a flag or a
+    subcommand (any case, ignoring leading dashes and trailing punctuation) is
+    refused with the right command instead. There is no fuzzy matching: it
+    refused real words such as "server", "updates" and "prompts". Only an argv
     prompt reaches this; stdin input is never checked.
     """
-    import difflib
-
     word = (prompt or "").strip()
     if not word or any(ch.isspace() for ch in word):
         return None
-    key = word.lower().lstrip("-")
+    key = word.lower().lstrip("-").rstrip("?.!,;:")
     if key in _COMMAND_WORDS:
         return _COMMAND_WORDS[key]
-    close = difflib.get_close_matches(key, _SUBCOMMANDS, n=1, cutoff=0.8)
-    if close:
-        return f"neo {close[0]}"
+    if key in _SUBCOMMANDS:
+        return f"neo {key}"
     return None
 
 
