@@ -1797,8 +1797,14 @@
   NAMES a field Neo sent it drops, renames or lowers that one field, retries, and
   persists the learning in `_ModelParamCompat` (`~/.neo/model_param_compat.json`,
   `"<provider>:<model>" → [flags]`) so the retry is paid once per model. Flags are
-  `drop_<field>`, `rename_<field>`, `max_<field>:<level>`; the first two are the
-  pre-generalisation spellings, so an old file still loads. **Nothing is persisted
+  `drop_<field>` / `rename_<field>` (optionally `@<ladder field>=<level>`: a drop
+  learned while effort was sent holds only at that level) and
+  `refuse_<field>:<level>` (that one level is refused; step down past it, levels
+  are never assumed contiguous). Stored refusals are applied to a fixed point
+  BEFORE drops, so a conditional drop is judged against the level actually sent.
+  Older `max_` caps are ignored; a 400 whose code is one of OpenAI's value-range
+  codes (`_VALUE_ERROR_CODES`) is a bad value, never a drop — a denylist, because
+  vLLM/xAI behind LocalAdapter send their own codes. **Nothing is persisted
   until the adapted call has SUCCEEDED**: learnings are collected during the retry
   walk and written once at the end, because they used to be written before the
   retry proved them, so a call that then failed (a context-length 400 whose text

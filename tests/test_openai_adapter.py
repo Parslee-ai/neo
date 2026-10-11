@@ -581,12 +581,40 @@ def test_a_drop_learned_at_one_level_does_not_apply_at_another():
     assert handler.seen[0][1]["temperature"] == 0.4
 
 
-def test_caps_stored_by_older_versions_are_still_honoured():
-    _seed({"openai:gpt-5.6": ["max_reasoning.effort:high", "drop_temperature"]})
+def test_caps_stored_by_older_versions_are_ignored():
+    """A #263-era `max_` cap assumed contiguous levels (#266 item 2); it is
+    no longer applied, and the level is relearned as a `refuse_` if needed."""
+    _seed({"openai:gpt-5.6": ["max_reasoning.effort:high"]})
     handler = _recording_handler()
-    _adapter("gpt-5.6", handler).generate(MSG, temperature=0.7, reasoning_effort="xhigh")
+    _adapter("gpt-5.6", handler).generate(MSG, reasoning_effort="xhigh")
+    assert handler.seen[0][1]["reasoning"] == {"effort": "xhigh"}
+
+
+def test_a_refused_bottom_level_keeps_a_drop_learned_only_at_that_level_off():
+    """Stored: `none` refused, and temperature refused at `none`. Applying the
+    refusal removes effort, so the conditional drop no longer holds."""
+    _seed({"openai:gpt-5.1": ["refuse_reasoning.effort:none",
+                              "drop_temperature@reasoning.effort=none"]})
+    handler = _recording_handler()
+    _adapter("gpt-5.1", handler).generate(MSG, temperature=0.4, reasoning_effort="none")
     sent = handler.seen[0][1]
-    assert sent["reasoning"] == {"effort": "high"} and "temperature" not in sent
+    assert "reasoning" not in sent and sent["temperature"] == 0.4
+
+
+@pytest.mark.parametrize("code", [400, "Client specified an invalid argument", None])
+def test_openai_compatible_servers_codes_still_drop_an_unsupported_field(code):
+    """vLLM sends an integer code and xAI a free-text one; only OpenAI's own
+    value-range codes mean "keep the field"."""
+    from neo.adapters import _rejection
+
+    class Rejected(Exception):
+        status_code = 400
+        body = {"code": code, "message": "temperature is not supported"}
+
+    exc = Rejected("Error code: 400 - temperature is not supported")
+    assert _rejection(exc, {"temperature": 0.3}, ("temperature",), {}, {}) == "drop_temperature"
+    Rejected.body = {"code": "decimal_above_max_value", "message": "temperature too high"}
+    assert _rejection(exc, {"temperature": 3.0}, ("temperature",), {}, {}) is None
 
 
 def test_a_level_drop_is_judged_against_the_level_actually_sent():

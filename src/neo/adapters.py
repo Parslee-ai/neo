@@ -70,9 +70,10 @@ class _ModelParamCompat:
     Backed by ``~/.neo/model_param_compat.json`` as ``{"<provider>:<model>":
     ["<flag>", ...]}``. Keyed by provider so a bare model name (e.g. ``gpt-4``)
     behind a Local endpoint can't collide with the same name on Azure/OpenAI.
-    Flags are ``drop_<field>``, ``rename_<field>`` and ``max_<field>:<value>``
-    (a level cap); the first two spellings predate this class's generalisation
-    and keep their meaning, so an old file loads unchanged.
+    Flags are ``drop_<field>`` and ``rename_<field>`` (either may carry an
+    ``@<field>=<value>`` condition) and ``refuse_<field>:<level>``. The
+    ``max_<field>:<value>`` caps older versions wrote are ignored: they assumed
+    contiguous levels, and a refused level is relearned in one request.
 
     - The path is resolved at call time so per-test ``Path.home()`` stubs apply
       (mirrors ``neo.memory.metrics._metrics_path``).
@@ -221,7 +222,7 @@ def _apply_flag(kwargs: dict, flag: str, renames: dict, ladders: dict) -> bool:
     if not _is_sent(kwargs, path) or not _condition_holds(kwargs, cond):
         return False
     node, key = _locate(kwargs, path)
-    if kind in ("drop", "bottom"):  # "bottom": dropped to get an answer, never persisted
+    if kind == "drop":
         del node[key]
         parent, _, _ = path.rpartition(".")
         if parent:  # don't leave an empty `reasoning: {}` behind
@@ -230,10 +231,6 @@ def _apply_flag(kwargs: dict, flag: str, renames: dict, ladders: dict) -> bool:
                 del holder[pkey]
     elif kind == "rename" and path in renames:
         node[renames[path]] = node.pop(key)
-    elif kind == "max" and path in ladders:  # legacy cap, still honoured
-        if _rank(ladders[path], node[key]) <= _rank(ladders[path], value):
-            return False
-        node[key] = value
     elif kind == "refuse" and path in ladders:
         # This exact level is refused: step one rung down, or remove the field
         # when it is the bottom rung. Levels are not assumed contiguous: only
@@ -249,10 +246,17 @@ def _apply_flag(kwargs: dict, flag: str, renames: dict, ladders: dict) -> bool:
     return True
 
 
-# OpenAI 400 codes that say a FIELD is unsupported, as opposed to a value of a
-# supported field being out of range (`decimal_above_max_value`, …). The live
-# API sends no code at all for an unsupported `temperature`.
-_FIELD_UNSUPPORTED_CODES = (None, "", "unsupported_parameter", "unsupported_value")
+# OpenAI 400 codes that say a VALUE of a supported field is wrong, as opposed
+# to the field itself being unsupported. A denylist, not an allowlist: the
+# OpenAI-compatible servers behind LocalAdapter use their own vocabulary (vLLM
+# sends the integer 400, xAI a free-text string), and those must still drop.
+_VALUE_ERROR_CODES = frozenset({
+    "invalid_value", "invalid_type",
+    "decimal_above_max_value", "decimal_below_min_value",
+    "integer_above_max_value", "integer_below_min_value",
+    "string_above_max_length", "string_below_min_length",
+    "array_above_max_length", "array_below_min_length",
+})
 
 
 def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
@@ -299,17 +303,18 @@ def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
         if path in ladders and code in ("invalid_value", "unsupported_value"):
             node, key = _locate(kwargs, path)
             return f"refuse_{path}:{node[key]}"
-        if code not in _FIELD_UNSUPPORTED_CODES:
+        if isinstance(code, str) and code in _VALUE_ERROR_CODES:
             continue  # a bad value for a supported field, not an unsupported field
         if path in renames and not any(
             w in text for w in (renames[path], "unsupported", "not supported")
         ):
             continue  # plain value error on a field we would only rename
         flag = f"{'rename' if path in renames else 'drop'}_{path}"
-        conditions = [
-            f"{lp}={_locate(kwargs, lp)[0][_locate(kwargs, lp)[1]]}"
-            for lp in ladders if lp != path and _is_sent(kwargs, lp)
-        ]
+        conditions = []
+        for lp in ladders:
+            if lp != path and _is_sent(kwargs, lp):
+                node, key = _locate(kwargs, lp)
+                conditions.append(f"{lp}={node[key]}")
         return flag + (f"@{conditions[0]}" if conditions else "")
     return None
 
@@ -345,7 +350,7 @@ def _create_resilient(create, kwargs: dict, provider: str, model: str, *,
     # Levels first, to a fixed point (a run of refused levels steps down all
     # the way); only then renames and drops, so a drop conditional on a level
     # is judged against the level actually sent, never an intermediate one.
-    levels = [f for f in stored if _parse_flag(f)[0] in ("refuse", "max")]
+    levels = [f for f in stored if _parse_flag(f)[0] == "refuse"]
     others = [f for f in stored if f not in levels]
     for _ in range(len(levels) + 1):
         if not any([_apply_flag(kwargs, f, renames, ladders) for f in levels]):
