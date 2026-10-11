@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Raw newlines in a model's JSON no longer fail the run** ([#259](https://github.com/Parslee-ai/neo/issues/259)). About one run in six died with `[escape_errors] … Invalid control character` when a model put a literal newline or tab inside a JSON string. `tolerant_json_load` now repairs in order, stopping at the first attempt that parses:
+  1. the text as given;
+  2. raw newlines, carriage returns and tabs escaped inside string literals (only there), plus trailing commas removed;
+  3. curly quotes mapped to straight ones.
+
+  Other control characters still fail. A curly quote inside a value survives.
+- **The curly-quote repair works.** It had been replacing ASCII quotes with themselves.
+- **Simulation and code-suggestion parsing get a repair attempt.** Only the plan used to go through the repair loop, so one bad character in a later phase ended the whole run.
+
 ### Changed
 
 - **Mod pane: clearer and more responsive** ([#280](https://github.com/Parslee-ai/neo/issues/280)).

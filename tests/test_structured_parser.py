@@ -5,6 +5,8 @@ Fuzzing tests for structured parser.
 Tests parser robustness against malformed inputs.
 """
 
+import pytest
+
 from neo.structured_parser import (
     parse_plan_steps,
     parse_simulation_traces,
@@ -409,3 +411,70 @@ if __name__ == "__main__":
 
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(0 if failed == 0 else 1)
+
+class TestTolerantJsonLoadRepairs:
+    """#259: models put raw control characters and curly quotes in JSON."""
+
+    def test_raw_newline_and_tab_inside_strings_are_repaired(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "line1\nline2", "b": "x\ty"}')
+        assert r.success, r.error_message
+        assert r.data == {"a": "line1\nline2", "b": "x\ty"}
+
+    def test_newlines_between_tokens_are_left_alone(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{\n  "a": "v",\n}')
+        assert r.success and r.data == {"a": "v"}
+
+    def test_other_control_characters_still_fail(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "bad\x00"}')
+        assert not r.success
+        assert r.error_code == "escape_errors"
+
+    def test_curly_quote_delimiters_are_mapped(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load("{“a”: “b”}")
+        assert r.success and r.data == {"a": "b"}
+
+    def test_curly_quotes_inside_a_value_survive(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "he said “hi”"}')
+        assert r.success and r.data == {"a": "he said “hi”"}
+
+    def test_escaped_quote_does_not_end_the_string(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "say \\"x\\"\nnext"}')
+        assert r.success and r.data == {"a": 'say "x"\nnext'}
+
+
+class TestLaterPhasesUseRepair:
+    """#259: simulation and code parsing raised on the first failure."""
+
+    @pytest.mark.parametrize(
+        "method,kind",
+        [("_parse_simulation_traces", "simulation"), ("_parse_code_suggestions", "code")],
+    )
+    def test_phase_parsing_goes_through_the_repair_loop(self, monkeypatch, method, kind):
+        from types import SimpleNamespace
+
+        import neo.repair_loop as repair_loop
+        from neo.engine import NeoEngine
+        from neo.structured_parser import ParseResult
+
+        seen = {}
+
+        def fake_repair(response, kind, parser_func, original_prompt, lm_adapter, enable_repair=True):
+            seen.update(kind=kind, lm=lm_adapter, enable=enable_repair)
+            return ParseResult(success=True, data=[])
+
+        monkeypatch.setattr(repair_loop, "parse_with_repair", fake_repair)
+        lm = object()
+        assert getattr(NeoEngine, method)(SimpleNamespace(lm=lm), "garbled") == []
+        assert seen == {"kind": kind, "lm": lm, "enable": True}
