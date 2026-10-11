@@ -2847,7 +2847,7 @@ RULES:
         denominator, which is the nested-cut defect this module exists to
         remove rather than relocate.
         """
-        if self.scoped_consumer is not None:
+        if getattr(self, "scoped_consumer", None) is not None:
             return ""
         cache = Path.home() / ".neo" / "community_facts_cache.json"
         if not cache.exists():
