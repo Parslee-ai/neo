@@ -621,6 +621,31 @@ async def test_a_stop_interrupts_the_reconnect_backoff(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_node_whose_supervisor_died_stops_reconnecting(monkeypatch):
+    daemon = _Daemon()
+    daemon.auth_error = ConnectionError("daemon down")
+    node = _node(daemon)
+    monkeypatch.setattr(lattice, "RECONNECT_MIN_SECS", 0.01)
+    run = asyncio.create_task(node.run())
+    await asyncio.sleep(0.05)  # reconnecting against a dead daemon
+    monkeypatch.setattr(lattice.os, "getppid", lambda: 1)  # reparented
+    await asyncio.wait_for(run, timeout=2)
+    assert node.orphaned is True
+
+
+@pytest.mark.asyncio
+async def test_a_connected_node_notices_its_supervisor_died(monkeypatch):
+    daemon = _Daemon()
+    monkeypatch.setattr(lattice, "POLL_SECS", 0.01)
+    node = _node(daemon)
+    run = asyncio.create_task(node.run())
+    await asyncio.wait_for(node._connected.wait(), timeout=2)
+    monkeypatch.setattr(lattice.os, "getppid", lambda: 1)
+    await asyncio.wait_for(run, timeout=2)
+    assert node.orphaned is True
+
+
+@pytest.mark.asyncio
 async def test_a_daemon_without_the_lattice_ends_the_node_cleanly():
     from neo.a2ui import RpcError
 

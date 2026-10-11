@@ -888,7 +888,13 @@ class LatticeNode:
         self.recycle = False
         self.signalled = False
         self.unavailable = False
+        self.orphaned = False
         self.working = False
+        # CAR's supervisor spawns the node directly, so it is our parent; the
+        # recycle execs in place and keeps it. A daemon that dies without
+        # stopping its children (SIGKILL, a crash, a test daemon torn down)
+        # reparents us, and the reconnect loop would otherwise retry forever.
+        self._supervisor_pid = os.getppid()
         self._spend: dict[str, list[float]] = {}
         # Ids of answers Neo sent -> how many follow-ups deep each is.
         self._answer_depth: dict[str, int] = {}
@@ -896,6 +902,9 @@ class LatticeNode:
         # fire-and-forget task can be collected mid-flight.
         self._tasks: set[asyncio.Task] = set()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo-lattice")
+
+    def supervisor_gone(self) -> bool:
+        return os.getppid() != self._supervisor_pid
 
     def should_recycle(self, now: Optional[float] = None) -> bool:
         """True once a loaded engine or store has sat idle past `IDLE_RECYCLE_SECS`."""
@@ -1281,12 +1290,18 @@ class LatticeNode:
         delay = RECONNECT_MIN_SECS
         try:
             while not self._stop.is_set():
+                if self.supervisor_gone():
+                    logger.warning("supervisor exited; exiting rather than reconnect forever")
+                    self.orphaned = True
+                    break
                 try:
                     if not await self._unless_stopped(self.connect_once()):
                         break
                     delay = RECONNECT_MIN_SECS
                     while self.client.connected and not self._stop.is_set():
                         await asyncio.sleep(POLL_SECS)
+                        if self.supervisor_gone():
+                            break
                         await self.renew_consumer_if_due()
                         if worker.done():
                             break
