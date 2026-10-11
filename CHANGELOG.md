@@ -28,6 +28,7 @@
   - **Last resort:** curly quotes are mapped to straight ones.
   Other control characters still fail, and the error reported is from the text as shown.
 - **The curly-quote repair works.** It had been replacing ASCII quotes with themselves.
+
 The plan's model-based repair is still not used for simulation or code-suggestion parsing. That repair shows the formatter only the first 1000 characters, so a "repaired" code suggestion could come back as a truncated or invented diff. The deterministic repairs above cover the reported failure.
 
 - **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
