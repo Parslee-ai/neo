@@ -342,11 +342,16 @@ def _create_resilient(create, kwargs: dict, provider: str, model: str, *,
     kwargs = {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
     stored = [f for f in _PARAM_COMPAT.flags(provider, model)
               if _known_field(f, optional, renames, ladders)]
-    # Level refusals first, then drops conditional on the level they leave;
-    # repeat to a fixed point so a run of refused levels steps down all the way.
-    for _ in range(len(stored) + 1):
-        if not any([_apply_flag(kwargs, f, renames, ladders) for f in sorted(stored)]):
+    # Levels first, to a fixed point (a run of refused levels steps down all
+    # the way); only then renames and drops, so a drop conditional on a level
+    # is judged against the level actually sent, never an intermediate one.
+    levels = [f for f in stored if _parse_flag(f)[0] in ("refuse", "max")]
+    others = [f for f in stored if f not in levels]
+    for _ in range(len(levels) + 1):
+        if not any([_apply_flag(kwargs, f, renames, ladders) for f in levels]):
             break
+    for flag in others:
+        _apply_flag(kwargs, flag, renames, ladders)
     learned: list[str] = []
     while True:
         try:

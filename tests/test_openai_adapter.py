@@ -587,3 +587,38 @@ def test_caps_stored_by_older_versions_are_still_honoured():
     _adapter("gpt-5.6", handler).generate(MSG, temperature=0.7, reasoning_effort="xhigh")
     sent = handler.seen[0][1]
     assert sent["reasoning"] == {"effort": "high"} and "temperature" not in sent
+
+
+def test_a_level_drop_is_judged_against_the_level_actually_sent():
+    """Stored: temperature refused at high, and high itself refused. A high
+    request steps down to medium, and the drop learned at high must not apply
+    there."""
+    _seed({"openai:gpt-5.1": ["drop_temperature@reasoning.effort=high",
+                              "refuse_reasoning.effort:high"]})
+    handler = _recording_handler()
+    _adapter("gpt-5.1", handler).generate(MSG, temperature=0.4, reasoning_effort="high")
+    sent = handler.seen[0][1]
+    assert sent["reasoning"] == {"effort": "medium"}
+    assert sent["temperature"] == 0.4
+
+
+def test_a_model_whose_lowest_level_is_above_the_request_pays_once():
+    """#265: gpt-5.2-pro accepts medium..xhigh. Asked for low, the first call
+    walks down past low, minimal and none and runs without effort (the
+    provider default); those refusals are remembered, so every later call is
+    one request."""
+    accepted = {"medium", "high", "xhigh"}
+    handler = _recording_handler(lambda p: None if (
+        "reasoning" not in p or p["reasoning"]["effort"] in accepted)
+        else _unsupported_level(p["reasoning"]["effort"]))
+    _adapter("gpt-5.2-pro", handler).generate(MSG, reasoning_effort="low")
+    first = len(handler.seen)
+    assert handler.seen[-1][1].get("reasoning") is None
+    handler.seen.clear()
+    _adapter("gpt-5.2-pro", handler).generate(MSG, reasoning_effort="low")
+    assert len(handler.seen) == 1 and handler.seen[0][1].get("reasoning") is None
+    assert first > 1
+    # A level the model accepts is still sent as asked.
+    handler.seen.clear()
+    _adapter("gpt-5.2-pro", handler).generate(MSG, reasoning_effort="high")
+    assert handler.seen[0][1]["reasoning"] == {"effort": "high"}

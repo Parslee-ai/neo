@@ -7,6 +7,7 @@
 - **The parameter-compatibility store no longer learns false facts about a model** ([#266](https://github.com/Parslee-ai/neo/issues/266)).
   - **Value errors:** a rejection whose code says a value is out of range (for example `decimal_above_max_value` on `temperature=5`) is no longer remembered as "field unsupported", so a later valid value is still sent. Only unsupported-field rejections (or a provider message with no code) teach a drop.
   - **Effort levels:** each refused level is remembered on its own (`refuse_reasoning.effort:low`), and a request steps down only past refused levels. A model's levels are no longer assumed contiguous, so refusing `low` no longer caps a later `high` request. Caps stored by older versions (`max_…`) are still honoured.
+  - **Models with a high floor:** a model whose lowest effort level is above the request (`gpt-5.2-pro` accepts `medium` to `xhigh`) used to make 3 requests on every call asked for `low`. Its refused levels are now remembered, so the walk is paid once and later calls are a single request at the provider default ([#265](https://github.com/Parslee-ai/neo/issues/265)).
   - **Hand-edited flags:** stored flags naming a field the adapter doesn't adapt (such as `drop_model`) are ignored.
   - **Level-dependent drops:** a drop learned while an effort level was sent applies only at that level (`drop_temperature@reasoning.effort=high`). Some models accept `temperature` at one effort and refuse it at another. A model that refuses a field at every level pays one extra request per level, once.
 
