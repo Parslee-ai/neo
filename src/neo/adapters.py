@@ -196,12 +196,29 @@ def _rank(ladder: tuple, value: object) -> int:
     return ladder.index(value) if value in ladder else len(ladder)
 
 
+def _parse_flag(flag: str) -> tuple[str, str, str, str]:
+    """`kind_path[:value][@cond_path=cond_value]` -> (kind, path, value, cond)."""
+    body, _, cond = flag.partition("@")
+    kind, _, rest = body.partition("_")
+    path, _, value = rest.partition(":")
+    return kind, path, value, cond
+
+
+def _condition_holds(kwargs: dict, cond: str) -> bool:
+    """A conditional flag applies only while the field it was learned under
+    still carries the same value (#266 item 4)."""
+    if not cond:
+        return True
+    cpath, _, cvalue = cond.partition("=")
+    node, key = _locate(kwargs, cpath)
+    return node is not None and key in node and str(node[key]) == cvalue
+
+
 def _apply_flag(kwargs: dict, flag: str, renames: dict, ladders: dict) -> bool:
     """Apply one learned adaptation in place. True when it changed `kwargs`,
     which is what bounds the retry loop: a flag that changes nothing ends it."""
-    kind, _, rest = flag.partition("_")
-    path, _, cap = rest.partition(":")
-    if not _is_sent(kwargs, path):
+    kind, path, value, cond = _parse_flag(flag)
+    if not _is_sent(kwargs, path) or not _condition_holds(kwargs, cond):
         return False
     node, key = _locate(kwargs, path)
     if kind in ("drop", "bottom"):  # "bottom": dropped to get an answer, never persisted
@@ -213,20 +230,37 @@ def _apply_flag(kwargs: dict, flag: str, renames: dict, ladders: dict) -> bool:
                 del holder[pkey]
     elif kind == "rename" and path in renames:
         node[renames[path]] = node.pop(key)
-    elif kind == "max" and path in ladders:
-        if _rank(ladders[path], node[key]) <= _rank(ladders[path], cap):
+    elif kind == "max" and path in ladders:  # legacy cap, still honoured
+        if _rank(ladders[path], node[key]) <= _rank(ladders[path], value):
             return False
-        node[key] = cap
+        node[key] = value
+    elif kind == "refuse" and path in ladders:
+        # This exact level is refused: step one rung down, or remove the field
+        # when it is the bottom rung. Levels are not assumed contiguous: only
+        # refused levels are skipped (#266 item 2).
+        if str(node[key]) != value:
+            return False
+        rung = _rank(ladders[path], node[key])
+        if rung == 0:
+            return _apply_flag(kwargs, f"drop_{path}", renames, ladders)
+        node[key] = ladders[path][rung - 1]
     else:
         return False
     return True
+
+
+# OpenAI 400 codes that say a FIELD is unsupported, as opposed to a value of a
+# supported field being out of range (`decimal_above_max_value`, …). The live
+# API sends no code at all for an unsupported `temperature`.
+_FIELD_UNSUPPORTED_CODES = (None, "", "unsupported_parameter", "unsupported_value")
 
 
 def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
                ladders: dict) -> Optional[str]:
     """The adaptation flag for the one field `exc` rejects, or None when `exc`
     is anything else (auth, rate limit, an unrelated 400, an unrelated
-    TypeError) and must re-raise untouched.
+    TypeError, or a value error on a supported field) and must re-raise
+    untouched.
 
     A field is only ever named by the rejection itself: the SDK refusing the
     keyword at the signature (TypeError), or an HTTP 400. When the 400 carries
@@ -234,13 +268,17 @@ def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
     a message that merely mentions a field is not a rejection of it; the
     message is the fallback only when there is no `param` (Anthropic, Google),
     and for a rename field it is still read after `param` matches, where it
-    can only veto. `code` separates the two shapes that name the
-    same ladder field: `unsupported_value` (a level this model does not offer)
-    or `invalid_value` (a level outside the known vocabulary) means the field
-    exists and the LEVEL is the problem (step down); anything else means the
-    field itself is unsupported (drop it). A level rejected at the bottom rung
-    returns `bottom_<field>`: "rejected" does not mean "too high", so that
-    removal serves this call only and is never persisted.
+    can only veto. `code` separates the shapes that name the same field:
+
+    - a ladder field with `unsupported_value` / `invalid_value`: this LEVEL is
+      refused -> `refuse_<field>:<level>` (step down past it; levels are not
+      assumed contiguous);
+    - a code saying the value is out of range: a value error, not a missing
+      field -> None (#266 item 1: dropping it would remember a false "drop");
+    - otherwise the field itself is unsupported -> `drop_` / `rename_`. A drop
+      learned while a ladder field is sent is conditional on that level
+      (`@reasoning.effort=high`), because support can depend on it (#266
+      item 4).
     """
     present = [p for p in optional if _is_sent(kwargs, p)]
     if isinstance(exc, TypeError):
@@ -260,16 +298,27 @@ def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
             continue
         if path in ladders and code in ("invalid_value", "unsupported_value"):
             node, key = _locate(kwargs, path)
-            rung = _rank(ladders[path], node[key])
-            return f"bottom_{path}" if rung == 0 else f"max_{path}:{ladders[path][rung - 1]}"
-        if code == "invalid_value":
+            return f"refuse_{path}:{node[key]}"
+        if code not in _FIELD_UNSUPPORTED_CODES:
             continue  # a bad value for a supported field, not an unsupported field
         if path in renames and not any(
             w in text for w in (renames[path], "unsupported", "not supported")
         ):
             continue  # plain value error on a field we would only rename
-        return f"{'rename' if path in renames else 'drop'}_{path}"
+        flag = f"{'rename' if path in renames else 'drop'}_{path}"
+        conditions = [
+            f"{lp}={_locate(kwargs, lp)[0][_locate(kwargs, lp)[1]]}"
+            for lp in ladders if lp != path and _is_sent(kwargs, lp)
+        ]
+        return flag + (f"@{conditions[0]}" if conditions else "")
     return None
+
+
+def _known_field(flag: str, optional: tuple, renames: dict, ladders: dict) -> bool:
+    """A stored flag applies only to a field this adapter may adapt; a
+    hand-edited `drop_model` must never strip a required field (#266 item 3)."""
+    _, path, _, _ = _parse_flag(flag)
+    return path in optional or path in renames or path in ladders
 
 
 def _create_resilient(create, kwargs: dict, provider: str, model: str, *,
@@ -281,19 +330,23 @@ def _create_resilient(create, kwargs: dict, provider: str, model: str, *,
     `optional` lists the dotted field paths Neo may send that a model might
     refuse; `renames` maps a field to its replacement name; `ladders` maps a
     field to its ordered levels, lowest first. Adaptations already learned for
-    ``provider``/``model`` are applied up front; a new rejection is applied and
-    retried, and what was learned is persisted only once a call has SUCCEEDED
-    (a call that ends in an exception persists nothing). A cap on a ladder
-    field whose level walk ended in removal is not persisted either: nothing
-    proved it. Anything that is not a rejection of a field Neo sent re-raises.
-    The loop is bounded by construction: every recovery removes a field,
-    renames it away, or lowers a level, and one that changes nothing ends the
-    loop. ``kwargs`` is copied, not mutated.
+    ``provider``/``model`` are applied up front (only for fields this adapter
+    knows); a new rejection is applied and retried, and what was learned is
+    persisted only once a call has SUCCEEDED (a call that ends in an exception
+    persists nothing). Anything that is not a rejection of a field Neo sent
+    re-raises. The loop is bounded by construction: every recovery removes a
+    field, renames it away, or lowers a level, and one that changes nothing
+    ends the loop. ``kwargs`` is copied, not mutated.
     """
     renames, ladders = renames or {}, ladders or {}
     kwargs = {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
-    for flag in _PARAM_COMPAT.flags(provider, model):
-        _apply_flag(kwargs, flag, renames, ladders)
+    stored = [f for f in _PARAM_COMPAT.flags(provider, model)
+              if _known_field(f, optional, renames, ladders)]
+    # Level refusals first, then drops conditional on the level they leave;
+    # repeat to a fixed point so a run of refused levels steps down all the way.
+    for _ in range(len(stored) + 1):
+        if not any([_apply_flag(kwargs, f, renames, ladders) for f in sorted(stored)]):
+            break
     learned: list[str] = []
     while True:
         try:
@@ -306,11 +359,8 @@ def _create_resilient(create, kwargs: dict, provider: str, model: str, *,
             learned.append(flag)
             logger.debug("%s/%s rejected a field (%s); adapted and retrying",
                          provider, model, flag)
-    bottomed = {f.partition("_")[2] for f in learned if f.startswith("bottom_")}
     for flag in learned:
-        path = flag.partition("_")[2].partition(":")[0]
-        if not flag.startswith("bottom_") and path not in bottomed:
-            _PARAM_COMPAT.learn(provider, model, flag)
+        _PARAM_COMPAT.learn(provider, model, flag)
     return response
 
 
