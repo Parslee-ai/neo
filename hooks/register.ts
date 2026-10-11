@@ -41,6 +41,14 @@ const INSTRUCTIONS: Record<string, string> = {
   optimize: "Find defensible performance improvements for:",
   pattern: "Identify existing or reusable patterns for:",
 };
+const DESCRIPTIONS: Record<string, string> = {
+  reason: "General reasoning about a question or code",
+  review: "Correctness, security, edge cases and maintainability",
+  debug: "Root cause and a proposed fix",
+  architect: "Architecture and concrete trade-offs",
+  optimize: "Defensible performance improvements",
+  pattern: "Existing or reusable patterns",
+};
 type Run = {
   id: string;
   session: string;
@@ -56,6 +64,9 @@ type Run = {
   error?: string;
   stream?: HookStream<ProcessSpawnChunk, ProcessSpawnResult>;
   timer?: Timer;
+  ticker?: Timer;
+  /** The session generation the run started in; a later one owns the pane. */
+  generation: number;
   started: number;
   elapsed?: number;
   stopped?: string;
@@ -82,6 +93,33 @@ let session = "",
   lastInvocation = "";
 const turns = new Map<string, string>();
 let generation = 0;
+/** Set while start() awaits, so a second press cannot start a second run. */
+let starting = false;
+/** The clock as of the last tick, so a drawing can show elapsed time. */
+let nowMs = 0;
+const clockText = (ms: number) => {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+};
+const JSON_CAP = 20000;
+/** Pretty JSON for a Code view, capped: one drawing shares a fixed character
+ * budget across every Code block it holds, diffs included. */
+function cappedJson(value: unknown): string {
+  const out = JSON.stringify(value, null, 2) ?? "";
+  return out.length > JSON_CAP
+    ? out.slice(0, JSON_CAP) + `\n… truncated (${out.length} characters)`
+    : out;
+}
+function progressLine(run: Run): string {
+  const active = run.status === "running" || run.status === "stopping";
+  const elapsed = Math.min(
+    DEADLINE,
+    active ? nowMs - run.started : (run.elapsed ?? nowMs - run.started),
+  );
+  return active
+    ? `${run.status} · ${clockText(elapsed)} of ${clockText(DEADLINE)} · ${run.parser.message}`
+    : `${run.status} · took ${clockText(elapsed)}`;
+}
 
 function redraw($: EngineInterface) {
   $.ui.invalidate("ui.render");
@@ -153,6 +191,9 @@ async function stop($: EngineInterface, reason = "cancelled") {
   run.stopped = reason;
   run.status = "stopping";
   run.timer?.cancel();
+  // If closing the stream never ends the loop, the ticker must not redraw
+  // forever: give the close ten seconds.
+  $.clock.after(10000, () => run.ticker?.cancel());
   redraw($);
   // Close only this invocation's stream; never signal a process group.
   try {
@@ -172,11 +213,21 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
     run.timer = $.clock.after(DEADLINE, () => {
       void stop($, "timed out after 4 minutes").catch(() => {});
     });
+    run.ticker = $.clock.every(1000, () => {
+      void $.clock.now().then(
+        (t) => {
+          nowMs = t;
+          redraw($);
+        },
+        () => {},
+      );
+    });
     for await (const chunk of run.stream) {
       run.parser.push(chunk.stream, chunk.text);
       redraw($);
     }
     const ended = await run.stream.result;
+    run.elapsed = (await $.clock.now()) - run.started;
     if (!run.stopped) {
       run.result = run.parser.finish(ended.code, ended.signal);
       const gates = object(run.result.validation_assessment);
@@ -194,15 +245,25 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
     }
   } finally {
     run.timer?.cancel();
-    run.elapsed = (await $.clock.now()) - run.started;
+    run.ticker?.cancel();
+    run.elapsed ??= (await $.clock.now()) - run.started;
     if (run.stopped) {
       run.status = "cancelled";
       run.error = run.stopped;
     }
+    const ownsPane = run.generation === generation;
     // A run that produced nothing gives its context back for the retry, unless
-    // the person has attached something new meanwhile.
-    if ((run.status === "failed" || run.status === "cancelled") && !context)
+    // the person has attached something new meanwhile, or the session it
+    // belonged to has ended.
+    if (
+      ownsPane &&
+      (run.status === "failed" || run.status === "cancelled") &&
+      !context
+    )
       context = run.context;
+    // A finished analysis may have written memory: the next Memory visit reads
+    // the store again.
+    if (ownsPane && run.result) snapshot = {};
     await record($, "event", {
       event: "neo_finished",
       session_id: run.session,
@@ -211,7 +272,7 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
       status: run.status,
     });
     redraw($);
-    if (run.error) $.ui.log("Neo: " + run.error);
+    if (run.error && ownsPane) $.ui.log("Neo: " + run.error);
   }
 }
 async function start(
@@ -220,13 +281,22 @@ async function start(
   selectedMode = mode,
   followup = false,
 ) {
-  if (current?.status === "running" || current?.status === "stopping")
+  if (
+    starting ||
+    current?.status === "running" ||
+    current?.status === "stopping"
+  )
     return "Neo is already working. Cancel that run before starting another.";
   if (!prompt.trim()) return "Enter a question or target first.";
   if (prompt.length > 24000 || context.length > 16000)
     return "Question or selected context exceeds the 24k / 16k character limits.";
-  session = await $.session.id();
-  cwd = await $.session.cwd();
+  starting = true;
+  try {
+    session = await $.session.id();
+    cwd = await $.session.cwd();
+  } finally {
+    starting = false;
+  }
   const prior = current?.result ? current : previous;
   if (followup && !prior?.result)
     return "Run an analysis before asking a follow-up.";
@@ -244,9 +314,12 @@ async function start(
     prompt,
     mode: selectedMode,
     context: sentContext,
+    generation,
     parser: new NeoStream(),
     started: await $.clock.now(),
   };
+  nowMs = run.started;
+  details = false;
   current = run;
   question = prompt;
   mode = selectedMode;
@@ -294,6 +367,13 @@ async function start(
       ? "Neo: " + run.error
       : "Neo started. /neo-status shows progress; /neo-cancel stops this run.";
 }
+/** Start from the pane (Ask, Follow up or Enter). A refusal is shown where
+ * the person asked; a started run shows its own progress line. */
+async function ask($: EngineInterface, followup: boolean) {
+  const before = current;
+  const answer = await start($, question, mode, followup);
+  notice = current === before ? answer : "";
+}
 function statusText(): string {
   return current
     ? `Neo ${current.status}: ${current.error ?? current.parser.message}`
@@ -328,9 +408,12 @@ function render(
       flexDirection: "row",
       gap: 1,
       children: [
-        label("Neo · " + (current?.status ?? "ready"), "remember"),
-        label(current?.parser.message ?? ""),
-        button("neo-cancel", "Cancel"),
+        label("Neo", "remember"),
+        Text({
+          children: current ? progressLine(current) : "ready",
+          wrap: "truncate-end",
+        }),
+        ...(current?.status === "running" ? [button("neo-cancel", "Cancel")] : []),
       ],
     });
   const children: RenderNode[] = [
@@ -352,10 +435,64 @@ function render(
     }),
   ];
   if (tab === "results") {
-    if (current?.error) children.push(label(current.error, "error"));
-    if (current?.status === "running" || current?.status === "stopping")
-      children.push(label(current.parser.message));
     const result = current?.result;
+    // The question form comes first: after a long answer it would otherwise
+    // be scrolled out of reach.
+    children.push(
+      Select({
+        key: "neo-mode",
+        label: "Mode",
+        value: mode,
+        options: MODES.map((value) => ({ value, label: value })),
+        onSelect: () => {},
+      }),
+      label(DESCRIPTIONS[mode] ?? "", "subtle"),
+      Input({
+        key: "neo-question",
+        label: "Question or target",
+        value: question,
+        onInput: () => {},
+        onSubmit: () => {},
+      }),
+      Input({
+        key: "neo-context",
+        label: "Selected context (optional)",
+        value: context,
+        onInput: () => {},
+        onSubmit: () => {},
+      }),
+    );
+    if (context)
+      children.push(
+        label(
+          `Context attached · ${context.length} characters · sent with the next question only`,
+          "subtle",
+        ),
+      );
+    children.push(
+      Box({
+        flexDirection: e.props.bodyColumns < 66 ? "column" : "row",
+        gap: 1,
+        children: [
+          button("neo-run", "Ask Neo", "a"),
+          // A follow-up needs a finished analysis to follow.
+          ...(result || previous?.result
+            ? [button("neo-followup", "Follow up", "f")]
+            : []),
+          button("neo-selection", "Use selection"),
+          ...(result ? [button("neo-share", "Share with Claude")] : []),
+        ],
+      }),
+    );
+    if (notice) children.push(label(notice, "warning"));
+    children.push(
+      label(
+        "Advisory · proposes changes; does not apply them or claim downstream acceptance.",
+        "subtle",
+      ),
+    );
+    if (current) children.push(label(progressLine(current)));
+    if (current?.error) children.push(label(current.error, "error"));
     if (result) {
       children.push(label(text(object(result.orchestrator).summary)));
       for (const caution of strings(object(result.orchestrator).cautions))
@@ -392,18 +529,15 @@ function render(
       );
       if (details)
         children.push(
-          label(
-            JSON.stringify(
-              {
-                plan: result.plan,
-                simulation_traces: result.simulation_traces,
-                validation: result.validation_assessment,
-                hypotheses: result.hypotheses,
-              },
-              null,
-              2,
-            ),
-          ),
+          Code({
+            source: cappedJson({
+              plan: result.plan,
+              simulation_traces: result.simulation_traces,
+              validation: result.validation_assessment,
+              hypotheses: result.hypotheses,
+            }),
+            language: "json",
+          }),
         );
     } else if (!current)
       children.push(
@@ -411,50 +545,6 @@ function render(
           "Ask Neo for a second opinion. Findings, cautions and evidence appear here.",
         ),
       );
-    if (notice) children.push(label(notice, "warning"));
-    if (context)
-      children.push(
-        label(
-          `Context attached · ${context.length} characters · sent with the next question only`,
-          "subtle",
-        ),
-      );
-    children.push(
-      Select({
-        key: "neo-mode",
-        value: mode,
-        options: MODES.map((value) => ({ value, label: value })),
-        onSelect: () => {},
-      }),
-      Input({
-        key: "neo-question",
-        label: "Question or target",
-        value: question,
-        onInput: () => {},
-        onSubmit: () => {},
-      }),
-      Input({
-        key: "neo-context",
-        label: "Selected context (optional)",
-        value: context,
-        onInput: () => {},
-        onSubmit: () => {},
-      }),
-      Box({
-        flexDirection: e.props.bodyColumns < 66 ? "column" : "row",
-        gap: 1,
-        children: [
-          button("neo-run", "Ask Neo", "a"),
-          button("neo-followup", "Follow up", "f"),
-          button("neo-selection", "Use selection"),
-          ...(result ? [button("neo-share", "Share with Claude")] : []),
-        ],
-      }),
-      label(
-        "Advisory · proposes changes; does not apply them or claim downstream acceptance.",
-        "subtle",
-      ),
-    );
   } else if (tab === "memory") {
     children.push(
       label(
@@ -484,8 +574,9 @@ function render(
       );
       if (details)
         children.push(
-          label(
-            JSON.stringify(
+          Code({
+            language: "json",
+            source: cappedJson(
               {
                 fact: f,
                 supporting: explanation.supporting_evidence,
@@ -494,10 +585,8 @@ function render(
                 mutations_and_rollback: explanation.mutation_history,
                 retrieval: explanation.retrieval_history,
               },
-              null,
-              2,
             ),
-          ),
+          }),
         );
       for (const c of strings(explanation.cautions))
         children.push(label(c, "warning"));
@@ -563,24 +652,52 @@ function render(
     children.push(
       label(
         "Analysis completion is separate from verified application and independent acceptance.",
+        "subtle",
       ),
     );
-    if (current?.result)
+    const result = current?.result;
+    if (result) {
+      const meta = object(result.metadata);
+      const scalars = Object.entries(meta).filter(
+        ([, v]) => ["string", "number", "boolean"].includes(typeof v) && v !== "",
+      );
+      children.push(label("Execution", "remember"));
+      for (const [k, v] of scalars) children.push(label(`${k} · ${String(v)}`));
+      children.push(label("Validation · " + validationText(result)));
+      const checks = rows(result.static_checks);
+      children.push(label(`Checks · ${checks.length}`, "remember"));
+      for (const c of checks)
+        children.push(
+          label(`${c.tool_name} · ${c.status || "status unavailable"} · ${text(c.summary)}`),
+        );
+      const memory = rows(result.memory_evidence);
+      const included = memory.filter((m) => m.included_in_context).length;
+      const cited = memory.filter((m) => m.hard_cited === true).length;
       children.push(
         label(
-          JSON.stringify(
-            {
-              execution: current.result.metadata,
-              validation: current.result.validation_assessment,
-              checks: current.result.static_checks,
-              memory: current.result.memory_evidence,
-            },
-            null,
-            2,
-          ),
+          `Memory · ${memory.length} retrieved · ${included} included · ${cited} hard cited`,
+          "remember",
         ),
       );
-    for (const event of current?.parser.events ?? [])
+      children.push(
+        button("neo-details", details ? "Hide raw evidence" : "Show raw evidence", "d"),
+      );
+      if (details)
+        children.push(
+          Code({
+            language: "json",
+            source: cappedJson({
+              execution: result.metadata,
+              validation: result.validation_assessment,
+              checks: result.static_checks,
+              memory: result.memory_evidence,
+            }),
+          }),
+        );
+    }
+    const events = current?.parser.events ?? [];
+    if (events.length) children.push(label("Progress", "remember"));
+    for (const event of events)
       children.push(label(`${event.type}: ${event.message ?? ""}`));
     if (current?.parser.malformed)
       children.push(
@@ -739,7 +856,7 @@ export const register: Register = (on, options) => {
       memoryPage = 0;
     }
     if (e.kind === "submit" && e.element === "neo-question")
-      await start($, question);
+      await ask($, false);
     if (e.kind === "submit" && e.element === "neo-fact")
       await inspect($, e.value.trim());
     redraw($);
@@ -751,16 +868,21 @@ export const register: Register = (on, options) => {
     return { element: e.element, value: e.value };
   });
   on("ui.press", { requestId: PANE }, async ($, e) => {
+    if (["neo-results", "neo-memory", "neo-evidence"].includes(e.element))
+      details = false;
     if (e.element === "neo-results") tab = "results";
     if (e.element === "neo-memory") {
       tab = "memory";
-      await inspect($);
+      // Status is a full read of the project store; Refresh re-reads it. A
+      // read from another checkout, or none, is read again.
+      if (!snapshot.schema_version || snapshot.checkout !== (await $.session.cwd()))
+        await inspect($);
     }
     if (e.element === "neo-evidence") tab = "evidence";
     if (e.element === "neo-details") details = !details;
     if (e.element === "neo-refresh") await inspect($);
     if (e.element === "neo-run" || e.element === "neo-followup")
-      $.ui.log(await start($, question, mode, e.element === "neo-followup"));
+      await ask($, e.element === "neo-followup");
     if (e.element === "neo-cancel") await stop($);
     if (e.element === "neo-selection") {
       const selected = (await $.ui.selection())?.text ?? "";
