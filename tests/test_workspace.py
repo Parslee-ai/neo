@@ -143,38 +143,68 @@ def test_host_identity_persists_as_diagnostic_without_promoting(tmp_path):
     assert store.entries == []
 
 
-def test_status_flags_facts_whose_named_files_are_all_gone(tmp_path, monkeypatch):
-    """A fact describing deleted code is still retrieved; the inspector names it
-    stale only when every file it names is absent from the checkout."""
+
+def _write_facts(tmp_path, root, facts):
+    _, project = detect_org_and_project(str(root))
+    facts_dir = tmp_path / ".neo" / "facts"
+    facts_dir.mkdir(parents=True, exist_ok=True)
+    rows = [Fact(id=i, subject=subj, body=body, kind=FactKind.REVIEW,
+                 scope=FactScope.PROJECT, project_id=project).to_dict()
+            for i, subj, body in facts]
+    (facts_dir / f"facts_project_{project}.json").write_text(json.dumps({"facts": rows}))
+
+
+def test_status_names_pattern_facts_about_files_the_checkout_lacks(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     root = tmp_path / "work"
     (root / "src").mkdir(parents=True)
     (root / "src" / "live.py").write_text("x = 1\n")
-    _, project = detect_org_and_project(str(root))
-    facts_dir = tmp_path / ".neo" / "facts"
-    facts_dir.mkdir(parents=True)
-
-    def fact(id, subject, body=""):
-        return Fact(id=id, subject=subject, body=body, kind=FactKind.REVIEW,
-                    scope=FactScope.PROJECT, project_id=project).to_dict()
-
-    facts = [
-        fact("gone", "pattern: src/car/ir/verify.py"),
-        fact("live", "pattern: src/live.py"),
-        fact("hist_gone", "pattern: history:de3e40ae Add search",
-             "Commit: de3e\nFiles: old/a.rs, old/b.rs\n"),
-        fact("hist_mixed", "pattern: history:1234 Mixed",
-             "Files: old/a.rs, src/live.py\n"),
-        fact("prose", "pattern: I/O", "no paths here"),
-        fact("decision", "Sibling project relationships"),
-    ]
-    (facts_dir / f"facts_project_{project}.json").write_text(json.dumps({"facts": facts}))
+    _write_facts(tmp_path, root, [
+        ("gone", "pattern: src/car/ir/verify.py", ""),
+        ("live", "pattern: src/live.py", ""),
+        # History records stay true after the files go: never checked.
+        ("hist", "history:de3e40ae Remove old module", "Files: old/a.rs\n"),
+        ("prose", "pattern: I/O", ""),
+        ("clipped", "pattern: mean/va", ""),
+        ("decision", "Sibling project relationships", ""),
+    ])
     status = workspace_status(str(root))
-    flagged = {f["id"]: f["missing_paths"] for f in status["facts"]}
-    assert flagged["gone"] == ["src/car/ir/verify.py"]
-    assert flagged["hist_gone"] == ["old/a.rs", "old/b.rs"]
-    assert flagged["live"] == []
-    assert flagged["hist_mixed"] == []  # one named file still exists
-    assert flagged["decision"] == []
-    assert status["stale_count"] == 2
+    missing = {f["id"]: f["missing_file"] for f in status["facts"]}
+    assert missing == {"gone": "src/car/ir/verify.py", "live": "", "hist": "",
+                       "prose": "", "clipped": "", "decision": ""}
+    assert status["missing_file_count"] == 1
     assert status["model_calls"] == 0
+
+
+def test_paths_are_relative_to_the_repository_top_not_the_session_dir(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "work"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "live.py").write_text("x = 1\n")
+    (root / "sub").mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _write_facts(tmp_path, root, [("live", "pattern: src/live.py", "")])
+    # Same project id from a subdirectory; the path must still resolve.
+    monkeypatch.setattr("neo.workspace.project_snapshot",
+                        lambda r, _orig=__import__("neo.workspace", fromlist=["x"]).project_snapshot: _orig(str(root)))
+    status = workspace_status(str(root / "sub"))
+    assert status["facts"][0]["missing_file"] == ""
+
+
+def test_paths_outside_the_checkout_and_unstatable_paths_are_never_flagged(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "work"
+    root.mkdir()
+    _write_facts(tmp_path, root, [
+        ("abs", "pattern: /nonexistent/x.py", ""),
+        ("up", "pattern: ../outside/x.py", ""),
+        ("win", "pattern: C:/x/y.py", ""),
+        ("url", "pattern: https://x.io/a.html", ""),
+        ("long", "pattern: src/" + "a" * 300 + ".py", ""),
+    ])
+    status = workspace_status(str(root))
+    flagged = {f["id"]: f["missing_file"] for f in status["facts"]}
+    assert flagged["abs"] == flagged["up"] == flagged["win"] == flagged["url"] == ""
+    assert status["missing_file_count"] in (0, 1)  # the 300-char name may or may not stat

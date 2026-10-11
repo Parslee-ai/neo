@@ -11,7 +11,11 @@
   - **Follow up** appears only once there is a finished analysis to follow.
   - **Elapsed time:** a running analysis shows elapsed time against the four-minute deadline, in the pane and in the band above the prompt. A finished one shows how long it took.
   - **Evidence tab:** shows labelled rows: execution fields, validation, each check with its status, and how much memory was retrieved, included and cited. **Show reasoning**, **Show provenance details** and the new **Show raw evidence** render JSON in the host's code view instead of as one long text.
-  - **Stale facts:** `neo workspace status` reports, for each fact, the files it names that are gone from the checkout (`missing_paths`), plus a `stale_count`. A fact counts as stale only when every file it names is absent. The Memory tab marks those facts `[stale]` and shows the count. This makes no model call and changes nothing in the store.
+  - **Facts about missing files:** for each `pattern: <file>` fact, `neo workspace status` reports the file when this checkout doesn't have it (`missing_file`), plus a `missing_file_count`. The Memory tab marks those facts `[missing file]` and shows the count.
+    - Paths resolve from the repository's top level, so starting in a subdirectory gives the same answer.
+    - History facts are never checked: a record of what a commit touched stays true after the files are gone.
+    - Absolute, `..` and URL-like paths are never looked at, and a path that can't be checked counts as present.
+    - No model call is made and nothing in the store changes.
   - **Memory tab:** returning to it reuses the last store read. A finished analysis, a different working directory, or **Refresh** reads it again.
   - **Details toggles:** opening details on one tab no longer opens them on the others, and a new run starts with details closed. Large JSON views are capped so they stay within the host's drawing limit.
   - **Band and runs:** the band above the prompt offers Cancel only while a run can be cancelled, and keeps its status on one line. A cancel that never completes stops redrawing after ten seconds. Pressing **Ask** twice quickly can no longer start two runs.

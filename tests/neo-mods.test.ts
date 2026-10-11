@@ -692,7 +692,7 @@ test("details opened on one tab stay closed on the others", async ($, on) => {
 });
 
 
-test("facts naming only deleted files are marked stale in Memory", async ($, on) => {
+test("facts about files not in this checkout are marked in Memory", async ($, on) => {
   host(on);
   on("process.run", () => ({
     value: {
@@ -702,10 +702,10 @@ test("facts naming only deleted files are marked stale in Memory", async ($, on)
         checkout: "/work",
         fact_count: 2,
         probation_count: 0,
-        stale_count: 1,
+        missing_file_count: 1,
         facts: [
-          { id: "gone", subject: "pattern: src/old.py", is_valid: true, missing_paths: ["src/old.py"] },
-          { id: "live", subject: "pattern: src/new.py", is_valid: true, missing_paths: [] },
+          { id: "gone", subject: "pattern: src/old.py", is_valid: true, missing_file: "src/old.py" },
+          { id: "live", subject: "pattern: src/new.py", is_valid: true, missing_file: "" },
         ],
       }),
       stderr: "",
@@ -717,8 +717,8 @@ test("facts naming only deleted files are marked stale in Memory", async ($, on)
   const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
   await ui.press({ key: "neo-memory" });
   const drawn = JSON.stringify(await ui.drawn());
-  expect(drawn).toContain("1 name only deleted files");
-  expect(drawn).toContain("[stale] pattern: src/old.py");
-  expect(drawn).not.toContain("[stale] pattern: src/new.py");
+  expect(drawn).toContain("1 about files not in this checkout");
+  expect(drawn).toContain("[missing file] pattern: src/old.py");
+  expect(drawn).not.toContain("[missing file] pattern: src/new.py");
   await ui.unmount();
 });
