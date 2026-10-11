@@ -1299,6 +1299,9 @@ class FactStore:
                     "file_path": outcome.file_path,
                     "repository_revision": outcome.repository_revision,
                 })
+                episode.outcome_details.pop("host_observations", None)
+                if outcome.host_observations:
+                    episode.outcome_details["host_observations"] = outcome.host_observations
             if (
                 append_verification
                 and outcome.outcome_type == OutcomeType.ACCEPTED

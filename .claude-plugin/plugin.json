@@ -1,6 +1,6 @@
 {
   "name": "neo",
-  "version": "0.55.2",
+  "version": "0.56.0",
   "description": "Multi-agent semantic reasoning system with persistent memory for code suggestions, architectural guidance, and optimization recommendations",
   "author": {
     "name": "Parslee AI"
@@ -8,6 +8,15 @@
   "repository": "https://github.com/Parslee-ai/neo",
   "homepage": "https://github.com/Parslee-ai/neo",
   "license": "Apache-2.0",
+  "userConfig": {
+    "executable": {
+      "type": "string",
+      "title": "Neo executable",
+      "description": "Executable name or absolute path to the matching neo-reasoner CLI. NEO_MOD_EXECUTABLE overrides this for development.",
+      "default": "neo",
+      "required": false
+    }
+  },
   "keywords": [
     "reasoning",
     "semantic-search",

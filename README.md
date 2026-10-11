@@ -330,6 +330,10 @@ If the CLI/daemon are present but the Python bindings aren't, Neo reports that s
 
 ### Join the CAR Lattice
 
+For organization-bound nodes with private storage and native lifecycle ownership,
+see [organization-bound Lattice setup](docs/scoped-lattice.md). The automatic
+registration described below applies to personal nodes.
+
 The Lattice is CAR's collaboration layer: Claude Code, Codex, CAR Coder and other agents on one CAR daemon say what they are good at, find each other by need, and send each other typed messages. With the `[car]` extra installed and `car-server` running, every repository you use Neo in automatically gets a **read-only Neo player**, a CAR-supervised agent named `neo-lattice-<id>`. Nothing to configure.
 
 Other players find it with `lattice_find` / `lattice.find` (for example "code review", "debugging", "project memory", "architecture"), then message it:
@@ -372,6 +376,8 @@ Neo ships as a **Claude Code plugin** with a specialized agent and six slash com
 
 # Install Neo
 /plugin install neo
+# Or install directly in one step on recent Claude Code hosts:
+/plugin install neo --marketplace Parslee-ai/neo
 ```
 
 `Parslee-ai/neo` also carries its own marketplace manifest, so
@@ -380,12 +386,16 @@ without the intermediate repository.
 
 Once installed:
 
+- **Native Neo workspace** (Mods-enabled hosts): `/neo-workspace` opens findings,
+  proposals, checks and read-only project memory. `/neo-ask` starts direct
+  reasoning, `/neo-followup` continues it, and `/neo-cancel` stops the owned run.
+  Requires a matching plugin/CLI build; see [setup and behavior](docs/claude-code-mods.md).
 - **Slash commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
 - **Specialized agent**: invoke with `Use the Neo agent to ...` for delegated semantic reasoning
 - **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Codex plugin
 - **Edit-recording hook**: a `PostToolUse` hook records which files Claude Code
-  edited, so Neo can observe whether a suggestion was applied instead of
-  inferring it from a later git diff. It records paths, never file contents, and
+  edited, adding observations to Neo's git-based outcome matching. Host events
+  alone do not prove acceptance. It records paths, never file contents, and
   costs no model context. Opt out with `NEO_HOOKS=0`.
 
 Examples:
@@ -412,8 +422,8 @@ the marketplace entry. **Components live at the repository root, not inside
 `.claude-plugin/`** — [`agents/neo.md`](agents/neo.md) defines the agent,
 [`commands/*.md`](commands/) each slash command, and
 [`hooks/hooks.json`](hooks/hooks.json) the edit-recording hook. Claude Code
-discovers components at the plugin root and reads only manifests from
-`.claude-plugin/`; nested there they are silently not loaded, which is what
+discovers components at the plugin root; `.claude-plugin/` contains manifests
+and generated Mod type declarations. Components nested there are silently not loaded, which is what
 `tests/test_host_adapter_parity.py` now pins.
 
 

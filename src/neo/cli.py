@@ -955,6 +955,10 @@ def main():
         from neo.hook import run_hook
         return run_hook(sys.argv[2:])
 
+    if len(sys.argv) > 1 and sys.argv[1] == "workspace":
+        from neo.workspace import run_workspace
+        return run_workspace(sys.argv[2:])
+
     # The lattice node is a long-running CAR-supervised process; like the
     # hook, it must not trigger the update check or the observer autostart.
     if len(sys.argv) > 1 and sys.argv[1] == "lattice":
@@ -1328,6 +1332,10 @@ def main():
         if not args.dry_run:
             _print_neo_greeting(prompt, working_dir)
 
+    # Structured hosts explicitly opt into the same bounded file selection as
+    # the text CLI. Existing JSON consumers keep their supplied context only.
+    if input_mode != "json" or input_data.get("auto_context") is True:
+        prompt = neo_input.prompt
         # Bound before the branch: `--no-scan` skips the gatherer entirely and
         # the dry-run report below still has to say something truthful.
         gathered = []
@@ -1577,6 +1585,8 @@ def main():
 
     # Serialize output
     try:
+        from neo.workspace import memory_evidence_for
+
         output_dict = {
             "plan": [
                 {
@@ -1610,6 +1620,8 @@ def main():
                     "tool_name": check.tool_name,
                     "diagnostics": check.diagnostics,
                     "summary": check.summary,
+                    "kind": check.kind,
+                    "status": check.status,
                 }
                 for check in output.static_checks
             ],
@@ -1618,6 +1630,7 @@ def main():
             "confidence_basis": output.confidence_basis,
             "notes": output.notes,
             "metadata": output.metadata,
+            "memory_evidence": memory_evidence_for(engine),
             "goal_assessment": (
                 asdict(output.goal_assessment) if output.goal_assessment else None
             ),

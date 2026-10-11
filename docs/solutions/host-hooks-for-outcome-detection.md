@@ -1,6 +1,7 @@
 # Host hooks for outcome detection
 
-**Status**: recording half shipped; consuming half not started. See *Status* below.
+**Status**: recorder and git-verifying consumer are implemented. The Claude Code
+Mod adds diagnostic identity and lifecycle observations; see *Status* below.
 
 ## The problem, as measured
 
@@ -159,18 +160,15 @@ Note which command proves what: `details` printed that `Hooks (1)` line for a
 plugin that was not loading at all, so it is evidence the file was FOUND, not
 that the plugin started. `claude plugin list` is the load-state check.
 
-**Not shipped (consuming half):** nothing reads `host_events.jsonl` yet.
-`collect_outcomes` still infers acceptance from a repo-wide git diff.
+**Implemented consumer:** `OutcomeTracker._load_host_edit_events` reads active
+and rotated ledgers once per collection, attributes paths to this repository's
+checkouts and adds eligible edit observations to git-based matching. The ledger
+does not replace content verification or establish independent acceptance.
+Lifecycle events are excluded. Mod session/turn/tool IDs and recent-invocation
+correlation are retained as outcome diagnostics, never promotion authority.
+See `tests/test_host_edit_ledger.py` and [Mod behavior](../claude-code-mods.md).
 
-The split is deliberate rather than partial delivery: a ledger is only worth
-reading once it has history, and history cannot be recorded retroactively, so
-the recorder has to land first regardless of when the consumer does. What the
-consumer should claim is narrower than the first draft of this note implied —
-see defect (2). The durable win is that the ledger cannot lose an acceptance
-that git later obscures (a revert, a reformat, a commit that moves the
-timestamp window), because it witnessed the edit rather than reconstructing it.
-
-**The consuming half must be written against a dirty tree.** CLAUDE.md records
+**Consumer tests run against a dirty tree.** CLAUDE.md records
 the precedent exactly: a previous fix here "passed every test because they all
 ran on a pristine tree, the one state neo is never invoked in", and it lost
 acceptances in production anyway.

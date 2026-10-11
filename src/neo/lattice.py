@@ -56,6 +56,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -459,8 +460,11 @@ class Answerer:
     """
 
     def __init__(self, root: str, engine_factory: Optional[Callable[[], Any]] = None,
-                 store_factory: Optional[Callable[[], Any]] = None):
+                 store_factory: Optional[Callable[[], Any]] = None, scoped_consumer=None):
         self.root = root
+        self.scoped_consumer = scoped_consumer
+        if scoped_consumer is not None and (engine_factory is not None or store_factory is not None):
+            raise ValueError("Scoped Neo requires its bound engine and private store")
         self._engine_factory = engine_factory or self._default_engine
         self._store_factory = store_factory or self._default_store
         self._engine: Any = None
@@ -473,9 +477,10 @@ class Answerer:
 
         config = NeoConfig.load()
         return NeoEngine(
-            lm_adapter=resolve_adapter(config),
+            lm_adapter=resolve_adapter(config, scoped_consumer=self.scoped_consumer),
             codebase_root=self.root,
             config=config,
+            scoped_consumer=self.scoped_consumer,
         )
 
     @property
@@ -493,11 +498,17 @@ class Answerer:
         return self._engine
 
     def answer(self, task: Task) -> str:
+        if self.scoped_consumer is not None:
+            self.scoped_consumer.authorize()
         if task.op == "memory":
-            return self.memory(task.prompt)
-        if task.op == "review":
-            return self.review(task)
-        return self.reason(task)
+            result = self.memory(task.prompt)
+        elif task.op == "review":
+            result = self.review(task)
+        else:
+            result = self.reason(task)
+        if self.scoped_consumer is not None:
+            self.scoped_consumer.authorize()
+        return result
 
     # -- memory ---------------------------------------------------------------
 
@@ -519,9 +530,23 @@ class Answerer:
         from neo.memory.store import FactStore
 
         # read_only: a lookup must not run the prune/demote chain and save.
-        return FactStore(codebase_root=self.root, config=NeoConfig.load(), read_only=True)
+        scope = self.scoped_consumer
+        if scope is not None:
+            scope.prepare_state_root()
+        return FactStore(codebase_root=self.root, config=NeoConfig.load(), read_only=True,
+                         **({"facts_dir": scope.state_root / "facts",
+                             "episodes_dir": scope.state_root / "episodes",
+                             "emit_metrics": False} if scope is not None else {}))
 
     def memory(self, query: str) -> str:
+        if self.scoped_consumer is not None:
+            self.scoped_consumer.authorize()
+        result = self._memory(query)
+        if self.scoped_consumer is not None:
+            self.scoped_consumer.authorize()
+        return result
+
+    def _memory(self, query: str) -> str:
         store = self._memory_store()
         if store is None:
             return "Neo's project memory is not available on this node."
@@ -580,7 +605,8 @@ class Answerer:
             prompt=task.prompt,
             error_trace=task.error_trace,
             working_directory=self.root,
-            operating_mode=OperatingMode.LEARN if promotable else OperatingMode.ADVISE,
+            operating_mode=(OperatingMode.ADVISE if self.scoped_consumer is not None
+                            else OperatingMode.LEARN if promotable else OperatingMode.ADVISE),
             # A peer's question wants an answer it can act on. Left at the
             # default `next_action`, an explanatory question came back as a
             # "change" whose diff created a file holding the prose answer.
@@ -598,12 +624,39 @@ class Answerer:
             for path, chunk in split_unified_diff(task.diff)
         ]
         if changes:
-            verified = self.engine.process(NeoInput(
-                prompt=task.prompt or "Verify the proposed change.",
-                working_directory=self.root,
-                operating_mode=OperatingMode.VERIFY,
-                proposed_changes=changes,
-            ))
+            if self.scoped_consumer is not None:
+                from types import SimpleNamespace
+                from neo.models import CodeSuggestion
+                from neo.static_analysis import run_static_checks
+
+                self.scoped_consumer.authorize()
+                root = Path(self.root).resolve()
+                suggestions = []
+                for change in changes:
+                    path = (root / change.file_path).resolve()
+                    if not path.is_relative_to(root):
+                        raise PermissionError("Peer review path escapes the original workspace")
+                    suggestions.append(CodeSuggestion(
+                        file_path=str(path), unified_diff=change.unified_diff,
+                        description=change.description, confidence=0.0,
+                    ))
+                checks = run_static_checks(suggestions)
+                request = NeoInput(prompt=task.prompt or "Verify the proposed change.",
+                                   working_directory=self.root,
+                                   operating_mode=OperatingMode.ADVISE)
+                constraint_check = self.engine._check_constraints_static(
+                    suggestions, self.engine._extract_input_constraints(request))
+                if constraint_check is not None:
+                    checks.append(constraint_check)
+                self.scoped_consumer.authorize()
+                verified = SimpleNamespace(static_checks=checks)
+            else:
+                verified = self.engine.process(NeoInput(
+                    prompt=task.prompt or "Verify the proposed change.",
+                    working_directory=self.root,
+                    operating_mode=OperatingMode.VERIFY,
+                    proposed_changes=changes,
+                ))
             sections.append(render_verification(verified))
         elif task.diff:
             sections.append("Deterministic checks: skipped — no `---`/`+++` file headers found in the diff.")
@@ -737,6 +790,7 @@ class NodeConfig:
     url: str
     display_name: str = ""
     capabilities: list[str] = field(default_factory=list)
+    work_context_json: Optional[str] = None
 
 
 def budget_key(sender: str) -> str:
@@ -749,6 +803,43 @@ def budget_key(sender: str) -> str:
     cannot contain `@`, so they are their own key.
     """
     return "@" + sender.rpartition("@")[2] if "@" in sender else sender
+
+
+# This explicit native parent profile also enables CAR's task incarnation lifecycle.
+SCOPED_PARENT_METHODS = tuple(sorted((
+    "agents.message", "infer", "lattice.join", "lattice.leave", "models.route",
+    "session.consumer.issue", "session.consumer.revoke",
+)))
+CONSUMER_TTL_SECS = 900
+CONSUMER_RENEW_MARGIN_SECS = 60
+
+
+def _original_receipt(auth: Any, agent_id: str, context: dict) -> tuple[dict, tuple[str, ...]]:
+    """Validate and canonicalize the native receipt before publishing pins."""
+    if (not isinstance(auth, dict) or auth.get("ok") is not True
+            or auth.get("auth_enabled") is not True or auth.get("agent_id") != agent_id
+            or auth.get("work_context") != context):
+        raise PermissionError("Original Neo coordination receipt changed")
+    task = auth.get("task_binding")
+    if (not isinstance(task, dict) or set(task) != {"version", "task_incarnation", "resource_key"}
+            or type(task["version"]) is not int or task["version"] != 1):
+        raise PermissionError("Original Neo task/resource receipt unavailable")
+    try:
+        task_id = uuid.UUID(task["task_incarnation"])
+    except (ValueError, TypeError, AttributeError):
+        raise PermissionError("Invalid original Neo task incarnation") from None
+    if task_id.int == 0 or str(task_id) != task["task_incarnation"]:
+        raise PermissionError("Invalid original Neo task incarnation")
+    if not isinstance(task["resource_key"], str) or re.fullmatch(r"context-private:work-[0-9a-f]{64}", task["resource_key"]) is None:
+        raise PermissionError("Invalid original Neo resource")
+    methods = auth.get("method_allowlist")
+    if (not isinstance(methods, list) or any(not isinstance(m, str) or not m or len(m) > 256
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in m) for m in methods)):
+        raise PermissionError("Invalid original Neo method scope")
+    canonical = tuple(sorted(set(methods)))
+    if canonical != SCOPED_PARENT_METHODS:
+        raise PermissionError("Neo requires its explicit original parent method profile")
+    return dict(task), canonical
 
 
 class LatticeNode:
@@ -769,6 +860,24 @@ class LatticeNode:
                  client_factory: Optional[Callable[[str], Any]] = None):
         self.config = config
         self.answerer = answerer or Answerer(config.root)
+        self._scoped_consumer = None
+        self._original_task_binding = None
+        self._original_method_allowlist = None
+        self._consumer_id = None
+        self._consumer_renew_at = 0.0
+        self._consumer_lock = asyncio.Lock()
+        self._consumer_refused = False
+        self._expected_work_context_json = config.work_context_json
+        self._original_agent_id = config.agent_id
+        self._original_token = config.token
+        self._original_url = config.url
+        if config.work_context_json is not None:
+            context = json.loads(config.work_context_json)
+            if (not isinstance(context, dict) or set(context) != {"api_base", "account_id", "organization_id"}
+                    or any(not isinstance(v, str) or not v.strip() or v != v.strip() for v in context.values())):
+                raise ValueError("Scoped Neo launch requires its complete original context")
+        if config.work_context_json is not None and answerer is not None:
+            raise ValueError("Scoped nodes cannot substitute an unbound answerer")
         self._client_factory = client_factory or _default_client
         self.client: Any = None
         self.queue: Optional[asyncio.Queue] = None
@@ -829,6 +938,7 @@ class LatticeNode:
     async def _lose(self, client: Any, why: str) -> None:
         logger.warning("dropping daemon connection (%s)", why)
         self._connected.clear()
+        await self._drop_consumer(client)
         await client.close()
 
     # -- profile --------------------------------------------------------------
@@ -955,10 +1065,26 @@ class LatticeNode:
                 await self.set_status("busy", f"answering a {req.kind or 'message'} from {req.sender}")
                 advertised_busy = True
                 try:
-                    text = await loop.run_in_executor(self._executor, self.answerer.answer, task)
+                    async with self._consumer_lock:
+                        await self._ensure_consumer()
+                        text = await loop.run_in_executor(self._executor, self.answerer.answer, task)
+                        if self._expected_work_context_json is not None:
+                            await self._authorize_consumer()
                 except Exception as e:  # noqa: BLE001 — the asker gets told
                     logger.exception("answering %s failed", req.message_id)
-                    text = f"Neo failed to answer: {type(e).__name__}: {e}"
+                    if self._expected_work_context_json is not None:
+                        try:
+                            await self._authorize_consumer()
+                        except PermissionError:
+                            self._stop.set()
+                        except (ConnectionError, OSError, asyncio.TimeoutError):
+                            if self.client is not None:
+                                await self._lose(self.client, "original child transport unavailable")
+                        except Exception:
+                            self._stop.set()
+                    text = ("Neo could not answer under its original authority."
+                            if self._expected_work_context_json is not None
+                            else f"Neo failed to answer: {type(e).__name__}: {e}")
                 await self._reply(req, text, depth=task.depth)
                 self.answered += 1
                 # Serving peers is use: a node nobody runs the neo CLI beside
@@ -973,16 +1099,163 @@ class LatticeNode:
 
     # -- connection -----------------------------------------------------------
 
+    def _close_consumer(self) -> None:
+        scope, self._scoped_consumer = self._scoped_consumer, None
+        self._consumer_id = None
+        if scope is not None:
+            scope.runtime.close()
+
+    async def _drop_consumer(self, client: Any) -> None:
+        async with self._consumer_lock:
+            if self._consumer_id is not None and client is not None and client.connected:
+                try:
+                    await self._retire_consumer(client, self._consumer_id)
+                except Exception:
+                    logger.warning("Neo child retirement unconfirmed; grant expiry remains enforced")
+            self._close_consumer()
+
+    async def _authorize_consumer(self) -> None:
+        if self._consumer_refused or self._scoped_consumer is None:
+            raise PermissionError("Original Neo consumer unavailable or refused")
+        try:
+            await asyncio.to_thread(self._scoped_consumer.authorize)
+        except PermissionError:
+            self._consumer_refused = True
+            raise
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            raise
+        except Exception as error:
+            message = str(error)
+            if (type(error) is RuntimeError and (message in {
+                    "rpc channel closed for models.route", "daemon closed connection",
+                    "send scoped consumer authentication failed",
+                    "scoped consumer authentication timed out",
+                    "daemon closed during scoped consumer authentication",
+                    "receive scoped consumer authentication failed",
+                } or message.startswith(f"connect daemon at {self._original_url}: ")
+                or message.startswith(f"connect daemon at {self._original_url} timed out after "))):
+                raise ConnectionError("Original Neo child transport unavailable") from error
+            self._consumer_refused = True
+            raise
+
+    async def _retire_consumer(self, client: Any, consumer_id: str) -> None:
+        result = await client.call("session.consumer.revoke", {"consumer_id": consumer_id}, timeout=RPC_TIMEOUT_SECS)
+        if not isinstance(result, dict) or result.get("revoked") is not True:
+            raise PermissionError("Original Neo child retirement unconfirmed")
+
+    async def _issue_consumer(self, client: Any, context: dict) -> None:
+        try:
+            await self._issue_consumer_once(client, context)
+        except PermissionError:
+            self._consumer_refused = True
+            raise
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            raise
+        except Exception as error:
+            message = str(error)
+            if (type(error) is RuntimeError and (message in {
+                    "rpc channel closed for models.route", "daemon closed connection",
+                    "send scoped consumer authentication failed",
+                    "scoped consumer authentication timed out",
+                    "daemon closed during scoped consumer authentication",
+                    "receive scoped consumer authentication failed",
+                } or message.startswith(f"connect daemon at {self._original_url}: ")
+                or message.startswith(f"connect daemon at {self._original_url} timed out after "))):
+                raise ConnectionError("Original Neo child transport unavailable") from error
+            self._consumer_refused = True
+            raise
+
+    async def _issue_consumer_once(self, client: Any, context: dict) -> None:
+        from neo.scoped_consumer import ScopedConsumer
+        if self._consumer_refused:
+            raise PermissionError("Original Neo consumer refused; new enrollment required")
+        issuance = await client.call("session.consumer.issue", {
+            "methods": ["infer", "models.route"], "ttl_secs": CONSUMER_TTL_SECS,
+        }, timeout=RPC_TIMEOUT_SECS)
+        now_ms = int(time.time() * 1000)
+        consumer_id = issuance.get("consumer_id") if isinstance(issuance, dict) else None
+        issued = issuance.get("issued_at_ms") if isinstance(issuance, dict) else None
+        expires = issuance.get("expires_at_ms") if isinstance(issuance, dict) else None
+        if (not isinstance(consumer_id, str) or not consumer_id or type(issued) is not int
+                or type(expires) is not int or issued > now_ms or expires <= now_ms
+                or expires <= issued or expires - issued > CONSUMER_TTL_SECS * 1000):
+            if isinstance(consumer_id, str) and consumer_id:
+                try:
+                    await self._retire_consumer(client, consumer_id)
+                except Exception:
+                    logger.warning("Malformed Neo child retirement unconfirmed; grant expiry remains enforced")
+            raise PermissionError("Invalid Neo child lifetime receipt")
+        # Cancellation cannot abandon a still-authenticating SDK socket in a thread.
+        factory = asyncio.create_task(asyncio.to_thread(ScopedConsumer.from_issued,
+            self._original_url, json.dumps(issuance), self._original_agent_id,
+            self._original_task_binding["resource_key"], context, Path.home() / ".neo" / "scoped"))
+        scope = None
+        old_scope, old_id = self._scoped_consumer, self._consumer_id
+        try:
+            scope = await asyncio.shield(factory)
+            now_ms = int(time.time() * 1000)
+            if expires <= now_ms:
+                raise PermissionError("Neo child expired while authenticating")
+            if old_id is not None:
+                await self._retire_consumer(client, old_id)
+        except BaseException:
+            if scope is None:
+                try:
+                    scope = await factory
+                except Exception:
+                    pass
+            if scope is not None:
+                scope.runtime.close()
+            try:
+                await self._retire_consumer(client, consumer_id)
+            except Exception:
+                logger.warning("Unused Neo child retirement unconfirmed; grant expiry remains enforced")
+            raise
+        self._scoped_consumer = scope
+        self._consumer_id = consumer_id
+        self._consumer_renew_at = time.monotonic() + max(0, (expires - now_ms) / 1000 - CONSUMER_RENEW_MARGIN_SECS)
+        self.answerer = Answerer(self.config.root, scoped_consumer=scope)
+        if old_scope is not None:
+            old_scope.runtime.close()
+
+    async def _ensure_consumer(self) -> None:
+        """Caller holds the consumer lock across renewal and answering."""
+        if self._expected_work_context_json is None:
+            return
+        await self._authorize_consumer()
+        if time.monotonic() >= self._consumer_renew_at:
+            if self.client is None or not self.client.connected:
+                raise ConnectionError("Original Neo coordination socket unavailable")
+            await self._issue_consumer(self.client, json.loads(self._expected_work_context_json))
+
+    async def renew_consumer_if_due(self) -> None:
+        if self._expected_work_context_json is not None and time.monotonic() >= self._consumer_renew_at:
+            async with self._consumer_lock:
+                await self._ensure_consumer()
+
     async def connect_once(self) -> None:
-        client = self._client_factory(self.config.url)
+        client = self._client_factory(self._original_url)
         client.on_request("agent.peer_message", self.on_peer_message)
         # Assigned before connecting, so a failed auth is closed by the run
         # loop instead of leaking a socket and a receive task per retry.
         self.client = client
-        await asyncio.wait_for(
-            client.connect({"token": self.config.token, "agent_id": self.config.agent_id}),
+        auth = await asyncio.wait_for(
+            client.connect({"token": self._original_token, "agent_id": self._original_agent_id}),
             RPC_TIMEOUT_SECS,
         )
+        if isinstance(auth, dict) and auth.get("work_context") is not None and self._expected_work_context_json is None:
+            raise PermissionError("Bound Neo launch requires its original context")
+        if self._expected_work_context_json is not None:
+            context = json.loads(self._expected_work_context_json)
+            task, methods = _original_receipt(auth, self._original_agent_id, context)
+            if self._original_task_binding is not None and self._original_task_binding != task:
+                raise PermissionError("Original Neo task/resource changed on reconnect")
+            if self._original_method_allowlist is not None and self._original_method_allowlist != methods:
+                raise PermissionError("Original Neo method scope changed on reconnect")
+            self._original_task_binding = task
+            self._original_method_allowlist = methods
+            async with self._consumer_lock:
+                await self._issue_consumer(client, context)
         try:
             from neo import __version__
             await client.call("server.handshake", {
@@ -1014,6 +1287,7 @@ class LatticeNode:
                     delay = RECONNECT_MIN_SECS
                     while self.client.connected and not self._stop.is_set():
                         await asyncio.sleep(POLL_SECS)
+                        await self.renew_consumer_if_due()
                         if worker.done():
                             break
                         if self.should_recycle():
@@ -1029,11 +1303,15 @@ class LatticeNode:
                     self._stop.set()
                 except Exception as e:  # noqa: BLE001 — reconnect with backoff
                     logger.warning("lattice connection failed: %s", e)
+                    if self._consumer_refused:
+                        logger.warning("Original Neo consumer refused; explicit re-enrollment required")
+                        self._stop.set()
                 if worker.done() and not self._stop.is_set():
                     # Acking into a queue nothing drains looks healthy and
                     # answers no one; fail so the supervisor restarts us.
                     raise WorkerDied(repr(worker.exception()) if not worker.cancelled() else "cancelled")
                 self._connected.clear()
+                await self._drop_consumer(self.client)
                 if self.client is not None:
                     await self.client.close()
                 if self._stop.is_set():
@@ -1043,6 +1321,10 @@ class LatticeNode:
                 delay = min(delay * 2, RECONNECT_MAX_SECS)
         finally:
             worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            await self._drop_consumer(self.client)
+            if self.client is not None:
+                await self.client.close()
             self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def _unless_stopped(self, coro: Any) -> bool:
@@ -1059,6 +1341,7 @@ class LatticeNode:
             work.result()  # re-raise its exception, if any
             return True
         work.cancel()
+        await asyncio.gather(work, return_exceptions=True)
         return False
 
     async def leave(self) -> None:
@@ -1146,11 +1429,14 @@ def node_argv(root: str, project: str) -> list[str]:
     return [*safe, "-m", "neo.lattice", "run", "--cwd", root, "--project", project]
 
 
-def build_spec(root: str, project: str) -> dict:
+def build_spec(root: str, project: str, work_context: Optional[dict] = None) -> dict:
     agent_id = agent_id_for(root)
+    if work_context is not None:
+        import hashlib
+        agent_id += "-" + hashlib.sha256(json.dumps(work_context, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]
     home = Path.home() / ".neo"
     home.mkdir(parents=True, exist_ok=True)
-    return {
+    spec = {
         "id": agent_id,
         "name": f"Neo ({project})",
         "command": sys.executable,
@@ -1162,6 +1448,10 @@ def build_spec(root: str, project: str) -> dict:
         "backoff_secs": 5,
         "auto_start": True,
     }
+    if work_context is not None:
+        spec["work_context"] = json.loads(json.dumps(work_context))
+        spec["method_allowlist"] = list(SCOPED_PARENT_METHODS)
+    return spec
 
 
 def _project_key(root: str) -> str:
@@ -1257,7 +1547,8 @@ def _reap_stale_nodes(car: Any, agents: list[dict], keep: str, now: float) -> li
     reaped: list[str] = []
     for agent in agents:
         agent_id = str(agent.get("id") or "")
-        if not agent_id.startswith(AGENT_PREFIX) or agent_id == keep:
+        if (not agent_id.startswith(AGENT_PREFIX) or agent_id == keep
+                or "-" in agent_id[len(AGENT_PREFIX):] or agent.get("work_context") is not None):
             continue
         seen = _seen_marker(agent_id)
         try:
@@ -1292,6 +1583,10 @@ def maybe_autojoin(cwd: Optional[str] = None) -> Optional[str]:
     for the second agent would let a caller silence one and not the other.
     """
     try:
+        # A bound consumer must not register an ambient personal node. Its
+        # trusted launcher registers the context-bearing spec explicitly.
+        if os.environ.get("CAR_WORK_CONTEXT") is not None:
+            return None
         if os.getenv("NEO_OBSERVER_AUTOSTART", "").strip() == "0":
             return None
         from neo.memory.observer import _car_server_reachable, _require_car_runtime
@@ -1368,7 +1663,15 @@ def _skew_message(agent_id: str, managed: Optional[dict]) -> Optional[str]:
     return None
 
 
-def join(root: str, project: Optional[str] = None) -> dict:
+def join(root: str, project: Optional[str] = None, *, work_context: Optional[dict] = None,
+         project_ids: Optional[list[str]] = None, native_owner: Optional[dict] = None) -> dict:
+    if native_owner is not None and work_context is None:
+        return {"status": "error", "message": "Native owner requires explicit organization work context"}
+    if work_context is not None:
+        from neo.lattice_enrollment import operation
+        return operation("join", root, project, work_context, project_ids, native_owner=native_owner)
+    if project_ids is not None:
+        return {"status": "error", "message": "Shared project approval requires an explicit organization work context"}
     from neo.memory.observer import _require_car_runtime
 
     try:
@@ -1406,7 +1709,12 @@ def join(root: str, project: Optional[str] = None) -> dict:
             "pid": managed.get("pid") if isinstance(managed, dict) else None}
 
 
-def leave(root: str) -> dict:
+def leave(root: str, *, work_context: Optional[dict] = None, native_owner: Optional[dict] = None) -> dict:
+    if native_owner is not None and work_context is None:
+        return {"status": "error", "message": "Native owner requires explicit organization work context"}
+    if work_context is not None:
+        from neo.lattice_enrollment import operation
+        return operation("leave", root, None, work_context, native_owner=native_owner)
     from neo.memory.observer import _require_car_runtime
 
     root = repository_root(root) or root
@@ -1436,7 +1744,12 @@ def leave(root: str) -> dict:
     return {"status": "left", "agent_id": agent_id}
 
 
-def status(root: str) -> dict:
+def status(root: str, *, work_context: Optional[dict] = None, native_owner: Optional[dict] = None) -> dict:
+    if native_owner is not None and work_context is None:
+        return {"status": "error", "message": "Native owner requires explicit organization work context"}
+    if work_context is not None:
+        from neo.lattice_enrollment import operation
+        return operation("status", root, None, work_context, native_owner=native_owner)
     from neo.memory.observer import _require_car_runtime
 
     try:
@@ -1492,6 +1805,7 @@ def _run_foreground(root: str, project: str) -> int:
         root=root, project=project, agent_id=agent_id, token=token,
         url=daemon_url(), display_name=f"neo-{project}",
         capabilities=capabilities_for(root),
+        work_context_json=os.environ.get("CAR_WORK_CONTEXT"),
     )
     node = LatticeNode(config)
     pid_file = _pid_file(agent_id)
@@ -1556,9 +1870,17 @@ def cli_main(argv: list[str]) -> int:
     ):
         p = sub.add_parser(name, help=text)
         p.add_argument("--cwd", default=None, help="repository root (default: cwd)")
+        if name in {"join", "leave", "status"}:
+            p.add_argument("--work-context-file", default=None,
+                           help="explicit original issuer/account/organization JSON; CAR verifies membership")
+        if name == "join":
+            p.add_argument("--project-id", action="append", default=None,
+                           help="approve a canonical repo:<64 lowercase hex> for organization work (repeatable)")
         if name in {"join", "run"}:
             p.add_argument("--project", default=None,
                            help="player project name (default: the git remote's repo name)")
+    for name in ("join", "leave", "status"):
+        sub.choices[name].add_argument("--native-owner-config", type=Path, default=None)
     args = parser.parse_args(argv)
     root = os.path.abspath(args.cwd or os.getcwd())
 
@@ -1569,8 +1891,24 @@ def cli_main(argv: list[str]) -> int:
         )
         return _run_foreground(root, args.project or derive_project_name(root))
 
-    result = {"join": lambda: join(root, args.project), "leave": lambda: leave(root),
-              "status": lambda: status(root)}[args.action]()
+    context = None
+    if args.work_context_file is not None:
+        try:
+            from neo.lattice_enrollment import work_context
+            context = work_context(json.loads(Path(args.work_context_file).read_text()))
+        except (OSError, ValueError) as error:
+            print(json.dumps({"status": "error", "message": str(error)}))
+            return 1
+    native_owner = None
+    if args.native_owner_config is not None:
+        try:
+            native_owner = json.loads(args.native_owner_config.read_text())
+        except (OSError, ValueError) as error:
+            print(json.dumps({"status": "error", "message": str(error)}))
+            return 1
+    result = {"join": lambda: join(root, args.project, work_context=context, project_ids=args.project_id, native_owner=native_owner),
+              "leave": lambda: leave(root, work_context=context, native_owner=native_owner),
+              "status": lambda: status(root, work_context=context, native_owner=native_owner)}[args.action]()
     print(json.dumps(result, indent=2))
     return 1 if result.get("status") == "error" else 0
 

@@ -132,6 +132,7 @@ def explain_fact(
                 "score": evidence.score,
                 "included_in_context": evidence.included_in_context,
                 "used_in_reasoning": evidence.used_in_reasoning,
+                "hard_cited": evidence.hard_cited,
                 "outcome_association": evidence.outcome_association,
                 "reason": (
                     "ranked for this task and included in final context"
