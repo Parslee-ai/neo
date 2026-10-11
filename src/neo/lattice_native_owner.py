@@ -10,6 +10,18 @@ from pathlib import Path
 import secrets
 import subprocess
 import sys
+from typing import BinaryIO
+
+
+# Installed guardian inventories can contain thousands of full path/hash pins.
+MAX_GUARDIAN_REQUEST_BYTES = 8 * 1024 * 1024
+
+
+def _read_worker_request(stream: BinaryIO):
+    payload = stream.read(MAX_GUARDIAN_REQUEST_BYTES + 1)
+    if len(payload) > MAX_GUARDIAN_REQUEST_BYTES:
+        raise ValueError("Native owner request exceeds its 8 MiB bound")
+    return json.loads(payload.decode("utf-8"))
 
 
 def _canonical(value):
@@ -53,8 +65,11 @@ def _run(config, action, spec_path, spec):
     env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
            "CAR_HOME", "CAR_KEYCHAIN_PATH", "CAR_KEYCHAIN_PROOF_ROOT", "CAR_DAEMON_URL") if k in os.environ}
     request = {"config": config, "action": action, "spec_path": str(spec_path), "agent_id": spec["id"]}
+    payload = _canonical(request)
+    if len(payload.encode("utf-8")) > MAX_GUARDIAN_REQUEST_BYTES:
+        raise ValueError("Native owner request exceeds its 8 MiB bound")
     result = subprocess.run([config["guardian_python"], "-I", "-B", str(Path(__file__).resolve()),
-                             "--guardian-worker"], input=_canonical(request), text=True,
+                             "--guardian-worker"], input=payload, text=True,
                             capture_output=True, env=env)
     if result.returncode != 0:
         fd = _directory(config["ownership_root"])
@@ -275,5 +290,5 @@ def operation(action, root, project, context, project_ids, native_owner):
 if __name__ == "__main__":
     if sys.argv[1:] != ["--guardian-worker"]:
         raise SystemExit("Internal guardian bridge invocation required")
-    request = json.loads(sys.stdin.read(1024 * 1024))
+    request = _read_worker_request(sys.stdin.buffer)
     print(_canonical(_worker(request)))
