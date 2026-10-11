@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
+  - **Memory paging:** **Next** stops at the last page, so **Previous** responds at once. Before, it counted past the end and needed as many presses back.
+  - **Use selection:** with no selection visible to Claude Code, it keeps the context that is there and says so, instead of silently clearing it. Typing context by hand clears that notice.
+  - **Duplicate findings:** the engine voices each of the first open questions as a caution ("Still open: …"), so every one of them was shown twice. Each is now shown once, in the pane and in the text output. A question only drops when a caution states exactly it.
+  - **Context reuse:** selected context goes with one question, and a follow-up to it, instead of being re-sent unseen with the next unrelated question. A run that fails or is cancelled gives the context back for the retry. While context is attached, the pane shows "Context attached · N characters".
+
 ## [0.56.0] - 2026-10-11
 
 ### Added

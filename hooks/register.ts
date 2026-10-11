@@ -13,6 +13,7 @@ import {
   NeoStream,
   followupContext,
   object,
+  openQuestions,
   resultText,
   rows,
   strings,
@@ -48,6 +49,8 @@ type Run = {
   status: string;
   prompt: string;
   mode: string;
+  /** The selected context this run was sent with. */
+  context: string;
   parser: NeoStream;
   result?: Document;
   error?: string;
@@ -64,7 +67,9 @@ let context = "",
   tab = "results",
   details = false;
 let memoryQuery = "",
-  memoryPage = 0;
+  memoryPage = 0,
+  notice = "";
+const FACTS_PER_PAGE = 30;
 let snapshot: Document = {},
   explanation: Document | undefined,
   inspectorError = "";
@@ -194,6 +199,10 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
       run.status = "cancelled";
       run.error = run.stopped;
     }
+    // A run that produced nothing gives its context back for the retry, unless
+    // the person has attached something new meanwhile.
+    if ((run.status === "failed" || run.status === "cancelled") && !context)
+      context = run.context;
     await record($, "event", {
       event: "neo_finished",
       session_id: run.session,
@@ -222,6 +231,9 @@ async function start(
   if (followup && !prior?.result)
     return "Run an analysis before asking a follow-up.";
   if (current?.result) previous = current;
+  // A follow-up is about the same code: with no new selection it carries the
+  // prior run's context. A fresh question carries only what is attached now.
+  const sentContext = context || (followup ? prior!.context : "");
   const id = crypto.randomUUID();
   const run: Run = {
     id,
@@ -231,6 +243,7 @@ async function start(
     status: "running",
     prompt,
     mode: selectedMode,
+    context: sentContext,
     parser: new NeoStream(),
     started: await $.clock.now(),
   };
@@ -244,7 +257,8 @@ async function start(
     : `${INSTRUCTIONS[selectedMode] ?? INSTRUCTIONS.reason} ${prompt}`;
   const payload = {
     prompt:
-      analysis + (context ? "\n\nUser-selected context:\n" + context : ""),
+      analysis +
+      (sentContext ? "\n\nUser-selected context:\n" + sentContext : ""),
     working_directory: cwd,
     safe_read_paths: [cwd],
     auto_context: true,
@@ -260,6 +274,10 @@ async function start(
       repositories_touched: [cwd],
     },
   };
+  // Selected context belongs to this question: keeping it would send it again,
+  // unseen, with the next unrelated one.
+  context = "";
+  notice = "";
   await record($, "event", {
     event: "neo_started",
     session_id: session,
@@ -280,6 +298,14 @@ function statusText(): string {
   return current
     ? `Neo ${current.status}: ${current.error ?? current.parser.message}`
     : `Neo ready. ${snapshot.fact_count ?? "Unknown"} project facts. /neo-workspace opens the workspace; /neo-ask <question> starts an analysis.`;
+}
+function matchingFacts(): Document[] {
+  return rows(snapshot.facts).filter((f) =>
+    `${f.id} ${f.subject}`.toLowerCase().includes(memoryQuery.toLowerCase()),
+  );
+}
+function lastPage(): number {
+  return Math.max(0, Math.ceil(matchingFacts().length / FACTS_PER_PAGE) - 1);
 }
 function render(
   $: EngineInterface,
@@ -355,7 +381,7 @@ function render(
           ),
         );
       children.push(label("Validation · " + validationText(result)));
-      for (const q of strings(result.next_questions))
+      for (const q of openQuestions(result))
         children.push(label("Open question · " + q, "warning"));
       children.push(
         button(
@@ -383,6 +409,14 @@ function render(
       children.push(
         label(
           "Ask Neo for a second opinion. Findings, cautions and evidence appear here.",
+        ),
+      );
+    if (notice) children.push(label(notice, "warning"));
+    if (context)
+      children.push(
+        label(
+          `Context attached · ${context.length} characters · sent with the next question only`,
+          "subtle",
         ),
       );
     children.push(
@@ -484,13 +518,9 @@ function render(
           "No retrieval evidence from this run. Stored facts below are not a claim of use.",
         ),
       );
-    const facts = rows(snapshot.facts).filter((f) =>
-      `${f.id} ${f.subject}`.toLowerCase().includes(memoryQuery.toLowerCase()),
-    );
-    const page = Math.min(
-      memoryPage,
-      Math.max(0, Math.ceil(facts.length / 30) - 1),
-    );
+    const facts = matchingFacts();
+    const last = Math.max(0, Math.ceil(facts.length / FACTS_PER_PAGE) - 1);
+    const page = Math.min(memoryPage, last);
     children.push(
       Input({
         key: "neo-memory-query",
@@ -500,7 +530,7 @@ function render(
         onSubmit: () => {},
       }),
       label(
-        `${facts.length} matching facts · page ${page + 1} / ${Math.max(1, Math.ceil(facts.length / 30))}`,
+        `${facts.length} matching facts · page ${page + 1} / ${last + 1}`,
       ),
       Box({
         flexDirection: "row",
@@ -511,7 +541,10 @@ function render(
         ],
       }),
     );
-    for (const f of facts.slice(page * 30, page * 30 + 30))
+    for (const f of facts.slice(
+      page * FACTS_PER_PAGE,
+      page * FACTS_PER_PAGE + FACTS_PER_PAGE,
+    ))
       children.push(
         button(
           "fact-" + f.id,
@@ -580,6 +613,7 @@ export const register: Register = (on, options) => {
     mode = "reason";
     memoryQuery = "";
     memoryPage = 0;
+    notice = "";
     turns.clear();
     binary = (await $.env.get("NEO_MOD_EXECUTABLE")) || binary;
     session = await $.session.id();
@@ -696,7 +730,10 @@ export const register: Register = (on, options) => {
   });
   on("ui.input", { requestId: PANE }, async ($, e) => {
     if (e.element === "neo-question") question = e.value;
-    if (e.element === "neo-context") context = e.value;
+    if (e.element === "neo-context") {
+      context = e.value;
+      notice = "";
+    }
     if (e.element === "neo-memory-query") {
       memoryQuery = e.value;
       memoryPage = 0;
@@ -725,10 +762,21 @@ export const register: Register = (on, options) => {
     if (e.element === "neo-run" || e.element === "neo-followup")
       $.ui.log(await start($, question, mode, e.element === "neo-followup"));
     if (e.element === "neo-cancel") await stop($);
-    if (e.element === "neo-selection")
-      context = (await $.ui.selection())?.text ?? "";
-    if (e.element === "neo-prev-page") memoryPage = Math.max(0, memoryPage - 1);
-    if (e.element === "neo-next-page") memoryPage++;
+    if (e.element === "neo-selection") {
+      const selected = (await $.ui.selection())?.text ?? "";
+      // Nothing selected keeps what is there: replacing it with "" lost
+      // typed context without a word.
+      if (selected.trim()) {
+        context = selected;
+        notice = "";
+      } else
+        notice =
+          "No selection is visible to Claude Code (selection needs fullscreen); context unchanged.";
+    }
+    if (e.element === "neo-prev-page")
+      memoryPage = Math.max(0, Math.min(memoryPage, lastPage()) - 1);
+    if (e.element === "neo-next-page")
+      memoryPage = Math.min(memoryPage + 1, lastPage());
     if (e.element.startsWith("fact-")) await inspect($, e.element.slice(5));
     if (e.element === "neo-share" && current?.result)
       await $.prompt.fill({
@@ -799,6 +847,7 @@ export const register: Register = (on, options) => {
     question = "";
     lastInvocation = "";
     inspectorError = "";
+    notice = "";
     return next(e);
   });
 };
