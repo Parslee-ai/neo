@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that is a flag name (`version`, `help`, `status`, `index`, …) or a near-miss of a subcommand (`workspce`, `memroy`) now exits with status 2 and names the command it meant. The check runs before the update check, the observer autostart and the engine. A question of two or more words, or a word that names no command, runs as before.
+- **`python -m neo` and `python -m neo.cli` now return Neo's exit status.** Both module entry points called `main()` and discarded what it returned, so every refusal and failure reported success under `python -m`. The `neo` console script already passed it through.
+
 ## [0.56.0] - 2026-10-11
 
 ### Added

@@ -944,6 +944,47 @@ def _is_network_timeout(exc: BaseException) -> bool:
     return bool(timeout_types) and isinstance(exc, tuple(timeout_types))
 
 
+# One-word prompts that are almost certainly a mistyped command, mapped to
+# the command meant. Any other prompt, including any question of two or more
+# words, goes to inference as before.
+_COMMAND_WORDS = {
+    "version": "neo --version",
+    "help": "neo --help",
+    "status": "neo workspace status",
+    "index": "neo --index",
+    "config": "neo --config list",
+    "upgrade": "neo update",
+    "init": "neo --help",
+    "stats": "neo memory learning-stats",
+}
+_SUBCOMMANDS = (
+    "contribute", "update", "serve", "car", "construct", "memory",
+    "prompt", "hook", "workspace", "lattice",
+)
+
+
+def bare_command_hint(prompt):
+    """The command a one-word prompt most likely meant, or None.
+
+    `neo version` used to take "version" as a question and start a paid
+    reasoning run (#278). A single word that names a flag or is a near-miss of
+    a subcommand is refused with the right command instead. Only an argv
+    prompt reaches this; stdin input is never checked.
+    """
+    import difflib
+
+    word = (prompt or "").strip()
+    if not word or any(ch.isspace() for ch in word):
+        return None
+    key = word.lower().lstrip("-")
+    if key in _COMMAND_WORDS:
+        return _COMMAND_WORDS[key]
+    close = difflib.get_close_matches(key, _SUBCOMMANDS, n=1, cutoff=0.8)
+    if close:
+        return f"neo {close[0]}"
+    return None
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # The host-hook recorder fires on every editor tool call, so it dispatches
@@ -967,6 +1008,18 @@ def main():
 
     # Parse arguments
     args = parse_args()
+
+    # A one-word prompt that names a command is a typo, not a question: refuse
+    # it before the update check, the observer autostart or any inference.
+    hint = bare_command_hint(getattr(args, "prompt", None))
+    if hint and not getattr(args, "command", None):
+        print(
+            f"neo: '{args.prompt.strip()}' looks like a command, not a question. "
+            f"Did you mean `{hint}`? To ask Neo about it, phrase a question of "
+            "more than one word.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Configure logging early so all subsequent code can log
     _configure_logging(args)
@@ -1735,4 +1788,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main() returns the exit status; dropping it made `python -m neo`
+    # report success for every refusal and failure.
+    sys.exit(main())
