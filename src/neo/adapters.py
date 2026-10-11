@@ -1019,13 +1019,22 @@ class ClaudeCodeAdapter(LMAdapter):
             system_prompt_file = f.name
 
         try:
-            # Build Claude Code CLI arguments
+            # Plain inference, isolated from the user's Claude Code setup
+            # (#260): no tools (a structured-output prompt answered with a tool
+            # call used up the one turn and exited 1, and ran commands in the
+            # working tree), no MCP servers, no user/project settings or hooks,
+            # and no saved session transcript per call. Not --bare: that skips
+            # the keychain read subscription login needs.
             args = [
                 self.cli_path,
                 "--system-prompt-file", system_prompt_file,
                 "--output-format", "stream-json",
                 "--model", self.model,
                 "--max-turns", "1",
+                "--tools", "",
+                "--strict-mcp-config",
+                "--setting-sources", "",
+                "--no-session-persistence",
                 "--verbose",
                 "-p",
             ]
@@ -1038,7 +1047,6 @@ class ClaudeCodeAdapter(LMAdapter):
             }
             env.pop("ANTHROPIC_API_KEY", None)
 
-            # Run Claude Code CLI
             process = subprocess.Popen(
                 args,
                 stdin=subprocess.PIPE,
@@ -1047,52 +1055,96 @@ class ClaudeCodeAdapter(LMAdapter):
                 env=env,
                 text=True,
             )
+            # communicate() drains both pipes together, so a chatty stderr
+            # cannot block the child, and the timeout covers the whole call
+            # rather than only the wait after stdout closes.
+            try:
+                stdout, stderr = process.communicate(
+                    json.dumps(conversation_messages), timeout=self.timeout
+                )
+            except subprocess.TimeoutExpired:
+                self._reap(process)
+                raise RuntimeError(
+                    f"Claude Code did not finish within {self.timeout}s"
+                )
+            except BaseException:
+                # Interrupted (Ctrl-C included): never leave the child running.
+                self._reap(process)
+                raise
 
-            # Write messages to stdin
-            process.stdin.write(json.dumps(conversation_messages))
-            process.stdin.close()
-
-            # Parse streaming JSON output
             response_text = ""
-            for line in process.stdout:
+            result_chunk: dict = {}
+            for line in stdout.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-
                 try:
                     chunk = json.loads(line)
-
-                    if chunk.get("type") == "assistant":
-                        message = chunk.get("message", {})
-                        for content in message.get("content", []):
-                            if content.get("type") == "text":
-                                response_text += content.get("text", "")
-
-                    if chunk.get("type") == "assistant":
-                        message = chunk.get("message", {})
-                        if message.get("stop_reason"):
-                            content = message.get("content", [{}])[0]
-                            if content.get("text", "").startswith("API Error"):
-                                stderr = process.stderr.read()
-                                raise RuntimeError(
-                                    f"Claude Code error: {content['text']}\n{stderr}"
-                                )
-
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("type") == "assistant":
+                    message = chunk.get("message", {})
+                    for content in message.get("content", []):
+                        if content.get("type") == "text":
+                            response_text += content.get("text", "")
+                    if message.get("stop_reason"):
+                        first = (message.get("content") or [{}])[0]
+                        if first.get("text", "").startswith("API Error"):
+                            raise RuntimeError(
+                                f"Claude Code error: {first['text']}\n{stderr}"
+                            )
+                elif chunk.get("type") == "result":
+                    result_chunk = chunk
 
-            return_code = process.wait(timeout=self.timeout)
-
-            if return_code != 0:
-                stderr = process.stderr.read()
+            # The CLI reports its own failures (max turns, auth, unknown model)
+            # as the stream-json `result` line on stdout. `is_error` is the
+            # field to trust: an unknown model reports subtype "success" with
+            # is_error true.
+            failed = process.returncode != 0 or bool(result_chunk.get("is_error"))
+            if not failed and not result_chunk:
+                failed = True  # output ended without a result line: cut short
+            if failed:
+                subtype = str(result_chunk.get("subtype") or "")
+                detail = "; ".join(
+                    part for part in (
+                        "" if subtype == "success" else subtype,
+                        ", ".join(str(e) for e in result_chunk.get("errors") or []),
+                        str(result_chunk.get("result") or "")
+                        if result_chunk.get("is_error") else "",
+                        (stderr or "").strip(),
+                        "" if result_chunk else "no result line in the output",
+                    ) if part
+                ) or "no error detail"
+                if "unknown option" in (stderr or ""):
+                    detail += " (this Claude Code is too old for neo's isolation flags; upgrade it)"
                 raise RuntimeError(
-                    f"Claude Code exited with code {return_code}: {stderr}"
+                    f"Claude Code failed (exit {process.returncode}): {detail}"
                 )
+
+            # The CLI has no stop-sequence option; cut at the first one, as a
+            # provider that honours `stop` would.
+            if stop:
+                cut = min(
+                    (i for i in (response_text.find(s) for s in stop if s) if i >= 0),
+                    default=-1,
+                )
+                if cut >= 0:
+                    response_text = response_text[:cut]
 
             return response_text.strip()
 
         finally:
             Path(system_prompt_file).unlink(missing_ok=True)
+
+    @staticmethod
+    def _reap(process) -> None:
+        """Kill the child and collect it, without waiting forever on pipes a
+        grandchild may still hold."""
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
     def name(self) -> str:
         return f"claude-code/{self.model}"
