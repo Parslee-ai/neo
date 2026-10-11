@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -67,12 +68,48 @@ def project_snapshot(root: str) -> tuple[str, list, list, list[str]]:
     return project_id, facts, episodes, sorted(set(cautions))
 
 
+def _named_paths(fact) -> list[str]:
+    """Repository paths a fact names: a path-like `pattern:` subject and the
+    `Files:` line history facts carry. Nothing else is guessed at."""
+    paths: list[str] = []
+    subject = fact.subject or ""
+    if subject.startswith("pattern: "):
+        candidate = subject[len("pattern: "):].strip()
+        # A path ends in a file name with an extension; "pattern: I/O" or a
+        # clipped "pattern: mean/va" is prose, not a file.
+        if (
+            candidate
+            and " " not in candidate
+            and "/" in candidate
+            and not candidate.startswith("history:")
+            and re.search(r"\.[A-Za-z0-9]{1,8}$", candidate.rsplit("/", 1)[-1])
+        ):
+            paths.append(candidate)
+    for line in (fact.body or "").splitlines():
+        if line.startswith("Files: "):
+            paths.extend(p.strip() for p in line[len("Files: "):].split(",") if p.strip())
+            break
+    return paths
+
+
+def _missing_paths(root: Path, fact) -> list[str]:
+    """The named paths absent from the checkout, when EVERY named path is
+    absent; a fact naming one live file among deleted ones is not stale."""
+    named = _named_paths(fact)
+    if not named:
+        return []
+    missing = [p for p in named if not (root / p).exists()]
+    return missing if len(missing) == len(named) else []
+
+
 def workspace_status(root: str) -> dict[str, Any]:
     """Summarize project facts without aging, learning, or model calls."""
     from neo import __version__
 
     project_id, facts, episodes, cautions = project_snapshot(root)
     valid = [fact for fact in facts if fact.is_valid]
+    checkout = Path(root).resolve()
+    missing = {fact.id: _missing_paths(checkout, fact) for fact in facts}
     return {
         "schema_version": WORKSPACE_SCHEMA_VERSION,
         "neo_version": __version__,
@@ -83,9 +120,13 @@ def workspace_status(root: str) -> dict[str, Any]:
         "fact_count": len(valid),
         "probation_count": sum("probation" in fact.tags for fact in valid),
         "episode_count": len(episodes),
+        # Valid facts whose every named file is gone from this checkout: still
+        # retrieved, but describing code that no longer exists.
+        "stale_count": sum(bool(missing[fact.id]) for fact in valid),
         "facts": [
             {"id": fact.id, "subject": fact.subject, "kind": fact.kind.value,
-             "probation": "probation" in fact.tags, "is_valid": fact.is_valid}
+             "probation": "probation" in fact.tags, "is_valid": fact.is_valid,
+             "missing_paths": missing[fact.id][:3]}
             for fact in facts
         ],
     }

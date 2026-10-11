@@ -691,3 +691,34 @@ test("details opened on one tab stay closed on the others", async ($, on) => {
   await ui.unmount();
 });
 
+
+test("facts naming only deleted files are marked stale in Memory", async ($, on) => {
+  host(on);
+  on("process.run", () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        schema_version: 1,
+        checkout: "/work",
+        fact_count: 2,
+        probation_count: 0,
+        stale_count: 1,
+        facts: [
+          { id: "gone", subject: "pattern: src/old.py", is_valid: true, missing_paths: ["src/old.py"] },
+          { id: "live", subject: "pattern: src/new.py", is_valid: true, missing_paths: [] },
+        ],
+      }),
+      stderr: "",
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }));
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-memory" });
+  const drawn = JSON.stringify(await ui.drawn());
+  expect(drawn).toContain("1 name only deleted files");
+  expect(drawn).toContain("[stale] pattern: src/old.py");
+  expect(drawn).not.toContain("[stale] pattern: src/new.py");
+  await ui.unmount();
+});

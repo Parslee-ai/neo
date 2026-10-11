@@ -548,7 +548,7 @@ function render(
   } else if (tab === "memory") {
     children.push(
       label(
-        `${snapshot.fact_count ?? "?"} project facts · ${snapshot.probation_count ?? "?"} on probation`,
+        `${snapshot.fact_count ?? "?"} project facts · ${snapshot.probation_count ?? "?"} on probation${snapshot.stale_count ? ` · ${snapshot.stale_count} name only deleted files` : ""}`,
       ),
       button("neo-refresh", "Refresh"),
     );
@@ -637,7 +637,7 @@ function render(
       children.push(
         button(
           "fact-" + f.id,
-          `${f.is_valid ? "" : "[invalid] "}${f.probation ? "[probation] " : ""}${f.subject || f.id}`,
+          `${f.is_valid ? "" : "[invalid] "}${f.probation ? "[probation] " : ""}${strings(f.missing_paths).length ? "[stale] " : ""}${f.subject || f.id}`,
         ),
       );
     children.push(

@@ -141,3 +141,40 @@ def test_host_identity_persists_as_diagnostic_without_promoting(tmp_path):
     assert saved.final_outcome == "unverified"
     assert all(item.status == "skipped" for item in saved.verification)
     assert store.entries == []
+
+
+def test_status_flags_facts_whose_named_files_are_all_gone(tmp_path, monkeypatch):
+    """A fact describing deleted code is still retrieved; the inspector names it
+    stale only when every file it names is absent from the checkout."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "work"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "live.py").write_text("x = 1\n")
+    _, project = detect_org_and_project(str(root))
+    facts_dir = tmp_path / ".neo" / "facts"
+    facts_dir.mkdir(parents=True)
+
+    def fact(id, subject, body=""):
+        return Fact(id=id, subject=subject, body=body, kind=FactKind.REVIEW,
+                    scope=FactScope.PROJECT, project_id=project).to_dict()
+
+    facts = [
+        fact("gone", "pattern: src/car/ir/verify.py"),
+        fact("live", "pattern: src/live.py"),
+        fact("hist_gone", "pattern: history:de3e40ae Add search",
+             "Commit: de3e\nFiles: old/a.rs, old/b.rs\n"),
+        fact("hist_mixed", "pattern: history:1234 Mixed",
+             "Files: old/a.rs, src/live.py\n"),
+        fact("prose", "pattern: I/O", "no paths here"),
+        fact("decision", "Sibling project relationships"),
+    ]
+    (facts_dir / f"facts_project_{project}.json").write_text(json.dumps({"facts": facts}))
+    status = workspace_status(str(root))
+    flagged = {f["id"]: f["missing_paths"] for f in status["facts"]}
+    assert flagged["gone"] == ["src/car/ir/verify.py"]
+    assert flagged["hist_gone"] == ["old/a.rs", "old/b.rs"]
+    assert flagged["live"] == []
+    assert flagged["hist_mixed"] == []  # one named file still exists
+    assert flagged["decision"] == []
+    assert status["stale_count"] == 2
+    assert status["model_calls"] == 0
