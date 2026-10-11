@@ -2,10 +2,29 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Mod pane: clearer and more responsive** ([#280](https://github.com/Parslee-ai/neo/issues/280)).
+  - **Form placement:** the question form now comes first, so it stays in reach after a long answer.
+  - **Mode descriptions:** each mode shows a one-line description.
+  - **In-pane feedback:** a refused **Ask** or **Follow up** is reported in the pane, where the button was pressed, instead of in the transcript.
+  - **Follow up** appears only once there is a finished analysis to follow.
+  - **Elapsed time:** a running analysis shows elapsed time against the four-minute deadline, in the pane and in the band above the prompt. A finished one shows how long it took.
+  - **Evidence tab:** shows labelled rows: execution fields, validation, each check with its status, and how much memory was retrieved, included and cited. **Show reasoning**, **Show provenance details** and the new **Show raw evidence** render JSON in the host's code view instead of as one long text.
+  - **Memory tab:** returning to it reuses the last store read. A finished analysis, a different working directory, or **Refresh** reads it again.
+  - **Details toggles:** opening details on one tab no longer opens them on the others, and a new run starts with details closed. Large JSON views are capped so they stay within the host's drawing limit.
+  - **Band and runs:** the band above the prompt offers Cancel only while a run can be cancelled, and keeps its status on one line. A cancel that never completes stops redrawing after ten seconds. Pressing **Ask** twice quickly can no longer start two runs.
+
 ### Fixed
 
 - **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that exactly names a flag (`version`, `help`, `status`, `index`, `config`, `upgrade`, `init`, `stats`) or a subcommand exits with status 2 and names the command it meant. Case, leading dashes and trailing punctuation are ignored. The check runs before the update check, the observer autostart and the engine. Every other prompt runs as before, including real words that resemble a command, such as `server` or `updates`.
 - **`python -m neo` and `python -m neo.cli` now return Neo's exit status.** Both module entry points called `main()` and discarded what it returned, so under `python -m` every refusal and failure reported success, and so did the `workspace` and `lattice` subcommands whatever their result. The `neo` console script already passed it through.
+
+- **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
+  - **Memory paging:** **Next** stops at the last page, so **Previous** responds at once. Before, it counted past the end and needed as many presses back.
+  - **Use selection:** with no selection visible to Claude Code, it keeps the context that is there and says so, instead of silently clearing it. Typing context by hand clears that notice.
+  - **Duplicate findings:** the engine voices each of the first open questions as a caution ("Still open: …"), so every one of them was shown twice. Each is now shown once, in the pane and in the text output. A question only drops when a caution states exactly it.
+  - **Context reuse:** selected context goes with one question, and a follow-up to it, instead of being re-sent unseen with the next unrelated question. A run that fails or is cancelled gives the context back for the retry. While context is attached, the pane shows "Context attached · N characters".
 
 ## [0.56.0] - 2026-10-11
 

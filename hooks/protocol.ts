@@ -77,6 +77,24 @@ export class NeoStream {
   }
 }
 
+const normalized = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/^still open:\s*/, "")
+    .replace(/\s+/g, " ");
+/** Open questions that do not repeat a caution. The engine voices each of the
+ * first open questions as a caution ("Still open: <question>", the
+ * `caution_open_question` beat), so showing both prints every one of them
+ * twice. A question is dropped only when a caution states exactly it, after
+ * that prefix; a question that merely ends like a caution survives. */
+export function openQuestions(result: Document): string[] {
+  const cautions = new Set(
+    strings(object(result.orchestrator).cautions).map(normalized),
+  );
+  return strings(result.next_questions).filter((q) => !cautions.has(normalized(q)));
+}
+
 export function resultText(result: Document): string {
   const o = object(result.orchestrator);
   return [
@@ -91,7 +109,7 @@ export function resultText(result: Document): string {
         `Check: ${c.tool_name} (${c.status || "status unavailable"}): ${c.summary}`,
     ),
     `Validation: ${validationText(result)}`,
-    ...strings(result.next_questions).map((q) => "Open question: " + q),
+    ...openQuestions(result).map((q) => "Open question: " + q),
   ]
     .filter(Boolean)
     .join("\n\n");
