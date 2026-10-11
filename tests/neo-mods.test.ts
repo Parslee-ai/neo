@@ -395,6 +395,7 @@ function statusHost(on: On, count: number) {
       exitCode: 0,
       stdout: JSON.stringify({
         schema_version: 1,
+        checkout: "/work",
         fact_count: count,
         probation_count: 0,
         facts: facts(count),
@@ -597,7 +598,13 @@ test("returning to Memory reuses the store read; Refresh re-reads it", async ($,
     return {
       value: {
         exitCode: 0,
-        stdout: JSON.stringify({ schema_version: 1, fact_count: 0, probation_count: 0, facts: [] }),
+        stdout: JSON.stringify({
+          schema_version: 1,
+          checkout: "/work",
+          fact_count: 0,
+          probation_count: 0,
+          facts: [],
+        }),
         stderr: "",
         isStdoutTruncated: false,
         isStderrTruncated: false,
@@ -627,3 +634,60 @@ test("the question form is drawn before the findings", async ($, on) => {
   expect(drawn.indexOf("neo-question")).toBeLessThan(drawn.indexOf("Found an edge case"));
   await ui.unmount();
 });
+
+test("pressing Enter on an empty question reports the refusal in the pane", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.input({ key: "neo-question", text: "   ", kind: "submit" } as any);
+  expect(JSON.stringify(await ui.drawn())).toContain("Enter a question or target first.");
+  await ui.unmount();
+});
+
+test("a finished analysis makes Memory read the store again", async ($, on) => {
+  host(on);
+  let reads = 0;
+  on("process.run", (_$, e) => {
+    // Count store reads only; the Mod's hook records also use process.run.
+    if (e.argv.includes("workspace")) reads++;
+    return {
+      value: {
+        exitCode: 0,
+        stdout: JSON.stringify({ schema_version: 1, checkout: "/work", fact_count: reads, probation_count: 0, facts: [] }),
+        stderr: "",
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    };
+  });
+  const payloads: any[] = [];
+  spawnHost(on, payloads);
+  await $.session.start(SESSION);
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-memory" });
+  const before = reads;
+  await $.command.run(command("neo-ask", "q"));
+  await ui.press({ key: "neo-results" });
+  await ui.press({ key: "neo-memory" });
+  expect(reads).toBeGreaterThan(before);
+  await ui.unmount();
+});
+
+test("details opened on one tab stay closed on the others", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  const payloads: any[] = [];
+  spawnHost(on, payloads);
+  await $.session.start(SESSION);
+  await $.command.run(command("neo-ask", "q"));
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-evidence" });
+  await ui.press({ key: "neo-details" });
+  expect(JSON.stringify(await ui.drawn())).toContain('\\"memory\\":');
+  await ui.press({ key: "neo-results" });
+  expect(JSON.stringify(await ui.drawn())).toContain("Show reasoning");
+  expect(JSON.stringify(await ui.drawn())).not.toContain("Hide reasoning");
+  await ui.unmount();
+});
+
