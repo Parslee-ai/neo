@@ -49,6 +49,8 @@ type Run = {
   status: string;
   prompt: string;
   mode: string;
+  /** The selected context this run was sent with. */
+  context: string;
   parser: NeoStream;
   result?: Document;
   error?: string;
@@ -197,6 +199,10 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
       run.status = "cancelled";
       run.error = run.stopped;
     }
+    // A run that produced nothing gives its context back for the retry, unless
+    // the person has attached something new meanwhile.
+    if ((run.status === "failed" || run.status === "cancelled") && !context)
+      context = run.context;
     await record($, "event", {
       event: "neo_finished",
       session_id: run.session,
@@ -225,6 +231,9 @@ async function start(
   if (followup && !prior?.result)
     return "Run an analysis before asking a follow-up.";
   if (current?.result) previous = current;
+  // A follow-up is about the same code: with no new selection it carries the
+  // prior run's context. A fresh question carries only what is attached now.
+  const sentContext = context || (followup ? prior!.context : "");
   const id = crypto.randomUUID();
   const run: Run = {
     id,
@@ -234,6 +243,7 @@ async function start(
     status: "running",
     prompt,
     mode: selectedMode,
+    context: sentContext,
     parser: new NeoStream(),
     started: await $.clock.now(),
   };
@@ -247,7 +257,8 @@ async function start(
     : `${INSTRUCTIONS[selectedMode] ?? INSTRUCTIONS.reason} ${prompt}`;
   const payload = {
     prompt:
-      analysis + (context ? "\n\nUser-selected context:\n" + context : ""),
+      analysis +
+      (sentContext ? "\n\nUser-selected context:\n" + sentContext : ""),
     working_directory: cwd,
     safe_read_paths: [cwd],
     auto_context: true,
@@ -508,7 +519,8 @@ function render(
         ),
       );
     const facts = matchingFacts();
-    const page = Math.min(memoryPage, lastPage());
+    const last = Math.max(0, Math.ceil(facts.length / FACTS_PER_PAGE) - 1);
+    const page = Math.min(memoryPage, last);
     children.push(
       Input({
         key: "neo-memory-query",
@@ -518,7 +530,7 @@ function render(
         onSubmit: () => {},
       }),
       label(
-        `${facts.length} matching facts · page ${page + 1} / ${lastPage() + 1}`,
+        `${facts.length} matching facts · page ${page + 1} / ${last + 1}`,
       ),
       Box({
         flexDirection: "row",
@@ -718,7 +730,10 @@ export const register: Register = (on, options) => {
   });
   on("ui.input", { requestId: PANE }, async ($, e) => {
     if (e.element === "neo-question") question = e.value;
-    if (e.element === "neo-context") context = e.value;
+    if (e.element === "neo-context") {
+      context = e.value;
+      notice = "";
+    }
     if (e.element === "neo-memory-query") {
       memoryQuery = e.value;
       memoryPage = 0;
@@ -754,7 +769,9 @@ export const register: Register = (on, options) => {
       if (selected.trim()) {
         context = selected;
         notice = "";
-      } else notice = "Nothing is selected; context unchanged.";
+      } else
+        notice =
+          "No selection is visible to Claude Code (selection needs fullscreen); context unchanged.";
     }
     if (e.element === "neo-prev-page")
       memoryPage = Math.max(0, Math.min(memoryPage, lastPage()) - 1);

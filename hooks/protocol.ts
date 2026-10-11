@@ -83,16 +83,16 @@ const normalized = (value: string) =>
     .toLowerCase()
     .replace(/^still open:\s*/, "")
     .replace(/\s+/g, " ");
-/** Open questions that do not repeat a caution: the engine reports an
- * unresolved simulation finding as both, and showing it twice reads as two
- * findings. A question that a caution already states (also when the caution
- * adds "Still open:") is dropped. */
+/** Open questions that do not repeat a caution. The engine voices each of the
+ * first open questions as a caution ("Still open: <question>", the
+ * `caution_open_question` beat), so showing both prints every one of them
+ * twice. A question is dropped only when a caution states exactly it, after
+ * that prefix; a question that merely ends like a caution survives. */
 export function openQuestions(result: Document): string[] {
-  const cautions = strings(object(result.orchestrator).cautions).map(normalized);
-  return strings(result.next_questions).filter((q) => {
-    const n = normalized(q);
-    return !cautions.some((c) => c === n || c.endsWith(n));
-  });
+  const cautions = new Set(
+    strings(object(result.orchestrator).cautions).map(normalized),
+  );
+  return strings(result.next_questions).filter((q) => !cautions.has(normalized(q)));
 }
 
 export function resultText(result: Document): string {

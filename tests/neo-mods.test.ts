@@ -359,6 +359,20 @@ test("a caution repeated as an open question is shown once", async () => {
     ],
   };
   expect(openQuestions(result)).toEqual(["Should empty input raise?"]);
+  // Tool-count and confidence questions are voiced as cautions the same way.
+  expect(
+    openQuestions({
+      orchestrator: { cautions: ["Still open: constraint_verifier found 2 issues"] },
+      next_questions: ["constraint_verifier found 2 issues"],
+    }),
+  ).toEqual([]);
+  // A question that only ends like a caution is a different question.
+  expect(
+    openQuestions({
+      orchestrator: { cautions: ["Still open: mypy_ruff found 2 issues"] },
+      next_questions: ["ruff found 2 issues"],
+    }),
+  ).toEqual(["ruff found 2 issues"]);
   const text = resultText(result);
   expect(text.split("race in caller").length - 1).toBe(1);
   expect(text).toContain("Open question: Should empty input raise?");
@@ -416,7 +430,7 @@ test("Use selection with nothing selected keeps typed context and says so", asyn
   await ui.press({ key: "neo-selection" });
   const drawn = JSON.stringify(await ui.drawn());
   expect(drawn).toContain("Context attached · 13 characters");
-  expect(drawn).toContain("Nothing is selected; context unchanged.");
+  expect(drawn).toContain("No selection is visible to Claude Code");
   await ui.unmount();
 });
 
@@ -439,4 +453,74 @@ test("selected context is sent with one question, not silently with the next", a
   await $.command.run(command("neo-ask", "unrelated question"));
   expect(payloads[0].prompt).toContain("SECRET_CONTEXT");
   expect(payloads[1].prompt).not.toContain("SECRET_CONTEXT");
+});
+
+function spawnHost(on: On, payloads: any[], fail = () => false) {
+  on("process.spawn", async function* (_$, e) {
+    payloads.push(JSON.parse(e.input!));
+    if (fail()) {
+      yield { stream: "stdout", text: '{"error":"provider unavailable"}' };
+      return { value: { code: 1, signal: null } };
+    }
+    yield { stream: "stderr", text: '{"type":"completed","message":"Done"}\n' };
+    yield { stream: "stdout", text: JSON.stringify(RESULT) };
+    return { value: { code: 0, signal: null } };
+  });
+}
+
+test("a follow-up carries the prior question's context; a new question does not", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  on("ui.selection", () => ({ value: { text: "def parse(x): ..." } as any }));
+  const payloads: any[] = [];
+  spawnHost(on, payloads);
+  await $.session.start(SESSION);
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-selection" });
+  await ui.unmount();
+  await $.command.run(command("neo-ask", "review parse"));
+  await $.command.run(command("neo-followup", "and the error path?"));
+  await $.command.run(command("neo-ask", "something unrelated"));
+  expect(payloads[0].prompt).toContain("def parse(x)");
+  expect(payloads[1].prompt).toContain("def parse(x)");
+  expect(payloads[2].prompt).not.toContain("def parse(x)");
+});
+
+test("a refused or failed run keeps the selected context for the retry", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  on("ui.selection", () => ({ value: { text: "KEEP_ME" } as any }));
+  const payloads: any[] = [];
+  let failNext = true;
+  spawnHost(on, payloads, () => {
+    const f = failNext;
+    failNext = false;
+    return f;
+  });
+  await $.session.start(SESSION);
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-selection" });
+  await ui.unmount();
+  const refused = await $.command.run(command("neo-ask", "   "));
+  expect(refused.text).toContain("Enter a question");
+  const failed = await $.command.run(command("neo-ask", "first try"));
+  expect(failed.exitCode).toBe(1);
+  await $.command.run(command("neo-ask", "retry"));
+  expect(payloads[0].prompt).toContain("KEEP_ME");
+  expect(payloads[1].prompt).toContain("KEEP_ME");
+});
+
+test("typing context by hand clears the selection notice", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  on("ui.selection", () => ({ value: undefined as any }));
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-selection" });
+  expect(JSON.stringify(await ui.drawn())).toContain("No selection is visible");
+  await ui.input({ key: "neo-context", text: "typed by hand" });
+  const drawn = JSON.stringify(await ui.drawn());
+  expect(drawn).not.toContain("No selection is visible");
+  expect(drawn).toContain("Context attached · 13 characters");
+  await ui.unmount();
 });
