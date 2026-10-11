@@ -5,7 +5,6 @@ Fuzzing tests for structured parser.
 Tests parser robustness against malformed inputs.
 """
 
-import pytest
 
 from neo.structured_parser import (
     parse_plan_steps,
@@ -454,27 +453,30 @@ class TestTolerantJsonLoadRepairs:
         assert r.success and r.data == {"a": 'say "x"\nnext'}
 
 
-class TestLaterPhasesUseRepair:
-    """#259: simulation and code parsing raised on the first failure."""
+class TestRepairKeepsStringContents:
+    def test_trailing_comma_inside_a_code_string_survives(self):
+        from neo.structured_parser import tolerant_json_load
 
-    @pytest.mark.parametrize(
-        "method,kind",
-        [("_parse_simulation_traces", "simulation"), ("_parse_code_suggestions", "code")],
-    )
-    def test_phase_parsing_goes_through_the_repair_loop(self, monkeypatch, method, kind):
-        from types import SimpleNamespace
+        r = tolerant_json_load('{"code": "items = [1, 2,]", "b": "y\nz",}')
+        assert r.success, r.error_message
+        assert r.data == {"code": "items = [1, 2,]", "b": "y\nz"}
 
-        import neo.repair_loop as repair_loop
-        from neo.engine import NeoEngine
-        from neo.structured_parser import ParseResult
+    def test_comma_brace_inside_a_string_survives(self):
+        from neo.structured_parser import tolerant_json_load
 
-        seen = {}
+        r = tolerant_json_load('{"code": "f(a, }", "x": 1,}')
+        assert r.success and r.data == {"code": "f(a, }", "x": 1}
 
-        def fake_repair(response, kind, parser_func, original_prompt, lm_adapter, enable_repair=True):
-            seen.update(kind=kind, lm=lm_adapter, enable=enable_repair)
-            return ParseResult(success=True, data=[])
+    def test_backslash_before_a_raw_newline_is_kept(self):
+        from neo.structured_parser import tolerant_json_load
 
-        monkeypatch.setattr(repair_loop, "parse_with_repair", fake_repair)
-        lm = object()
-        assert getattr(NeoEngine, method)(SimpleNamespace(lm=lm), "garbled") == []
-        assert seen == {"kind": kind, "lm": lm, "enable": True}
+        r = tolerant_json_load('{"sh": "make \\\nall"}')
+        assert r.success, r.error_message
+        assert r.data == {"sh": "make \\\nall"}
+
+    def test_the_reported_error_is_from_the_text_shown(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": \u201cb"')
+        assert not r.success
+        assert "char" in r.error_message

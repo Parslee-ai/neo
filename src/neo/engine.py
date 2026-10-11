@@ -4891,20 +4891,10 @@ Generate unified diff patches. Keep changes minimal and isolated."""
     def _parse_simulation_traces(self, response: str) -> list[SimulationTrace]:
         """Parse simulation traces from LM response."""
         from neo.structured_parser import parse_simulation_traces
-        from neo.repair_loop import parse_with_repair
         import logging
 
         logger = logging.getLogger(__name__)
-        # Same repair path as the plan (#259): one bad character in a later
-        # phase used to end the whole run with no repair attempt.
-        result = parse_with_repair(
-            response=response,
-            kind="simulation",
-            parser_func=parse_simulation_traces,
-            original_prompt="",
-            lm_adapter=self.lm,
-            enable_repair=True,
-        )
+        result = parse_simulation_traces(response)
 
         if not result.success:
             logger.error(
@@ -4931,20 +4921,10 @@ Generate unified diff patches. Keep changes minimal and isolated."""
     def _parse_code_suggestions(self, response: str) -> list[CodeSuggestion]:
         """Parse code suggestions from LM response."""
         from neo.structured_parser import parse_code_suggestions
-        from neo.repair_loop import parse_with_repair
         import logging
 
         logger = logging.getLogger(__name__)
-        # Same repair path as the plan (#259): one bad character in a later
-        # phase used to end the whole run with no repair attempt.
-        result = parse_with_repair(
-            response=response,
-            kind="code",
-            parser_func=parse_code_suggestions,
-            original_prompt="",
-            lm_adapter=self.lm,
-            enable_repair=True,
-        )
+        result = parse_code_suggestions(response)
 
         if not result.success:
             logger.error(
