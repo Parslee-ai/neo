@@ -77,6 +77,24 @@ export class NeoStream {
   }
 }
 
+const normalized = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/^still open:\s*/, "")
+    .replace(/\s+/g, " ");
+/** Open questions that do not repeat a caution: the engine reports an
+ * unresolved simulation finding as both, and showing it twice reads as two
+ * findings. A question that a caution already states (also when the caution
+ * adds "Still open:") is dropped. */
+export function openQuestions(result: Document): string[] {
+  const cautions = strings(object(result.orchestrator).cautions).map(normalized);
+  return strings(result.next_questions).filter((q) => {
+    const n = normalized(q);
+    return !cautions.some((c) => c === n || c.endsWith(n));
+  });
+}
+
 export function resultText(result: Document): string {
   const o = object(result.orchestrator);
   return [
@@ -91,7 +109,7 @@ export function resultText(result: Document): string {
         `Check: ${c.tool_name} (${c.status || "status unavailable"}): ${c.summary}`,
     ),
     `Validation: ${validationText(result)}`,
-    ...strings(result.next_questions).map((q) => "Open question: " + q),
+    ...openQuestions(result).map((q) => "Open question: " + q),
   ]
     .filter(Boolean)
     .join("\n\n");

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
+  - **Memory paging:** **Next** stops at the last page, so **Previous** responds at once. Before, it counted past the end and needed as many presses back.
+  - **Use selection:** with nothing selected, it keeps the typed context and says so, instead of silently clearing it.
+  - **Duplicate findings:** a finding the engine reports as both a caution and an open question is shown once, in the pane and in the text output.
+  - **Context reuse:** selected context goes with one question only, instead of being re-sent unseen with the next. While attached, the pane shows "Context attached · N characters".
+
 ## [0.56.0] - 2026-10-11
 
 ### Added

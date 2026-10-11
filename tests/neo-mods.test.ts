@@ -1,6 +1,11 @@
 import type { On } from "claude-code";
 import { expect, mock, test } from "claude-code/testing";
-import { NeoStream, followupContext, resultText } from "../hooks/protocol.js";
+import {
+  NeoStream,
+  followupContext,
+  openQuestions,
+  resultText,
+} from "../hooks/protocol.js";
 
 const command = (command: string, args = "") => ({
   command,
@@ -339,4 +344,99 @@ test("provenance opens above the fact list with details on demand", async ($, on
   await ui.press({ key: "neo-details" });
   expect(JSON.stringify(await ui.drawn())).toContain("supporting");
   await ui.unmount();
+});
+
+test("a caution repeated as an open question is shown once", async () => {
+  const result = {
+    ...RESULT,
+    orchestrator: {
+      summary: "s",
+      cautions: ["Still open: Simulation found: race in caller", "Tests not run"],
+    },
+    next_questions: [
+      "Simulation found: race in caller",
+      "Should empty input raise?",
+    ],
+  };
+  expect(openQuestions(result)).toEqual(["Should empty input raise?"]);
+  const text = resultText(result);
+  expect(text.split("race in caller").length - 1).toBe(1);
+  expect(text).toContain("Open question: Should empty input raise?");
+});
+
+function facts(n: number) {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `fact${i}`,
+    subject: `Fact ${i}`,
+    probation: false,
+    is_valid: true,
+  }));
+}
+function statusHost(on: On, count: number) {
+  on("process.run", () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        schema_version: 1,
+        fact_count: count,
+        probation_count: 0,
+        facts: facts(count),
+      }),
+      stderr: "",
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }));
+}
+
+test("memory paging stops at the last page so Previous answers at once", async ($, on) => {
+  host(on);
+  statusHost(on, 45); // two pages of 30
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-memory" });
+  for (let i = 0; i < 5; i++) await ui.press({ key: "neo-next-page" });
+  expect(JSON.stringify(await ui.drawn())).toContain("page 2 / 2");
+  await ui.press({ key: "neo-prev-page" });
+  expect(JSON.stringify(await ui.drawn())).toContain("page 1 / 2");
+  expect(await ui.find({ key: "fact-fact0" })).toBeDefined();
+  await ui.unmount();
+});
+
+test("Use selection with nothing selected keeps typed context and says so", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  let selection: { text: string } | undefined = { text: "def f(x): ..." };
+  on("ui.selection", () => ({ value: selection as any }));
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-selection" });
+  expect(JSON.stringify(await ui.drawn())).toContain("Context attached · 13 characters");
+  selection = undefined;
+  await ui.press({ key: "neo-selection" });
+  const drawn = JSON.stringify(await ui.drawn());
+  expect(drawn).toContain("Context attached · 13 characters");
+  expect(drawn).toContain("Nothing is selected; context unchanged.");
+  await ui.unmount();
+});
+
+test("selected context is sent with one question, not silently with the next", async ($, on) => {
+  host(on);
+  statusHost(on, 0);
+  on("ui.selection", () => ({ value: { text: "SECRET_CONTEXT" } as any }));
+  const payloads: any[] = [];
+  on("process.spawn", async function* (_$, e) {
+    payloads.push(JSON.parse(e.input!));
+    yield { stream: "stderr", text: '{"type":"completed","message":"Done"}\n' };
+    yield { stream: "stdout", text: JSON.stringify(RESULT) };
+    return { value: { code: 0, signal: null } };
+  });
+  await $.session.start(SESSION);
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-selection" });
+  await ui.unmount();
+  await $.command.run(command("neo-ask", "first question"));
+  await $.command.run(command("neo-ask", "unrelated question"));
+  expect(payloads[0].prompt).toContain("SECRET_CONTEXT");
+  expect(payloads[1].prompt).not.toContain("SECRET_CONTEXT");
 });
