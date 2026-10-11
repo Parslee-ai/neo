@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `claude-code` provider runs plain, isolated inference** ([#260](https://github.com/Parslee-ai/neo/issues/260)).
+  - **Isolated:** `claude -p` now starts with no tools, no MCP servers, no user or project settings or hooks, and no saved session. Before, a structured-output prompt was sometimes answered with a tool call that ran a command in the working tree, used up the single turn and exited 1. Every call also ran the user's hooks and left a session transcript on disk.
+  - **Real errors:** a failure now shows the error the CLI reports on stdout (for example `error_max_turns: Reached maximum number of turns (1)`) instead of `exited with code 1:` with nothing after it. A result marked `is_error` fails even when the exit code is 0.
+  - **Timeout and pipes:** both output pipes drain together, so the child can't block on stderr. The timeout covers the whole call, not just the wait after output ends.
+  - **Stop sequences:** these now apply to this provider. The CLI has no stop option, so the response is cut at the first one, as with the other providers.
+
 ### Changed
 
 - **Mod pane: clearer and more responsive** ([#280](https://github.com/Parslee-ai/neo/issues/280)).
