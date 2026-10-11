@@ -218,7 +218,16 @@ class NeoEngine:
         execution_adapter: Optional[ExecutionAdapter] = None,
         event_sink: Optional[NeoEventSink] = None,
         dry_run: bool = False,
+        scoped_consumer=None,
     ):
+        self.scoped_consumer = scoped_consumer
+        if scoped_consumer is not None:
+            scoped_consumer.prepare_state_root()
+            from neo.adapters import CarAdapter
+            if not isinstance(lm_adapter, CarAdapter) or lm_adapter._rt is not scoped_consumer.runtime or lm_adapter.scoped_consumer is not scoped_consumer:
+                raise ValueError("Scoped Neo requires its exact admitted CAR adapter")
+            if exemplar_index is not None:
+                raise ValueError("Scoped Neo cannot use an unbound exemplar index")
         self.lm = lm_adapter
         # Assemble for real, stop before inference, mutate nothing. See
         # `neo.dry_run` for why the prompt is recorded rather than rebuilt.
@@ -268,6 +277,8 @@ class NeoEngine:
             memory_backend = "fact_store"
             if config and hasattr(config, "memory_backend"):
                 memory_backend = config.memory_backend
+            if scoped_consumer is not None and memory_backend != "fact_store":
+                raise ValueError("Scoped Neo requires partitioned fact storage")
 
             if memory_backend == "fact_store":
                 try:
@@ -279,11 +290,16 @@ class NeoEngine:
                         # `initialize()` prunes, demotes and purges, then
                         # saves -- all before inference. A dry run must not
                         # age the store it is inspecting.
-                        read_only=dry_run,
+                        read_only=dry_run or scoped_consumer is not None,
+                        **({"facts_dir": scoped_consumer.state_root / "facts",
+                            "episodes_dir": scoped_consumer.state_root / "episodes",
+                            "emit_metrics": False} if scoped_consumer is not None else {}),
                     )
                     # Set persistent_memory for backward compat in methods that check it
                     self.persistent_memory = self.fact_store
                 except ImportError:
+                    if scoped_consumer is not None:
+                        raise
                     logger.warning("FactStore not available, falling back to legacy memory")
                     memory_backend = "legacy"
 
@@ -319,7 +335,8 @@ class NeoEngine:
         else:
             from neo.memory.scope import detect_org_and_project
             _, episode_project_id = detect_org_and_project(codebase_root)
-        self.episode_store = LearningEpisodeStore(episode_project_id or "unscoped")
+        self.episode_store = LearningEpisodeStore(episode_project_id or "unscoped",
+            **({"base_dir": scoped_consumer.state_root / "episodes"} if scoped_consumer is not None else {}))
         self.current_learning_episode = None
 
     def _emit(
@@ -464,7 +481,16 @@ class NeoEngine:
                 "concurrent request, or serialize the calls."
             )
         try:
-            return self._process_guarded(neo_input)
+            if self.scoped_consumer is not None:
+                self.scoped_consumer.authorize()
+                if getattr(neo_input, "operating_mode", None) is not OperatingMode.ADVISE:
+                    raise ModeValidationError("Scoped Neo consumers require ADVISE mode")
+            from neo.memory.metrics import scoped_metrics
+            with scoped_metrics(self.scoped_consumer.state_root / "metrics.jsonl" if self.scoped_consumer is not None else None):
+                result = self._process_guarded(neo_input)
+                if self.scoped_consumer is not None:
+                    self.scoped_consumer.authorize()
+                return result
         finally:
             self._process_lock.release()
 
@@ -2250,6 +2276,13 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         """(car_available, capable_model_count, route_fn|None). Multi-agent needs
         CAR reachable AND a diverse pool; ``route_model`` (decision-only) reports
         the pool via its ``candidates`` ranking."""
+        scope = getattr(self, "scoped_consumer", None)
+        if scope is not None:
+            scope.authorize()
+            runtime = scope.runtime
+            from neo.panel import capable_model_count
+            route_fn = runtime.route_model
+            return True, capable_model_count(route_fn, probe=(prompt[:200] or "code task")), route_fn
         try:
             from neo.a2ui import is_daemon_reachable
             from neo.car_inference import is_available as car_available, get_runtime
@@ -2334,6 +2367,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         coder / critic / judge), falling back to ``self.lm``. Diversity comes from
         the routing plan (``plan_role_models`` threads exclude_models)."""
         fallback = self.lm
+        scope = getattr(self, "scoped_consumer", None)
         if route_fn is None:
             return lambda role: fallback
         from neo.panel import plan_role_models, build_role_factory
@@ -2341,13 +2375,17 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
             role_models = plan_role_models(route_fn, prompt[:500])
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("role model planning failed: %s", e)
+            if scope is not None:
+                raise
             role_models = {}
         from neo.adapters import create_adapter
         # The router plan's ids are CAR catalog ids, so they are pinned
         # exactly (`model_id`), whatever their shape.
         return build_role_factory(
             role_models,
-            lambda m: create_adapter("car", model=m, model_is_catalog_id=True),
+            lambda m: create_adapter("car", model=m, model_is_catalog_id=True,
+                                     **({"runtime": scope.runtime,
+                                         "scoped_consumer": scope} if scope is not None else {})),
             fallback,
         )
 
@@ -2809,6 +2847,8 @@ RULES:
         denominator, which is the nested-cut defect this module exists to
         remove rather than relocate.
         """
+        if self.scoped_consumer is not None:
+            return ""
         cache = Path.home() / ".neo" / "community_facts_cache.json"
         if not cache.exists():
             return ""
@@ -4189,7 +4229,7 @@ RULES:
             }
 
             # Log to local file (always)
-            log_file = Path.home() / ".neo" / "usage_metrics.jsonl"
+            log_file = (self.scoped_consumer.state_root if self.scoped_consumer is not None else Path.home() / ".neo") / "usage_metrics.jsonl"
             log_file.parent.mkdir(parents=True, exist_ok=True)
 
             with open(log_file, "a") as f:
@@ -4283,7 +4323,7 @@ RULES:
                 ]
             }
 
-            log_file = Path.home() / ".neo" / "pattern_retrieval.jsonl"
+            log_file = (self.scoped_consumer.state_root if self.scoped_consumer is not None else Path.home() / ".neo") / "pattern_retrieval.jsonl"
             log_file.parent.mkdir(parents=True, exist_ok=True)
 
             with open(log_file, "a") as f:
@@ -4750,7 +4790,11 @@ Generate unified diff patches. Keep changes minimal and isolated."""
         import time
 
         logger = logging.getLogger(__name__)
-        lm_logger = get_lm_logger()
+        if self.scoped_consumer is not None:
+            from neo.lm_logger import LMLogger
+            lm_logger = LMLogger(storage_dir=self.scoped_consumer.state_root / "lm_logs")
+        else:
+            lm_logger = get_lm_logger()
 
         # Create interaction record
         interaction = LMInteraction(

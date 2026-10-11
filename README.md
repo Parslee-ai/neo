@@ -330,6 +330,10 @@ If the CLI/daemon are present but the Python bindings aren't, Neo reports that s
 
 ### Join the CAR Lattice
 
+For organization-bound nodes with private storage and native lifecycle ownership,
+see [organization-bound Lattice setup](docs/scoped-lattice.md). The automatic
+registration described below applies to personal nodes.
+
 The Lattice is CAR's collaboration layer: Claude Code, Codex, CAR Coder and other agents on one CAR daemon say what they are good at, find each other by need, and send each other typed messages. With the `[car]` extra installed and `car-server` running, every repository you use Neo in automatically gets a **read-only Neo player**, a CAR-supervised agent named `neo-lattice-<id>`. Nothing to configure.
 
 Other players find it with `lattice_find` / `lattice.find` (for example "code review", "debugging", "project memory", "architecture"), then message it:
