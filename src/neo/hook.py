@@ -124,7 +124,7 @@ def build_record(payload: dict, *, now: Optional[float] = None) -> Optional[dict
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
-    file_path = tool_input.get("file_path")
+    file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not isinstance(file_path, str) or not file_path:
         return None
 
@@ -148,6 +148,26 @@ def build_record(payload: dict, *, now: Optional[float] = None) -> Optional[dict
     session_id = payload.get("session_id")
     if isinstance(session_id, str) and session_id:
         record["session_id"] = session_id
+    for key in ("tool_use_id", "turn_id", "agent_id", "recent_invocation_id", "source"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            record[key] = value[:256]
+    if payload.get("source") == "claude-mod":
+        record["event"] = "edit_applied"
+        record["file_path"] = os.path.abspath(os.path.join(cwd, file_path))
+        # The host cwd may belong to another repository. Attribute the edit
+        # to the path's checkout; retain host cwd as separate evidence.
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(Path(record["file_path"]).parent),
+                 "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0:
+                record["checkout"] = result.stdout.strip()
+                record["head"] = _head(record["checkout"])
+        except (OSError, subprocess.SubprocessError):
+            pass
     return record
 
 
@@ -167,9 +187,59 @@ def append(record: dict, ledger: Optional[Path] = None) -> None:
     """Append one JSON line. Callers treat failure as nothing-happened."""
     target = HOOK_LEDGER if ledger is None else ledger
     target.parent.mkdir(parents=True, exist_ok=True)
-    _rotate_if_large(target)
-    with target.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
+    # The mod records before the legacy command. Deduplicate the same host
+    # call, never different calls to one file. Serialize rotation and append.
+    with target.with_suffix(".lock").open("a") as lock:
+        try:
+            import fcntl
+        except ImportError:  # Windows: serial hooks still deduplicate.
+            fcntl = None
+        if fcntl is not None:
+            deadline = time.monotonic() + 0.2
+            while True:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        _debug("ledger busy; skipped observation")
+                        return
+                    time.sleep(0.01)
+        try:
+            call_id = record.get("tool_use_id")
+            if call_id:
+                for path in (target, target.with_name(target.name + ".1")):
+                    if not path.exists():
+                        continue
+                    with path.open("rb") as prior:
+                        prior.seek(max(0, path.stat().st_size - 65536))
+                        for line in prior.read().splitlines():
+                            try:
+                                old = json.loads(line)
+                            except (ValueError, UnicodeDecodeError):
+                                continue
+                            if (isinstance(old, dict)
+                                    and old.get("tool_use_id") == call_id
+                                    and old.get("session_id") == record.get("session_id")):
+                                return
+            _rotate_if_large(target)
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def build_lifecycle_record(payload: dict) -> Optional[dict]:
+    """Record identity and disposition, never prompts, answers or tool bodies."""
+    if payload.get("event") not in {"turn_started", "turn_completed", "neo_started", "neo_finished"}:
+        return None
+    record = {"ts": time.time(), "source": "claude-mod"}
+    for key in ("event", "session_id", "turn_id", "agent_id", "invocation_id", "cwd", "status"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            record[key] = value[:4096]
+    return record
 
 
 def run_hook(argv: list) -> int:
@@ -178,7 +248,7 @@ def run_hook(argv: list) -> int:
         if os.environ.get("NEO_HOOKS") == "0":
             return 0
         action = argv[0] if argv else ""
-        if action != "record":
+        if action not in {"record", "event"}:
             # Not worth failing a tool call over, and a future host may send an
             # action this build predates.
             _debug(f"unknown action {action!r}")
@@ -187,7 +257,7 @@ def run_hook(argv: list) -> int:
         if not isinstance(payload, dict):
             _debug("payload was not a JSON object")
             return 0
-        record = build_record(payload)
+        record = build_record(payload) if action == "record" else build_lifecycle_record(payload)
         if record is None:
             return 0
         append(record)

@@ -36,7 +36,9 @@ CLAUDE_ROOT = REPO
 CODEX_PLUGIN = REPO / "plugins" / "neo"
 
 # What is allowed to live in the manifest directory.
-CLAUDE_MANIFEST_FILES = {"plugin.json", "marketplace.json"}
+CLAUDE_MANIFEST_FILES = {"plugin.json", "marketplace.json", "types"}
+# Claude Code generates .claude-plugin/types/ for Mod type checking. These
+# are host API declarations, not plugin components.
 
 # The six capabilities Neo claims on every integration surface.
 CAPABILITIES = ["neo", "neo-review", "neo-debug", "neo-architect",

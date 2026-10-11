@@ -1176,6 +1176,7 @@ class CarAdapter(LMAdapter):
         intent_hint: Optional[dict] = None,
         runtime: Optional[object] = None,
         model_is_catalog_id: bool = False,
+        scoped_consumer=None,
     ):
         self.model = model
         # True when `model` is a catalog id CAR handed us (the panel's router
@@ -1190,11 +1191,17 @@ class CarAdapter(LMAdapter):
         self.intent_hint = dict(intent_hint) if intent_hint else dict(self.DEFAULT_INTENT_HINT)
         # Give large-context inference room to finish before CAR's FFI read
         # timeout cuts it off (a quality remote can take ~140s on neo's context).
-        _apply_car_daemon_timeout_default()
-        if runtime is None:
+        if scoped_consumer is None:
+            _apply_car_daemon_timeout_default()
+        if scoped_consumer is not None:
+            if runtime is not None and runtime is not scoped_consumer.runtime:
+                raise ValueError("Scoped adapter requires its admitted consumer runtime")
+            runtime = scoped_consumer.runtime
+        elif runtime is None:
             from neo.car_inference import get_runtime
             runtime = get_runtime()
         self._rt = runtime
+        self.scoped_consumer = scoped_consumer
 
     @staticmethod
     def _messages_to_prompt(messages) -> str:
@@ -1215,7 +1222,19 @@ class CarAdapter(LMAdapter):
                 parts.append(str(m))
         return "\n\n".join(parts)
 
-    def generate(
+    def generate(self, messages, stop=None, max_tokens: int = 4096,
+                 temperature: float = 0.7, reasoning_effort: Optional[str] = None) -> str:
+        from neo.memory.metrics import scoped_metrics
+        if self.scoped_consumer is not None:
+            self.scoped_consumer.authorize()
+        with scoped_metrics(self.scoped_consumer.state_root / "metrics.jsonl"
+                            if self.scoped_consumer is not None else None):
+            result = self._generate(messages, stop, max_tokens, temperature, reasoning_effort)
+            if self.scoped_consumer is not None:
+                self.scoped_consumer.authorize()
+            return result
+
+    def _generate(
         self,
         messages,
         stop: Optional[list] = None,
@@ -1596,7 +1615,7 @@ def _adapter_kwargs_for_config(config) -> dict:
     return adapter_kwargs
 
 
-def resolve_adapter(config) -> LMAdapter:
+def resolve_adapter(config, *, scoped_consumer=None) -> LMAdapter:
     """Build the inference adapter for a NeoConfig, honoring ``inference_mode``.
 
     Default ("auto"): prefer CAR's dynamic router when car-runtime is importable
@@ -1608,6 +1627,11 @@ def resolve_adapter(config) -> LMAdapter:
     the fallback after a CAR failure) so that a CAR-only install with no static
     provider key configured still works.
     """
+    if scoped_consumer is not None:
+        scoped_consumer.authorize()
+        # Scoped refusal never enters AutoAdapter's personal provider fallback.
+        return CarAdapter(runtime=scoped_consumer.runtime, scoped_consumer=scoped_consumer)
+
     def build_static() -> LMAdapter:
         return create_adapter(
             config.provider,

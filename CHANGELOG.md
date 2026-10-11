@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-10-11
+
+### Added
+
+- **A native Neo workspace for Claude Code Mods.** Direct reason, review, debug, architect, optimize and pattern requests stream progress into a Results, Memory and Evidence pane, with linked follow-ups, selected context, draft sharing, cancellation and a four-minute deadline. Headless and unsupported-pane sessions retain text commands. Python continues to own inference, context and learning policy.
+- **Read-only project memory inspection.** `neo workspace status` and `neo workspace explain` inspect persisted project facts and provenance without model calls, embeddings, migration, memory aging or observer startup. Results distinguish retrieved context from cited evidence and analysis completion from validation and acceptance.
+- **Organization-bound CAR Lattice integration.** Explicit enrollment preserves immutable organization context, partitions private storage, restricts inference to the admitted CAR consumer and reauthorizes results. Native-owner join, status and leave preserve original ownership and refuse replacement while admission or cleanup is uncertain.
+
+### Fixed
+
+- Mod and classic host hooks deduplicate successful edits by host identity, retain bounded lifecycle diagnostics and exclude those observations from acceptance and promotion decisions. Existing git verification and independent-outcome gates remain authoritative.
+- Native-owner requests now accept complete guardian inventories within an 8 MiB UTF-8 byte bound; oversized requests fail before launching the guardian instead of truncating JSON at 1 MiB.
+- Community fallback remains compatible with callers that do not initialize scoped-consumer state.
+
+### Documentation and validation
+
+- Added Mods setup, command, privacy, evidence and fallback documentation, plus scoped Lattice enrollment and native-owner configuration guidance.
+- Terminal Mods reasoning, linked follow-ups, cancellation, edit deduplication and zero-model provenance inspection were exercised live. Desktop has host-kit coverage; live Desktop acceptance remains unavailable.
+- Scoped Lattice requires matching CAR scoped-consumer and native-guardian contracts and pinned installed artifacts. Installed native-owner restart recovery, cleanup and real multiplayer acceptance remain unverified; automated controls do not establish those outcomes.
+
 ## [0.55.2] - 2026-10-07
 
 Two fixes to how neo talks to CAR, validated against car-runtime and CarHost 0.56.1.

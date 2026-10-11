@@ -251,6 +251,8 @@ class Outcome:
     candidate_subject: str = ""
     candidate_body: str = ""
     candidate_kind: str = "pattern"
+    # Diagnostic correlation, never an input to acceptance or promotion.
+    host_observations: list[dict] = field(default_factory=list)
 
 
 def _resolved(path: Path) -> Optional[Path]:
@@ -408,6 +410,7 @@ class OutcomeTracker:
         # Every checkout of this repository, `codebase_root` first. Listed once
         # per collect_outcomes; None means "not listed", read as the root alone.
         self._checkout_roots: Optional[list[str]] = None
+        self._host_observations: list[tuple[float, str, dict]] = []
 
     def _get_session_path(self) -> Optional[Path]:
         if not self.project_id:
@@ -795,11 +798,15 @@ class OutcomeTracker:
                 f"{len(prev.suggestion_fact_ids)} linked fact(s)"
             )
 
-            all_outcomes.extend(
-                self._match_to_suggestions(
-                    changed_files, prev, elsewhere=elsewhere, dirty_roots=dirty_roots
-                )
+            matched = self._match_to_suggestions(
+                changed_files, prev, elsewhere=elsewhere, dirty_roots=dirty_roots
             )
+            for outcome in matched:
+                outcome.host_observations = [
+                    observation for ts, path, observation in self._host_observations
+                    if path == outcome.file_path and ts >= since
+                ][-12:]
+            all_outcomes.extend(matched)
 
         # Also check for non-git outcomes (weak implicit acceptance for paths the
         # git matcher can't see: review docs, /dev/null, docs/).
@@ -1271,6 +1278,7 @@ class OutcomeTracker:
         torn final write is the expected corruption and the records before it
         are still good.
         """
+        self._host_observations: list[tuple[float, str, dict]] = []
         if not self.codebase_root:
             return []
         try:
@@ -1309,6 +1317,9 @@ class OutcomeTracker:
                             continue
                         if not isinstance(record, dict):
                             continue
+                        # Lifecycle events cannot establish application.
+                        if record.get("event") not in {None, "edit_applied"}:
+                            continue
                         raw = record.get("file_path")
                         ts = record.get("ts")
                         if not isinstance(raw, str) or not raw:
@@ -1326,6 +1337,16 @@ class OutcomeTracker:
                             continue  # not under any checkout of this project
                         relative, own = located
                         events.append((float(ts), relative, own))
+                        observation = {
+                            key: record[key] for key in (
+                                "session_id", "turn_id", "agent_id", "tool_use_id",
+                                "recent_invocation_id", "source", "checkout", "head",
+                            ) if isinstance(record.get(key), str)
+                        }
+                        if observation:
+                            observation["ts"] = float(ts)
+                            observation["relation"] = "observed_edit_not_causal_acceptance"
+                            self._host_observations.append((float(ts), relative, observation))
             except OSError as exc:
                 logger.debug("host-edit ledger unreadable (non-fatal): %s", exc)
                 continue
