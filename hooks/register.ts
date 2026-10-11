@@ -548,7 +548,7 @@ function render(
   } else if (tab === "memory") {
     children.push(
       label(
-        `${snapshot.fact_count ?? "?"} project facts · ${snapshot.probation_count ?? "?"} on probation`,
+        `${snapshot.fact_count ?? "?"} project facts · ${snapshot.probation_count ?? "?"} on probation${snapshot.missing_file_count ? ` · ${snapshot.missing_file_count} about files not in this checkout` : ""}`,
       ),
       button("neo-refresh", "Refresh"),
     );
@@ -637,7 +637,7 @@ function render(
       children.push(
         button(
           "fact-" + f.id,
-          `${f.is_valid ? "" : "[invalid] "}${f.probation ? "[probation] " : ""}${f.subject || f.id}`,
+          `${f.is_valid ? "" : "[invalid] "}${f.probation ? "[probation] " : ""}${text(f.missing_file) ? "[missing file] " : ""}${f.subject || f.id}`,
         ),
       );
     children.push(

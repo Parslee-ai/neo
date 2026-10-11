@@ -691,3 +691,34 @@ test("details opened on one tab stay closed on the others", async ($, on) => {
   await ui.unmount();
 });
 
+
+test("facts about files not in this checkout are marked in Memory", async ($, on) => {
+  host(on);
+  on("process.run", () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        schema_version: 1,
+        checkout: "/work",
+        fact_count: 2,
+        probation_count: 0,
+        missing_file_count: 1,
+        facts: [
+          { id: "gone", subject: "pattern: src/old.py", is_valid: true, missing_file: "src/old.py" },
+          { id: "live", subject: "pattern: src/new.py", is_valid: true, missing_file: "" },
+        ],
+      }),
+      stderr: "",
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }));
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.press({ key: "neo-memory" });
+  const drawn = JSON.stringify(await ui.drawn());
+  expect(drawn).toContain("1 about files not in this checkout");
+  expect(drawn).toContain("[missing file] pattern: src/old.py");
+  expect(drawn).not.toContain("[missing file] pattern: src/new.py");
+  await ui.unmount();
+});
