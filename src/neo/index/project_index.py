@@ -23,7 +23,7 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 import numpy as np
@@ -55,6 +55,15 @@ MAX_CHUNK_LENGTH = 2000  # Characters per chunk
 STALENESS_THRESHOLD = 0.1  # 10% of files changed triggers full reindex warning
 REFRESH_BUDGET_MS = 5000  # Max 5s for opportunistic refresh
 REFRESH_MAX_CHUNKS = 100  # Max chunks to update during opportunistic refresh
+
+# Catalogs built on Windows before keys were POSIX hold `pkg\\mod.py`. Only
+# there is a backslash a separator; on POSIX it is a legal filename character.
+_BACKSLASH_IS_SEPARATOR = os.sep == "\\"
+
+
+def _stored_key(rel_path: str) -> str:
+    """A catalog key as stored on disk, in the POSIX form the walk uses."""
+    return rel_path.replace("\\", "/") if _BACKSLASH_IS_SEPARATOR else rel_path
 
 # Which paths exist and are eligible is answered in ONE place — `neo.eligibility`
 # — which this module, prompt assembly and the architecture scan all call. A
@@ -166,6 +175,18 @@ class ProjectIndex:
         self.chunks_path = self.neo_dir / "chunks.json"
         self.edges_path = self.neo_dir / "edges.json"
         self.faiss_path = self.neo_dir / "faiss.index"
+        # New-file detection (#217), kept OUT of index.json on purpose: older
+        # neo builds `IndexSnapshot(**json)`, and an unknown key there makes
+        # it discard the whole catalog. Holds the last full build's walk
+        # patterns, its `max_files`, and every path that walk saw, catalogued
+        # or not (a file the cap or dedup passed over was seen, not missed).
+        # A path walked now that is in neither `walked` nor `file_hashes` was
+        # created after the build. None for a catalog built before this file
+        # existed, which cannot tell a new file from a passed-over one.
+        self.walk_record_path = self.neo_dir / "walked.json"
+        self.walk_patterns: Optional[List[str]] = None
+        self.walk_max_files: Optional[int] = None
+        self.walked: set = set()
 
         # In-memory state
         self.chunks: List[CodeChunk] = []
@@ -188,7 +209,12 @@ class ProjectIndex:
             # Load snapshot
             with open(self.snapshot_path) as f:
                 snapshot_dict = json.load(f)
-                self.snapshot = IndexSnapshot(**snapshot_dict)
+                # Unknown keys (a newer neo's) are dropped, not fatal.
+                known = {f.name for f in fields(IndexSnapshot)}
+                self.snapshot = IndexSnapshot(
+                    **{k: v for k, v in snapshot_dict.items() if k in known})
+                self.snapshot.file_hashes = {
+                    _stored_key(k): v for k, v in self.snapshot.file_hashes.items()}
 
             # Load chunks
             if self.chunks_path.exists():
@@ -201,7 +227,7 @@ class ProjectIndex:
                             embedding = np.array(chunk_dict['embedding'], dtype=np.float32)
 
                         chunk = CodeChunk(
-                            file_path=chunk_dict['file_path'],
+                            file_path=_stored_key(chunk_dict['file_path']),
                             chunk_id=chunk_dict['chunk_id'],
                             content=chunk_dict['content'],
                             chunk_type=chunk_dict['chunk_type'],
@@ -219,6 +245,9 @@ class ProjectIndex:
             if self.edges_path.exists():
                 with open(self.edges_path) as f:
                     self.edges = json.load(f)
+                for edge in self.edges:
+                    if isinstance(edge.get('source_file'), str):
+                        edge['source_file'] = _stored_key(edge['source_file'])
                 logger.info(f"Loaded {len(self.edges)} edges")
 
             # Load FAISS index if available
@@ -235,6 +264,31 @@ class ProjectIndex:
             self.edges = []
             self.snapshot = None
             self.faiss_index = None
+            return
+        self._load_walk_record()
+
+    def _load_walk_record(self) -> None:
+        """Load `walked.json` if it belongs to THIS build. It is stamped with
+        the snapshot's `created_at`, which every build rewrites; an older neo
+        rebuilds without touching it, and a record describing a different
+        build would make the next refresh remove that build's files as
+        ineligible. A missing, foreign or unreadable record means "no record"
+        (no new-file detection), never a lost catalog."""
+        if not self.walk_record_path.exists():
+            return
+        try:
+            with open(self.walk_record_path) as f:
+                record = json.load(f)
+            if record.get("built_at") != self.snapshot.created_at:
+                logger.info("walked.json belongs to another build; ignoring it")
+                return
+            patterns = [str(p) for p in record["file_patterns"]]
+            walked = {_stored_key(str(p)) for p in record["walked_paths"]}
+            max_files = record.get("max_files")
+        except Exception as e:
+            logger.warning(f"Ignoring unreadable {self.walk_record_path.name}: {e}")
+            return
+        self.walk_patterns, self.walked, self.walk_max_files = patterns, walked, max_files
 
     def _save(self):
         """Save index to disk with atomic write."""
@@ -250,6 +304,13 @@ class ProjectIndex:
 
             # Atomic write: write to unique temp files, then replace.
             self._atomic_write_json(self.snapshot_path, self.snapshot.__dict__)
+            if self.walk_patterns is not None:
+                self._atomic_write_json(self.walk_record_path, {
+                    "built_at": self.snapshot.created_at,
+                    "file_patterns": self.walk_patterns,
+                    "max_files": self.walk_max_files,
+                    "walked_paths": sorted(self.walked),
+                })
 
             # Chunks
             chunks_data = []
@@ -271,12 +332,14 @@ class ProjectIndex:
 
             self._atomic_write_json(self.chunks_path, chunks_data)
 
-            # Edges
-            if self.edges:
-                self._atomic_write_json(self.edges_path, self.edges)
+            # Edges. Written even when empty: a refresh that removed the
+            # last edge must not leave the previous list on disk to reload.
+            self._atomic_write_json(self.edges_path, self.edges)
 
-            # FAISS index
-            if FAISS_AVAILABLE and self.faiss_index:
+            # FAISS index (likewise removed, not left stale, when there is none)
+            if FAISS_AVAILABLE and self.faiss_index is None:
+                self.faiss_path.unlink(missing_ok=True)
+            elif FAISS_AVAILABLE and self.faiss_index:
                 fd, tmp_name = tempfile.mkstemp(dir=self.faiss_path.parent, suffix=".tmp")
                 os.close(fd)
                 try:
@@ -405,6 +468,32 @@ class ProjectIndex:
             kept.extend(group[: allocation.get(path, 0)])
         return kept
 
+    def _ensure_parser(self) -> None:
+        """Build and refresh both extract chunks; neither may run without a
+        parser. A catalog loaded from disk has none until this runs, and a
+        refresh that extracted with none used to wipe every changed file's
+        chunks and save the wipe."""
+        if self.parser is None:
+            try:
+                self.parser = TreeSitterParser()
+            except ImportError as e:
+                raise RuntimeError(
+                    "Tree-sitter is required for indexing. "
+                    "Install with: pip install neo-reasoner"
+                ) from e
+
+    def _walk(self, file_patterns: List[str]):
+        """The shared eligibility walk under `file_patterns`. Through the walk
+        cache, so the build and every later staleness check share one walk."""
+        from neo.eligibility import WalkPolicy
+        from neo.index.walk_cache import cached_walk
+
+        return cached_walk(
+            str(self.repo_root),
+            WalkPolicy(match_globs=tuple(file_patterns)),
+            record=False,
+        )
+
     def _select_files(
         self, file_patterns: List[str], max_files: int
     ) -> Tuple[List[Tuple[Path, str]], Dict[str, Any]]:
@@ -418,8 +507,6 @@ class ProjectIndex:
         printed "Built index" and exited 0 whether it had indexed the
         repository or 83 files of a stale worktree copy.
         """
-        from neo.eligibility import WalkPolicy
-        from neo.index.walk_cache import cached_walk
         from neo.languages import language_for_path
 
         # One walk, shared with prompt assembly. It prunes ignored directories
@@ -436,12 +523,12 @@ class ProjectIndex:
         # Through the shared walk cache: `--index` is the documented
         # cache-warmer, so it must warm the walk as well as the catalog, and
         # on a repository the gatherer has already visited it costs nothing.
-        walked = cached_walk(
-            str(self.repo_root),
-            WalkPolicy(match_globs=tuple(file_patterns)),
-            record=False,
-        )
+        walked = self._walk(file_patterns)
         excluded = walked.excluded
+        # The build records exactly the walk it selected from (a second walk
+        # could see a file created in between and hide it for good).
+        unreadable: set = set()
+        self._selection_walk = ([e.rel_path for e in walked.paths], unreadable)
 
         by_language: Dict[str, List[Path]] = {}
         for entry in walked.paths:
@@ -515,6 +602,7 @@ class ProjectIndex:
                 if not file_hash:
                     # Unreadable, or vanished since the glob. Not counted
                     # against the quota, so the next candidate takes its slot.
+                    unreadable.add(path.relative_to(self.repo_root).as_posix())
                     continue
                 # Content-identical files must not each consume a slot: they
                 # produce identical chunks and identical embeddings, so the
@@ -592,15 +680,7 @@ class ProjectIndex:
             languages: Languages to index (e.g., ['python', 'csharp', 'typescript'])
             max_files: Maximum files to index (prevent runaway on large repos)
         """
-        # Lazy-initialize parser
-        if self.parser is None:
-            try:
-                self.parser = TreeSitterParser()
-            except ImportError as e:
-                raise RuntimeError(
-                    "Tree-sitter is required for indexing. "
-                    "Install with: pip install neo-reasoner"
-                ) from e
+        self._ensure_parser()
 
         # Auto-generate file patterns from languages if specified
         if languages and not file_patterns:
@@ -631,22 +711,30 @@ class ProjectIndex:
         files_to_index, selection = self._select_files(file_patterns, max_files)
         self.selection_report = selection
         self.snapshot.total_files = len(files_to_index)
+        walked_paths, unreadable = self._selection_walk
+        self.walk_patterns = list(file_patterns)
+        self.walk_max_files = max_files
+        # An unreadable file was not seen in any useful sense: leaving it out
+        # lets it be picked up as new once it can be read.
+        self.walked = set(walked_paths) - unreadable
 
         # Extract chunks and edges from each file
         all_chunks = []
         all_edges = []
         for file_path, file_hash in files_to_index:
-            rel_path = file_path.relative_to(self.repo_root)
-            chunks = self._extract_chunks_from_file(file_path, str(rel_path))
+            # POSIX keys, like every walk path they are compared against; a
+            # backslash key on Windows matched nothing in the walk (#217).
+            rel_path = file_path.relative_to(self.repo_root).as_posix()
+            chunks = self._extract_chunks_from_file(file_path, rel_path)
             all_chunks.extend(chunks)
 
             # Extract edges
-            edges = self._extract_edges_from_file(file_path, str(rel_path))
+            edges = self._extract_edges_from_file(file_path, rel_path)
             all_edges.extend(edges)
 
             # Hash was computed during selection (it is what rejects
             # duplicate content), so reuse it rather than re-reading.
-            self.snapshot.file_hashes[str(rel_path)] = file_hash
+            self.snapshot.file_hashes[rel_path] = file_hash
 
         # Limit total chunks. Round-robin across files rather than slicing,
         # for exactly the reason the file budget is apportioned rather than
@@ -733,9 +821,12 @@ class ProjectIndex:
                 min(k, len(self.chunks))
             )
             results = []
+            # FAISS row r is the r-th chunk WITH an embedding (see
+            # `_build_faiss_index`), not `self.chunks[r]`.
+            rows = [n for n, c in enumerate(self.chunks) if c.embedding is not None]
             for i, dist in zip(indices[0], distances[0]):
-                if i < len(self.chunks):
-                    chunk = self.chunks[i]
+                if 0 <= i < len(rows):
+                    chunk = self.chunks[rows[i]]
                     chunk.similarity = float(dist)  # FAISS returns cosine similarity (after normalization)
                     results.append(chunk)
             return results
@@ -784,6 +875,27 @@ class ProjectIndex:
         if current_commit != self.snapshot.commit_hash:
             logger.info(f"Commit changed: {self.snapshot.commit_hash[:7]} -> {current_commit[:7]}")
 
+        changed, new, ineligible = self._staleness_parts()
+        changed_files = changed + new + ineligible
+
+        # Calculate staleness ratio (new files can outnumber tracked ones)
+        total_files = len(self.snapshot.file_hashes)
+        staleness_ratio = (min(1.0, len(changed_files) / total_files)
+                           if total_files > 0 else (1.0 if changed_files else 0.0))
+        is_stale = staleness_ratio > STALENESS_THRESHOLD
+
+        return is_stale, staleness_ratio, changed_files
+
+    def _staleness_parts(self) -> Tuple[List[str], List[str], List[str]]:
+        """`(changed_or_deleted, new, ineligible)`.
+
+        `changed_or_deleted` are tracked files whose hash moved or that are
+        gone, in the order the snapshot tracks them, so two calls on an
+        unchanged tree cannot disagree. `new` and `ineligible` need the walk
+        record (empty for an older catalog): eligible files the build's walk
+        never saw, and tracked files that still exist but the walk no longer
+        admits (a `.gitignore` added since).
+        """
         tracked = self.snapshot.file_hashes
         current = [
             freshness.Candidate(
@@ -800,87 +912,137 @@ class ProjectIndex:
             current,
             self._compute_file_hash,
         )
-        # Reported in the order the snapshot tracks them, so two calls on an
-        # unchanged tree cannot disagree about the list.
         stale = set(moved) | set(gone)
-        changed_files = [rel_path for rel_path in tracked if rel_path in stale]
+        changed = [rel_path for rel_path in tracked if rel_path in stale]
+        if self.walk_patterns is None:
+            return changed, [], []
+        eligible = [e.rel_path for e in self._walk(self.walk_patterns).paths]
+        eligible_set = set(eligible)
+        new = [p for p in eligible if p not in tracked and p not in self.walked]
+        ineligible = [p for p in tracked
+                      if p not in eligible_set and p not in stale]
+        return changed, new, ineligible
 
-        # Calculate staleness ratio
-        total_files = len(tracked)
-        staleness_ratio = len(changed_files) / total_files if total_files > 0 else 0.0
-        is_stale = staleness_ratio > STALENESS_THRESHOLD
+    def refresh_changed_files(self, budget_ms: int = REFRESH_BUDGET_MS,
+                              max_chunks: int = REFRESH_MAX_CHUNKS) -> Dict[str, Any]:
+        """Bring the catalog up to date with changed, new, deleted and
+        no-longer-eligible files, within a time and chunk budget.
 
-        return is_stale, staleness_ratio, changed_files
+        Deletions are cheap and always run in full. The budgets then bound
+        the extraction work; both are checked before each file, the clock
+        starts after the staleness scan, and at least one file is always
+        processed, so repeated runs always make progress. A file that cannot
+        be read or parsed keeps its previous chunks, edges and hash and is
+        reported in `failed`: it is never wiped and marked fresh.
 
-    def refresh_changed_files(self, budget_ms: int = REFRESH_BUDGET_MS, max_chunks: int = REFRESH_MAX_CHUNKS):
+        New files obey the build's rules: one whose content duplicates a
+        catalogued file is skipped, and none is added once the catalog holds
+        the build's `max_files`; both are recorded as seen, so they are not
+        retried every run, and counted.
+
+        Returns what the refresh did (#217): `refreshed`, `added`, `removed`,
+        `failed` (paths), `skipped_duplicate`, `skipped_cap`,
+        `chunks_extracted`, `chunks_embedded`, `remaining` (stale files not
+        reached), `bound` (`"time"`, `"chunks"` or None), `max_files` and
+        `tracks_new_files`.
         """
-        Opportunistic refresh: re-embed only changed files within time budget.
+        self._ensure_parser()
+        result: Dict[str, Any] = {
+            'refreshed': 0, 'added': 0, 'removed': 0, 'failed': [],
+            'skipped_duplicate': 0, 'skipped_cap': 0,
+            'chunks_extracted': 0, 'chunks_embedded': 0,
+            'remaining': [], 'bound': None, 'max_files': self.walk_max_files,
+            'tracks_new_files': self.walk_patterns is not None,
+        }
+        if not self.snapshot:
+            return result
+        changed, new, ineligible = self._staleness_parts()
+        hashes = self.snapshot.file_hashes
 
-        This is called during LLM wait time to keep index fresh without blocking.
+        def forget(rel_path: str) -> None:
+            self.chunks = [c for c in self.chunks if c.file_path != rel_path]
+            self.edges = [e for e in self.edges if e.get('source_file') != rel_path]
+            hashes.pop(rel_path, None)
+            self.walked.discard(rel_path)
 
-        Args:
-            budget_ms: Time budget in milliseconds
-            max_chunks: Maximum chunks to update
-        """
+        removals = [p for p in changed if not (self.repo_root / p).exists()] + ineligible
+        for rel_path in removals:
+            forget(rel_path)
+        result['removed'] = len(removals)
+        dirty = bool(removals)
+
+        removed_set = set(removals)
+        work = [p for p in changed if p not in removed_set] + new
+        new_set = set(new)
         start_time = time.time()
-        budget_s = budget_ms / 1000.0
+        updated_chunks: List[CodeChunk] = []
+        for position, rel_path in enumerate(work):
+            if position:
+                if time.time() - start_time > budget_ms / 1000.0:
+                    result['bound'] = 'time'
+                elif len(updated_chunks) >= max_chunks:
+                    result['bound'] = 'chunks'
+                if result['bound']:
+                    result['remaining'] = work[position:]
+                    break
 
-        is_stale, ratio, changed_files = self.check_staleness()
-        if not changed_files:
-            logger.debug("No changes detected, index is fresh")
-            return
-
-        logger.info(f"Refreshing {len(changed_files)} changed files (budget: {budget_ms}ms)")
-
-        updated_chunks = []
-        for rel_path in changed_files:
-            # Check budget
-            if time.time() - start_time > budget_s:
-                logger.info("Refresh budget exceeded, stopping early")
-                break
-
-            if len(updated_chunks) >= max_chunks:
-                logger.info(f"Max chunks reached ({max_chunks}), stopping early")
-                break
-
-            # Re-extract chunks from changed file
             file_path = self.repo_root / rel_path
-            if not file_path.exists():
-                # File deleted, remove chunks
-                self.chunks = [c for c in self.chunks if c.file_path != rel_path]
-                if rel_path in self.snapshot.file_hashes:
-                    del self.snapshot.file_hashes[rel_path]
+            new_hash = self._compute_file_hash(file_path)
+            if not new_hash:
+                result['failed'].append(rel_path)
+                continue
+            if rel_path in new_set:
+                if new_hash in hashes.values():
+                    self.walked.add(rel_path)
+                    result['skipped_duplicate'] += 1
+                    dirty = True
+                    continue
+                if self.walk_max_files is not None and len(hashes) >= self.walk_max_files:
+                    self.walked.add(rel_path)
+                    result['skipped_cap'] += 1
+                    dirty = True
+                    continue
+            try:
+                new_chunks = self._extract_chunks_from_file(file_path, rel_path, strict=True)
+                new_edges = self._extract_edges_from_file(file_path, rel_path, strict=True)
+            except Exception as e:
+                logger.warning(f"Refresh could not extract {rel_path}: {e}")
+                result['failed'].append(rel_path)
                 continue
 
-            # Extract new chunks
-            new_chunks = self._extract_chunks_from_file(file_path, rel_path)
-
-            # Remove old chunks for this file
-            self.chunks = [c for c in self.chunks if c.file_path != rel_path]
-
-            # Add new chunks
+            forget(rel_path)
             self.chunks.extend(new_chunks)
+            self.edges.extend(new_edges)
             updated_chunks.extend(new_chunks)
+            hashes[rel_path] = new_hash
+            if self.walk_patterns is not None:
+                self.walked.add(rel_path)
+            result['added' if rel_path in new_set else 'refreshed'] += 1
+            dirty = True
 
-            # Update file hash
-            new_hash = self._compute_file_hash(file_path)
-            self.snapshot.file_hashes[rel_path] = new_hash
-
-        # Re-embed updated chunks
-        if updated_chunks:
-            self._embed_chunks(updated_chunks)
-
-            # Rebuild FAISS index
+        result['chunks_extracted'] = len(updated_chunks)
+        result['chunks_embedded'] = self._embed_chunks(updated_chunks)
+        # A file whose chunks failed to embed is not fresh: an empty hash
+        # never matches, so the next refresh tries it again. Only when a model
+        # exists; with none there is nothing a retry could change, and every
+        # refresh would rewrite the catalog for nothing.
+        result['embedding_model'] = self.embedding_model is not None
+        if result['embedding_model']:
+            for chunk in updated_chunks:
+                if chunk.embedding is None:
+                    hashes[chunk.file_path] = ""
+        if dirty:
+            # Deletions shift chunk positions too, so the vector index is
+            # rebuilt and the catalog saved whenever anything changed, not
+            # only when something was re-embedded.
+            self.snapshot.total_files = len(hashes)
             if FAISS_AVAILABLE:
                 self._build_faiss_index()
-
-            # Save changes
             self._save()
+        return result
 
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.info(f"Refreshed {len(updated_chunks)} chunks in {elapsed_ms:.0f}ms")
-
-    def _extract_chunks_from_file(self, file_path: Path, rel_path: str) -> List[CodeChunk]:
+    def _extract_chunks_from_file(self, file_path: Path, rel_path: str,
+                                  strict: bool = False) -> List[CodeChunk]:
         """
         Extract semantic chunks from a file using tree-sitter.
 
@@ -890,6 +1052,8 @@ class ProjectIndex:
         - Interfaces (for languages that support them)
         """
         if not self.parser:
+            if strict:
+                raise RuntimeError("Tree-sitter parser not available")
             logger.error("Tree-sitter parser not available")
             return []
 
@@ -926,12 +1090,17 @@ class ProjectIndex:
             return chunks
 
         except Exception as e:
+            if strict:  # a refresh must tell "no chunks" from "could not read"
+                raise
             logger.error(f"Failed to extract chunks from {file_path}: {e}")
             return []
 
-    def _extract_edges_from_file(self, file_path: Path, rel_path: str) -> List[Dict[str, Any]]:
+    def _extract_edges_from_file(self, file_path: Path, rel_path: str,
+                                 strict: bool = False) -> List[Dict[str, Any]]:
         """Extract relationship edges from a file using tree-sitter."""
         if not self.parser:
+            if strict:
+                raise RuntimeError("Tree-sitter parser not available")
             return []
 
         try:
@@ -952,6 +1121,8 @@ class ProjectIndex:
                 for e in parser_edges
             ]
         except Exception as e:
+            if strict:
+                raise
             logger.error(f"Failed to extract edges from {file_path}: {e}")
             return []
 
@@ -983,7 +1154,7 @@ class ProjectIndex:
                 results.append(edge)
         return results
 
-    def _embed_chunks(self, chunks: List[CodeChunk]):
+    def _embed_chunks(self, chunks: List[CodeChunk]) -> int:
         """Generate embeddings for chunks.
 
         Embeds a structured representation of each chunk (symbols +
@@ -1000,7 +1171,7 @@ class ProjectIndex:
           implementation details dilute.
         """
         if not chunks:
-            return
+            return 0
 
         # Initialize embedding model if needed
         if not self.embedding_model and FASTEMBED_AVAILABLE:
@@ -1009,7 +1180,7 @@ class ProjectIndex:
 
         if not self.embedding_model:
             logger.warning("No embedding model available, skipping embeddings")
-            return
+            return 0
 
         # Build structured texts: symbols + imports + head-of-body.
         texts = [_chunk_embed_text(chunk) for chunk in chunks]
@@ -1019,8 +1190,10 @@ class ProjectIndex:
             embeddings = list(self.embedding_model.embed(texts))
             for chunk, embedding in zip(chunks, embeddings):
                 chunk.embedding = np.array(embedding, dtype=np.float32)
+            return len(embeddings)
         except Exception as e:
             logger.error(f"Failed to generate embeddings: {e}")
+            return 0
 
     def _embed_text(self, text: str) -> Optional[np.ndarray]:
         """Generate embedding for a single text."""
@@ -1051,6 +1224,7 @@ class ProjectIndex:
 
         if not embeddings:
             logger.warning("No embeddings available, skipping FAISS index")
+            self.faiss_index = None  # never leave the previous catalog's vectors behind
             return
 
         # Build index
@@ -1145,6 +1319,7 @@ class ProjectIndex:
             'commit_hash': self.snapshot.commit_hash[:7] if self.snapshot.commit_hash else 'unknown',
             'last_updated': self.snapshot.last_updated,
             'total_edges': len(self.edges),
+            'tracks_new_files': self.walk_patterns is not None,
             'embedding_model': self.snapshot.embedding_model,
             'embedding_dim': self.snapshot.embedding_dim
         }

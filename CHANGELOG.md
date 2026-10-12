@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- **`neo --update` works, sees new files, and says when it stopped early** ([#217](https://github.com/Parslee-ai/neo/issues/217)).
+  - **Reachable:** `--update` now implies `--index`. A bare `neo --update` used to fall through to the reasoning path and refresh nothing.
+  - **New files:** an eligible file the last full build never saw is now picked up. A copy the build skipped as a duplicate is not. New files follow the build's rules: content already catalogued is skipped, and nothing is added beyond the build's `--max-files`. The build records every path it saw in `.neo/walked.json`, so a file the cap passed over is not mistaken for a new one. A catalog built by an older version reports no new files and says to run `neo --index` once.
+  - **Deleted and ignored files:** a file deleted, or newly matched by `.gitignore`, now leaves the catalog, and the deletion is saved.
+  - **Honest report:** the refresh says how many changed, new and removed files it handled and how many chunks it actually embedded. When the time or chunk budget stops it, it says how many stale files are left. A file it cannot read or parse is named, and its previous entries are kept.
+  - **Found along the way:**
+    - A refresh never updated edges.
+    - Emptied edge and vector files were left on disk and reloaded.
+    - A semantic hit could return the wrong chunk whenever any chunk lacked an embedding.
+    - An unknown key in `.neo/index.json` (written by a newer neo) made the whole catalog unreadable. It is now ignored.
+    - Catalog paths are now stored with forward slashes on every platform, and Windows catalogs with backslash paths are read correctly.
+    - Chunks that fail to embed leave their file stale, so the next refresh retries them.
+
 - **The parameter-compatibility store no longer learns false facts about a model** ([#266](https://github.com/Parslee-ai/neo/issues/266)).
   - **Value errors:** a rejection whose code says a value is out of range (for example `decimal_above_max_value` on `temperature=5`) is no longer remembered as "field unsupported", so a later valid value is still sent. Only OpenAI's own value-range codes are treated this way; any other code still teaches a drop, so OpenAI-compatible servers with their own codes (vLLM's integer `400`, xAI's free-text codes) keep recovering.
   - **Effort levels:** each refused level is remembered on its own (`refuse_reasoning.effort:low`), and a request steps down only past refused levels. A model's levels are no longer assumed contiguous, so refusing `low` no longer caps a later `high` request. Caps stored by older versions (`max_…`) are now ignored; a level the model really refuses is relearned in one request. Other flags in an existing `~/.neo/model_param_compat.json` are not migrated: an unconditional `drop_temperature` learned at a high effort level still applies at every level. Delete the file to relearn from scratch.

@@ -675,9 +675,9 @@ neo --cwd /path/to/project "optimize this function"
 # keyword index refresh themselves on every call.
 neo --index
 
-# Re-embed catalogued files whose contents changed. Must be passed WITH --index;
-# new files are not picked up, so a repo that grew needs a full build.
-neo --index --update
+# Refresh the catalog: re-embed changed and new files, drop deleted ones.
+# Bounded at 5 s / 100 chunks; it says so when it stops early.
+neo --update
 
 # Preview the assembled context without making an LLM call
 neo --dry-run "your query"
