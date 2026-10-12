@@ -237,14 +237,39 @@ _EMBEDDERS_LOCK = threading.Lock()
 DEFAULT_EMBED_MODEL = "jinaai/jina-embeddings-v2-base-code"
 
 
+class _FairLock:
+    """A FIFO (ticket) lock. `threading.Lock` makes no fairness promise, and on
+    Linux a thread that releases it and immediately re-acquires usually wins:
+    one run's batch, embedded text by text, then holds the model end to end
+    while another run's short query times out behind it."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._next = 0
+        self._serving = 0
+
+    def __enter__(self):
+        with self._cond:
+            ticket = self._next
+            self._next += 1
+            while self._serving != ticket:
+                self._cond.wait()
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._serving += 1
+            self._cond.notify_all()
+
+
 class _Serialized:
     """One model, called from several threads: the observer's sweep and the
     requests its resident embedder serves. `embed` is materialized under a
-    lock rather than trusting the tokenizer and session to be re-entrant."""
+    fair lock rather than trusting the tokenizer and session to be
+    re-entrant, so callers take turns in arrival order."""
 
     def __init__(self, embedder):
         self._embedder = embedder
-        self._lock = threading.Lock()
+        self._lock = _FairLock()
 
     def embed(self, texts):
         with self._lock:

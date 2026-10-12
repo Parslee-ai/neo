@@ -38,3 +38,35 @@ def test_a_failed_build_is_not_retried_by_every_caller(monkeypatch, tmp_path):
     assert store.build_resilient_embedder(cache_dir=tmp_path) is None
     assert store.build_resilient_embedder(cache_dir=tmp_path) is None
     assert len(calls) == 1
+
+
+def test_the_model_lock_serves_callers_in_arrival_order():
+    """A thread that releases and immediately re-acquires must not jump a
+    waiter: on Linux `threading.Lock` let one run's batch hold the model end
+    to end while another run's query timed out."""
+    import threading
+    import time
+
+    lock = store._FairLock()
+    order = []
+    started = threading.Event()
+
+    def greedy():
+        for i in range(20):
+            with lock:
+                if i == 0:
+                    started.set()
+                order.append("a")
+                time.sleep(0.01)
+
+    def waiter():
+        started.wait()
+        with lock:
+            order.append("b")
+
+    a, b = threading.Thread(target=greedy), threading.Thread(target=waiter)
+    a.start()
+    b.start()
+    a.join()
+    b.join()
+    assert order.index("b") <= 2
