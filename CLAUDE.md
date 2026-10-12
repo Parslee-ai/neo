@@ -125,6 +125,16 @@
 - Claude Code components live at the plugin ROOT; verify with
   `claude plugin list`, not `details`; never redeclare `hooks/hooks.json`.
 - `neo hook record` never fails, stays cheap, records paths not contents.
+- The mod joins in unasked (`hooks/auto.ts`, `docs/claude-code-mods.md`):
+  `neo recall` per typed prompt (no model call/load, 1 s embed deadline, writes
+  nothing, never constructs a `FactStore`); `learn`-mode review at Stop,
+  diagnosis of failing checks, plan check at ExitPlanMode. Cost is bounded by
+  dedup, not a toggle; never re-review when `stop_hook_active`. Code calling `$`
+  must live in `register.ts` (the validator rejects `$` across imports); work
+  outliving a hook starts from `$.clock.after`.
+- Beats stay situational: the mod passes the person's last prompt
+  (`beat_context.ask`) and recently spoken beats (`recent_beats`), never its
+  own wording; recall beats live in `recall_beats`, gated by `stages`.
 - Claude / Codex / Cursor adapters must stay in parity
   (`tests/test_host_adapter_parity.py`). Version is single-sourced in
   `pyproject.toml` (`make sync-version`). The ruff invocation must stay identical

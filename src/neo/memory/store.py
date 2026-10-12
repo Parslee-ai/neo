@@ -44,6 +44,7 @@ from neo.memory.models import (
     FactMetadata,
     FactScope,
     Provenance,
+    is_legacy_suggestion_fact,
     rank_score,
     update_effectiveness,
     update_recall,
@@ -387,6 +388,60 @@ def _strip_tombstone_text(fact) -> bool:
         setattr(fact, field, "" if field == "body" else None)
         changed = True
     return changed
+
+
+
+def memory_level_of(facts) -> float:
+    """Calculate memory level based on quality-weighted facts.
+
+    Each valid fact contributes its confidence (boosted by success rate
+    for well-tested facts). Sigmoid scaling maps total to 0.0-1.0.
+
+    The reference quality scales with the total capacity of loaded scopes,
+    so a project-only view and a multi-project view both reach "The One"
+    at ~80% of their potential quality. Neo's voice stage follows this
+    (`memory_stage`), so the engine and `neo recall` must compute it the
+    same way: both call this.
+    """
+    valid = [f for f in facts if f.is_valid]
+    if not valid:
+        return 0.0
+
+    total_quality = 0.0
+    for f in valid:
+        score = f.metadata.confidence
+        access = f.metadata.access_count
+        if access > 0 and f.metadata.success_count > 0:
+            success_rate = f.metadata.success_count / access
+            score = score * 0.5 + success_rate * 0.5
+        # Usage bonus: reward facts that have been applied
+        usage_factor = min(1.0, access / 10)
+        score *= (0.9 + 0.1 * usage_factor)
+        total_quality += score
+
+    # Reference quality = 20% of aggregate capacity across loaded scopes.
+    # "The One" (0.80) requires ~80% of capacity filled with well-validated
+    # facts (avg confidence ~0.7 + some success history).
+    loaded_scopes = {f.scope for f in facts}
+    capacity = sum(SCOPE_LIMITS.get(s.value, 200) for s in loaded_scopes)
+    reference_quality = max(50.0, capacity * 0.2)
+
+    return 1.0 - 1.0 / (1.0 + total_quality / reference_quality)
+
+
+def memory_stage(memory_level: float) -> int:
+    """Neo's personality stage (1-5) for a memory level: Sleeper, Glitch,
+    Unplugged, Training, The One. His voice grows more certain as he
+    remembers more (`orchestrator_voice.stages` in the beat deck)."""
+    if memory_level < 0.2:
+        return 1
+    elif memory_level < 0.4:
+        return 2
+    elif memory_level < 0.6:
+        return 3
+    elif memory_level < 0.8:
+        return 4
+    return 5
 
 
 class FactStore:
@@ -1235,39 +1290,8 @@ class FactStore:
     # ------------------------------------------------------------------ #
 
     def memory_level(self) -> float:
-        """Calculate memory level based on quality-weighted facts.
-
-        Each valid fact contributes its confidence (boosted by success rate
-        for well-tested facts). Sigmoid scaling maps total to 0.0-1.0.
-
-        The reference quality scales with the total capacity of loaded scopes,
-        so a project-only view and a multi-project view both reach "The One"
-        at ~80% of their potential quality.
-        """
-        valid = [f for f in self._facts if f.is_valid]
-        if not valid:
-            return 0.0
-
-        total_quality = 0.0
-        for f in valid:
-            score = f.metadata.confidence
-            access = f.metadata.access_count
-            if access > 0 and f.metadata.success_count > 0:
-                success_rate = f.metadata.success_count / access
-                score = score * 0.5 + success_rate * 0.5
-            # Usage bonus: reward facts that have been applied
-            usage_factor = min(1.0, access / 10)
-            score *= (0.9 + 0.1 * usage_factor)
-            total_quality += score
-
-        # Reference quality = 20% of aggregate capacity across loaded scopes.
-        # "The One" (0.80) requires ~80% of capacity filled with well-validated
-        # facts (avg confidence ~0.7 + some success history).
-        loaded_scopes = {f.scope for f in self._facts}
-        capacity = sum(SCOPE_LIMITS.get(s.value, 200) for s in loaded_scopes)
-        reference_quality = max(50.0, capacity * 0.2)
-
-        return 1.0 - 1.0 / (1.0 + total_quality / reference_quality)
+        """See `memory_level_of`, shared with `neo recall`."""
+        return memory_level_of(self._facts)
 
     @staticmethod
     def _outcome_rank(outcome_type) -> int:
@@ -3215,21 +3239,8 @@ class FactStore:
 
     @staticmethod
     def _is_legacy_suggestion_fact(fact: Fact) -> bool:
-        """The exact shape ``engine._store_reasoning`` minted for every feature
-        suggestion before episodes replaced immediate fact-writing (412a174):
-        kind DECISION, first tag ``feature``, subject ``feature: <prompt>``,
-        body ``Reasoning: ...``. A promoted fact always carries a
-        ``canonical_signature``, which that path never wrote, so no durable
-        lesson can match; nothing mints this shape any more.
-        """
-        return (
-            fact.is_valid
-            and fact.kind == FactKind.DECISION
-            and fact.tags[:1] == ["feature"]
-            and fact.subject.startswith("feature: ")
-            and fact.body.startswith("Reasoning: ")
-            and not fact.canonical_signature
-        )
+        """See `models.is_legacy_suggestion_fact` (shared with `neo recall`)."""
+        return is_legacy_suggestion_fact(fact)
 
     def retire_legacy_suggestion_facts(self, save: bool = True) -> int:
         """Invalidate legacy per-suggestion facts.

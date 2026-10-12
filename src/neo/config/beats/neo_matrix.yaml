@@ -160,10 +160,12 @@ base_expressions:
 #                     and five near-identical variants would be upkeep with no
 #                     reader-visible payoff.
 #
-# No cooldown/max_uses field. Each `neo` invocation is a fresh process that
-# selects at most one beat, so an in-process cooldown would be a no-op and a
-# cross-run one would need session state that does not exist. Better absent
-# than faked.
+# No cooldown/max_uses field in the deck. Each `neo` invocation is a fresh
+# process that selects at most one beat, so an in-process cooldown would be a
+# no-op. The cross-run one lives with the host that has session state: the
+# Claude Code mod remembers which beats Neo spoke and passes them back
+# (`beat_context.recent_beats`, `neo recall --recent-beats`), and a recently
+# spoken beat is skipped in favour of the next fit, or silence.
 beats:
   # DOUBT category (triggered by failures, low confidence)
   - beat_id: "error_cascade"
@@ -331,3 +333,58 @@ beats:
         notes_tone: "Been here. Know the edges."
       5:
         notes_tone: "Obvious."
+
+# Recall beats: what Neo says when `neo recall` hands Claude a memory on a
+# typed prompt. Kept out of `beats` so the engine and the CLI greeting never
+# select them. Same rules as above: the situation picks the beat (triggers are
+# computed from what was recalled, not from the prompt), silence is the
+# default, one line per beat. `stages` is the change over time: a beat speaks
+# only at the memory stages listed, so the hedging lines fall away as Neo
+# remembers more and the terse ones arrive. Ties go to deck order.
+#
+# Triggers (neo.recall._recall_triggers):
+#   failure_lesson  a recalled lesson is about something that went wrong
+#   proven_lesson   a recalled lesson has been applied successfully, or promoted
+#   elsewhere       a recalled lesson came from another project (global scope)
+#   strong_match    the best match is close (cosine >= 0.6)
+#   faint_match     the best match only just cleared the bar
+recall_beats:
+  - beat_id: "recall_failure_early"
+    stages: [1, 2, 3]
+    trigger_contexts: ["failure_lesson"]
+    line: "This went wrong before. Here's what I kept from it."
+
+  - beat_id: "recall_failure_late"
+    stages: [4, 5]
+    trigger_contexts: ["failure_lesson"]
+    line: "Watched this break once. Not again."
+
+  - beat_id: "recall_proven"
+    stages: [2, 3, 4, 5]
+    trigger_contexts: ["proven_lesson"]
+    line: "This one held up last time."
+
+  - beat_id: "recall_elsewhere"
+    stages: [1, 2, 3, 4, 5]
+    trigger_contexts: ["elsewhere"]
+    line: "Saw this in another codebase. Same shape, different names."
+
+  - beat_id: "recall_deja_vu"
+    stages: [1, 2]
+    trigger_contexts: ["strong_match"]
+    line: "Déjà vu. I think I've been here."
+
+  - beat_id: "recall_remember"
+    stages: [3]
+    trigger_contexts: ["strong_match"]
+    line: "I remember this."
+
+  - beat_id: "recall_know"
+    stages: [4, 5]
+    trigger_contexts: ["strong_match"]
+    line: "Know this one."
+
+  - beat_id: "recall_faint"
+    stages: [1, 2, 3]
+    trigger_contexts: ["faint_match"]
+    line: "Something from before might apply. Maybe."

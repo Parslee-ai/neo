@@ -207,6 +207,12 @@ class NeoInput:
     # CLAUDE.md, and tool-specific rule files) for a single request. The
     # default preserves standalone and existing host behavior.
     allow_implicit_context: bool = True
+    # Host-supplied situation for personality beats. A host that calls Neo on
+    # its own (the Claude Code mod) writes the prompt itself, so its wording
+    # must not choose the beat: `ask` is what the person last typed, and
+    # `recent_beats` are beat ids Neo already spoke this session, skipped so
+    # he does not repeat himself. Empty means "use the prompt, no history".
+    beat_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -387,6 +393,10 @@ class OrchestratorMessage:
 
     personality: str = ""
     """An in-voice line, present only when a beat is tied to a real finding."""
+
+    beat_id: str = ""
+    """Which beat spoke `personality` ("" when silent), so a host with session
+    state can pass it back in `beat_context.recent_beats`."""
 
     phase_summary: list[dict[str, Any]] = field(default_factory=list)
     """Per-phase {name, status, message} records, in execution order."""

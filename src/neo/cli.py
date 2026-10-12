@@ -1053,6 +1053,11 @@ def main():
         from neo.hook import run_hook
         return run_hook(sys.argv[2:])
 
+    # The Claude Code mod calls recall on every user prompt: same discipline.
+    if len(sys.argv) > 1 and sys.argv[1] == "recall":
+        from neo.recall import run_recall
+        return run_recall(sys.argv[2:])
+
     if len(sys.argv) > 1 and sys.argv[1] == "workspace":
         from neo.workspace import run_workspace
         return run_workspace(sys.argv[2:])
@@ -1393,6 +1398,11 @@ def main():
                     ContextFile(**cf) for cf in input_data.get("context_files", [])
                 ],
                 error_trace=input_data.get("error_trace"),
+                beat_context=(
+                    input_data["beat_context"]
+                    if isinstance(input_data.get("beat_context"), dict)
+                    else {}
+                ),
                 recent_commands=input_data.get("recent_commands", []),
                 safe_read_paths=input_data.get("safe_read_paths", []),
                 working_directory=working_dir,

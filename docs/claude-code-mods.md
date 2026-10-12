@@ -68,15 +68,61 @@ observer. Org/global facts and other projects are excluded from the inspector.
 An analysis can retrieve other authorized scopes through Neo's normal engine;
 those rows show their scope and cannot be opened through the project inspector.
 
-Inference runs only when requested, using Neo's configured provider and model.
-It can transmit selected source, rule files, retrieved memory and user-selected
-context to that provider and incur its normal cost. There is no automatic
-retrieval/context injection or background inference at session startup.
+Direct requests (`/neo-ask`, the pane) use `advise`: Neo proposes changes and
+does not apply them, execute generated command strings, detect outcomes or
+create learning candidates from the advisory run.
 
-All direct requests use `advise`: Neo proposes changes and does not apply them,
-execute generated command strings, detect outcomes or create learning candidates
-from the advisory run. The Mod does not intercept permissions, auto-approve
-tools, send prompts as the user, or rewrite repository instructions.
+### Neo joining in on its own
+
+Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
+
+| When | What Neo does | Model call | How Claude gets it |
+| --- | --- | --- | --- |
+| You type a prompt | `neo recall`: up to 3 learned lessons matching it | none | context on that prompt |
+| A turn that edited files is about to end | reviews those edits (`git diff HEAD` per path; a new or untracked file as a whole-file addition) | one, up to 90 s | the turn continues with Neo's fix, only when it carries a diff or code |
+| A test, build or lint command fails | diagnoses the failure, in the background | one | context at the next main-thread hook |
+| A plan leaves plan mode | checks the plan | one, up to 90 s | context as the work starts |
+
+- **Recall** makes no model call and never loads the embedding model: it asks
+  the observer's resident embedder once, with a 1 s deadline, and says nothing
+  if it does not answer. It reads fact files without constructing a store, so
+  it writes nothing, and it leaves out what Claude already has (rule files,
+  its own memory files, git history) along with generic seed and community
+  patterns. It runs only for prompts a person typed, not machine-injected ones.
+- **Reviews, diagnoses and plan checks** are real inference on Neo's configured
+  provider: they send the diff, error output or plan, plus the source and
+  memory Neo selects, and incur its normal cost. They are bounded by
+  deduplication, not by a switch: one review per distinct set of edits, one
+  diagnosis per distinct failure (command plus error), at most one running and
+  six per session, one check per plan. A turn that any Stop hook continued is
+  not reviewed then; its edits are kept and reviewed at the next Stop that is
+  not a continuation. Only a review with a concrete change continues a
+  turn; a diagnosis never does.
+- **Subagents** contribute edits to the review but never trigger a diagnosis
+  or consume findings meant for the main thread. A diagnosis that finishes
+  after its session ended (`/clear`, resume) is dropped.
+- **They run in `learn` mode.** Neo's suggestions are recorded, so when Claude
+  applies one, git can verify the acceptance and the usual promotion rules
+  apply. No task type is fixed; the CLI classifies the prompt.
+- Findings reach Claude framed as data from a second model, not instructions,
+  and with the same relay rule as the Neo agent: quote Neo's lines as written.
+- **Neo's personality stays situational, staged and unrepeated.** His summary
+  is phrased by his memory stage (`memory_stage` of `memory_level_of`, shared
+  by the engine and `neo recall`). Beats are chosen by the situation: recall
+  picks from `recall_beats` in `neo_matrix.yaml` using what it recalled (a
+  failure, a proven lesson, one from another project, a strong or faint
+  match), and each recall beat speaks only at the stages it lists, so the
+  hedging lines fall away and the terse ones arrive as he remembers more.
+  Automatic runs pick engine beats from what the person last typed
+  (`beat_context.ask`), not from the mod's own prompt wording. The mod keeps
+  the beats Neo spoke lately (`RECENT_BEATS`) and passes them back
+  (`beat_context.recent_beats`, `neo recall --recent-beats`); a recently
+  spoken beat is skipped for the next fit, or silence, which stays the
+  default. Earned beats show in the pane and every text form.
+- A failed or timed-out run adds nothing and never blocks the turn.
+
+The Mod does not intercept permissions, auto-approve tools, send prompts as the
+user, or rewrite repository instructions.
 
 Successful Edit/Write/MultiEdit/NotebookEdit observations and turn/invocation
 lifecycle records use the existing host ledger. Records retain paths, checkout,
@@ -115,7 +161,7 @@ can retry. Project inspector corruption is reported without quarantine/writes.
 ```sh
 claude plugin validate . --json
 claude plugin test .
-python -m pytest tests/test_workspace.py tests/test_hook.py \
+python -m pytest tests/test_workspace.py tests/test_hook.py tests/test_recall.py \
   tests/test_host_edit_ledger.py tests/test_memory_explain.py \
   tests/test_operating_modes.py tests/test_host_adapter_parity.py \
   tests/test_orchestrator_events.py -q
