@@ -8,6 +8,26 @@
 
 ### Fixed
 
+- **`neo --update` works, sees new files, and says when it stopped early** ([#217](https://github.com/Parslee-ai/neo/issues/217)).
+  - **Reachable:** `--update` now implies `--index`. A bare `neo --update` used to fall through to the reasoning path and refresh nothing.
+  - **New files:** an eligible file the last full build never saw is now picked up. A copy the build skipped as a duplicate is not. New files follow the build's rules: content already catalogued is skipped, and nothing is added beyond the build's `--max-files`. The build records every path it saw in `.neo/walked.json`, so a file the cap passed over is not mistaken for a new one. A catalog built by an older version reports no new files and says to run `neo --index` once.
+  - **Deleted and ignored files:** a file deleted, or newly matched by `.gitignore`, now leaves the catalog, and the deletion is saved.
+  - **Honest report:** the refresh says how many changed, new and removed files it handled and how many chunks it actually embedded. When the time or chunk budget stops it, it says how many stale files are left. A file it cannot read or parse is named, and its previous entries are kept.
+  - **Found along the way:**
+    - A refresh never updated edges.
+    - Emptied edge and vector files were left on disk and reloaded.
+    - A semantic hit could return the wrong chunk whenever any chunk lacked an embedding.
+    - An unknown key in `.neo/index.json` (written by a newer neo) made the whole catalog unreadable. It is now ignored.
+    - Catalog paths are now stored with forward slashes on every platform, and Windows catalogs with backslash paths are read correctly.
+    - Chunks that fail to embed leave their file stale, so the next refresh retries them.
+
+- **The parameter-compatibility store no longer learns false facts about a model** ([#266](https://github.com/Parslee-ai/neo/issues/266)).
+  - **Value errors:** a rejection whose code says a value is out of range (for example `decimal_above_max_value` on `temperature=5`) is no longer remembered as "field unsupported", so a later valid value is still sent. Only OpenAI's own value-range codes are treated this way; any other code still teaches a drop, so OpenAI-compatible servers with their own codes (vLLM's integer `400`, xAI's free-text codes) keep recovering.
+  - **Effort levels:** each refused level is remembered on its own (`refuse_reasoning.effort:low`), and a request steps down only past refused levels. A model's levels are no longer assumed contiguous, so refusing `low` no longer caps a later `high` request. Caps stored by older versions (`max_…`) are now ignored; a level the model really refuses is relearned in one request. Other flags in an existing `~/.neo/model_param_compat.json` are not migrated: an unconditional `drop_temperature` learned at a high effort level still applies at every level. Delete the file to relearn from scratch.
+  - **Models with a high floor:** a model whose lowest effort level is above the request (`gpt-5.2-pro` accepts `medium` to `xhigh`) used to make 3 requests on every call asked for `low`. Its refused levels are now remembered, so the walk is paid once and later calls are a single request at the provider default ([#265](https://github.com/Parslee-ai/neo/issues/265)).
+  - **Hand-edited flags:** stored flags naming a field the adapter doesn't adapt (such as `drop_model`) are ignored.
+  - **Level-dependent drops:** a drop learned while an effort level was sent applies only at that level (`drop_temperature@reasoning.effort=high`). Some models accept `temperature` at one effort and refuse it at another. A model that refuses a field at every level pays one extra request per level, once.
+
 - **One embedding model per process** ([#211](https://github.com/Parslee-ai/neo/issues/211)). A reasoning run built the 614 MB embedding model twice: once for the history boost in file selection and again for the engine's memory, 0.3 s each. Every caller now shares one instance, which takes about 0.25 s off a run. The model is still about 1.3 GB resident; #211 tracks that.
 
 - **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that exactly names a flag (`version`, `help`, `status`, `index`, `config`, `upgrade`, `init`, `stats`) or a subcommand exits with status 2 and names the command it meant. Case, leading dashes and trailing punctuation are ignored. The check runs before the update check, the observer autostart and the engine. Every other prompt runs as before, including real words that resemble a command, such as `server` or `updates`.

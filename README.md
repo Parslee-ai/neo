@@ -723,9 +723,9 @@ neo --cwd /path/to/project "optimize this function"
 # keyword index refresh themselves on every call.
 neo --index
 
-# Re-embed catalogued files whose contents changed. Must be passed WITH --index;
-# new files are not picked up, so a repo that grew needs a full build.
-neo --index --update
+# Refresh the catalog: re-embed changed and new files, drop deleted ones.
+# Bounded at 5 s / 100 chunks; it says so when it stops early.
+neo --update
 
 # Preview the assembled context without making an LLM call
 neo --dry-run "your query"
@@ -1304,10 +1304,10 @@ Cap with `NEO_REASONING_EFFORT={none,low,medium,high,xhigh}` for cost control.
 > without `reasoning.effort` has it dropped, and a model that tops out lower
 > (older `gpt-5-codex` stops at `high`) is stepped down one level at a time.
 > Either way the retry is paid once per model and remembered in
-> `~/.neo/model_param_compat.json`. The exception is a model whose lowest level
-> is above the one requested (some `-pro` models start at `medium`): nothing can
-> be learned safely from that, so the call runs at the provider default and the
-> extra rejected requests recur each time. `NEO_REASONING_EFFORT` still caps the
+> `~/.neo/model_param_compat.json`. Each refused level is remembered on its own,
+> so a model whose lowest level is above the request (some `-pro` models start at
+> `medium`) pays the walk once; later calls drop effort in one request and run at
+> the provider default. `NEO_REASONING_EFFORT` still caps the
 > auto-selector if you want a lower ceiling for cost.
 
 ### Architectural Quality Feedback Loop

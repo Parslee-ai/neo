@@ -161,7 +161,8 @@ def test_rejected_temperature_is_dropped_retried_once_and_remembered():
         MSG, temperature=0.7, reasoning_effort="xhigh") == "ok"
     assert [("temperature" in p, p["reasoning"]) for _, p in handler.seen] == [
         (True, {"effort": "xhigh"}), (False, {"effort": "xhigh"})]
-    assert _learned() == {"openai:gpt-6.1-sol": ["drop_temperature"]}
+    # Learned under the level it was refused at: support can depend on it.
+    assert _learned() == {"openai:gpt-6.1-sol": ["drop_temperature@reasoning.effort=xhigh"]}
 
     handler.seen.clear()
     _adapter("gpt-6.1-sol", handler).generate(MSG, temperature=0.7, reasoning_effort="xhigh")
@@ -186,13 +187,14 @@ def test_rejected_effort_is_dropped_retried_once_and_remembered():
 
 def test_a_rejected_level_is_lowered_to_the_highest_accepted_and_remembered():
     """The model supports effort up to `high`: xhigh is refused as invalid, so
-    the level steps down once and effort is NOT dropped. The cap is remembered."""
+    the level steps down once and effort is NOT dropped. The refused level is
+    remembered."""
     handler = _recording_handler(
         lambda p: _bad_level("xhigh") if p["reasoning"]["effort"] == "xhigh" else None)
 
     _adapter("gpt-5.6", handler).generate(MSG, reasoning_effort="xhigh")
     assert [p["reasoning"]["effort"] for _, p in handler.seen] == ["xhigh", "high"]
-    assert _learned() == {"openai:gpt-5.6": ["max_reasoning.effort:high"]}
+    assert _learned() == {"openai:gpt-5.6": ["refuse_reasoning.effort:xhigh"]}
 
     handler.seen.clear()
     _adapter("gpt-5.6", handler).generate(MSG, reasoning_effort="xhigh")
@@ -433,18 +435,18 @@ def _store_exists():
     return (Path.home() / ".neo" / "model_param_compat.json").exists()
 
 
-def test_unsupported_value_steps_down_and_persists_the_proven_cap():
+def test_unsupported_value_steps_down_and_persists_the_refused_level():
     handler = _recording_handler(
         lambda p: _unsupported_level("xhigh") if p["reasoning"]["effort"] == "xhigh" else None)
     _adapter("gpt-5.6", handler).generate(MSG, reasoning_effort="xhigh")
     assert [p["reasoning"]["effort"] for _, p in handler.seen] == ["xhigh", "high"]
-    assert _learned() == {"openai:gpt-5.6": ["max_reasoning.effort:high"]}
+    assert _learned() == {"openai:gpt-5.6": ["refuse_reasoning.effort:xhigh"]}
 
 
-def test_bottom_of_ladder_removes_effort_for_this_call_only_and_persists_nothing():
+def test_bottom_of_ladder_removes_effort_and_remembers_only_that_level():
     """gpt-6.1-sol refuses `none` but accepts `xhigh`. Asking for `none` walks to
-    the bottom and runs without effort for that call; nothing is written, so a
-    following `xhigh` request still sends `xhigh`."""
+    the bottom and runs without effort; only "`none` is refused" is written, so
+    a following `xhigh` request still sends `xhigh`."""
     offered = {"low", "medium", "high", "xhigh"}
     handler = _recording_handler(
         lambda p: None if p.get("reasoning", {}).get("effort") in offered or "reasoning" not in p
@@ -452,20 +454,26 @@ def test_bottom_of_ladder_removes_effort_for_this_call_only_and_persists_nothing
 
     assert _adapter("gpt-6.1-sol", handler).generate(MSG, reasoning_effort="none") == "ok"
     assert [p.get("reasoning") for _, p in handler.seen] == [{"effort": "none"}, None]
-    assert not _store_exists()
+    assert _learned() == {"openai:gpt-6.1-sol": ["refuse_reasoning.effort:none"]}
 
     handler.seen.clear()
     _adapter("gpt-6.1-sol", handler).generate(MSG, reasoning_effort="xhigh")
     assert [p["reasoning"] for _, p in handler.seen] == [{"effort": "xhigh"}]
 
 
-def test_a_walk_that_ends_in_removal_discards_the_caps_found_on_the_way():
+def test_a_walk_to_the_bottom_remembers_each_refused_level_and_nothing_else():
     handler = _recording_handler(
         lambda p: _unsupported_level(p["reasoning"]["effort"]) if "reasoning" in p else None)
     _adapter("gpt-6.1-sol", handler).generate(MSG, reasoning_effort="medium")
     assert [p.get("reasoning", {}).get("effort") for _, p in handler.seen] == [
         "medium", "low", "none", None]
-    assert not _store_exists()
+    assert _learned() == {"openai:gpt-6.1-sol": [
+        "refuse_reasoning.effort:low", "refuse_reasoning.effort:medium",
+        "refuse_reasoning.effort:none"]}
+    # A level never refused is still sent as asked.
+    handler.seen.clear()
+    _adapter("gpt-6.1-sol", handler).generate(MSG, reasoning_effort="high")
+    assert handler.seen[0][1]["reasoning"] == {"effort": "high"}
 
 
 def test_a_call_whose_retries_all_fail_persists_nothing():
@@ -518,3 +526,127 @@ def test_context_length_error_without_param_persists_nothing_when_retries_fail()
     with pytest.raises(openai.BadRequestError):
         _adapter("gpt-6.1-sol", handler).generate(MSG, temperature=0.7)
     assert not _store_exists()
+
+
+
+# ---------------------------------------------------------------------------
+# #266: four ways a false learning could be stored
+# ---------------------------------------------------------------------------
+
+def _seed(flags_by_key):
+    from pathlib import Path
+    path = Path.home() / ".neo" / "model_param_compat.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(flags_by_key))
+
+
+def test_a_value_error_on_a_supported_field_is_not_remembered_as_a_drop():
+    handler = _recording_handler(lambda p: (
+        "temperature", "decimal_above_max_value",
+        "Invalid 'temperature': decimal above maximum value. Expected <= 2."))
+    with pytest.raises(openai.BadRequestError):
+        _adapter("gpt-4o-mini", handler).generate(MSG, temperature=5)
+    assert len(handler.seen) == 1  # no drop-and-retry on a value error
+    assert not _store_exists()
+
+
+def test_effort_levels_are_not_assumed_contiguous():
+    """Accepts none and high, refuses low: asking low runs at none, and a later
+    high request is still sent as high."""
+    handler = _recording_handler(
+        lambda p: _unsupported_level("low") if p["reasoning"]["effort"] == "low" else None)
+    _adapter("odd-model", handler).generate(MSG, reasoning_effort="low")
+    assert [p["reasoning"]["effort"] for _, p in handler.seen] == ["low", "none"]
+    handler.seen.clear()
+    _adapter("odd-model", handler).generate(MSG, reasoning_effort="high")
+    assert [p["reasoning"]["effort"] for _, p in handler.seen] == ["high"]
+
+
+def test_stored_flags_for_fields_the_adapter_does_not_adapt_are_ignored():
+    _seed({"openai:gpt-5.6": ["drop_model", "drop_input", "drop_reasoning"]})
+    handler = _recording_handler()
+    _adapter("gpt-5.6", handler).generate(MSG, reasoning_effort="high")
+    sent = handler.seen[0][1]
+    assert sent["model"] == "gpt-5.6" and sent["input"] and sent["reasoning"] == {"effort": "high"}
+
+
+def test_a_drop_learned_at_one_level_does_not_apply_at_another():
+    """gpt-5.1 takes temperature at effort none and refuses it at high."""
+    handler = _recording_handler(lambda p: _UNSUPPORTED_TEMP if (
+        "temperature" in p and p.get("reasoning", {}).get("effort") == "high") else None)
+    _adapter("gpt-5.1", handler).generate(MSG, temperature=0.4, reasoning_effort="high")
+    assert _learned() == {"openai:gpt-5.1": ["drop_temperature@reasoning.effort=high"]}
+    handler.seen.clear()
+    _adapter("gpt-5.1", handler).generate(MSG, temperature=0.4, reasoning_effort="none")
+    assert handler.seen[0][1]["temperature"] == 0.4
+
+
+def test_caps_stored_by_older_versions_are_ignored():
+    """A #263-era `max_` cap assumed contiguous levels (#266 item 2); it is
+    no longer applied, and the level is relearned as a `refuse_` if needed."""
+    _seed({"openai:gpt-5.6": ["max_reasoning.effort:high"]})
+    handler = _recording_handler()
+    _adapter("gpt-5.6", handler).generate(MSG, reasoning_effort="xhigh")
+    assert handler.seen[0][1]["reasoning"] == {"effort": "xhigh"}
+
+
+def test_a_refused_bottom_level_keeps_a_drop_learned_only_at_that_level_off():
+    """Stored: `none` refused, and temperature refused at `none`. Applying the
+    refusal removes effort, so the conditional drop no longer holds."""
+    _seed({"openai:gpt-5.1": ["refuse_reasoning.effort:none",
+                              "drop_temperature@reasoning.effort=none"]})
+    handler = _recording_handler()
+    _adapter("gpt-5.1", handler).generate(MSG, temperature=0.4, reasoning_effort="none")
+    sent = handler.seen[0][1]
+    assert "reasoning" not in sent and sent["temperature"] == 0.4
+
+
+@pytest.mark.parametrize("code", [400, "Client specified an invalid argument", None])
+def test_openai_compatible_servers_codes_still_drop_an_unsupported_field(code):
+    """vLLM sends an integer code and xAI a free-text one; only OpenAI's own
+    value-range codes mean "keep the field"."""
+    from neo.adapters import _rejection
+
+    class Rejected(Exception):
+        status_code = 400
+        body = {"code": code, "message": "temperature is not supported"}
+
+    exc = Rejected("Error code: 400 - temperature is not supported")
+    assert _rejection(exc, {"temperature": 0.3}, ("temperature",), {}, {}) == "drop_temperature"
+    Rejected.body = {"code": "decimal_above_max_value", "message": "temperature too high"}
+    assert _rejection(exc, {"temperature": 3.0}, ("temperature",), {}, {}) is None
+
+
+def test_a_level_drop_is_judged_against_the_level_actually_sent():
+    """Stored: temperature refused at high, and high itself refused. A high
+    request steps down to medium, and the drop learned at high must not apply
+    there."""
+    _seed({"openai:gpt-5.1": ["drop_temperature@reasoning.effort=high",
+                              "refuse_reasoning.effort:high"]})
+    handler = _recording_handler()
+    _adapter("gpt-5.1", handler).generate(MSG, temperature=0.4, reasoning_effort="high")
+    sent = handler.seen[0][1]
+    assert sent["reasoning"] == {"effort": "medium"}
+    assert sent["temperature"] == 0.4
+
+
+def test_a_model_whose_lowest_level_is_above_the_request_pays_once():
+    """#265: gpt-5.2-pro accepts medium..xhigh. Asked for low, the first call
+    walks down past low, minimal and none and runs without effort (the
+    provider default); those refusals are remembered, so every later call is
+    one request."""
+    accepted = {"medium", "high", "xhigh"}
+    handler = _recording_handler(lambda p: None if (
+        "reasoning" not in p or p["reasoning"]["effort"] in accepted)
+        else _unsupported_level(p["reasoning"]["effort"]))
+    _adapter("gpt-5.2-pro", handler).generate(MSG, reasoning_effort="low")
+    first = len(handler.seen)
+    assert handler.seen[-1][1].get("reasoning") is None
+    handler.seen.clear()
+    _adapter("gpt-5.2-pro", handler).generate(MSG, reasoning_effort="low")
+    assert len(handler.seen) == 1 and handler.seen[0][1].get("reasoning") is None
+    assert first > 1
+    # A level the model accepts is still sent as asked.
+    handler.seen.clear()
+    _adapter("gpt-5.2-pro", handler).generate(MSG, reasoning_effort="high")
+    assert handler.seen[0][1]["reasoning"] == {"effort": "high"}
