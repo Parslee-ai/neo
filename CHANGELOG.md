@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that exactly names a flag (`version`, `help`, `status`, `index`, `config`, `upgrade`, `init`, `stats`) or a subcommand exits with status 2 and names the command it meant. Case, leading dashes and trailing punctuation are ignored. The check runs before the update check, the observer autostart and the engine. Every other prompt runs as before, including real words that resemble a command, such as `server` or `updates`.
+- **`python -m neo` and `python -m neo.cli` now return Neo's exit status.** Both module entry points called `main()` and discarded what it returned, so under `python -m` every refusal and failure reported success, and so did the `workspace` and `lattice` subcommands whatever their result. The `neo` console script already passed it through.
+
 - **The `claude-code` provider runs plain, isolated inference** ([#260](https://github.com/Parslee-ai/neo/issues/260)).
   - **Isolated:** `claude -p` now starts with no tools, no MCP servers, no user or project settings or hooks, and no saved session. Before, a structured-output prompt was sometimes answered with a tool call that ran a command in the working tree, used up the single turn and exited 1. Every call also ran the user's hooks and left a session transcript on disk.
   - **Real errors:** a failure now shows the error the CLI reports on stdout (for example `error_max_turns: Reached maximum number of turns (1)`) instead of `exited with code 1:` with nothing after it. A result marked `is_error` fails even when the exit code is 0.
@@ -30,8 +33,14 @@
 
 ### Fixed
 
-- **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that exactly names a flag (`version`, `help`, `status`, `index`, `config`, `upgrade`, `init`, `stats`) or a subcommand exits with status 2 and names the command it meant. Case, leading dashes and trailing punctuation are ignored. The check runs before the update check, the observer autostart and the engine. Every other prompt runs as before, including real words that resemble a command, such as `server` or `updates`.
-- **`python -m neo` and `python -m neo.cli` now return Neo's exit status.** Both module entry points called `main()` and discarded what it returned, so under `python -m` every refusal and failure reported success, and so did the `workspace` and `lattice` subcommands whatever their result. The `neo` console script already passed it through.
+- **Raw newlines in a model's JSON no longer fail the run** ([#259](https://github.com/Parslee-ai/neo/issues/259)). About one run in six died with `[escape_errors] … Invalid control character` when a model put a literal newline or tab inside a JSON string. `tolerant_json_load` now makes one string-aware pass, stopping at the first attempt that parses:
+  - **Inside strings:** raw newlines, carriage returns and tabs are escaped, and so is a backslash right before a raw newline.
+  - **Outside strings:** trailing commas are removed. Before, a regex did this anywhere, so code in a value such as `[1, 2,]` was rewritten.
+  - **Last resort:** curly quotes are mapped to straight ones.
+  Other control characters still fail, and the error reported is from the text as shown.
+- **The curly-quote repair works.** It had been replacing ASCII quotes with themselves.
+
+The plan's model-based repair is still not used for simulation or code-suggestion parsing. That repair shows the formatter only the first 1000 characters, so a "repaired" code suggestion could come back as a truncated or invented diff. The deterministic repairs above cover the reported failure.
 
 - **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
   - **Memory paging:** **Next** stops at the last page, so **Previous** responds at once. Before, it counted past the end and needed as many presses back.
