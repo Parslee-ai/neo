@@ -6,6 +6,8 @@ import subprocess
 import pytest
 
 from neo.adapters import ClaudeCodeAdapter
+from neo.schemas import STRUCTURED_STOP
+from neo.structured_parser import parse_plan_steps
 
 
 class FakeProcess:
@@ -93,8 +95,27 @@ def test_the_timeout_covers_the_whole_call_and_kills_the_child(monkeypatch, adap
 
 def test_stop_sequences_cut_the_response(monkeypatch, adapter):
     proc = FakeProcess([assistant("plan here</neo> trailing junk"), {"type": "result", "subtype": "success", "is_error": False}])
-    out, _ = run_with(monkeypatch, adapter, proc, stop=["</neo>", "```"])
+    out, _ = run_with(monkeypatch, adapter, proc, stop=list(STRUCTURED_STOP))
     assert out == "plan here"
+
+
+def test_a_fence_inside_a_json_string_survives_the_structured_stop_list(monkeypatch, adapter):
+    """#292: with a fence in the stop list this cut before <<<END:plan>>> and
+    every such response failed `missing_end_sentinel`, repair included."""
+    body = (
+        "<<<NEO:SCHEMA=v3:KIND=plan>>>\n"
+        '[{"id": "ps_1", "description": "Run:\\n```sh\\nmake test\\n```", '
+        '"rationale": "r", "dependencies": [], "schema_version": "3"}]\n'
+        "<<<END:plan>>>"
+    )
+    proc = FakeProcess([assistant(body), {"type": "result", "subtype": "success", "is_error": False}])
+    out, _ = run_with(monkeypatch, adapter, proc, stop=list(STRUCTURED_STOP))
+    assert out == body
+    assert parse_plan_steps(out).success
+
+
+def test_the_structured_stop_list_holds_no_code_fence():
+    assert not any("```" in s for s in STRUCTURED_STOP)
 
 
 def test_messages_go_to_stdin_and_the_system_prompt_to_a_file(monkeypatch, adapter):

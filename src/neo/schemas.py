@@ -11,6 +11,13 @@ SCHEMA_VERSION = "3"
 SENTINEL_START = "<<<NEO:SCHEMA=v3:KIND={kind}>>>"
 SENTINEL_END = "<<<END:{kind}>>>"  # Labeled to prevent collisions in multi-block responses
 
+# Stop sequences for every structured (sentinel-block) call. Never add a code
+# fence: a fence is legitimate CONTENT inside a JSON string (a quoted Markdown
+# plan, a diff of a .md file), and a provider that honours `stop` -- or the
+# claude-code adapter, which cuts client-side -- ends the response there,
+# before the end sentinel, so the parse fails `missing_end_sentinel` (#292).
+STRUCTURED_STOP = ("</neo>",)
+
 
 # JSON Schema definitions
 HYPOTHESIS_SCHEMA = {

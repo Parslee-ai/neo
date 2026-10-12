@@ -52,6 +52,21 @@ class ParseErrorCode:
     OFF_POLICY_EXPLANATION = "off_policy_explanation"
 
 
+def _unwrap_fence(block: str) -> str:
+    """Strip one code fence that wraps the WHOLE block between the sentinels.
+
+    Only a fence opening on the block's first line and closing on its last is
+    wrapping; a fence anywhere else is content and is left untouched.
+    """
+    if not (block.startswith("```") and block.endswith("```") and "\n" in block):
+        return block
+    first_line, rest = block.split("\n", 1)
+    inner = rest[:-3].strip()
+    if "```" in first_line[3:] or not inner:
+        return block
+    return inner
+
+
 def extract_block(response: str, kind: str) -> ParseResult:
     """
     Extract structured JSON block from LM response.
@@ -67,16 +82,17 @@ def extract_block(response: str, kind: str) -> ParseResult:
     start_sentinel = SENTINEL_START.format(kind=kind)
     end_sentinel = SENTINEL_END.format(kind=kind)  # Format with kind for labeled end tags
 
-    # Check for markdown wrapping FIRST (even if sentinels present)
-    if "```json" in response or (response.startswith("```") and "```" in response[3:]):
-        return ParseResult(
-            success=False,
-            error_code=ParseErrorCode.MARKDOWN_WRAPPED,
-            error_message="Response wrapped in markdown code fence"
-        )
-
-    # Check for start sentinel
+    # Check for start sentinel. A fence is only "markdown wrapping" when it
+    # stands in for the sentinels; with sentinels present a fence may be
+    # legitimate content inside a JSON string (#292), so it is judged below,
+    # at the block boundary, not anywhere in the response.
     if start_sentinel not in response:
+        if "```json" in response or (response.startswith("```") and "```" in response[3:]):
+            return ParseResult(
+                success=False,
+                error_code=ParseErrorCode.MARKDOWN_WRAPPED,
+                error_message="Response wrapped in markdown code fence"
+            )
         # Check for wrong kind sentinel
         if "<<<NEO:SCHEMA=" in response:
             return ParseResult(
@@ -110,7 +126,19 @@ def extract_block(response: str, kind: str) -> ParseResult:
             error_message="Sentinels out of order or empty block"
         )
 
-    raw_block = response[start_idx:end_idx].strip()
+    raw_block = _unwrap_fence(response[start_idx:end_idx].strip())
+
+    # A fence still opening the block was not a clean wrap (it closes past the
+    # end sentinel, or sits on one line). Report it as wrapping, which the
+    # repair loop can fix, rather than letting the JSON parse misread it as
+    # unrecoverable truncation.
+    if raw_block.startswith(("```", "~~~")):
+        return ParseResult(
+            success=False,
+            error_code=ParseErrorCode.MARKDOWN_WRAPPED,
+            error_message="Block between sentinels opens with a markdown code fence",
+            raw_block=raw_block,
+        )
 
     # Check for stray text before start or after end
     before_text = response[:response.index(start_sentinel)].strip()

@@ -117,3 +117,11 @@ def test_repair_gives_up_after_max_attempts():
 
     assert not result.success
     assert lm.calls == 2
+
+
+def test_the_repair_prompt_names_the_end_sentinel_the_parser_requires():
+    from neo.repair_loop import create_repair_prompt
+    from neo.schemas import SENTINEL_END
+    prompt = create_repair_prompt("bad", "missing_end_sentinel", "m", "plan", "task")
+    assert SENTINEL_END.format(kind="plan") in prompt
+    assert "<<<END>>>" not in prompt

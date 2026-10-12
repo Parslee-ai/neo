@@ -8,6 +8,7 @@ import logging
 from typing import Optional
 from dataclasses import dataclass
 
+from neo.schemas import STRUCTURED_STOP
 from neo.structured_parser import ParseResult, ParseErrorCode
 from neo.text_budget import truncate_marked
 
@@ -64,7 +65,7 @@ def create_repair_prompt(
 **Expected Format:**
 <<<NEO:SCHEMA=v3:KIND={kind}>>>
 [valid JSON array matching the schema]
-<<<END>>>
+<<<END:{kind}>>>
 
 **Error Detected:** [{error_code}] {error_message}
 
@@ -83,7 +84,7 @@ def create_repair_prompt(
 
 **Rules:**
 - Start with <<<NEO:SCHEMA=v3:KIND={kind}>>>
-- End with <<<END>>>
+- End with <<<END:{kind}>>>
 - Valid JSON only between sentinels
 - No text before or after sentinels
 - All fields must match schema requirements
@@ -157,7 +158,7 @@ def repair_response(
 
             repaired = lm_adapter.generate(
                 messages,
-                stop=["</neo>", "```"],
+                stop=list(STRUCTURED_STOP),
                 max_tokens=4096,
                 temperature=0.0,  # Deterministic
                 reasoning_effort="low",  # Reformatting JSON, not reasoning.
