@@ -117,6 +117,10 @@ applies learned patterns, generates solutions, and stores new facts for continuo
 
 1. Jina's embeddings model (open source) is downloaded automatically when you first run Neo.
     This model runs locally on your machine to generate vector embeddings.
+    It takes about 1.3 GB of memory once loaded. When the background observer
+    is running, it holds the one copy and each neo run borrows it over a
+    private local socket (`~/.neo/run/embed.sock`), so a run needs about 200 MB
+    instead. Without the observer, each run loads its own copy.
 
 
 

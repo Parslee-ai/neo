@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **A neo run borrows the observer's embedding model instead of loading its own** ([#211](https://github.com/Parslee-ai/neo/issues/211)). The model was a run's whole memory floor, about 1.3 GB of the 1.4 GB peak. The observer now holds the one copy and serves it over a private Unix socket (`~/.neo/run/embed.sock`). Measured on a 2,209-fact store, a dry run's peak fell from 1,439 MB to 195 MB, with wall time unchanged. When the observer isn't running, a run loads the model as before, and so it does when the observer's server is stale, hung or gone. The observer itself is now about 1.3 GB larger, by design. POSIX only.
+
 ### Fixed
 
 - **The parameter-compatibility store no longer learns false facts about a model** ([#266](https://github.com/Parslee-ai/neo/issues/266)).

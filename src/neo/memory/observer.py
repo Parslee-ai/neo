@@ -380,6 +380,11 @@ class Observer:
         scope = "all projects" if self.global_mode else f"project={self.project_id[:8]}"
         print(f"neo observer started pid={os.getpid()} {scope}", flush=True)
 
+        # Hold the embedding model and serve it to neo runs (#211). Loaded off
+        # the event loop; a failure only means runs keep loading their own.
+        loop = asyncio.get_running_loop()
+        self._embed_server = await loop.run_in_executor(None, _start_embed_service)
+
         # Best-effort A2UI surface (per-project inspector). The surface is keyed
         # to one project_id, so it only applies in per-project mode; the global
         # sweep skips it.
@@ -404,6 +409,7 @@ class Observer:
                 # Recycle between cycles, never mid-sweep, so no project is
                 # left half-processed and no fact file is mid-save.
                 if self._should_recycle():
+                    _stop_embed_service(self._embed_server)
                     await self._teardown_surface()
                     if self._lock is not None:
                         self._lock.release()
@@ -416,8 +422,12 @@ class Observer:
                 await asyncio.sleep(1.0)
                 slept += 1.0
 
+        _stop_embed_service(self._embed_server)
         await self._teardown_surface()
         print(f"neo observer stopped pid={os.getpid()}", flush=True)
+
+    #: The resident embedder this process serves, if it started (#211).
+    _embed_server = None
 
     #: Set by ``_daemon_main`` so a recycle can drop the single-instance lock
     #: before exec. None when the Observer is driven directly (tests).
@@ -1344,6 +1354,36 @@ def maybe_autostart_observer() -> None:
 _LOCK_ACQUIRE_ATTEMPTS = 10
 _LOCK_ESCALATE_AFTER = 3  # attempts of SIGTERM grace before SIGKILL
 _LOCK_PATH = os.path.expanduser("~/.neo/observer.lock")
+
+
+def _start_embed_service():
+    """Load the embedding model and serve it at `embed_service.socket_path()`.
+
+    This keeps the model (~1.3 GB) resident in the observer for as long as it
+    runs, which is the trade #211 chose: one resident copy instead of one per
+    neo run. The sweep shares the same instance through
+    `build_resilient_embedder`. Never raises."""
+    try:
+        from neo.memory import embed_service
+        from neo.memory.store import DEFAULT_EMBED_MODEL, build_resilient_embedder
+
+        embed_service.mark_server_process()
+        embedder = build_resilient_embedder(log_prefix="Observer")
+        if embedder is None:
+            return None
+        return embed_service.serve(embedder, DEFAULT_EMBED_MODEL)
+    except Exception as e:
+        logger.warning(f"Resident embedder not started: {type(e).__name__}: {e}")
+        return None
+
+
+def _stop_embed_service(server) -> None:
+    if server is None:
+        return
+    try:
+        server.close()
+    except Exception as e:
+        logger.warning(f"Resident embedder did not stop cleanly: {e}")
 
 
 def _reexec_self() -> None:

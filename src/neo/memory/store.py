@@ -234,14 +234,33 @@ def scope_file_lock(path: "Path"):
 _EMBEDDERS: dict = {}
 _EMBEDDERS_LOCK = threading.Lock()
 
+DEFAULT_EMBED_MODEL = "jinaai/jina-embeddings-v2-base-code"
+
+
+class _Serialized:
+    """One model, called from several threads: the observer's sweep and the
+    requests its resident embedder serves. `embed` is materialized under a
+    lock rather than trusting the tokenizer and session to be re-entrant."""
+
+    def __init__(self, embedder):
+        self._embedder = embedder
+        self._lock = threading.Lock()
+
+    def embed(self, texts):
+        with self._lock:
+            return iter(list(self._embedder.embed(list(texts))))
+
 
 def build_resilient_embedder(
-    model_name: str = "jinaai/jina-embeddings-v2-base-code",
+    model_name: str = DEFAULT_EMBED_MODEL,
     cache_dir: Optional[Path] = None,
     log_prefix: str = "",
 ):
-    """The process's shared embedder for `model_name` (see `_EMBEDDERS`);
-    built by `_build_embedder` on first use."""
+    """The process's shared embedder for `model_name` (see `_EMBEDDERS`).
+
+    Borrowed from the resident embedder when the observer is serving one
+    (`neo.memory.embed_service`), else built here by `_build_embedder` on
+    first use. Either way every caller in the process gets the same object."""
     if not FASTEMBED_AVAILABLE:
         return None
     if cache_dir is None:
@@ -250,7 +269,16 @@ def build_resilient_embedder(
     key = (model_name, str(cache_dir))
     with _EMBEDDERS_LOCK:
         if key not in _EMBEDDERS:
-            _EMBEDDERS[key] = _build_embedder(model_name, cache_dir, log_prefix)
+            from neo.memory import embed_service
+
+            def local():
+                built = _build_embedder(model_name, cache_dir, log_prefix)
+                return _Serialized(built) if built is not None else None
+
+            remote = None
+            if not embed_service.is_server_process():
+                remote = embed_service.connect(model_name, local_factory=local)
+            _EMBEDDERS[key] = remote if remote is not None else local()
         return _EMBEDDERS[key]
 
 

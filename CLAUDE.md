@@ -771,6 +771,21 @@
   never take it — it exits as "contended" and the machine is left with no
   observer. That failure was measured directly. The floor is one cycle's working
   set (~380 MB), so recycling caps drift, not baseline.
+  **Resident embedder** (`memory.embed_service`, #211): the observer also loads
+  the embedding model at start and serves it over `~/.neo/run/embed.sock`
+  (0600, in a 0700 dir; newline JSON, protocol v1, hello carries model + dim).
+  The model is ~1.3 GB resident, and it WAS a neo run's whole memory floor:
+  measured on a 2,209-fact store, a dry run peaked at 1,439 MB loading it and
+  195 MB borrowing it. So the observer now sits ~1.3 GB above the figures
+  above, by design: one resident copy instead of one per run. The sweep shares
+  the same instance (`build_resilient_embedder` returns the process's one
+  embedder, wrapped in `_Serialized` because the server thread and the sweep
+  call it concurrently). **The fallback is the product**: no socket, stale
+  socket, other model or protocol, a hung server (0.5 s hello timeout), a bad
+  reply, or a server gone mid-run (it closes before every re-exec) all end in
+  the run loading the model itself, once, and only a socket that exists and
+  then fails logs a warning. The serving process never borrows from itself
+  (`mark_server_process`). POSIX only; Windows always loads locally.
   Lifecycle: `neo memory observer {start|stop|status|kick}` — `kick` maps to
   `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
   CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |
