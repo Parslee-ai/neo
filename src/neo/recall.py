@@ -105,33 +105,63 @@ def _load_facts(root: str) -> list:
     return facts
 
 
-_RECALL_OPENER_FALLBACK = "I remember this. From earlier sessions:"
+STRONG_MATCH = 0.6
+FAINT_MATCH = 0.52
 
 
-def _recall_opener(facts: list) -> str:
-    """Neo's opener for the stage his memory has reached, from the beat deck.
+def _recall_triggers(scored_hits: list) -> set:
+    """The situation, read from what was recalled (see `recall_beats`)."""
+    triggers = set()
+    top = max(score for score, _ in scored_hits)
+    if top >= STRONG_MATCH:
+        triggers.add("strong_match")
+    elif top < FAINT_MATCH:
+        triggers.add("faint_match")
+    for _, fact in scored_hits:
+        if fact.kind.value == "failure":
+            triggers.add("failure_lesson")
+        if fact.metadata.success_count > 0 or fact.canonical_signature:
+            triggers.add("proven_lesson")
+        if fact.scope.value == "global":
+            triggers.add("elsewhere")
+    return triggers
 
-    The engine phrases its summary by the same stage (`memory_stage` of
-    `memory_level_of` the loaded facts), so recall sounds like the Neo whose
-    findings follow it. A missing or malformed deck degrades to the
-    Unplugged line rather than failing the prompt."""
+
+def _recall_beat(facts: list, scored_hits: list, recent: set) -> dict:
+    """The recall beat for this situation at Neo's current stage, or {}.
+
+    Most matching triggers wins, ties in deck order; a beat Neo spoke
+    recently in this session is skipped (the host passes them back), and no
+    fit means silence. The stage is the engine's own (`memory_stage` of
+    `memory_level_of` the loaded facts), so the beats available change as
+    Neo remembers more. A missing or malformed deck means silence.
+    """
     import yaml
 
     from neo.memory.store import memory_level_of, memory_stage
 
     try:
         deck_path = Path(__file__).parent / "config" / "beats" / "neo_matrix.yaml"
-        deck = yaml.safe_load(deck_path.read_text()) or {}
-        stages = deck.get("orchestrator_voice", {}).get("stages", {})
-        stage = stages.get(memory_stage(memory_level_of(facts))) or {}
-        return str(stage.get("recall_opener") or _RECALL_OPENER_FALLBACK)
+        beats = (yaml.safe_load(deck_path.read_text()) or {}).get("recall_beats") or []
+        stage = memory_stage(memory_level_of(facts))
+        triggers = _recall_triggers(scored_hits)
+        best, best_score = {}, 0
+        for beat in beats:
+            if stage not in (beat.get("stages") or []) or beat.get("beat_id") in recent:
+                continue
+            score = len(triggers & set(beat.get("trigger_contexts") or []))
+            if score > best_score and beat.get("line"):
+                best, best_score = beat, score
+        return best
     except Exception:
-        return _RECALL_OPENER_FALLBACK
+        return {}
 
 
 def recall(prompt: str, cwd: str,
-           embed: Optional[Callable[[str], object]] = None) -> str:
-    """Text block of relevant learned lessons, or "" when there are none."""
+           embed: Optional[Callable[[str], object]] = None,
+           recent_beats: Optional[set] = None) -> dict:
+    """`{"text", "beat_id"}`: relevant learned lessons, opened by Neo's beat
+    for the situation when one fits. Empty text when nothing is relevant."""
     import numpy as np
 
     from neo.math_utils import batched_cosine
@@ -139,11 +169,12 @@ def recall(prompt: str, cwd: str,
     from neo.memory.store import MAX_TEXT_LENGTH, STALE_MAX_CONFIDENCE
     from neo.text_budget import truncate_marked
 
+    silent = {"text": "", "beat_id": ""}
     if not prompt.strip():
-        return ""
+        return silent
     vector = (embed or _resident_embed)(prompt[:MAX_TEXT_LENGTH])
     if vector is None:
-        return ""
+        return silent
     query = np.asarray(vector, dtype=np.float32)
 
     facts = _load_facts(_project_root(cwd))
@@ -158,32 +189,40 @@ def recall(prompt: str, cwd: str,
         and not is_legacy_suggestion_fact(fact)
     ]
     if not candidates:
-        return ""
+        return silent
     scores = batched_cosine([fact.embedding for fact in candidates], query)
     ranked = sorted(zip(scores, candidates), key=lambda pair: -pair[0])
-    hits = [fact for score, fact in ranked[:MAX_FACTS] if score >= MIN_SIMILARITY]
-    if not hits:
-        return ""
+    scored_hits = [(score, fact) for score, fact in ranked[:MAX_FACTS]
+                   if score >= MIN_SIMILARITY]
+    if not scored_hits:
+        return silent
 
-    lines = [f"Neo memory: {_recall_opener(facts)}"]
-    for fact in hits:
+    beat = _recall_beat(facts, scored_hits, recent_beats or set())
+    lines = [f"Neo memory: {beat['line']}" if beat else "Neo memory:"]
+    for _, fact in scored_hits:
         body = " ".join(truncate_marked(fact.body, MAX_BODY_CHARS).split())
         lines.append(f"- {fact.subject} [{fact.kind.value}, {fact.scope.value}]: {body}")
-    return "\n".join(lines)
+    return {"text": "\n".join(lines), "beat_id": beat.get("beat_id", "") if beat else ""}
 
 
 def run_recall(argv: list[str], stdin=None) -> int:
-    """`neo recall [--cwd DIR]`, prompt on stdin. Always exits 0."""
+    """`neo recall [--cwd DIR] [--recent-beats IDS] [--json]`, prompt on stdin.
+    Always exits 0."""
     try:
         logging.disable(logging.WARNING)
         parser = argparse.ArgumentParser(prog="neo recall")
         parser.add_argument("--cwd", default=str(Path.cwd()))
+        parser.add_argument("--recent-beats", default="",
+                            help="comma-separated beat ids Neo spoke recently")
+        parser.add_argument("--json", action="store_true")
         args = parser.parse_args(argv)
         prompt = (stdin or sys.stdin).read()
-        text = recall(prompt, args.cwd)
-        if text:
-            print(text)
+        recent = {b for b in args.recent_beats.split(",") if b}
+        result = recall(prompt, args.cwd, recent_beats=recent)
+        if args.json:
+            print(json.dumps(result))
+        elif result["text"]:
+            print(result["text"])
     except BaseException:  # a host hook must never fail on our account
         pass
     return 0
-

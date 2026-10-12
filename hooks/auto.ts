@@ -140,16 +140,30 @@ export function architectPrompt(plan: string): string {
   );
 }
 
+/** Beats Neo spoke recently in this session; skipped so he does not repeat
+ * himself (the deck's cooldown, which needs the session state a mod has). */
+export const RECENT_BEATS = 4;
+
+export function rememberBeat(recent: string[], beat: string): string[] {
+  return beat ? [...recent.filter((b) => b !== beat), beat].slice(-RECENT_BEATS) : recent;
+}
+
 export function autoPayload(
   prompt: string,
   cwd: string,
   session: string,
   id: string,
+  beat: { ask: string; recent: string[] } = { ask: "", recent: [] },
+  errorTrace = "",
 ): Document {
   // No task_type: the CLI classifies the prompt, so a bug found in review can
   // become a promotable pattern. A fixed type would decide that in advance.
+  // The beat is chosen from the person's own words, not this prompt, which is
+  // the mod's wording and would pick the same beat every time.
   return {
     prompt,
+    ...(errorTrace ? { error_trace: errorTrace } : {}),
+    beat_context: { ask: beat.ask, recent_beats: beat.recent },
     working_directory: cwd,
     safe_read_paths: [cwd],
     auto_context: true,

@@ -1398,6 +1398,11 @@ def main():
                     ContextFile(**cf) for cf in input_data.get("context_files", [])
                 ],
                 error_trace=input_data.get("error_trace"),
+                beat_context=(
+                    input_data["beat_context"]
+                    if isinstance(input_data.get("beat_context"), dict)
+                    else {}
+                ),
                 recent_commands=input_data.get("recent_commands", []),
                 safe_read_paths=input_data.get("safe_read_paths", []),
                 working_directory=working_dir,

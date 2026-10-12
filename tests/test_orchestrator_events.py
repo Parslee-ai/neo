@@ -663,6 +663,39 @@ def test_no_matching_beat_means_silence_not_a_fallback_line():
     assert engine._orchestrator_beat(confidence=0.5) == ""
 
 
+def test_a_host_written_prompt_does_not_choose_the_beat():
+    """The mod writes "find bugs, propose a fix" for every review; the
+    person's own words pick the beat, or every review speaks the same line."""
+    engine = _engine_for_beats()
+    engine.context = NeoInput(
+        prompt="Review the changes for correctness bugs and propose a fix.",
+        beat_context={"ask": "optimize the search algorithm"},
+    )
+    engine._findings = ["hash lookups beat scans here"]
+    assert engine._run_beat(0.9)["beat_id"] == "algorithm_insight"
+
+
+def test_a_beat_spoken_recently_in_the_session_is_skipped():
+    engine = _engine_for_beats()
+    engine.context = NeoInput(
+        prompt="optimize the search algorithm",
+        beat_context={"recent_beats": ["algorithm_insight"]},
+    )
+    engine._findings = ["hash lookups beat scans here"]
+    beat = engine._run_beat(0.9)
+    assert beat is None or beat["beat_id"] != "algorithm_insight"
+
+
+def test_the_spoken_beat_is_reported_so_a_host_can_pass_it_back():
+    output, _ = _run(_response(issues=["callers may not handle None"]),
+                     prompt="fix the crash in the parser")
+    o = output.orchestrator
+    assert (o.beat_id != "") == (o.personality != "")
+    if o.personality:
+        beat = next(b for b in _engine_for_beats().beat_deck["beats"] if b["beat_id"] == o.beat_id)
+        assert beat["orchestrator_line"] == o.personality
+
+
 def test_surfaced_beat_is_also_emitted_as_an_event():
     output, sink = _run(_response(), prompt="fix the crash in the parser")
     beats = sink.of_type(NeoEventType.PERSONALITY_BEAT)

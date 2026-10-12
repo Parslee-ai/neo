@@ -57,13 +57,15 @@ const stop = (active = false) => ({
 });
 
 test("a typed prompt gets matching memory; a machine-injected one does not", async ($, on) => {
-  const calls = host(on, (c) => (c.argv[1] === "recall" ? { stdout: "Neo memory: lesson\n" } : {}));
+  const calls = host(on, (c) =>
+    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo memory: lesson\n", beat_id: "" }) } : {},
+  );
   await $.session.start(SESSION);
   const typed = await $.classic.UserPromptSubmit({
     ...BASE, prompt: "fix the hook", source: "user",
   });
   expect(typed.additionalContext?.[0]).toContain("Neo memory: lesson");
-  expect(calls[0]!.argv).toEqual(["neo", "recall", "--cwd", "/work"]);
+  expect(calls[0]!.argv).toEqual(["neo", "recall", "--cwd", "/work", "--json", "--recent-beats", ""]);
   expect(calls[0]!.stdin).toBe("fix the hook");
   const system = await $.classic.UserPromptSubmit({
     ...BASE, prompt: "<task-notification>", source: "system",
@@ -307,7 +309,9 @@ test("findings carry Neo's beat and ask Claude to relay his lines as written", a
 });
 
 test("recalled memory is framed as data and relayed in Neo's words", async ($, on) => {
-  host(on, (c) => (c.argv[1] === "recall" ? { stdout: "Neo memory: I remember this. From earlier sessions:\n- lesson" } : {}));
+  host(on, (c) =>
+    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo memory: I remember this.\n- lesson", beat_id: "recall_remember" }) } : {},
+  );
   await $.session.start(SESSION);
   const r = await $.classic.UserPromptSubmit({ ...BASE, prompt: "q", source: "user" });
   expect(r.additionalContext?.[0]).toContain("Neo memory: I remember this.");
@@ -317,4 +321,55 @@ test("recalled memory is framed as data and relayed in Neo's words", async ($, o
 test("make counts only for check targets; a prefixed or hyphenated name does not", () => {
   for (const c of ["make", "make test", "make ci-local", "sudo pytest -q"]) expect(isCheckCommand(c)).toBe(true);
   for (const c of ["make clean", "make install", "pytest-helper run", "ruffle"]) expect(isCheckCommand(c)).toBe(false);
+});
+
+test("Neo's beats answer the person's words and are not repeated across the session", async ($, on) => {
+  const voiced = (beat: string) => ({
+    ...FIX,
+    orchestrator: { summary: "I read it.", personality: beat ? "line" : "", beat_id: beat, cautions: [] },
+  });
+  let next = "critical_bug";
+  const calls = host(on, (c) => {
+    if (c.argv[1] === "recall") return { stdout: JSON.stringify({ text: "Neo memory: I remember this.\n- x", beat_id: "recall_remember" }) };
+    if (c.argv[0] === "git") return { stdout: `diff --git ${c.argv.at(-1)}` };
+    if (c.argv[1] === "--stdin-json") return { stdout: JSON.stringify(voiced(next)) };
+    return {};
+  });
+  await $.session.start(SESSION);
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "make the parser faster", source: "user" });
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  await $.classic.Stop(stop());
+  const first = JSON.parse(neoRuns(calls)[0]!.stdin);
+  expect(first.beat_context.ask).toBe("make the parser faster");
+  expect(first.beat_context.recent_beats).toEqual(["recall_remember"]);
+  // The next prompt's recall and run both hear what Neo already said.
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "and the lexer", source: "user" });
+  const recall = calls.filter((c) => c.argv[1] === "recall")[1]!;
+  expect(recall.argv.at(-1)).toBe("recall_remember,critical_bug");
+  next = "";
+  await $.classic.PostToolUse(edit("/work/b.py"));
+  await $.classic.Stop(stop());
+  const second = JSON.parse(neoRuns(calls)[1]!.stdin);
+  expect(second.beat_context.ask).toBe("and the lexer");
+  expect(second.beat_context.recent_beats).toEqual(["critical_bug", "recall_remember"]);
+});
+
+test("a diagnosis hands Neo the real error output, so error beats can fire", async ($, on) => {
+  const calls = host(on, (c) => (c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {}));
+  await $.session.start(SESSION);
+  await $.classic.PostToolUseFailure(failure("pytest", "Traceback: boom"));
+  await calls.clock.advance(1);
+  await calls.clock.settle();
+  expect(JSON.parse(neoRuns(calls)[0]!.stdin).error_trace).toBe("Traceback: boom");
+});
+
+test("a new session starts with no remembered beats or ask", async ($, on) => {
+  const calls = host(on, (c) =>
+    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo memory:\n- x", beat_id: "recall_know" }) } : {},
+  );
+  await $.session.start(SESSION);
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "a", source: "user" });
+  await $.session.start(SESSION);
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "b", source: "user" });
+  expect(calls.filter((c) => c.argv[1] === "recall")[1]!.argv.at(-1)).toBe("");
 });

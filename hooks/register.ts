@@ -27,6 +27,7 @@ import {
   EDIT_TOOLS,
   MAX_DIAGNOSES,
   RECALL_TIMEOUT,
+  rememberBeat,
   architectPrompt,
   autoPayload,
   debugPrompt,
@@ -750,12 +751,17 @@ let diagnosing = 0,
 /** Bumped by resetAuto: background work started under an older value belongs
  * to a session that has ended and must not deliver into this one. */
 let autoGeneration = 0;
+/** What the person last typed, and the beats Neo spoke lately: the situation
+ * his personality answers to, kept here because each `neo` run forgets it. */
+let lastAsk = "";
+let spokenBeats: string[] = [];
 
 async function autoNeo(
   $: EngineInterface,
   cwd: string,
   session: string,
   prompt: string,
+  errorTrace = "",
 ): Promise<Document | undefined> {
   try {
     const run = await $.process.run(
@@ -763,14 +769,23 @@ async function autoNeo(
       {
         cwd,
         stdin: JSON.stringify(
-          autoPayload(prompt, cwd, session, crypto.randomUUID()),
+          autoPayload(
+            prompt,
+            cwd,
+            session,
+            crypto.randomUUID(),
+            { ask: lastAsk, recent: spokenBeats },
+            errorTrace,
+          ),
         ),
         timeoutMs: AUTO_DEADLINE,
       },
     );
     if (run.exitCode !== 0) return undefined;
     const result = JSON.parse(run.stdout) as Document;
-    return result && !result.error ? result : undefined;
+    if (!result || result.error) return undefined;
+    spokenBeats = rememberBeat(spokenBeats, text(object(result.orchestrator).beat_id));
+    return result;
   } catch {
     return undefined; // Neo joining in must never break the session.
   }
@@ -779,13 +794,16 @@ async function autoNeo(
 async function autoRecall($: EngineInterface, cwd: string, prompt: string) {
   if (recallMissing) return "";
   try {
-    const run = await $.process.run([binary, "recall", "--cwd", cwd], {
-      stdin: prompt,
-      timeoutMs: RECALL_TIMEOUT,
-    });
+    const run = await $.process.run(
+      [binary, "recall", "--cwd", cwd, "--json", "--recent-beats", spokenBeats.join(",")],
+      { stdin: prompt, timeoutMs: RECALL_TIMEOUT },
+    );
     // An older CLI without `recall` answers with an argparse error (exit 2).
     if (run.exitCode === 2) recallMissing = true;
-    return run.exitCode === 0 ? run.stdout.trim() : "";
+    if (run.exitCode !== 0 || !run.stdout.trim()) return "";
+    const result = JSON.parse(run.stdout) as Document;
+    spokenBeats = rememberBeat(spokenBeats, text(result.beat_id));
+    return text(result.text).trim();
   } catch {
     return "";
   }
@@ -903,6 +921,8 @@ function resetAuto() {
   recallMissing = false;
   diagnosing = 0;
   diagnoses = 0;
+  lastAsk = "";
+  spokenBeats = [];
 }
 
 function registerAuto(on: On) {
@@ -912,6 +932,7 @@ function registerAuto(on: On) {
       // Only prompts a person typed get memory: task notifications and other
       // machine-injected turns are not questions.
       if ((e.source ?? "user") !== "user") return result;
+      lastAsk = e.prompt;
       const extra = autoDrain();
       const memory = await autoRecall($, e.cwd, e.prompt);
       if (memory) extra.push(recallInjection(memory));
@@ -940,12 +961,13 @@ function registerAuto(on: On) {
       diagnosing++;
       diagnoses++;
       const prompt = debugPrompt(command, e.error);
+      const trace = e.error.slice(-8000);
       const owner = autoGeneration;
       // In the background: the failure is delivered now, the diagnosis at the
       // next main-thread hook. Work that outlives this dispatch runs from a
       // timer; a call left in flight when the hook returns is aborted.
       $.clock.after(0, () => {
-        void autoNeo($, e.cwd, e.session_id, prompt)
+        void autoNeo($, e.cwd, e.session_id, prompt, trace)
           .then(
             (found) => {
               if (owner === autoGeneration && found && hasFindings(found))

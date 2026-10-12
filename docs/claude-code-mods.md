@@ -106,12 +106,20 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
   apply. No task type is fixed; the CLI classifies the prompt.
 - Findings reach Claude framed as data from a second model, not instructions,
   and with the same relay rule as the Neo agent: quote Neo's lines as written.
-  His summary and recall's opener are phrased by his memory stage (`memory_stage`
-  of `memory_level_of`, shared by the engine and `neo recall`; openers are
-  `recall_opener` in `neo_matrix.yaml`), so the hedge at Sleeper and the
-  terseness at The One are information, and the earned personality beat is
-  shown in the pane and in every text form. A failed or timed-out run adds
-  nothing and never blocks the turn.
+- **Neo's personality stays situational, staged and unrepeated.** His summary
+  is phrased by his memory stage (`memory_stage` of `memory_level_of`, shared
+  by the engine and `neo recall`). Beats are chosen by the situation: recall
+  picks from `recall_beats` in `neo_matrix.yaml` using what it recalled (a
+  failure, a proven lesson, one from another project, a strong or faint
+  match), and each recall beat speaks only at the stages it lists, so the
+  hedging lines fall away and the terse ones arrive as he remembers more.
+  Automatic runs pick engine beats from what the person last typed
+  (`beat_context.ask`), not from the mod's own prompt wording. The mod keeps
+  the beats Neo spoke lately (`RECENT_BEATS`) and passes them back
+  (`beat_context.recent_beats`, `neo recall --recent-beats`); a recently
+  spoken beat is skipped for the next fit, or silence, which stays the
+  default. Earned beats show in the pane and every text form.
+- A failed or timed-out run adds nothing and never blocks the turn.
 
 The Mod does not intercept permissions, auto-approve tools, send prompts as the
 user, or rewrite repository instructions.

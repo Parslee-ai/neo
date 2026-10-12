@@ -3365,7 +3365,13 @@ RULES:
         best_match = None
         best_score = 0
 
+        # A beat Neo already spoke this session is skipped: the next-best fit
+        # speaks, or nothing does. Repetition is what turns a character into
+        # a catchphrase.
+        recent = context.get('recent_beats') or set()
         for beat in self.beat_deck.get('beats', []):
+            if beat.get('beat_id') in recent:
+                continue
             beat_triggers = set(beat.get('trigger_contexts', []))
             match_score = len(triggers & beat_triggers)
 
@@ -3390,8 +3396,15 @@ RULES:
             return self._selected_beat
         if not self.context:
             return None
+        beat_context = getattr(self.context, "beat_context", None) or {}
+        ask = beat_context.get("ask")
+        recent = beat_context.get("recent_beats")
         self._selected_beat = self._select_beat({
-            "prompt": self.context.prompt,
+            # A host that wrote the prompt itself supplies the person's own
+            # words, or its instructions ("find bugs, propose a fix") would
+            # pick the same beat on every call.
+            "prompt": ask if isinstance(ask, str) and ask.strip() else self.context.prompt,
+            "recent_beats": set(recent) if isinstance(recent, list) else set(),
             "error_trace": self.context.error_trace,
             "high_confidence": (
                 confidence is not None and confidence >= self.EARLY_EXIT_CONFIDENCE
@@ -3598,9 +3611,11 @@ RULES:
             if record.get("message") and record.get("status") != "running"
         ]
 
+        personality = self._orchestrator_beat(confidence)
         return OrchestratorMessage(
             summary=summary,
-            personality=self._orchestrator_beat(confidence),
+            personality=personality,
+            beat_id=(self._selected_beat or {}).get("beat_id", "") if personality else "",
             # Copy each record, not just the list. These dicts are live engine
             # state, and this object is handed to foreign consumers.
             phase_summary=[dict(record) for record in self._phase_records],
