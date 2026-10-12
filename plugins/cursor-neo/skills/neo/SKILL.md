@@ -30,9 +30,7 @@ When the user invokes this skill (`/neo <question or task>`), do the following:
    invoking `/neo` is not blanket consent to send unrelated sensitive context.
 
 5. **Invoke Neo with `--json --no-scan --no-memory`.** Allow up to 5 minutes — Neo runs
-   multi-agent reasoning across LLM calls. Use Cursor's Shell tool for the
-   command. Before a call that needs network access, name the Neo provider and
-   summarize the data being sent.
+   multi-agent reasoning across LLM calls. Run the command with Cursor's Shell tool. Before a call that needs network access, name the Neo provider and summarize the data being sent.
 
    ```bash
    neo --json --no-scan --no-memory --mode advise <<'QUERY'
@@ -128,9 +126,11 @@ is no fallback line.
 
 ## Notes
 
-- This skill uses explicit `advise` mode: it may retrieve established memory but does not create candidates or update durable memory. Use `neo --mode learn` only when the user intends to contribute outcome evidence.
+- This skill uses explicit `advise` mode: Neo reasons and answers, but records no candidates and updates no durable memory. Use `neo --mode learn` only when the user intends to contribute outcome evidence.
+- It also passes `--no-memory`, so **no stored facts are retrieved either** — see the privacy note in step 4. Retrieval happens only when the user omits that flag and authorizes stored facts as provider context; the two settings are independent, and `advise` alone would still retrieve.
 - For code review, optimization, architectural decisions, debugging, or pattern extraction, prefer the more specific Neo skills (`/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`).
 - Always verify low-confidence suggestions (< 0.7) before applying them. A
   `null` confidence is not a low one — read `confidence_basis` first.
-- For a longer delegated session with a visible boundary, prefer the **Neo
-  agent** over this mid-loop skill.
+
+For a longer delegated session with a visible boundary, prefer the **Neo
+agent** over this mid-loop skill.

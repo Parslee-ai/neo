@@ -23,8 +23,7 @@ When the user invokes this skill (`/neo-optimize <target>`), do the following:
    that provider and scope.
 
 4. **Invoke Neo with an optimization-framed prompt.** Allow up to 5 minutes.
-   Use Cursor's Shell tool; before a call that needs network access, name the
-   provider and summarized data categories.
+   Run it with Cursor's Shell tool; before a call that needs network access, name the provider and summarized data.
 
    ```bash
    neo --json --no-scan --no-memory --mode advise <<'QUERY'

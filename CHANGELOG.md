@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Cursor plugin** (`plugins/cursor-neo/`, contributed by Joe Rinehart in [#236](https://github.com/Parslee-ai/neo/pull/236)). It provides the same six skills as the Codex plugin, invoked as `/neo`, `/neo-review` and so on in Cursor's Agent chat, plus a `neo-agent` subagent with a visible boundary, like Claude Code's Neo agent. Install it locally (`~/.cursor/plugins/local`) or import this repository as a team marketplace (`.cursor-plugin/marketplace.json`). Each Cursor skill is tested against its Codex counterpart, paragraph by paragraph, so a privacy fix to one cannot be left out of the other. The README lists what is weaker on Cursor: there is no shell approval flow, and the subagent inherits every tool.
+
 ### Fixed
 
 - **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that exactly names a flag (`version`, `help`, `status`, `index`, `config`, `upgrade`, `init`, `stats`) or a subcommand exits with status 2 and names the command it meant. Case, leading dashes and trailing punctuation are ignored. The check runs before the update check, the observer autostart and the engine. Every other prompt runs as before, including real words that resemble a command, such as `server` or `updates`.

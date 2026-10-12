@@ -193,6 +193,14 @@ def test_local_marketplace_points_at_the_codex_plugin():
         assert (REPO / path).is_dir(), path
 
 
+def test_cursor_marketplace_carries_no_version_of_its_own():
+    """Cursor documents `metadata.version` as optional. The Claude and Codex
+    marketplaces carry none, and a fifth version literal would be one
+    `make sync-version` does not write."""
+    manifest = json.loads((REPO / ".cursor-plugin" / "marketplace.json").read_text())
+    assert "version" not in manifest.get("metadata", {})
+
+
 def test_cursor_marketplace_points_at_the_cursor_plugin():
     """Team / repo marketplace import reads `.cursor-plugin/marketplace.json`."""
     manifest = json.loads((REPO / ".cursor-plugin" / "marketplace.json").read_text())
@@ -306,6 +314,48 @@ def test_cursor_entry_skill_rejects_blanket_sensitive_context_consent():
     for secret_class in ("secrets", "credentials", "tokens", "cookies",
                          "session"):
         assert secret_class in body
+
+
+def _skill_body(text: str) -> str:
+    assert text.startswith("---\n")
+    return text[4:].split("\n---\n", 1)[1]
+
+
+def _paragraphs(text: str) -> list[str]:
+    return [re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+
+def _codex_to_cursor(text: str) -> str:
+    """The ONLY differences a Cursor skill may have from its Codex twin: the
+    invocation sigil, the host name, and how network consent is asked for
+    (Codex has an approval flow; Cursor's Shell tool does not, so the skill
+    names provider and data before the call instead)."""
+    text = text.replace("$neo", "/neo").replace("Codex", "Cursor")
+    text = re.sub(
+        r"Use\s+Cursor's approval flow when the\s+command needs network access\.\s+"
+        r"The approval description must name\s+(.+?)\.",
+        lambda m: "Run the command with Cursor's Shell tool. Before a call that "
+                  "needs network access, name " + m.group(1) + ".",
+        text, flags=re.S)
+    text = re.sub(
+        r"Use\s+Cursor's approval flow for required network access,\s+naming\s+"
+        r"(.+?)\s+in the approval description\.",
+        lambda m: "Run it with Cursor's Shell tool; before a call that needs "
+                  "network access, name " + m.group(1) + ".",
+        text, flags=re.S)
+    return text.replace("before approval.", "before the call.")
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_cursor_skills_carry_every_paragraph_of_their_codex_twin(name):
+    """A copy-and-rename adapter is checked as a diff, not by keyword: the
+    first Cursor port copied two skills from before a privacy fix and still
+    passed a test looking for the words "stored facts". Cursor-only additions
+    are allowed as paragraphs of their own."""
+    cursor = set(_paragraphs(_skill_body(_cursor_skill(name))))
+    missing = [p for p in _paragraphs(_codex_to_cursor(_skill_body(_codex_skill(name))))
+               if p not in cursor]
+    assert not missing, f"{name}: Cursor skill lacks {missing[:2]}"
 
 
 @pytest.mark.parametrize("name", [name for name in CAPABILITIES if name != "neo-pattern"])

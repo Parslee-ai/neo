@@ -24,8 +24,7 @@ When the user invokes this skill (`/neo-architect <question>`), do the following
    authorization for that provider and scope.
 
 4. **Invoke Neo with an architecture-framed prompt.** Allow up to 5 minutes.
-   Use Cursor's Shell tool; before a call that needs network access, name the
-   provider and summarized data categories.
+   Run it with Cursor's Shell tool; before a call that needs network access, name the provider and summarized data.
 
    ```bash
    neo --json --no-scan --no-memory --mode advise <<'QUERY'
@@ -40,7 +39,7 @@ When the user invokes this skill (`/neo-architect <question>`), do the following
 
 5. **Present Neo's plan and simulations together.** Architecture answers benefit from the SIMULATIONS section especially — those describe how the recommendation would actually play out.
 
-6. **Surface any architectural facts Neo retrieved from memory.** If past projects had similar decisions, Neo references them — those are higher-trust than fresh reasoning.
+6. **If — and only if — memory was enabled for this call, surface any architectural facts Neo retrieved.** Past decisions from similar projects are higher-trust than fresh reasoning. Under the default `--no-memory` there are none, and Neo's answer is reasoning alone: do not present it as informed by past projects.
 
 `--no-scan` is mandatory: Cursor already summarized the relevant architecture
 context, so Neo must not silently add working-directory files to the provider

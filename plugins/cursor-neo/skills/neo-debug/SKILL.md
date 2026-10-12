@@ -23,9 +23,7 @@ When the user invokes this skill (`/neo-debug <bug description>`), do the follow
    files or data categories. Production, private, or customer diagnostics
    require explicit authorization for that provider and scope.
 
-4. **Invoke Neo with a debug-framed prompt.** Allow up to 5 minutes. Use
-   Cursor's Shell tool; before a call that needs network access, name the
-   provider and summarized data categories.
+4. **Invoke Neo with a debug-framed prompt.** Allow up to 5 minutes. Run it with Cursor's Shell tool; before a call that needs network access, name the provider and summarized data.
 
    ```bash
    neo --json --no-scan --no-memory --mode advise <<'QUERY'

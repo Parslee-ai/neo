@@ -222,8 +222,8 @@ neo/
 
 6. **New Cursor Skill** (`plugins/cursor-neo/`)
    - Add a SKILL file under `skills/<name>/SKILL.md`
-   - Keep `plugins/cursor-neo/.cursor-plugin/plugin.json` and
-     `.cursor-plugin/marketplace.json` in sync with the package
+   - Bump nothing by hand: `make sync-version` writes the Cursor manifest's
+     version along with the others
    - Mirror it as a Claude Code slash command and a Codex skill
    - Document it in the README's Cursor Plugin section
    - If the capability needs a visible-boundary path, also update

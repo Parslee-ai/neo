@@ -1,5 +1,5 @@
 ---
-name: neo
+name: neo-agent
 description: >-
   Semantic reasoning helper using multi-agent MapCoder approach with persistent
   memory. Use when the user asks to delegate to the Neo agent for architecture,

@@ -29,9 +29,7 @@ When the user invokes this skill (`/neo-pattern <code reference or description>`
    memory, also disclose that relevant stored facts may be selected for the
    provider prompt and that `learn` records an episode candidate.
 
-5. **Invoke Neo with a pattern-framed prompt.** Allow up to 5 minutes. Use
-   Cursor's Shell tool; before a call that needs network access, name the
-   provider, summarized data, and candidate-learning effect.
+5. **Invoke Neo with a pattern-framed prompt.** Allow up to 5 minutes. Run it with Cursor's Shell tool; before a call that needs network access, name the provider, summarized data, and candidate-learning effect.
 
    ```bash
    neo --json --no-scan --mode learn <<'QUERY'

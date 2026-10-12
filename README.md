@@ -509,12 +509,22 @@ Once installed:
 - **Skills** (mid-loop, `/` in Agent chat): `/neo`, `/neo-review`, `/neo-optimize`,
   `/neo-architect`, `/neo-debug`, `/neo-pattern` — same Codex privacy defaults
   (`--no-scan`, advise `--no-memory`)
-- **Neo agent** (visible boundary): delegate with “use the Neo agent…” — Claude-style
+- **Neo agent** (visible boundary): delegate with “use the Neo agent…” or
+  `/neo-agent` (named apart from the `/neo` skill) — Claude-style
   `neo --json --mode advise` without mandatory `--no-scan` / `--no-memory`
 - **Shared memory**: same `~/.neo/facts/` store as the CLI, Claude Code, and Codex plugins
 
 The plugin wraps the local `neo` CLI (`pip install neo-reasoner[…]` + provider
 key). It is intentionally skills + agent, not an MCP server.
+
+Two boundaries are weaker than on the other hosts, by construction. Cursor has
+no approval flow for shell commands, so a skill *tells* the model to name the
+provider and data before a network call, where Codex makes it part of the
+approval the user sees. And a Cursor subagent inherits every tool of its parent
+(Claude's Neo agent is limited to Bash, Read, Grep and Glob). The
+Claude Code-only features, the Mods pane (`/neo-workspace`, `/neo-ask`) and the
+`executable` override, have no Cursor equivalent; the Cursor skills run the
+`neo` on `PATH`.
 
 All three host adapters consume the **same host-neutral contract**: they invoke
 `neo --json` and read the `orchestrator` envelope described under
@@ -557,7 +567,7 @@ use:**
 
 - **Claude Code** users get the deepest integration via the [Claude Code Plugin](#claude-code-plugin), but neo runs standalone too.
 - **Codex CLI** users get parity via the [Codex Plugin](#codex-plugin) — same six skills, packaged for Codex. Neo also automatically picks up `AGENTS.md` (the cross-tool standard Codex co-led) plus anything under `.codex/`.
-- **Cursor** users get parity via the [Cursor Plugin](#cursor-plugin) — same six skills plus a Neo agent; project rules under `.cursor/rules/` still land in every neo session's context.
+- **Cursor** users get the same six capabilities via the [Cursor Plugin](#cursor-plugin), plus a Neo agent (see that section for what differs from Claude Code); project rules under `.cursor/rules/` still land in every neo session's context.
 - **Windsurf / Aider / Continue / Augment** users — the rules dirs you've curated land in every neo session's context.
 - **GitHub Copilot** users — `.github/copilot-instructions.md` is read on every invocation.
 - **Spec Kit** projects — your specs are folded into neo's reasoning context, no manual paste.

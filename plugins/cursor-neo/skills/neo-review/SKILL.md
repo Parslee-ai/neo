@@ -22,9 +22,7 @@ When the user invokes this skill (`/neo-review <file or module>`), do the follow
    Production, private, or customer code requires explicit authorization for
    that provider and scope; invoking the skill is not blanket consent.
 
-4. **Invoke Neo with a review-framed prompt.** Allow up to 5 minutes. Use
-   Cursor's Shell tool; before a call that needs network access, name the
-   provider and summarized data categories.
+4. **Invoke Neo with a review-framed prompt.** Allow up to 5 minutes. Run it with Cursor's Shell tool; before a call that needs network access, name the provider and summarized data.
 
    ```bash
    neo --json --no-scan --no-memory --mode advise <<'QUERY'
