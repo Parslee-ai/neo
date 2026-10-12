@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- **One embedding model per process** ([#211](https://github.com/Parslee-ai/neo/issues/211)). A reasoning run built the 614 MB embedding model twice: once for the history boost in file selection and again for the engine's memory, 0.3 s each. Every caller now shares one instance, which takes about 0.25 s off a run. The model is still about 1.3 GB resident; #211 tracks that.
+
 - **The `claude-code` provider runs plain, isolated inference** ([#260](https://github.com/Parslee-ai/neo/issues/260)).
   - **Isolated:** `claude -p` now starts with no tools, no MCP servers, no user or project settings or hooks, and no saved session. Before, a structured-output prompt was sometimes answered with a tool call that ran a command in the working tree, used up the single turn and exited 1. Every call also ran the user's hooks and left a session transcript on disk.
   - **Real errors:** a failure now shows the error the CLI reports on stdout (for example `error_max_turns: Reached maximum number of turns (1)`) instead of `exited with code 1:` with nothing after it. A result marked `is_error` fails even when the exit code is 0.
