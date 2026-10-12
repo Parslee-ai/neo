@@ -388,3 +388,39 @@ def test_an_observer_that_cannot_serve_still_clears_a_stale_socket(monkeypatch, 
     monkeypatch.setattr(store, "build_resilient_embedder", lambda **k: None)
     assert observer._start_embed_service() is None
     assert not sock.exists()
+
+
+# ------------------------------------------------- embed_query (neo recall)
+
+
+def test_embed_query_answers_from_the_server(server, sock):
+    vector = es.embed_query("q", MODEL, 2.0, path=sock)
+    assert vector.tolist() == expected(["q"])[0]
+
+
+def test_embed_query_never_waits_past_its_deadline(sock):
+    """`neo recall` runs on every prompt: a query queued behind the observer's
+    own 32k-char texts must give up, not wait the normal 90 s."""
+    def stall(conn):
+        time.sleep(3)
+
+    listener = _fake_server(sock, [_hello(), stall])
+    try:
+        started = time.monotonic()
+        assert es.embed_query("q", MODEL, 0.3, path=sock) is None
+        assert time.monotonic() - started < 1.5
+    finally:
+        listener.close()
+
+
+def test_embed_query_refuses_an_incompatible_server(sock):
+    listener = _fake_server(sock, [_hello(model="other")])
+    try:
+        assert es.embed_query("q", MODEL, 1.0, path=sock) is None
+    finally:
+        listener.close()
+
+
+def test_embed_query_records_no_metric_and_loads_nothing(server, sock, monkeypatch):
+    monkeypatch.setattr(es, "_record", lambda *a, **k: (_ for _ in ()).throw(AssertionError("metric")))
+    assert es.embed_query("q", MODEL, 2.0, path=sock) is not None

@@ -133,6 +133,27 @@ def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> 
 EFFECTIVENESS_EPSILON = 0.5
 
 
+def is_legacy_suggestion_fact(fact: "Fact") -> bool:
+    """The exact shape ``engine._store_reasoning`` minted for every feature
+    suggestion before episodes replaced immediate fact-writing (412a174):
+    kind DECISION, first tag ``feature``, subject ``feature: <prompt>``,
+    body ``Reasoning: ...``. A promoted fact always carries a
+    ``canonical_signature``, which that path never wrote, so no durable
+    lesson can match; nothing mints this shape any more.
+
+    `FactStore.retire_legacy_suggestion_facts` invalidates these on a cold
+    start; `neo recall`, which never initializes a store, filters them here.
+    """
+    return (
+        fact.is_valid
+        and fact.kind == FactKind.DECISION
+        and fact.tags[:1] == ["feature"]
+        and fact.subject.startswith("feature: ")
+        and fact.body.startswith("Reasoning: ")
+        and not fact.canonical_signature
+    )
+
+
 def update_effectiveness(fact: "Fact", *, outcome: str) -> None:
     """LessonL c/n update on a reuse outcome.
 

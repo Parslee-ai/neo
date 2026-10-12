@@ -3,17 +3,23 @@
 The Claude Code mod runs this on EVERY user prompt and hands the output to the
 model as additional context, so three rules decide its shape:
 
-1. **No model call, no model load.** Only the observer's resident embedder is
-   used (`neo.memory.embed_service`). If it does not answer, recall prints
-   nothing: loading the ~1.3 GB model per prompt is the cost the resident
-   embedder exists to remove.
-2. **Nothing is mutated.** The store is opened `read_only` without
-   `initialize()` (no ingestion, pruning or saves), and access is not stamped.
+1. **No model call, no model load, a hard deadline.** One request to the
+   observer's resident embedder (`embed_service.embed_query`): no retries, no
+   local fallback, `EMBED_DEADLINE_S` over the whole exchange. If it does not
+   answer in time, recall prints nothing: loading the ~1.3 GB model, or
+   queueing behind the observer's own sweep, per prompt is not affordable.
+2. **Nothing is written.** The fact files are read directly. Constructing a
+   `FactStore` is NOT read-only even with `read_only=True`: it creates
+   directories, migrates legacy file names and backs up a corrupt file, all
+   outside `save()`. Nothing here writes a metrics line either.
 3. **Only what the model does not already have.** Rule-file constraints, the
    host's own memory files and git history are already in its context; seed
    and community patterns are textbook; outcome logs and simulation episodes
-   are bookkeeping. Measured on this repo's store, 19 of 203 valid facts
-   survive, and they are the lessons mined from real sessions.
+   are bookkeeping. Legacy unverified suggestion facts and low-confidence
+   facts, which a store's cold start would retire or prune, are skipped here
+   because nothing here runs that cold start. Measured on this repo's store,
+   19 of 203 valid facts survive, and they are the lessons mined from real
+   sessions.
 
 It never fails the host: every error path prints nothing and exits 0.
 """
@@ -21,10 +27,12 @@ It never fails the host: every error path prints nothing and exits 0.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable, Optional
 
 # Below this cosine a fact is noise for the prompt. Calibrated on a live store
 # (jina-v2-base-code): relevant lessons scored 0.52-0.68 against prompts they
@@ -32,6 +40,9 @@ from pathlib import Path
 MIN_SIMILARITY = 0.45
 MAX_FACTS = 3
 MAX_BODY_CHARS = 400
+# The whole embedding exchange. A short query takes ~0.16 s on an idle server;
+# past this the observer is busy with its own sweep and we stay silent.
+EMBED_DEADLINE_S = 1.0
 
 # Provenance the model already has in context, or that carries no lesson.
 _REDUNDANT_TAGS = frozenset({
@@ -58,42 +69,68 @@ def _project_root(cwd: str) -> str:
     return cwd
 
 
-def _resident_embedder():
-    """The observer's embedder, or None. Never loads a model locally."""
+def _resident_embed(text: str):
     from neo.memory import embed_service
     from neo.memory.store import DEFAULT_EMBED_MODEL
 
-    return embed_service.connect(DEFAULT_EMBED_MODEL, local_factory=lambda: None)
+    return embed_service.embed_query(text, DEFAULT_EMBED_MODEL, EMBED_DEADLINE_S)
 
 
-def recall(prompt: str, cwd: str, embedder=None) -> str:
+def _load_facts(root: str) -> list:
+    """Global, org and project facts, parsed straight from disk."""
+    from neo.memory.models import Fact
+    from neo.memory.scope import _compute_legacy_project_id, detect_org_and_project
+
+    org_id, project_id = detect_org_and_project(root)
+    base = Path.home() / ".neo" / "facts"
+    paths = [base / "facts_global.json"]
+    if org_id != "unknown":
+        paths.append(base / f"facts_org_{org_id}.json")
+    if project_id:
+        project = base / f"facts_project_{project_id}.json"
+        if not project.exists():
+            project = base / f"facts_project_{_compute_legacy_project_id(root)}.json"
+        paths.append(project)
+    facts = []
+    for path in paths:
+        try:
+            records = json.loads(path.read_text()).get("facts", [])
+        except (OSError, ValueError, AttributeError):
+            continue
+        for record in records:
+            try:
+                facts.append(Fact.from_dict(record))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+    return facts
+
+
+def recall(prompt: str, cwd: str,
+           embed: Optional[Callable[[str], object]] = None) -> str:
     """Text block of relevant learned lessons, or "" when there are none."""
     import numpy as np
 
     from neo.math_utils import batched_cosine
-    from neo.memory.store import MAX_TEXT_LENGTH, FactStore
+    from neo.memory.models import is_legacy_suggestion_fact
+    from neo.memory.store import MAX_TEXT_LENGTH, STALE_MAX_CONFIDENCE
     from neo.text_budget import truncate_marked
 
     if not prompt.strip():
         return ""
-    embedder = embedder if embedder is not None else _resident_embedder()
-    if embedder is None:
+    vector = (embed or _resident_embed)(prompt[:MAX_TEXT_LENGTH])
+    if vector is None:
         return ""
-    vectors = list(embedder.embed([prompt[:MAX_TEXT_LENGTH]]))
-    if not vectors:
-        return ""
-    query = np.asarray(vectors[0], dtype=np.float32)
+    query = np.asarray(vector, dtype=np.float32)
 
-    store = FactStore(
-        codebase_root=_project_root(cwd), eager_init=False,
-        read_only=True, emit_metrics=False,
-    )
     candidates = [
-        fact for fact in store.entries
+        fact for fact in _load_facts(_project_root(cwd))
         if fact.is_valid
         and fact.embedding is not None
+        and np.shape(fact.embedding) == query.shape  # a foreign model's vector
+        and fact.metadata.confidence >= STALE_MAX_CONFIDENCE
         and fact.kind.value not in _REDUNDANT_KINDS
         and not _REDUNDANT_TAGS.intersection(fact.tags)
+        and not is_legacy_suggestion_fact(fact)
     ]
     if not candidates:
         return ""

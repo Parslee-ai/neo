@@ -24,16 +24,9 @@ def _unit(i: int) -> np.ndarray:
     return v
 
 
-class _Embedder:
+def _embed(table):
     """Maps known prompts to fixed vectors; everything else to axis 7."""
-
-    def __init__(self, table):
-        self.table = table
-        self.calls = 0
-
-    def embed(self, texts):
-        self.calls += 1
-        return iter([self.table.get(t, _unit(7)) for t in texts])
+    return lambda text: table.get(text, _unit(7))
 
 
 def _seed(root: Path, *facts: Fact) -> Path:
@@ -50,7 +43,7 @@ def _fact(subject, *, axis=0, kind=FactKind.PATTERN, tags=(), body="Do the caref
 
 def test_a_matching_learned_lesson_is_returned(tmp_path):
     _seed(tmp_path, _fact("Verify unrelated hook failures", tags=["transcript-derived"]))
-    text = recall("hook fails", str(tmp_path), embedder=_Embedder({"hook fails": _unit(0)}))
+    text = recall("hook fails", str(tmp_path), embed=_embed({"hook fails": _unit(0)}))
     assert text.startswith("Neo memory:")
     assert "- Verify unrelated hook failures [pattern, project]: Do the careful thing." in text
 
@@ -67,21 +60,21 @@ def test_what_the_model_already_has_is_never_returned(tmp_path):
         _fact("rule file line", kind=FactKind.CONSTRAINT),
         _fact("Simulation: trace", kind=FactKind.EPISODE),
     )
-    assert recall("q", str(tmp_path), embedder=_Embedder({"q": _unit(0)})) == ""
+    assert recall("q", str(tmp_path), embed=_embed({"q": _unit(0)})) == ""
 
 
 def test_an_unrelated_prompt_gets_nothing(tmp_path):
     _seed(tmp_path, _fact("lesson", axis=0))
     near_miss = _unit(0) * (MIN_SIMILARITY - 0.05) + _unit(1)
     near_miss /= np.linalg.norm(near_miss)
-    assert recall("q", str(tmp_path), embedder=_Embedder({"q": near_miss})) == ""
+    assert recall("q", str(tmp_path), embed=_embed({"q": near_miss})) == ""
 
 
 def test_at_most_three_lessons_best_first(tmp_path):
     lessons = [_fact(f"lesson {i}", axis=0) for i in range(5)]
     _seed(tmp_path, _fact("best", axis=1), *lessons)
     query = 0.8 * _unit(1) + 0.6 * _unit(0)  # best 0.8, the rest 0.6
-    text = recall("q", str(tmp_path), embedder=_Embedder({"q": query / np.linalg.norm(query)}))
+    text = recall("q", str(tmp_path), embed=_embed({"q": query / np.linalg.norm(query)}))
     rows = [line for line in text.splitlines() if line.startswith("- ")]
     assert len(rows) == 3
     assert rows[0].startswith("- best ")
@@ -91,7 +84,7 @@ def test_without_the_resident_embedder_it_never_loads_a_model(tmp_path, monkeypa
     from neo.memory import embed_service, store
 
     _seed(tmp_path, _fact("lesson"))
-    monkeypatch.setattr(embed_service, "connect", lambda *a, **k: None)
+    monkeypatch.setattr(embed_service, "socket_path", lambda: tmp_path / "absent.sock")
 
     def _loaded(*a, **k):
         raise AssertionError("recall must never build the 1.3 GB model locally")
@@ -100,21 +93,47 @@ def test_without_the_resident_embedder_it_never_loads_a_model(tmp_path, monkeypa
     assert recall("anything", str(tmp_path)) == ""
 
 
-def test_the_fallback_it_hands_the_resident_embedder_loads_nothing(monkeypatch):
-    from neo.memory import embed_service
-
-    seen = {}
-    monkeypatch.setattr(embed_service, "connect",
-                        lambda model, local_factory: seen.setdefault("factory", local_factory))
-    recall_mod._resident_embedder()
-    assert seen["factory"]() is None
+def _tree(root: Path) -> dict:
+    return {
+        str(p.relative_to(root)): (p.stat().st_mtime_ns, p.read_bytes() if p.is_file() else b"")
+        for p in sorted(root.rglob("*"))
+    }
 
 
-def test_the_store_is_not_modified(tmp_path):
-    path = _seed(tmp_path, _fact("lesson", tags=["transcript-derived"]))
-    before = path.read_bytes(), path.stat().st_mtime_ns
-    recall("q", str(tmp_path), embedder=_Embedder({"q": _unit(0)}))
-    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+def test_nothing_under_the_neo_home_is_written(tmp_path):
+    """Constructing a FactStore writes outside save() (mkdir, legacy-name
+    migration, corrupt-file backup), so recall must not construct one; and
+    it must not append a metrics line per prompt."""
+    _seed(tmp_path, _fact("lesson", tags=["transcript-derived"]))
+    neo_home = Path.home() / ".neo"
+    (neo_home / "facts" / "facts_global.json").write_text("{not json")
+    before = _tree(neo_home)
+    recall("q", str(tmp_path), embed=_embed({"q": _unit(0)}))
+    assert _tree(neo_home) == before
+
+
+def test_legacy_suggestion_facts_are_not_injected(tmp_path):
+    """A cold start would retire these; recall never runs one."""
+    legacy = Fact(subject="feature: add caching", body="Reasoning: because",
+                  kind=FactKind.DECISION, scope=FactScope.PROJECT,
+                  tags=["feature"], embedding=_unit(0))
+    _seed(tmp_path, legacy)
+    assert recall("q", str(tmp_path), embed=_embed({"q": _unit(0)})) == ""
+
+
+def test_a_fact_from_another_embedding_model_is_skipped_not_fatal(tmp_path):
+    foreign = _fact("foreign", axis=0)
+    foreign.embedding = np.ones(DIM * 2, dtype=np.float32)
+    _seed(tmp_path, foreign, _fact("lesson", axis=0))
+    text = recall("q", str(tmp_path), embed=_embed({"q": _unit(0)}))
+    assert "- lesson " in text and "foreign" not in text
+
+
+def test_low_confidence_facts_are_not_injected(tmp_path):
+    weak = _fact("weak")
+    weak.metadata.confidence = 0.2
+    _seed(tmp_path, weak)
+    assert recall("q", str(tmp_path), embed=_embed({"q": _unit(0)})) == ""
 
 
 def test_the_command_never_fails_the_host(monkeypatch, capsys):

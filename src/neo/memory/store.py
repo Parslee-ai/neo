@@ -44,6 +44,7 @@ from neo.memory.models import (
     FactMetadata,
     FactScope,
     Provenance,
+    is_legacy_suggestion_fact,
     rank_score,
     update_effectiveness,
     update_recall,
@@ -3215,21 +3216,8 @@ class FactStore:
 
     @staticmethod
     def _is_legacy_suggestion_fact(fact: Fact) -> bool:
-        """The exact shape ``engine._store_reasoning`` minted for every feature
-        suggestion before episodes replaced immediate fact-writing (412a174):
-        kind DECISION, first tag ``feature``, subject ``feature: <prompt>``,
-        body ``Reasoning: ...``. A promoted fact always carries a
-        ``canonical_signature``, which that path never wrote, so no durable
-        lesson can match; nothing mints this shape any more.
-        """
-        return (
-            fact.is_valid
-            and fact.kind == FactKind.DECISION
-            and fact.tags[:1] == ["feature"]
-            and fact.subject.startswith("feature: ")
-            and fact.body.startswith("Reasoning: ")
-            and not fact.canonical_signature
-        )
+        """See `models.is_legacy_suggestion_fact` (shared with `neo recall`)."""
+        return is_legacy_suggestion_fact(fact)
 
     def retire_legacy_suggestion_facts(self, save: bool = True) -> int:
         """Invalidate legacy per-suggestion facts.

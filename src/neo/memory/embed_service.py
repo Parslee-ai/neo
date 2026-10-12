@@ -346,6 +346,29 @@ def connect(model_name: str, local_factory: Callable[[], object],
     return RemoteEmbedder(path, model_name, dim, local_factory)
 
 
+
+def embed_query(text: str, model_name: str, deadline_s: float,
+                path: Optional[Path] = None) -> Optional[np.ndarray]:
+    """One short text from a live, compatible server within `deadline_s`, or
+    None. For callers on a latency budget (`neo recall`, on every prompt):
+    no retries, no local fallback, no metrics line, never raises."""
+    path = path or socket_path()
+    if not supported() or not path.exists():
+        return None
+    end = time.monotonic() + deadline_s
+    try:
+        hello = _call(path, {"v": PROTOCOL_VERSION, "op": "hello"},
+                      max(0.0, end - time.monotonic()))
+        if hello.get("model") != model_name or hello.get("libs") != library_versions():
+            return None
+        dim = int(hello["dim"])
+        reply = _call(path, {"v": PROTOCOL_VERSION, "op": "embed", "model": model_name,
+                             "texts": [text[:MAX_TEXT_CHARS]]},
+                      max(0.0, end - time.monotonic()))
+        return _vectors(reply, 1, dim)[0]
+    except Exception:
+        return None
+
 # ------------------------------------------------------------------ server
 
 
