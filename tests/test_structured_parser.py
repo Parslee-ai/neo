@@ -5,6 +5,7 @@ Fuzzing tests for structured parser.
 Tests parser robustness against malformed inputs.
 """
 
+import pytest
 
 from neo.structured_parser import (
     parse_plan_steps,
@@ -82,16 +83,78 @@ This plan addresses the constraints by..."""
 
 
 def test_markdown_wrapped():
-    """Test response wrapped in markdown code fence."""
+    """A fence standing in for the sentinels is markdown wrapping."""
     response = """```json
-<<<NEO:SCHEMA=v3:KIND=plan>>>
 [{"id": "ps_1", "description": "test", "rationale": "reason", "dependencies": [], "schema_version": "3"}]
-<<<END:plan>>>
 ```"""
 
     result = parse_plan_steps(response)
     assert not result.success
     assert result.error_code == ParseErrorCode.MARKDOWN_WRAPPED
+
+
+_PLAN_JSON = '[{"id": "ps_1", "description": "test", "rationale": "reason", "dependencies": [], "schema_version": "3"}]'
+
+
+def test_fence_around_the_sentinels_is_tolerated():
+    """The block is intact, so a fence around it costs no repair call."""
+    response = f"```json\n<<<NEO:SCHEMA=v3:KIND=plan>>>\n{_PLAN_JSON}\n<<<END:plan>>>\n```"
+
+    result = parse_plan_steps(response)
+    assert result.success
+    assert result.data[0]["id"] == "ps_1"
+
+
+def test_fence_around_the_block_inside_the_sentinels_is_unwrapped():
+    response = f"<<<NEO:SCHEMA=v3:KIND=plan>>>\n```json\n{_PLAN_JSON}\n```\n<<<END:plan>>>"
+
+    result = parse_plan_steps(response)
+    assert result.success
+    assert result.data[0]["id"] == "ps_1"
+
+
+@pytest.mark.parametrize("block", [
+    "```json\n[1]\n<<<END:plan>>>\n```",  # fence closes past the end sentinel
+    "```json [1]```\n<<<END:plan>>>",       # fence on one line
+    "```\n```\n<<<END:plan>>>",             # block is nothing but a fence
+    "~~~json\n[1]\n<<<END:plan>>>",         # tilde fence
+])
+def test_an_unstrippable_fence_stays_markdown_wrapped(block):
+    """Repairable, never misread as (unrecoverable) truncation."""
+    result = parse_plan_steps("<<<NEO:SCHEMA=v3:KIND=plan>>>\n" + block)
+    assert result.error_code == ParseErrorCode.MARKDOWN_WRAPPED
+
+
+@pytest.mark.parametrize("response", [
+    f"```javascript\n<<<NEO:SCHEMA=v3:KIND=plan>>>\n{_PLAN_JSON}\n<<<END:plan>>>\n```",
+    f"<<<NEO:SCHEMA=v3:KIND=plan>>>\n````json\n{_PLAN_JSON}\n````\n<<<END:plan>>>",
+    f"<<<NEO:SCHEMA=v3:KIND=plan>>>\n~~~json\n{_PLAN_JSON}\n~~~\n<<<END:plan>>>",
+])
+def test_any_complete_fence_wrapper_parses(response):
+    """The wrapper's info string or delimiter length does not decide the outcome."""
+    result = parse_plan_steps(response)
+    assert result.success, result.error_code
+    assert result.data[0]["id"] == "ps_1"
+
+
+def test_mismatched_fence_lengths_are_not_partially_stripped():
+    response = f"<<<NEO:SCHEMA=v3:KIND=plan>>>\n````json\n{_PLAN_JSON}\n```\n<<<END:plan>>>"
+    assert parse_plan_steps(response).error_code == ParseErrorCode.MARKDOWN_WRAPPED
+
+
+def test_fence_inside_a_json_string_is_content():
+    """#292: a quoted Markdown plan or a .md diff carries fences in a string."""
+    description = "Config:\\n```json\\n{}\\n```\\nthen review."
+    response = (
+        "<<<NEO:SCHEMA=v3:KIND=plan>>>\n"
+        f'[{{"id": "ps_1", "description": "{description}", "rationale": "reason", '
+        '"dependencies": [], "schema_version": "3"}]\n'
+        "<<<END:plan>>>"
+    )
+
+    result = parse_plan_steps(response)
+    assert result.success, result.error_message
+    assert "```json" in result.data[0]["description"]
 
 
 def test_wrong_kind_sentinel():

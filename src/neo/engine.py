@@ -34,6 +34,7 @@ from neo.events import (
     safe_emit,
 )
 from neo.text_budget import apportion, elide_middle, shown_of, truncate_marked
+from neo.schemas import STRUCTURED_STOP
 from neo.models import (
     CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE,
     CONFIDENCE_BASIS_SUGGESTIONS,
@@ -2092,7 +2093,7 @@ class NeoEngine:
 
         response = self.lm.generate(
             messages,
-            stop=["</neo>", "```"],
+            stop=list(STRUCTURED_STOP),
             max_tokens=2048,
             temperature=0.3,
         )
@@ -2134,7 +2135,7 @@ class NeoEngine:
 
         response = self.lm.generate(
             messages,
-            stop=["</neo>", "```"],
+            stop=list(STRUCTURED_STOP),
             max_tokens=3072,
             temperature=0.2,
         )
@@ -2162,7 +2163,7 @@ class NeoEngine:
 
         response = self.lm.generate(
             messages,
-            stop=["</neo>", "```"],
+            stop=list(STRUCTURED_STOP),
             max_tokens=4096,
             temperature=0.2,
         )
@@ -4805,7 +4806,7 @@ Generate unified diff patches. Keep changes minimal and isolated."""
             provider=self.lm.provider if hasattr(self.lm, 'provider') else "unknown",
             temperature=0.3,
             max_tokens=2048,
-            stop_sequences=["</neo>", "```"],
+            stop_sequences=list(STRUCTURED_STOP),
             system_prompt=self._get_planning_system_prompt()[:200],
             user_prompt=original_prompt[:200] if original_prompt else "",
             response=response,
