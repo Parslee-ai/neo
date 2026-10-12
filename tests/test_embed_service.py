@@ -1,5 +1,6 @@
 """The resident embedder (#211): a neo run borrows the observer's model, and
-every way that can fail ends with the run loading its own."""
+every way that can fail ends with the run loading its own, without paying
+that 1.3 GB where waiting would have worked."""
 
 import json
 import shutil
@@ -14,9 +15,9 @@ import numpy as np
 import pytest
 
 import neo.memory.store as store
-from neo.memory import embed_service
+from neo.memory import embed_service as es
 
-pytestmark = pytest.mark.skipif(not embed_service.supported(), reason="POSIX only")
+pytestmark = pytest.mark.skipif(not es.supported(), reason="POSIX only")
 
 MODEL = store.DEFAULT_EMBED_MODEL
 
@@ -24,14 +25,21 @@ MODEL = store.DEFAULT_EMBED_MODEL
 class Fake:
     """Deterministic 4-dim 'model': the vector is the text's length and bytes."""
 
-    def __init__(self):
-        self.calls = 0
+    def __init__(self, delay: float = 0.0):
+        self.batches: list[int] = []
+        self.delay = delay
 
     def embed(self, texts):
-        self.calls += 1
+        texts = list(texts)
+        self.batches.append(len(texts))
+        time.sleep(self.delay)
         for t in texts:
             b = t.encode()[:3].ljust(3, b"\0")
             yield np.array([len(t), b[0], b[1], b[2]], dtype=np.float32)
+
+
+def expected(texts):
+    return [v.tolist() for v in Fake().embed(texts)]
 
 
 @pytest.fixture
@@ -45,7 +53,7 @@ def sock():
 @pytest.fixture
 def server(sock):
     fake = Fake()
-    srv = embed_service.serve(fake, MODEL, sock)
+    srv = es.serve(fake, MODEL, sock)
     assert srv is not None
     yield srv, fake
     srv.close()
@@ -55,22 +63,66 @@ def _local_never():
     raise AssertionError("the local model must not load while the server is up")
 
 
+def _fake_server(sock, replies, backlog=8):
+    """A hand-rolled peer answering each connection with the next reply (bytes,
+    or a callable given the connection)."""
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(sock))
+    listener.listen(backlog)
+
+    def run():
+        for reply in replies:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                with conn:
+                    conn.recv(65536)
+                    reply(conn) if callable(reply) else conn.sendall(reply)
+            except OSError:
+                pass  # the client gave up first, which is what some tests check
+
+    threading.Thread(target=run, daemon=True).start()
+    return listener
+
+
+def _hello(**override) -> bytes:
+    body = {"v": 1, "model": MODEL, "dim": 4, "libs": es.library_versions(), **override}
+    return json.dumps({k: v for k, v in body.items() if v is not ...}).encode() + b"\n"
+
+
+# ------------------------------------------------------------ the happy path
+
+
 def test_a_run_borrows_the_resident_model(server, sock):
-    _, fake = server
-    remote = embed_service.connect(MODEL, _local_never, sock)
+    remote = es.connect(MODEL, _local_never, sock)
     assert remote is not None and remote.dim == 4
-    got = list(remote.embed(["hello", "ab"]))
-    assert [v.tolist() for v in got] == [v.tolist() for v in Fake().embed(["hello", "ab"])]
+    assert [v.tolist() for v in remote.embed(["hello", "ab"])] == expected(["hello", "ab"])
 
 
 def test_build_resilient_embedder_uses_the_server_and_never_builds(server, sock, monkeypatch):
     monkeypatch.setattr(store, "FASTEMBED_AVAILABLE", True)
     monkeypatch.setattr(store, "_EMBEDDERS", {})
-    monkeypatch.setattr(embed_service, "socket_path", lambda: sock)
+    monkeypatch.setattr(es, "socket_path", lambda: sock)
     monkeypatch.setattr(store, "_build_embedder", lambda *a: _local_never())
     emb = store.build_resilient_embedder(cache_dir=sock.parent)
-    assert isinstance(emb, embed_service.RemoteEmbedder)
+    assert isinstance(emb, es.RemoteEmbedder)
     assert list(emb.embed(["x"]))[0][0] == 1.0
+
+
+def test_large_requests_are_batched(server, sock):
+    _, fake = server
+    texts = [f"t{i}" for i in range(200)]
+    remote = es.connect(MODEL, _local_never, sock)
+    assert [v.tolist() for v in remote.embed(texts)] == expected(texts)
+    assert max(fake.batches[1:]) <= es.BATCH_TEXTS  # [0] is serve()'s probe
+
+
+def test_rows_are_writable_like_fastembeds(server, sock):
+    row = next(es.connect(MODEL, _local_never, sock).embed(["abc"]))
+    row /= 2  # a caller normalizing in place
 
 
 def test_the_socket_is_private(server, sock):
@@ -78,104 +130,189 @@ def test_the_socket_is_private(server, sock):
     assert stat.S_IMODE(sock.parent.stat().st_mode) == 0o700
 
 
+def test_a_burst_of_runs_all_connect(server, sock, monkeypatch):
+    monkeypatch.setattr(es, "RECOVER_S", 0)  # the backlog alone, no retry to mask it
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(
+        es.connect(MODEL, _local_never, sock) is not None)) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert results == [True] * 40
+
+
+def test_a_recycle_mid_run_is_waited_out_not_paid_for(server, sock):
+    srv, _ = server
+    remote = es.connect(MODEL, _local_never, sock)
+    srv.close()  # the observer re-execs...
+    replacement = []
+    threading.Timer(1.0, lambda: replacement.append(es.serve(Fake(), MODEL, sock))).start()
+    try:
+        assert list(remote.embed(["hi"]))[0][0] == 2.0  # ...and is back in ~1 s
+    finally:
+        time.sleep(1.2)
+        for s in replacement:
+            s and s.close()
+
+
+# ------------------------------------------------------------ no server to use
+
+
 def test_no_socket_means_no_remote(sock):
-    assert embed_service.connect(MODEL, _local_never, sock) is None
+    assert es.connect(MODEL, _local_never, sock) is None
 
 
 def test_a_server_for_another_model_is_not_used(sock):
-    srv = embed_service.serve(Fake(), "other/model", sock)
+    srv = es.serve(Fake(), "other/model", sock)
     try:
-        assert embed_service.connect(MODEL, _local_never, sock) is None
+        assert es.connect(MODEL, _local_never, sock) is None
     finally:
         srv.close()
 
 
-def test_a_stale_socket_is_not_used_and_a_new_server_replaces_it(sock):
+@pytest.mark.parametrize("hello", [
+    _hello(dim=...), _hello(dim="x"), _hello(dim=0), _hello(dim=True),
+    _hello(libs={"fastembed": "0.0.1", "onnxruntime": "0.0.1"}),
+    b'{"v": 1}\n', b"not json\n", b'{"v": 2, "model": "m", "dim": 4}\n',
+])
+def test_an_unusable_hello_means_no_remote_never_an_exception(sock, hello):
+    listener = _fake_server(sock, [hello])
+    try:
+        assert es.connect(MODEL, _local_never, sock) is None
+    finally:
+        listener.close()
+
+
+def test_a_stale_socket_is_not_used_and_a_new_server_replaces_it(sock, monkeypatch):
+    monkeypatch.setattr(es, "RECOVER_S", 0.3)
     sock.parent.mkdir(parents=True)
     dead = socket.socket(socket.AF_UNIX)
     dead.bind(str(sock))
     dead.close()  # file left behind, nobody listening
-    assert embed_service.connect(MODEL, _local_never, sock) is None
-    srv = embed_service.serve(Fake(), MODEL, sock)
+    assert es.connect(MODEL, _local_never, sock) is None
+    srv = es.serve(Fake(), MODEL, sock)
     assert srv is not None
     srv.close()
     assert not sock.exists()
 
 
-def test_a_hung_server_is_abandoned_quickly(sock):
-    sock.parent.mkdir(parents=True)
-    hung = socket.socket(socket.AF_UNIX)
-    hung.bind(str(sock))
-    hung.listen(1)  # accepts, never answers
+def test_a_silent_server_is_abandoned_after_one_hello_timeout(sock):
+    listener = _fake_server(sock, [lambda conn: time.sleep(es.HELLO_TIMEOUT_S + 1)])
     try:
         start = time.time()
-        assert embed_service.connect(MODEL, _local_never, sock) is None
-        assert time.time() - start < embed_service.HELLO_TIMEOUT_S + 0.5
+        assert es.connect(MODEL, _local_never, sock) is None
+        assert time.time() - start < es.HELLO_TIMEOUT_S + 0.5
     finally:
-        hung.close()
+        listener.close()
+
+
+def test_a_trickling_server_cannot_stretch_the_hello_deadline(sock):
+    def trickle(conn):
+        for _ in range(20):
+            conn.sendall(b" ")
+            time.sleep(0.3)
+
+    listener = _fake_server(sock, [trickle])
+    try:
+        start = time.time()
+        assert es.connect(MODEL, _local_never, sock) is None
+        assert time.time() - start < es.HELLO_TIMEOUT_S + 0.5
+    finally:
+        listener.close()
 
 
 def test_a_second_server_does_not_steal_a_live_socket(server, sock):
-    assert embed_service.serve(Fake(), MODEL, sock) is None
-    assert embed_service.connect(MODEL, _local_never, sock) is not None
+    assert es.serve(Fake(), MODEL, sock) is None
+    assert es.connect(MODEL, _local_never, sock) is not None
 
 
-def test_a_server_gone_mid_run_falls_back_to_a_local_model_once(server, sock):
+# ------------------------------------------------------------ falling back
+
+
+def test_a_server_gone_for_good_falls_back_to_a_local_model_once(server, sock, monkeypatch):
+    monkeypatch.setattr(es, "RECOVER_S", 0.3)
     srv, _ = server
     built = []
-
-    def local():
-        built.append(1)
-        return Fake()
-
-    remote = embed_service.connect(MODEL, local, sock)
-    srv.close()  # the observer recycled
+    remote = es.connect(MODEL, lambda: built.append(1) or Fake(), sock)
+    srv.close()
     assert list(remote.embed(["hi"]))[0][0] == 2.0
     assert list(remote.embed(["hey"]))[0][0] == 3.0
     assert built == [1]
 
 
-def test_a_malformed_reply_falls_back(sock):
-    sock.parent.mkdir(parents=True)
-    liar = socket.socket(socket.AF_UNIX)
-    liar.bind(str(sock))
-    liar.listen(4)
+def test_a_failed_local_load_is_tried_once_not_per_call(server, sock, monkeypatch):
+    """A stale cache is healed by deleting and re-downloading it; doing that on
+    every embed call (the first cut did) wipes the observer's cache too."""
+    monkeypatch.setattr(es, "RECOVER_S", 0.3)
+    srv, _ = server
+    attempts = []
+    remote = es.connect(MODEL, lambda: attempts.append(1), sock)
+    srv.close()
+    for text in ("a", "b", "c"):
+        assert list(remote.embed([text])) == []
+    assert attempts == [1]
 
-    def answer():
-        for reply in (b'{"v": 1, "model": "%s", "dim": 4}\n' % MODEL.encode(),
-                      b'{"v": 1, "dim": 4, "n": 1, "vectors": "AAAA"}\n'):
-            conn, _ = liar.accept()
-            conn.recv(65536)
-            conn.sendall(reply)
-            conn.close()
 
-    t = threading.Thread(target=answer, daemon=True)
-    t.start()
-    remote = embed_service.connect(MODEL, Fake, sock)
-    assert remote is not None
-    assert list(remote.embed(["hi"]))[0][0] == 2.0  # local, after a short payload
-    t.join(2)
-    liar.close()
+def test_a_slow_embed_times_out_and_falls_back(sock, monkeypatch):
+    monkeypatch.setattr(es, "EMBED_TIMEOUT_S", 0.5)
+    srv = es.serve(Fake(), MODEL, sock)
+    try:
+        remote = es.connect(MODEL, Fake, sock)
+        srv._server.embedder.delay = 1.5
+        start = time.time()
+        assert list(remote.embed(["hi"]))[0][0] == 2.0
+        assert time.time() - start < 1.5
+    finally:
+        srv.close()
+
+
+@pytest.mark.parametrize("reply", [
+    b'{"v": 1, "dim": 4, "n": 1, "vectors": "AAAA"}\n',  # short payload
+    b'{"v": 1, "dim": 4, "n": 1, "vect',                  # half a reply, then close
+    b"",                                                   # closed without a word
+])
+def test_a_broken_embed_reply_falls_back(sock, monkeypatch, reply):
+    monkeypatch.setattr(es, "RECOVER_S", 0.3)
+    listener = _fake_server(sock, [_hello()] + [reply] * 10)
+    try:
+        remote = es.connect(MODEL, Fake, sock)
+        assert remote is not None
+        assert list(remote.embed(["hi"]))[0][0] == 2.0
+    finally:
+        listener.close()
 
 
 def test_a_server_never_borrows_from_itself(monkeypatch, sock, server):
     monkeypatch.setattr(store, "FASTEMBED_AVAILABLE", True)
     monkeypatch.setattr(store, "_EMBEDDERS", {})
-    monkeypatch.setattr(embed_service, "socket_path", lambda: sock)
-    monkeypatch.setattr(embed_service, "_server_process", True)
+    monkeypatch.setattr(es, "socket_path", lambda: sock)
+    monkeypatch.setattr(es, "_server_process", True)
     monkeypatch.setattr(store, "_build_embedder", lambda *a: Fake())
     assert isinstance(store.build_resilient_embedder(cache_dir=sock.parent), store._Serialized)
 
 
-def test_wire_errors_are_reported_not_raised(server, sock):
+# ------------------------------------------------------------ the server's own guards
+
+
+def _raw(sock, request: dict) -> dict:
     with socket.socket(socket.AF_UNIX) as s:
         s.connect(str(sock))
-        s.sendall(json.dumps({"v": 1, "op": "embed", "model": "nope", "texts": []}).encode() + b"\n")
-        reply = json.loads(s.makefile().readline())
-    assert "error" in reply and "embeds with" in reply["error"]
+        s.sendall(json.dumps(request).encode() + b"\n")
+        return json.loads(s.makefile().readline())
+
+
+def test_wire_errors_are_reported_not_raised(server, sock):
+    assert "embeds with" in _raw(sock, {"v": 1, "op": "embed", "model": "nope", "texts": []})["error"]
+
+
+def test_an_oversized_request_is_refused(server, sock):
+    reply = _raw(sock, {"v": 1, "op": "embed", "model": MODEL,
+                        "texts": ["x"] * (es.MAX_TEXTS + 1)})
+    assert "over" in reply["error"]
 
 
 def test_tests_cannot_reach_the_real_daemon():
     from tests.conftest import REAL_HOME
 
-    assert not embed_service.socket_path().is_relative_to(REAL_HOME / ".neo")
+    assert not es.socket_path().is_relative_to(REAL_HOME / ".neo")

@@ -9,18 +9,35 @@ the model and serves embeddings over a Unix socket at
 of loading its own.
 
 The fallback is the product, not the daemon. No socket, a stale socket, a
-server for another model or protocol, a hung server, a malformed reply, a
-server that went away mid-run (the observer re-execs to bound its RSS): every
-one of these ends with the run loading the model itself, exactly as it did
-before this module existed. Only a socket that exists and then fails is worth
-a warning; no daemon at all is the ordinary case and stays quiet.
+server for another model, protocol or library version, a hung server, a
+malformed reply: every one of these ends with the run loading the model
+itself, exactly as it did before this module existed. Loading locally costs
+1.3 GB, so the client prefers waiting to falling back where waiting can work:
+
+- requests are split into batches (`BATCH_TEXTS`), so no request holds the
+  server's model for long and no reply is large;
+- a deadline covers a whole request, generous because a request may queue
+  behind other clients and the observer's own sweep, which share one model;
+- a transport failure (refused, gone, reset: an observer recycle, ~2 s of exec
+  plus model load) is retried until `RECOVER_S` has passed before the run
+  gives up on the server.
+
+Once a process has loaded its own model it keeps it: dropping an ONNX session
+does not reliably return memory to the OS, so switching back would cost a
+reconnect and save nothing. A failed local load is remembered too, so a broken
+cache is healed (deleted and re-downloaded) once per process, not per call.
 
 Wire format: one JSON object per line, one request per connection.
 
-- ``{"v": 1, "op": "hello"}`` -> ``{"v": 1, "model": <name>, "dim": <int>}``
+- ``{"v": 1, "op": "hello"}`` ->
+  ``{"v": 1, "model": <name>, "dim": <int>, "libs": {<package>: <version>}}``
 - ``{"v": 1, "op": "embed", "model": <name>, "texts": [...]}`` ->
   ``{"v": 1, "dim": <int>, "n": <int>, "vectors": <base64 float32, row-major>}``
 - any failure -> ``{"v": 1, "error": <message>}``
+
+`libs` must match the client's installed versions exactly: a different
+fastembed or onnxruntime may preprocess or pool differently, and query vectors
+that drift from the stored ones fail retrieval with no error anywhere.
 
 POSIX only: on Windows there is no server and every run loads locally.
 """
@@ -28,12 +45,14 @@ POSIX only: on Windows there is no server and every run loads locally.
 from __future__ import annotations
 
 import base64
+import importlib.metadata
 import json
 import logging
 import os
 import socket
 import socketserver
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -42,12 +61,23 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
-# A hello must answer at once; anything slower is a server not worth waiting on.
-HELLO_TIMEOUT_S = 0.5
-# Embedding is ~20 ms a query; the allowance grows with the batch.
-EMBED_TIMEOUT_BASE_S = 5.0
-EMBED_TIMEOUT_PER_TEXT_S = 0.05
-MAX_LINE_BYTES = 64 * 1024 * 1024
+HELLO_TIMEOUT_S = 2.0
+# A request may wait behind other clients' batches and the sweep: the deadline
+# is mostly queueing allowance, not compute (a batch computes in well under it).
+EMBED_TIMEOUT_S = 30.0
+# How long a transport failure is retried before the run loads its own model.
+# An observer recycle is exec plus a ~0.3 s model load from a warm cache.
+RECOVER_S = 5.0
+RETRY_PAUSE_S = 0.25
+BATCH_TEXTS = 64
+BATCH_CHARS = 512 * 1024
+# Server-side caps: a client batches well below them, so hitting one means a
+# client that does not, and it is refused rather than allowed to hold the model.
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_TEXTS = 256
+MAX_REPLY_BYTES = 64 * 1024 * 1024
+SERVER_READ_TIMEOUT_S = 10.0
+LIB_PACKAGES = ("fastembed", "onnxruntime")
 
 _server_process = False
 
@@ -73,25 +103,68 @@ def is_server_process() -> bool:
     return _server_process
 
 
+def library_versions() -> dict:
+    versions = {}
+    for package in LIB_PACKAGES:
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def _record(source: str, **fields) -> None:
+    """Where this process's embedder came from, so the memory win is a
+    recorded fact rather than an inference."""
+    try:
+        from neo.memory.metrics import record
+        record("embedder_source", source=source, **fields)
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------------ client
 
 
+class _Transport(Exception):
+    """The server could not be reached or went away mid-request. Worth
+    retrying: this is what an observer recycle looks like from outside."""
+
+
 def _call(path: Path, request: dict, timeout: float) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        sock.connect(str(path))
-        sock.sendall(json.dumps(request).encode() + b"\n")
-        chunks, size = [], 0
-        while True:
-            chunk = sock.recv(1 << 16)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > MAX_LINE_BYTES:
-                raise ValueError("reply too large")
-            if chunk.endswith(b"\n"):
-                break
+    """One request, bounded by a deadline over the whole exchange (a peer that
+    trickles bytes cannot stretch a per-recv timeout indefinitely)."""
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("deadline passed")
+        return left
+
+    payload = json.dumps(request).encode() + b"\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(remaining())
+            sock.connect(str(path))
+            sock.settimeout(remaining())
+            sock.sendall(payload)
+            chunks, size = [], 0
+            while True:
+                sock.settimeout(remaining())
+                chunk = sock.recv(1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_REPLY_BYTES:
+                    raise ValueError("reply too large")
+                if chunk.endswith(b"\n"):
+                    break
+    except (FileNotFoundError, ConnectionError) as e:
+        raise _Transport(f"{type(e).__name__}: {e}") from e
+    if not chunks:
+        raise _Transport("connection closed before a reply")
     reply = json.loads(b"".join(chunks))
     if not isinstance(reply, dict) or reply.get("v") != PROTOCOL_VERSION:
         raise ValueError(f"unexpected reply {str(reply)[:80]!r}")
@@ -100,88 +173,155 @@ def _call(path: Path, request: dict, timeout: float) -> dict:
     return reply
 
 
-def _vectors(reply: dict, expected: int) -> np.ndarray:
-    dim, n = int(reply["dim"]), int(reply["n"])
-    if n != expected:
-        raise ValueError(f"asked for {expected} vectors, got {n}")
+def _vectors(reply: dict, expected: int, dim: int) -> list:
+    n = int(reply["n"])
+    if n != expected or int(reply["dim"]) != dim:
+        raise ValueError(f"asked for {expected}x{dim} vectors, got {n}x{reply['dim']}")
     data = np.frombuffer(base64.b64decode(reply["vectors"]), dtype=np.float32)
     if data.size != n * dim:
         raise ValueError("vector payload does not match its shape")
-    return data.reshape(n, dim)
+    # Writable rows, like fastembed's own: a caller normalizing in place must
+    # not trip over a read-only buffer.
+    return list(data.reshape(n, dim).copy())
+
+
+def _batches(texts: list) -> Iterable[list]:
+    batch, chars = [], 0
+    for text in texts:
+        if batch and (len(batch) >= BATCH_TEXTS or chars + len(text) > BATCH_CHARS):
+            yield batch
+            batch, chars = [], 0
+        batch.append(text)
+        chars += len(text)
+    if batch:
+        yield batch
 
 
 class RemoteEmbedder:
     """Drop-in for a fastembed ``TextEmbedding``: callers use only
-    ``embed(texts)``. Falls back to ``local_factory()`` for the rest of the
-    process on the first failure, so a dead server is tried once, not on
-    every call."""
+    ``embed(texts)``. See the module docstring for when it waits, when it
+    falls back, and why a fallback is final for the process."""
 
     def __init__(self, path: Path, model_name: str, dim: int,
                  local_factory: Callable[[], object]):
         self.path, self.model_name, self.dim = path, model_name, dim
         self._local_factory = local_factory
         self._local: Optional[object] = None
+        self._local_failed = False
         self._lock = threading.Lock()
 
     def embed(self, texts: Iterable[str]):
         texts = list(texts)
-        if self._local is None:
+        if self._local is None and not self._local_failed:
             try:
-                timeout = EMBED_TIMEOUT_BASE_S + EMBED_TIMEOUT_PER_TEXT_S * len(texts)
-                reply = _call(self.path, {"v": PROTOCOL_VERSION, "op": "embed",
-                                          "model": self.model_name, "texts": texts},
-                              timeout)
-                return iter(list(_vectors(reply, len(texts))))
+                return iter(self._remote(texts))
             except Exception as e:
-                with self._lock:
-                    if self._local is None:
-                        logger.warning(
-                            "Resident embedder at %s failed (%s: %s); loading the "
-                            "model in this process", self.path, type(e).__name__, e)
-                        self._local = self._local_factory()
-        if self._local is None:
-            raise RuntimeError("no embedding model available")
-        return self._local.embed(texts)
+                self._fall_back(e)
+        if self._local is not None:
+            return self._local.embed(texts)
+        return iter(())  # no model anywhere: callers treat this as "no embedding"
+
+    def _remote(self, texts: list) -> list:
+        vectors: list = []
+        for batch in _batches(texts):
+            request = {"v": PROTOCOL_VERSION, "op": "embed",
+                       "model": self.model_name, "texts": batch}
+            give_up = time.monotonic() + RECOVER_S
+            while True:
+                try:
+                    reply = _call(self.path, request, EMBED_TIMEOUT_S)
+                    break
+                except _Transport:
+                    if time.monotonic() >= give_up:
+                        raise
+                    time.sleep(RETRY_PAUSE_S)
+            vectors.extend(_vectors(reply, len(batch), self.dim))
+        return vectors
+
+    def _fall_back(self, error: Exception) -> None:
+        with self._lock:
+            if self._local is not None or self._local_failed:
+                return
+            logger.warning("Resident embedder at %s failed (%s: %s); loading the "
+                           "model in this process", self.path, type(error).__name__, error)
+            self._local = self._local_factory()
+            self._local_failed = self._local is None
+            _record("fallback", reason=type(error).__name__, loaded=not self._local_failed)
 
 
 def connect(model_name: str, local_factory: Callable[[], object],
             path: Optional[Path] = None) -> Optional[RemoteEmbedder]:
-    """A `RemoteEmbedder` when a live server for `model_name` answers at
-    `path`, else None (the caller loads the model itself)."""
+    """A `RemoteEmbedder` when a live, compatible server for `model_name`
+    answers at `path`, else None (the caller loads the model itself). Never
+    raises."""
     path = path or socket_path()
     if not supported() or not path.exists():
         return None
+    give_up = time.monotonic() + RECOVER_S
+    while True:
+        try:
+            hello = _call(path, {"v": PROTOCOL_VERSION, "op": "hello"}, HELLO_TIMEOUT_S)
+            break
+        except _Transport as e:
+            # Refused or gone (a recycle under way): worth a few more tries
+            # before paying 1.3 GB. A server that is up but silent is not.
+            if time.monotonic() >= give_up:
+                logger.warning("Resident embedder at %s did not answer (%s); loading "
+                               "the model in this process", path, e)
+                _record("local", reason="unreachable")
+                return None
+            time.sleep(RETRY_PAUSE_S)
+        except Exception as e:
+            logger.warning("Resident embedder at %s answered unusably (%s: %s); "
+                           "loading the model in this process", path, type(e).__name__, e)
+            _record("local", reason="bad_hello")
+            return None
     try:
-        hello = _call(path, {"v": PROTOCOL_VERSION, "op": "hello"}, HELLO_TIMEOUT_S)
+        dim = hello["dim"]
+        if hello.get("model") != model_name:
+            reason = f"serves {hello.get('model')}"
+        elif not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
+            reason = f"reported dim {dim!r}"
+        elif hello.get("libs") != library_versions():
+            reason = f"runs {hello.get('libs')}, this process {library_versions()}"
+        else:
+            reason = ""
     except Exception as e:
-        logger.warning("Resident embedder at %s did not answer (%s: %s); loading "
-                       "the model in this process", path, type(e).__name__, e)
+        reason = f"{type(e).__name__}: {e}"
+    if reason:
+        logger.info("Resident embedder at %s not used: %s", path, reason)
+        _record("local", reason="incompatible")
         return None
-    if hello.get("model") != model_name:
-        logger.info("Resident embedder serves %s, not %s", hello.get("model"), model_name)
-        return None
-    return RemoteEmbedder(path, model_name, int(hello["dim"]), local_factory)
+    _record("remote")
+    return RemoteEmbedder(path, model_name, dim, local_factory)
 
 
 # ------------------------------------------------------------------ server
 
 
 class _Handler(socketserver.StreamRequestHandler):
+    timeout = SERVER_READ_TIMEOUT_S
+
     def handle(self) -> None:
         server: "_Server" = self.server  # type: ignore[assignment]
         try:
-            line = self.rfile.readline(MAX_LINE_BYTES)
+            line = self.rfile.readline(MAX_REQUEST_BYTES + 1)
+            if len(line) > MAX_REQUEST_BYTES:
+                raise ValueError(f"request over {MAX_REQUEST_BYTES} bytes")
             request = json.loads(line)
             if not isinstance(request, dict) or request.get("v") != PROTOCOL_VERSION:
                 raise ValueError("unsupported protocol version")
             if request.get("op") == "hello":
-                reply = {"v": PROTOCOL_VERSION, "model": server.model_name, "dim": server.dim}
+                reply = {"v": PROTOCOL_VERSION, "model": server.model_name,
+                         "dim": server.dim, "libs": server.libs}
             elif request.get("op") == "embed":
                 if request.get("model") != server.model_name:
                     raise ValueError(f"this server embeds with {server.model_name}")
                 texts = request.get("texts")
                 if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
                     raise ValueError("texts must be a list of strings")
+                if len(texts) > MAX_TEXTS:
+                    raise ValueError(f"over {MAX_TEXTS} texts in one request")
                 matrix = np.asarray([np.asarray(v, dtype=np.float32)
                                      for v in server.embedder.embed(texts)],
                                     dtype=np.float32).reshape(len(texts), server.dim)
@@ -199,9 +339,13 @@ class _Handler(socketserver.StreamRequestHandler):
 
 class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
+    # Runs start together (hooks, parallel agents); a backlog of 5 refused
+    # the sixth concurrent hello on macOS, and each refusal cost 1.3 GB.
+    request_queue_size = socket.SOMAXCONN
     embedder: object
     model_name: str
     dim: int
+    libs: dict
 
 
 class EmbedServer:
@@ -243,6 +387,7 @@ def serve(embedder, model_name: str, path: Optional[Path] = None) -> Optional[Em
         server = _Server(str(path), _Handler)
         os.chmod(path, 0o600)
         server.embedder, server.model_name, server.dim = embedder, model_name, dim
+        server.libs = library_versions()
         logger.info("Serving %s embeddings at %s", model_name, path)
         return EmbedServer(server, path)
     except Exception as e:

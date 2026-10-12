@@ -957,7 +957,7 @@ stays silent.
 (car-runtime ≥ 0.18.0). Logs land in
 `~/.car/logs/neo-observer.{stdout,stderr}.log`. Tunables:
 `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
-(default 60), `NEO_OBSERVER_RECYCLE_CYCLES` (default 48 — the daemon re-execs
+(default 60), `NEO_OBSERVER_RECYCLE_CYCLES` (default 3, ~15 min — the daemon re-execs
 itself to bound RSS drift; 0 disables). See
 [the observer design note](docs/solutions/async-observer.md).
 
@@ -1376,7 +1376,7 @@ export NEO_ALLOW_PLAINTEXT_API_KEY=1              # permit storing api_key in co
 export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer (put in ~/.zshenv, not ~/.zshrc)
 export NEO_OBSERVER_INTERVAL_SECONDS=300          # sweep interval
 export NEO_OBSERVER_COOLDOWN=60                   # per-process cooldown between cycles
-export NEO_OBSERVER_RECYCLE_CYCLES=48             # re-exec after N cycles to bound RSS (0 disables)
+export NEO_OBSERVER_RECYCLE_CYCLES=3              # re-exec after N cycles to bound RSS (0 disables)
 ```
 
 ### Install Sanity
