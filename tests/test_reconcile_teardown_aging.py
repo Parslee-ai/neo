@@ -50,6 +50,7 @@ def _feed(store, episodes_dir, prefix, n, otype):
         outcome = Outcome(
             outcome_type=otype, file_path="src/sh.py",
             suggestion_id=sid, learning_episode_id=ep_id, candidate_id=cid,
+            applied_on_revision=f"rev-{ep_id}",
             candidate_subject=SUBJECT, candidate_body=BODY, candidate_kind="pattern")
         with patch.object(store._outcome_tracker, "detect_outcomes",
                           return_value=([outcome], {})):

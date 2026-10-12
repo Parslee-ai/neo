@@ -1,0 +1,288 @@
+{
+  "static_model": "gpt-6.1-sol",
+  "judge_provider": "openai",
+  "summary": {
+    "n": 6,
+    "car_errors": 0,
+    "car_models": [
+      "anthropic/claude-opus-4-8:latest"
+    ],
+    "small_model_routes": 0,
+    "car_schema_ok": 6,
+    "static_errors": 0,
+    "static_schema_ok": 6,
+    "judged": 6,
+    "car_wins": 0,
+    "static_wins": 6,
+    "ties": 0,
+    "car_mean_score": 3.0,
+    "static_mean_score": 9.0,
+    "parity": false
+  },
+  "rows": [
+    {
+      "prompt": "fix the bug where _create_resilient persists a learned flag before the retried call succeeds",
+      "prompt_chars": 132195,
+      "car": {
+        "model": "anthropic/claude-opus-4-8:latest",
+        "model_used": "claude-opus-4-8",
+        "resolved_model_id": "anthropic/claude-opus-4-8:latest",
+        "seconds": 32.7,
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "completion_tokens": 2137,
+          "context_window": 1000000,
+          "prompt_tokens": 50722,
+          "total_tokens": 52859
+        },
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "static": {
+        "model": "gpt-6.1-sol",
+        "seconds": 28.0,
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "judge": {
+        "car_is_a": false,
+        "winner": "A",
+        "car_won": false,
+        "car_score": 3,
+        "static_score": 9,
+        "reason": "A correctly recognizes that the affected implementation is truncated and that existing tests already specify persist-after-success behavior. It stays within the planner role, proposes inspection before a conditional surgical fix, and covers failed retries, shared-memory mutation, cumulative adaptations, existing entries, effort-cap removal, and typed errors without claiming execution. B has the right general sequencing idea but invents an implementation and APIs (_adapt_for, _apply_flag, _client_create, self._compat.record) unsupported by the supplied code. Its purported diff is therefore not grounded or demonstrably applicable. Its instruction to persist only the specific final adaptation also risks losing earlier cumulative adaptations required by a successful request, and it supplies neither concrete regression tests nor a validation step."
+      }
+    },
+    {
+      "prompt": "explain how FactStore decides when an episode candidate promotes to a durable pattern",
+      "prompt_chars": 127894,
+      "car": {
+        "model": "anthropic/claude-opus-4-8:latest",
+        "model_used": "claude-opus-4-8",
+        "resolved_model_id": "anthropic/claude-opus-4-8:latest",
+        "seconds": 37.3,
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "completion_tokens": 2719,
+          "context_window": 1000000,
+          "prompt_tokens": 49490,
+          "total_tokens": 52209
+        },
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "static": {
+        "model": "gpt-6.1-sol",
+        "seconds": 32.0,
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "judge": {
+        "car_is_a": true,
+        "winner": "B",
+        "car_won": false,
+        "car_score": 6,
+        "static_score": 9,
+        "reason": "B accurately explains subject-signature correlation, attributed acceptance, deterministic-failure blocking, per-suggestion application bases, fail-closed missing revisions, and transitive sitting grouping, including the required uncommitted condition on parent links. It appropriately avoids changes and flags truncated implementation details. A omits that condition, incorrectly models a candidate with kind='bugfix' as being classified during promotion rather than minted as 'pattern', and blurs project and global acceptance thresholds (the context documents a four-episode/two-project global gate). A also omits the rollback guard and supplies an unnecessary documentation artifact. B's main omission is not stating the documented global threshold explicitly."
+      }
+    },
+    {
+      "prompt": "refactor collect_outcomes so the host edit ledger read is a separate helper",
+      "prompt_chars": 126702,
+      "car": {
+        "model": "anthropic/claude-opus-4-8:latest",
+        "model_used": "claude-opus-4-8",
+        "resolved_model_id": "anthropic/claude-opus-4-8:latest",
+        "seconds": 36.0,
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "completion_tokens": 2850,
+          "context_window": 1000000,
+          "prompt_tokens": 48876,
+          "total_tokens": 51726
+        },
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "static": {
+        "model": "gpt-6.1-sol",
+        "seconds": 21.6,
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "judge": {
+        "car_is_a": true,
+        "winner": "B",
+        "car_won": false,
+        "car_score": 2,
+        "static_score": 9,
+        "reason": "A invents an inline implementation and an unusable diff with a placeholder signature despite documentation already naming _load_host_edit_events. Its proposed reader omits timestamp and repository-path filtering, unions raw absolute paths, assumes an unverified HOOK_LEDGER binding, and crashes on valid non-object JSON records. The simulations also contradict its set-returning code. These changes cannot substantiate a behavior-preserving refactor. B correctly recognizes the truncated source and existing-helper evidence, stays within the planner/next_action role, and proposes inspecting the actual boundary before surgical extraction and characterization tests. It preserves git evidence, attribution, verification, and pending-session semantics without claiming implementation or validation. Its remaining limitation is that exact helper responsibilities and test expectations are appropriately deferred until inspection."
+      }
+    },
+    {
+      "prompt": "add a --limit flag to neo memory citation-stats that caps the number of rows printed",
+      "prompt_chars": 131996,
+      "car": {
+        "model": "anthropic/claude-opus-4-8:latest",
+        "model_used": "claude-opus-4-8",
+        "resolved_model_id": "anthropic/claude-opus-4-8:latest",
+        "seconds": 49.9,
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "completion_tokens": 3132,
+          "context_window": 1000000,
+          "prompt_tokens": 51803,
+          "total_tokens": 54935
+        },
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "static": {
+        "model": "gpt-6.1-sol",
+        "seconds": 25.8,
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "judge": {
+        "car_is_a": false,
+        "winner": "A",
+        "car_won": false,
+        "car_score": 2,
+        "static_score": 9,
+        "reason": "A correctly recognizes that the relevant parser and renderer are omitted, stays within the planner/next-action role, and proposes inspection followed by a surgical display-only cap with explicit boundary, parser, JSON, and aggregate-preservation tests. It makes no unsupported implementation or validation claims. B invents aggregation and formatting APIs, a stats['rows'] structure, and per-fact output not established by the context. Its illustrative diffs are not executable patches, and its test creates no metrics fixture and never verifies the row count or JSON completeness. B also silently chooses unlimited behavior for nonpositive limits and exempts JSON without verifying repository conventions."
+      }
+    },
+    {
+      "prompt": "why does the observer re-exec itself every N cycles and what breaks if the lock is held across exec",
+      "prompt_chars": 128826,
+      "car": {
+        "model": "anthropic/claude-opus-4-8:latest",
+        "model_used": "claude-opus-4-8",
+        "resolved_model_id": "anthropic/claude-opus-4-8:latest",
+        "seconds": 59.9,
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "completion_tokens": 4022,
+          "context_window": 1000000,
+          "prompt_tokens": 49615,
+          "total_tokens": 53637
+        },
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "static": {
+        "model": "gpt-6.1-sol",
+        "seconds": 31.0,
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "judge": {
+        "car_is_a": false,
+        "winner": "A",
+        "car_won": false,
+        "car_score": 3,
+        "static_score": 9,
+        "reason": "A correctly grounds recycling in the documented 48-cycle RSS bound, explains inherited flock self-contention, distinguishes retry-and-exit from blocking deadlock, and notes that close-on-exec can prevent lock survival. It appropriately treats the omitted implementation as unverified and proposes inspection rather than an unnecessary patch. B gets the general RSS and open-file-description mechanisms right, but invents _recycle_via_exec and an unappliable diff, assumes descriptor inheritance despite Python's normally non-inheritable descriptors, claims unverified round-robin restoration and measured RSS values, and overstates silent permanent observer loss despite CAR supervision. Its POSIX-only patch also ignores the documented Windows lock backend and exec-failure handling."
+      }
+    },
+    {
+      "prompt": "optimize _history_boost in context_gatherer, it is slow on large repos",
+      "prompt_chars": 129527,
+      "car": {
+        "model": "anthropic/claude-opus-4-8:latest",
+        "model_used": "claude-opus-4-8",
+        "resolved_model_id": "anthropic/claude-opus-4-8:latest",
+        "seconds": 40.7,
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "completion_tokens": 2759,
+          "context_window": 1000000,
+          "prompt_tokens": 49786,
+          "total_tokens": 52545
+        },
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "static": {
+        "model": "gpt-6.1-sol",
+        "seconds": 30.0,
+        "error": null,
+        "schema": {
+          "plan": true,
+          "simulation": true,
+          "code": true,
+          "all": true
+        }
+      },
+      "judge": {
+        "car_is_a": false,
+        "winner": "A",
+        "car_won": false,
+        "car_score": 2,
+        "static_score": 9,
+        "reason": "A correctly treats the truncated implementation and unknown bottleneck as blockers to a justified patch, stays within the planner/next-action role, and supplies concrete profiling and regression-test steps. It explicitly protects top-k/filter ordering, shared scoring, scope isolation, and read-only behavior without claiming unobserved success. B invents a retrieve_relevant(candidates=...) API without implementing it, references FactKind without establishing its import, and claims profiling established a hot path when no measurements are supplied. Its episode-only prefilter can change which facts survive top-k, contradicting its behavior-preservation claim; its cosine-only proposal also neglects the documented hybrid ranking and episode expansion. The proposed patch could simply fail and return {}, silently disabling history boosts, and no executable tests or required store changes are provided."
+      }
+    }
+  ]
+}

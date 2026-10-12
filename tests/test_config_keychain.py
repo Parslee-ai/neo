@@ -156,7 +156,7 @@ def test_save_does_not_write_plaintext_api_key_by_default(tmp_path, monkeypatch)
     monkeypatch.delenv("NEO_ALLOW_PLAINTEXT_API_KEY", raising=False)
     path = tmp_path / "config.json"
 
-    NeoConfig(provider="openai", api_key="secret-key").save(str(path))
+    NeoConfig(provider="openai", api_key="example-secret-key").save(str(path))
 
     saved = json.loads(path.read_text())
     assert saved["api_key"] is None
@@ -166,10 +166,10 @@ def test_save_can_write_plaintext_api_key_when_explicitly_allowed(tmp_path, monk
     monkeypatch.setenv("NEO_ALLOW_PLAINTEXT_API_KEY", "1")
     path = tmp_path / "config.json"
 
-    NeoConfig(provider="openai", api_key="secret-key").save(str(path))
+    NeoConfig(provider="openai", api_key="example-secret-key").save(str(path))
 
     saved = json.loads(path.read_text())
-    assert saved["api_key"] == "secret-key"
+    assert saved["api_key"] == "example-secret-key"
     assert list(tmp_path.glob("*.tmp")) == []
 
 

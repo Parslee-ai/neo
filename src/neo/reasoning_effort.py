@@ -1,8 +1,12 @@
-"""Memory-driven reasoning effort selection for OpenAI gpt-5* models.
+"""Memory-driven reasoning effort selection for OpenAI models.
 
 The OpenAI /v1/responses endpoint accepts a `reasoning.effort` parameter that
 controls how many "thinking" tokens the model spends before answering. Effort
-levels (for gpt-5.6): none < low < medium < high < xhigh.
+levels: none < low < medium < high < xhigh. Neo sends the chosen level to every
+OpenAI model rather than guessing from the model name which ones take it: a
+model without the field drops it, and a model that tops out below the chosen
+level is stepped down this ladder, from the provider's own rejection (see
+`adapters._create_resilient`).
 
 Neo's memory system already tracks per-pattern confidence, so we can use that
 signal to spend reasoning tokens where they actually help: novel queries get

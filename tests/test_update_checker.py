@@ -629,6 +629,108 @@ class TestPerformUpdate:
             assert result is False
 
 
+
+class TestPerformUpdateForcesFreshCheck:
+    """`neo update` must ask PyPI now, not trust a cache up to an hour old.
+
+    Regression for #245: a fresh cache saying "up to date" made `neo update`
+    report "already up to date" for a release that was already on PyPI.
+    """
+
+    def _fresh_cache(self, cache_file: Path, *, latest: str, current: str = "0.9.0") -> None:
+        cache_file.write_text(json.dumps({
+            "last_check": time.time() - 10,  # well inside UPDATE_CHECK_INTERVAL
+            "current_version": current,
+            "latest_version": latest,
+            "new_version": latest if latest != current else None,
+        }))
+
+    def test_neo_update_sees_a_release_the_fresh_cache_does_not(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value="0.10.0"), \
+                 patch.object(update_checker, "_refresh_in_background") as bg, \
+                 patch.object(update_checker, "refresh_car_runtime", return_value=None), \
+                 patch.object(update_checker, "_detect_install_method",
+                              return_value=INSTALL_PIP_VENV), \
+                 patch.object(update_checker, "_perform_upgrade_and_verify",
+                              return_value=(update_checker.UpgradeOutcome.UPGRADED,
+                                            "0.10.0")) as upgrade:
+                result = perform_update()
+
+            assert result is True
+            upgrade.assert_called_once_with(INSTALL_PIP_VENV, "0.10.0", quiet=False)
+            bg.assert_not_called()
+
+    def test_forced_check_rewrites_the_cache(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value="0.10.0") as fetch:
+                result = check_for_updates(suppress_output=True, force=True)
+
+            assert result == "0.10.0"
+            fetch.assert_called_once()
+            written = json.loads(cache_file.read_text())
+            assert written["latest_version"] == "0.10.0"
+            assert written["new_version"] == "0.10.0"
+
+    def test_forced_check_falls_back_to_cache_when_pypi_fails(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.5")
+            before = cache_file.read_text()
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value=None) as fetch:
+                result = check_for_updates(suppress_output=True, force=True)
+
+            fetch.assert_called_once()
+            assert result == "0.9.5"
+            assert cache_file.read_text() == before
+
+    def test_forced_check_with_no_cache_and_failed_fetch_returns_none(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value=None):
+                assert check_for_updates(suppress_output=True, force=True) is None
+
+    def test_passive_check_with_fresh_cache_still_skips_pypi(self, monkeypatch):
+        monkeypatch.delenv("NEO_SKIP_UPDATE_CHECK", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "update_check.json"
+            self._fresh_cache(cache_file, latest="0.9.0")
+
+            with patch.object(update_checker, "_get_cache_file", return_value=cache_file), \
+                 patch.object(update_checker, "_get_current_version", return_value="0.9.0"), \
+                 patch.object(update_checker, "_refresh_in_background") as bg, \
+                 patch.object(update_checker, "_fetch_latest_version_from_pypi",
+                              return_value="0.10.0") as fetch:
+                result = check_for_updates(suppress_output=True)
+
+            assert result is None
+            fetch.assert_not_called()
+            bg.assert_not_called()
+
 class TestGetCurrentVersion:
     """Test _get_current_version() function."""
 
@@ -1137,3 +1239,151 @@ class TestUpgradeVerificationIsShared:
             mock_run.return_value = MagicMock(returncode=0, stderr="")
             update_checker._run_pipx_upgrade(quiet=True)
         assert "--verbose" not in mock_run.call_args[0][0]
+
+
+class TestCarRuntimeRefresh:
+    """The CAR binding must track CAR's releases, not neo's.
+
+    `pipx upgrade neo-reasoner` leaves it alone: pip does not touch a
+    dependency that already satisfies its specifier, and the `[car]` extra's
+    specifier is a range. Measured on a live install, that left the binding two
+    CAR releases behind the daemon it was talking to.
+    """
+
+    def _patched(self, tmp_path, **overrides):
+        defaults = dict(
+            _car_runtime_is_installed=lambda: True,
+            _car_check_is_due=lambda: True,
+            _detect_install_method=lambda: INSTALL_PIPX,
+            _car_cache_file=lambda: tmp_path / "car_runtime_check.json",
+            _append_log=lambda message: None,
+        )
+        defaults.update(overrides)
+        return [patch.object(update_checker, name, value)
+                for name, value in defaults.items()]
+
+    def _run(self, tmp_path, *, latest, installed_versions, returncode=0,
+             force=False, **overrides):
+        """Returns (result, the subprocess argv list actually used)."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=returncode, stderr="", stdout="")
+
+        stack = self._patched(tmp_path, **overrides)
+        if "_fetch_latest_version_from_pypi" not in overrides:
+            stack.append(patch.object(
+                update_checker, "_fetch_latest_version_from_pypi",
+                lambda *a, **k: latest))
+        stack.append(patch.object(
+            update_checker, "_get_installed_version_fresh",
+            MagicMock(side_effect=installed_versions)))
+        stack.append(patch.object(update_checker.subprocess, "run", fake_run))
+        for p in stack:
+            p.start()
+        try:
+            return update_checker.refresh_car_runtime(force=force), calls
+        finally:
+            for p in reversed(stack):
+                p.stop()
+
+    def test_upgrades_a_binding_that_is_behind(self, tmp_path):
+        result, calls = self._run(
+            tmp_path, latest="0.54.0", installed_versions=["0.53.0", "0.54.0"])
+        assert result == "0.54.0"
+        assert len(calls) == 1
+        cmd = calls[0]
+        # runpip, because `pipx upgrade` only moves neo and `pipx inject`
+        # refuses an already-installed package.
+        assert cmd[:4] == ["pipx", "runpip", "neo-reasoner", "install"]
+        assert f"{update_checker.CAR_PACKAGE_NAME}<1.0" in cmd
+
+    def test_pip_venv_installs_into_the_current_interpreter(self, tmp_path):
+        result, calls = self._run(
+            tmp_path, latest="0.54.0", installed_versions=["0.53.0", "0.54.0"],
+            _detect_install_method=lambda: INSTALL_PIP_VENV)
+        assert result == "0.54.0"
+        assert calls[0][:3] == [sys.executable, "-m", "pip"]
+
+    def test_does_nothing_when_already_current(self, tmp_path):
+        result, calls = self._run(
+            tmp_path, latest="0.54.0", installed_versions=["0.54.0"])
+        assert result is None
+        assert calls == []
+
+    def test_never_crosses_the_extras_version_ceiling(self, tmp_path):
+        """CAR is pre-1.0; a 1.x is a decision, not an automatic upgrade."""
+        result, calls = self._run(
+            tmp_path, latest="1.0.0", installed_versions=["0.54.0"])
+        assert result is None
+        assert calls == []
+
+    def test_exit_zero_that_does_not_move_the_disk_is_not_success(self, tmp_path):
+        """This module's invariant: the disk confirms an upgrade, not a status."""
+        result, calls = self._run(
+            tmp_path, latest="0.54.0", installed_versions=["0.53.0", "0.53.0"])
+        assert result is None
+        assert len(calls) == 1
+
+    def test_skips_when_the_car_extra_is_not_installed(self, tmp_path):
+        result, calls = self._run(
+            tmp_path, latest="0.54.0", installed_versions=["0.53.0"],
+            _car_runtime_is_installed=lambda: False)
+        assert result is None
+        assert calls == []
+
+    def test_skips_installs_owned_by_another_manager(self, tmp_path):
+        for method in (INSTALL_BREW, INSTALL_EXTERNAL):
+            result, calls = self._run(
+                tmp_path, latest="0.54.0", installed_versions=["0.53.0", "0.54.0"],
+                _detect_install_method=lambda: method)
+            assert result is None, method
+            assert calls == [], method
+
+    def test_throttled_between_checks_but_force_overrides(self, tmp_path):
+        result, calls = self._run(
+            tmp_path, latest="0.54.0", installed_versions=["0.53.0", "0.54.0"],
+            _car_check_is_due=lambda: False)
+        assert result is None
+        assert calls == []
+
+        forced, calls = self._run(
+            tmp_path, latest="0.54.0", installed_versions=["0.53.0", "0.54.0"],
+            _car_check_is_due=lambda: False, force=True)
+        assert forced == "0.54.0"
+        assert len(calls) == 1
+
+    def test_attempt_is_stamped_before_the_network_call(self, tmp_path):
+        """A PyPI outage costs one attempt per interval, not one per invocation.
+
+        The raising fetch is the point: neo runs from editor hooks many times a
+        minute, and a check that stamps only on a clean answer would retry a
+        failing network on every one of them.
+        """
+        cache = tmp_path / "car_runtime_check.json"
+
+        def exploding_fetch(*_a, **_k):
+            raise OSError("DNS is down")
+
+        result, calls = self._run(
+            tmp_path, latest=None, installed_versions=["0.53.0"],
+            _fetch_latest_version_from_pypi=exploding_fetch)
+        assert result is None
+        assert calls == []
+        assert cache.exists(), "a failed check must still stamp the interval"
+
+    def test_periodic_check_refreshes_only_when_auto_install_is_on(self, tmp_path):
+        for auto_install, expected in ((True, 1), (False, 0)):
+            seen = []
+            with patch.object(update_checker, "_get_current_version", lambda: "0.53.0"), \
+                 patch.object(update_checker, "_read_cache",
+                              lambda: {"last_check": time.time(),
+                                       "current_version": "0.53.0",
+                                       "latest_version": "0.53.0",
+                                       "new_version": None}), \
+                 patch.object(update_checker, "refresh_car_runtime",
+                              lambda *a, **k: seen.append(1)):
+                update_checker.check_for_updates(
+                    suppress_output=True, auto_install=auto_install)
+            assert len(seen) == expected, auto_install

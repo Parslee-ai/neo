@@ -1,5 +1,220 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that exactly names a flag (`version`, `help`, `status`, `index`, `config`, `upgrade`, `init`, `stats`) or a subcommand exits with status 2 and names the command it meant. Case, leading dashes and trailing punctuation are ignored. The check runs before the update check, the observer autostart and the engine. Every other prompt runs as before, including real words that resemble a command, such as `server` or `updates`.
+- **`python -m neo` and `python -m neo.cli` now return Neo's exit status.** Both module entry points called `main()` and discarded what it returned, so under `python -m` every refusal and failure reported success, and so did the `workspace` and `lattice` subcommands whatever their result. The `neo` console script already passed it through.
+
+- **The `claude-code` provider runs plain, isolated inference** ([#260](https://github.com/Parslee-ai/neo/issues/260)).
+  - **Isolated:** `claude -p` now starts with no tools, no MCP servers, no user or project settings or hooks, and no saved session. Before, a structured-output prompt was sometimes answered with a tool call that ran a command in the working tree, used up the single turn and exited 1. Every call also ran the user's hooks and left a session transcript on disk.
+  - **Real errors:** a failure now shows the error the CLI reports on stdout (for example `error_max_turns: Reached maximum number of turns (1)`) instead of `exited with code 1:` with nothing after it. A result marked `is_error` fails even when the exit code is 0.
+  - **Timeout and pipes:** both output pipes drain together, so the child can't block on stderr. The timeout covers the whole call, not just the wait after output ends.
+  - **Stop sequences:** these now apply to this provider. The CLI has no stop option, so the response is cut at the first one, as with the other providers.
+
+### Changed
+
+- **Mod pane: clearer and more responsive** ([#280](https://github.com/Parslee-ai/neo/issues/280)).
+  - **Form placement:** the question form now comes first, so it stays in reach after a long answer.
+  - **Mode descriptions:** each mode shows a one-line description.
+  - **In-pane feedback:** a refused **Ask** or **Follow up** is reported in the pane, where the button was pressed, instead of in the transcript.
+  - **Follow up** appears only once there is a finished analysis to follow.
+  - **Elapsed time:** a running analysis shows elapsed time against the four-minute deadline, in the pane and in the band above the prompt. A finished one shows how long it took.
+  - **Evidence tab:** shows labelled rows: execution fields, validation, each check with its status, and how much memory was retrieved, included and cited. **Show reasoning**, **Show provenance details** and the new **Show raw evidence** render JSON in the host's code view instead of as one long text.
+  - **Facts about missing files:** for each `pattern: <file>` fact, `neo workspace status` reports the file when this checkout doesn't have it (`missing_file`), plus a `missing_file_count`. The Memory tab marks those facts `[missing file]` and shows the count.
+    - Paths resolve from the repository's top level, so starting in a subdirectory gives the same answer.
+    - History facts are never checked: a record of what a commit touched stays true after the files are gone.
+    - Absolute, `..` and URL-like paths are never looked at, and a path that can't be checked counts as present.
+    - No model call is made and nothing in the store changes.
+  - **Memory tab:** returning to it reuses the last store read. A finished analysis, a different working directory, or **Refresh** reads it again.
+  - **Details toggles:** opening details on one tab no longer opens them on the others, and a new run starts with details closed. Large JSON views are capped so they stay within the host's drawing limit.
+  - **Band and runs:** the band above the prompt offers Cancel only while a run can be cancelled, and keeps its status on one line. A cancel that never completes stops redrawing after ten seconds. Pressing **Ask** twice quickly can no longer start two runs.
+
+### Fixed
+
+- **Raw newlines in a model's JSON no longer fail the run** ([#259](https://github.com/Parslee-ai/neo/issues/259)). About one run in six died with `[escape_errors] … Invalid control character` when a model put a literal newline or tab inside a JSON string. `tolerant_json_load` now makes one string-aware pass, stopping at the first attempt that parses:
+  - **Inside strings:** raw newlines, carriage returns and tabs are escaped, and so is a backslash right before a raw newline.
+  - **Outside strings:** trailing commas are removed. Before, a regex did this anywhere, so code in a value such as `[1, 2,]` was rewritten.
+  - **Last resort:** curly quotes are mapped to straight ones.
+  Other control characters still fail, and the error reported is from the text as shown.
+- **The curly-quote repair works.** It had been replacing ASCII quotes with themselves.
+
+The plan's model-based repair is still not used for simulation or code-suggestion parsing. That repair shows the formatter only the first 1000 characters, so a "repaired" code suggestion could come back as a truncated or invented diff. The deterministic repairs above cover the reported failure.
+
+- **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
+  - **Memory paging:** **Next** stops at the last page, so **Previous** responds at once. Before, it counted past the end and needed as many presses back.
+  - **Use selection:** with no selection visible to Claude Code, it keeps the context that is there and says so, instead of silently clearing it. Typing context by hand clears that notice.
+  - **Duplicate findings:** the engine voices each of the first open questions as a caution ("Still open: …"), so every one of them was shown twice. Each is now shown once, in the pane and in the text output. A question only drops when a caution states exactly it.
+  - **Context reuse:** selected context goes with one question, and a follow-up to it, instead of being re-sent unseen with the next unrelated question. A run that fails or is cancelled gives the context back for the retry. While context is attached, the pane shows "Context attached · N characters".
+
+## [0.56.0] - 2026-10-11
+
+### Added
+
+- **A native Neo workspace for Claude Code Mods.** Direct reason, review, debug, architect, optimize and pattern requests stream progress into a Results, Memory and Evidence pane, with linked follow-ups, selected context, draft sharing, cancellation and a four-minute deadline. Headless and unsupported-pane sessions retain text commands. Python continues to own inference, context and learning policy.
+- **Read-only project memory inspection.** `neo workspace status` and `neo workspace explain` inspect persisted project facts and provenance without model calls, embeddings, migration, memory aging or observer startup. Results distinguish retrieved context from cited evidence and analysis completion from validation and acceptance.
+- **Organization-bound CAR Lattice integration.** Explicit enrollment preserves immutable organization context, partitions private storage, restricts inference to the admitted CAR consumer and reauthorizes results. Native-owner join, status and leave preserve original ownership and refuse replacement while admission or cleanup is uncertain.
+
+### Fixed
+
+- Mod and classic host hooks deduplicate successful edits by host identity, retain bounded lifecycle diagnostics and exclude those observations from acceptance and promotion decisions. Existing git verification and independent-outcome gates remain authoritative.
+- Native-owner requests now accept complete guardian inventories within an 8 MiB UTF-8 byte bound; oversized requests fail before launching the guardian instead of truncating JSON at 1 MiB.
+- Community fallback remains compatible with callers that do not initialize scoped-consumer state.
+
+### Documentation and validation
+
+- Added Mods setup, command, privacy, evidence and fallback documentation, plus scoped Lattice enrollment and native-owner configuration guidance.
+- Terminal Mods reasoning, linked follow-ups, cancellation, edit deduplication and zero-model provenance inspection were exercised live. Desktop has host-kit coverage; live Desktop acceptance remains unavailable.
+- Scoped Lattice requires matching CAR scoped-consumer and native-guardian contracts and pinned installed artifacts. Installed native-owner restart recovery, cleanup and real multiplayer acceptance remain unverified; automated controls do not establish those outcomes.
+
+## [0.55.2] - 2026-10-07
+
+Two fixes to how neo talks to CAR, validated against car-runtime and CarHost 0.56.1.
+
+### Fixed
+
+- **The CAR inference path now honours the temperature Neo asks for.** `CarAdapter` called `infer_tracked`, which has no sampling parameters, so every CAR call ran at the backend's default temperature whatever the engine requested. It now uses the request-shaped `infer_tracked_with_request` for routed, name-pinned and exact-pinned calls alike, carrying `params.temperature` and the routing intent. CAR was measured to forward temperature to both local and hosted models, and to drop it itself for models that reject it. `stop` and reasoning effort are still not sent: CAR 0.56.1 accepts `stop` without applying it and has no effort field (Parslee-ai/car-releases#107, #108). Runtimes without the request call keep the old path. ([#273](https://github.com/Parslee-ai/neo/pull/273))
+- **`neo --dry-run` no longer registers the memory observer or joins the Lattice.** Both run from `cli.main` whenever car-server is reachable, so an inspection command was upserting and starting the global observer agent and joining the repository's Lattice. Run under a different `$HOME`, as the test suite does, it left an orphan observer bound to that home. Dry runs now skip both, alongside `--version` and `--config`. ([#272](https://github.com/Parslee-ai/neo/pull/272))
+
+## [0.55.1] - 2026-10-05
+
+One fix to how neo decides that a model pin sent to CAR is an exact catalog id.
+
+### Fixed
+
+- **Router-provided model ids are pinned exactly whatever their shape.** 0.54.3 sent a pin through CAR's exact `model_id` path when the id contained `/`. CAR's catalog contract guarantees the `provider/name[:tag]` shape only for built-in ids. Discovered, gateway and operator-registered ids pass through verbatim, and an operator id need not contain `/` at all. Such an id would have fallen back to the alias path and lost the exact check. The multi-agent panel now marks every id CAR's router hands it as a catalog id (`CarAdapter(model_is_catalog_id=True)`), so the id is sent as `model_id` and must be echoed exactly. A model name typed into config stays on the `model` path, now with an equality-first check: a resolved id equal to the pin is honoured without parsing, so a typed full id of any shape works. ([#267](https://github.com/Parslee-ai/neo/pull/267))
+
+## [0.55.0] - 2026-10-05
+
+Every OpenAI model now uses the `/v1/responses` endpoint and receives the reasoning effort Neo chose. Before this, a model whose name did not contain `gpt-5` or `codex`, including `gpt-6.1-sol`, was sent to chat completions and had its effort silently dropped.
+
+### Fixed
+
+- **Reasoning effort never reached OpenAI models outside the gpt-5 family.** `OpenAIAdapter` picked the endpoint, and whether to send `reasoning.effort`, from a substring of the model's name. A new model name missed the test, so Neo computed an effort level and then did not send it, and the model ran at its default. The adapter now has one call path, `client.responses.create`, for every model, and no model name decides the endpoint or the fields. The failure-cause extraction in `persistent_reasoning.py`, the last other OpenAI chat-completions call, moved too. ([#263](https://github.com/Parslee-ai/neo/pull/263))
+
+### Changed
+
+- **One learn-and-retry helper for every provider.** Providers refuse optional fields model by model: `gpt-6.1-sol` refuses `temperature` and accepts effort `xhigh`, while `gpt-4o-mini` does the reverse. Neo now sends the field, and when the provider's rejection names it, drops that one field, retries, and remembers the result per model in `~/.neo/model_param_compat.json`, so the retry is paid once. `_create_resilient` replaces `_chat_completion_resilient` and the Anthropic adapter's separate copy, and Google gains the same recovery. Azure and Local stay on chat completions and use the same helper. Existing `model_param_compat.json` files load unchanged.
+  - **A refused effort level is lowered, not dropped.** `gpt-5` refuses `xhigh` and accepts `high`; Neo steps down one level at a time and remembers the cap. A cap is remembered only when a lower level was then accepted. A refusal at the bottom of the ladder is never treated as "this model has no effort": `gpt-6.1-sol` refuses `none` and accepts `xhigh`.
+  - **Nothing is remembered until the retried call succeeds**, and when the provider names the refused field in a structured `param`, only that field can match. An error that merely mentions a field name cannot teach Neo something false about a model.
+- **`temperature` is now sent to gpt-5-family models**, which never received it. Each such model refuses it once per machine, then Neo remembers.
+- **`stop` sequences are not sent on `/v1/responses`**, which has none. This was already true for gpt-5 models and now applies to older OpenAI chat models too.
+- **`provider=openai` with a custom `base_url` now needs a server that implements `/v1/responses`.** Use `provider=local` for OpenAI-compatible servers that speak only chat completions.
+
+### Known limits
+
+- A model whose lowest effort level is above the one Neo asks for (some `-pro` models start at `medium`) runs at the provider default for that call and pays the extra rejected requests each time, because nothing can be learned safely from that refusal.
+- The Anthropic, Google and Azure paths through the shared helper are covered by unit tests, not live calls.
+
+## [0.54.3] - 2026-10-05
+
+Neo now asks CAR for a model by its exact catalog id whenever it has one, instead of by name.
+
+### Changed
+
+- **Catalog-id pins are sent to CAR as `model_id`.** CAR has two ways to pin a model. `model_id` is an exact catalog-id pin: CAR serves only that row and echoes it back as `requested_model_id`. `model` is a display-name or alias path, where a short name can resolve to some other row. A pin that is a full catalog id (`provider/name[:tag]`) now goes through `model_id`, using `infer_tracked_with_request`, since car-runtime's `infer_tracked` has no `model_id` keyword. It is accepted only if CAR echoes it exactly, with no name parsing. CAR's router hands the multi-agent panel a catalog id for every role, so all panel calls now take this path. A bare model name, or a car-runtime without `infer_tracked_with_request`, keeps the previous `model` path. A daemon too old to acknowledge `model_id` fails with an error saying CarHost needs updating, not one blaming the pin. A Hugging Face-style `Org/Model` pin is treated as a catalog id and fails loudly with `model not found` if it is not one. ([#261](https://github.com/Parslee-ai/neo/pull/261))
+
+## [0.54.2] - 2026-10-05
+
+One fix that let the multi-agent panel run again on machines whose CAR router picks a local model, and a CI timing fix.
+
+### Fixed
+
+- **The multi-agent panel rejected models CAR's own router had chosen.** `CarAdapter` refuses to run when CAR silently swaps a pinned model for another. It judged the pin against `model_used`, which is CAR's display name. For a local model, the router's choice `mlx/qwen3-0.6b:6bit` is served and reported as `Qwen3-0.6B-MLX`, and neither name contains the other. So the check refused the router's own pick, and every panel that drew it fell back to the single-model path (`deliberation failed: CAR did not honor pinned model`). The pin is now judged against `resolved_model_id`, the catalog id CAR reports in the pin's own namespace (`anthropic/claude-sonnet-4-6:latest`). The match is exact: the name must match, and the provider and tag only when the pin states them. This also closes an older hole where a `gpt-5` pin served as `gpt-5.5` passed the fuzzy match. A refusal now names both the resolved id and the display name. CAR builds that do not report `resolved_model_id` keep the previous check. ([#257](https://github.com/Parslee-ai/neo/pull/257))
+
+### Changed
+
+- The worktree-acceptance tests added in 0.54.1 order their events with a fake clock instead of two-second sleeps (76s to 4s). The sleeps had pushed CI's test jobs into their 10-minute timeout.
+
+## [0.54.1] - 2026-10-05
+
+One fix to the learning loop. Before it, an acceptance made anywhere other than the checkout neo ran in could not count toward promotion, so CAR Lattice peers and worktree-based agent sessions could never teach neo anything durable.
+
+### Fixed
+
+- **Acceptances made in other checkouts never reached promotion.** Neo promotes a suggested pattern to a durable fact only after two git-verified acceptances on two distinct revisions. Two links in that chain broke when the suggestion was applied somewhere other than where neo ran. That is the normal case for a Lattice node, which answers from the main checkout while the asking agent works in a linked worktree on its own branch. ([#254](https://github.com/Parslee-ai/neo/issues/254), [#255](https://github.com/Parslee-ai/neo/pull/255))
+  - **Detection only looked at the main checkout.** A suggested path is now also resolved against every local branch and every linked worktree. A worktree's uncommitted files count only if they were written after the suggestion, since agents keep work in progress uncommitted in the very file they asked about. Host-ledger edits are attributed to the checkout that holds them, so an edit under `.claude/worktrees/x/` matches `src/foo.py`. Remote-tracking branches are excluded, so a teammate's fetched commit is not read as an acceptance. The wider evidence only resolves paths neo suggested; independent-change detection keeps its old scope.
+  - **The distinct-revision gate compared HEAD at ask time.** On a main checkout that sits still while peers commit elsewhere, that is one value forever, so nothing could promote. The gate now compares the revision each accepted change was applied on top of, and acceptances that continue one another count as one sitting. Those are acceptances that share that revision, build on the other's commit, or were committed after being seen uncommitted. One lesson applied file by file, or by parallel agents, therefore still cannot promote itself. The evidence is stored per suggestion in a free-form field of the episode record, so no schema bump makes an older running neo process quarantine new records.
+
+## [0.54.0] - 2026-10-04
+
+Neo joins the CAR Lattice as a read-only player: other agents on the same CAR daemon can find it by capability and ask it questions, look up project memory, or request reviews. It stays inert until the daemon ships the Lattice API.
+
+### Added
+
+- **Neo joins the CAR Lattice as a read-only player.** With `car-server` running, every repository Neo is used in gets a CAR-supervised `neo-lattice-<id>` agent. Like the observer, it is registered automatically. The agent joins the repository's project with capability tags (`code-review`, `debugging`, `architecture`, `project-memory`, `past-solutions`, …, plus the repository's main languages), so Claude Code, Codex and CAR Coder sessions find it with `lattice.find` rather than by address. Because it is a supervised agent, the daemon pushes each `agent.peer_message` to it. MCP coding sessions only see mail when they poll, so Neo answers while the asker keeps working.
+  - **`question`:** Neo answers in prose. Only bugfix and algorithm questions, the kinds a later git-verified acceptance can promote, run in LEARN mode. Everything else runs in ADVISE and records no episode that could never be confirmed.
+  - **`memory:` lookup:** answered from this repository's facts with no model call. Retrieval runs with the new `retrieve_relevant(record_access=False)`, so a lookup cannot lift a fact out of probation or push it toward demotion without git evidence. Global and org facts, which are mined from every repository on the machine, are never returned to a peer.
+  - **`review_request` with a diff:** runs the deterministic VERIFY checks, then a review in ADVISE mode, so a peer's patch never enters Neo's learning loop as a Neo suggestion. A JSON body cannot widen a review request into the learning path. The diff splitter handles renames, binary sections, form feeds inside hunks, diffs of patch files, and C-quoted paths.
+  - **Other kinds:** a `handoff` is declined, because Neo writes no files and never claims work. Neo answers only `question` and `review_request`; every other kind, and an untyped reply, is dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one Neo answer stops after 4, so auto-responders cannot loop or run up a bill.
+  - **Answers:** replies carry `kind: answer` and `in_reply_to`, and cautions come first so truncation cannot cut them.
+  - **Supervised process:**
+    - It starts in `~/.neo` with `-P`, not in the repository. `python -m` puts the cwd first on `sys.path`, so a node started inside an untrusted clone would have imported that clone's `json.py` or `neo/` while holding an agent token.
+    - It is registered for the repository's main checkout, not a linked worktree that may later be deleted.
+    - Its agent credentials are removed from the environment once read, so in-process CAR use cannot supersede its binding.
+    - Every daemon call has a timeout. A silent or superseded daemon is treated as a lost connection.
+    - A dead worker exits the process so CAR restarts it.
+    - A signal mid-answer exits immediately instead of waiting for the model call.
+  - **Lifecycle:**
+    - **Inert on a daemon without the Lattice API.** Autojoin probes the daemon before registering: a plain `lattice.nodes` is refused either way, and only `unknown method` means the API is missing. Today's CarHost gets no node, and Neo joins automatically once CAR is updated. A node that meets a daemon without the API exits cleanly instead of reconnecting forever.
+    - Nodes whose repository has gone, or that have neither answered a peer nor seen neo run beside them in 14 days, are reaped. A node whose checkout vanished is re-registered.
+    - `neo lattice status` and `join` cross-check CAR's answer against the node's own pid file, so client/daemon protocol skew cannot make them report a running node as stopped.
+    - An idle node uses about 35 MB. Once it has loaded memory, it re-execs itself after 10 idle minutes.
+    - `neo lattice leave` takes a repository off and records the choice; `neo lattice join` reverses it. `NEO_OBSERVER_AUTOSTART=0` turns this agent off along with the observer.
+- `DaemonClient` (`neo.a2ui`) answers daemon-to-client JSON-RPC requests (`on_request`) and accepts an agent-bound `session.auth`. Previously it treated a request with an `id` as a notification and never replied, so the daemon waited out its acknowledgement timeout. `call()` takes a `timeout` and distinguishes a refusal (`RuntimeError`) from a dead transport (`ConnectionError`). A failed `session.auth` now closes the socket it opened.
+
+### Fixed
+
+- **The observer's supervised process imported from `~`.** Its CAR spec used `cwd: ~`, and `python -m` puts the cwd first on `sys.path`, so a stray `~/json.py` or `~/neo/` would have been imported. It now starts in `~/.neo`. The fix applies to new registrations.
+- **A remote CAR could rotate node names past a Neo node's hourly answer budget.** On a Lattice that spans daemons, a node on another CAR is addressed `<node>@<car>`, and that CAR chooses the `<node>` part. The per-sender budget was keyed on the full address, so each new name got a fresh 12 answers an hour on the operator's API key. A remote sender is now charged to its CAR (`@<car>`), which cannot collide with a local node of the same name. The follow-up depth cap was never affected: it is keyed on `in_reply_to`, not on the sender. ([#251](https://github.com/Parslee-ai/neo/issues/251), [#252](https://github.com/Parslee-ai/neo/pull/252))
+
+## [0.53.2] - 2026-09-24
+
+One fix to `neo update`, which could report "already up to date" for up to an hour after a new release reached PyPI, and a cleanup that lets neo pass the plugin-scanner gate the awesome-ai-plugins catalog enforces before listing a plugin.
+
+### Fixed
+
+- **`neo update` could say "already up to date" while a newer release was on PyPI.** `perform_update` reused the passive per-invocation update check, which answers from `~/.neo/update_check.json` whenever that cache is under an hour old, so a command the user runs on purpose trusted an answer up to an hour stale. `neo update` now asks PyPI synchronously (`check_for_updates(force=True)`), rewrites the cache with the answer, and acts on the version it just fetched rather than re-reading the cache, so an unwritable `~/.neo` cannot send it back to the stale value. If the fetch fails it falls back to the cached answer. The passive check that runs on every invocation is unchanged. ([#245](https://github.com/Parslee-ai/neo/issues/245), [#246](https://github.com/Parslee-ai/neo/pull/246))
+
+### Changed
+
+- **neo now passes the plugin-scanner gate used by the awesome-ai-plugins catalog.** The HOL AI Plugin Scanner reported 13 high-severity findings and a score of 76 against the catalog's bar of 80; it now reports 0 high and 82. All 13 were false positives, and none was a real secret or a real runtime `eval`. Fake API keys in tests are now `example-*` placeholders, and the three tests that need a realistic key build it at runtime so the value under test is unchanged. The generated stdin wrapper's fallback calls `globals()[func_name](line)` instead of `eval`, with the same behaviour and a new test that runs the generated script. Three recorded measurement files under `evidence/` whose file lists contain `sk-`-prefixed doc paths are now committed gzipped; their content is byte-identical when decompressed, and `evidence/score_subsets.py` reads either form. ([#247](https://github.com/Parslee-ai/neo/pull/247))
+
+## [0.53.1] - 2026-09-23
+
+Two fixes for neo's own plumbing: the Claude Code plugin failed to load on Claude Code 2.1.278 and earlier, and the CAR binding fell further behind with every CAR release. The plugin fix reaches existing installs only through this version bump.
+
+### Fixed
+
+- **Neo upgraded itself while its CAR binding stayed behind.** `pipx upgrade neo-reasoner` does not move `car-runtime`: pip leaves a dependency that already satisfies its specifier alone, and the `[car]` extra's specifier is a range (`>=0.27.0,<1.0`). So the binding stayed at whatever version first satisfied that range while CAR shipped a release a week, and neo spoke an older protocol to the daemon it was talking to. Measured on a live install: neo auto-upgraded 0.46 → 0.52 with its binding two CAR releases behind the running daemon. The periodic update check now also refreshes the binding — on its own interval, because the drift accumulates *between* neo releases, so a refresh tied to a neo upgrade would have missed exactly this case. It runs only where the `[car]` extra is installed and only on installs neo owns (pipx, pip-venv; brew and external are skipped for the same reason neo's own pip-override is, #81/#89), never crosses the extra's `<1.0` ceiling, and confirms the result by reading the installed version from disk in a fresh interpreter rather than trusting an exit code. `neo update` refreshes it immediately. ([#241](https://github.com/Parslee-ai/neo/pull/241))
+
+- **The Claude Code plugin failed to load on Claude Code 2.1.278 and earlier.** `.claude-plugin/plugin.json` declared `"hooks": "./hooks/hooks.json"`, a path Claude Code already loads automatically. On Claude Code 2.1.278 and earlier (verified in the 2.1.277 and 2.1.278 binaries) that duplicate is a `hook-load-failed`, and `claude plugin list` shows the plugin as `✘ failed to load` — taking all six commands and the agent down with the hook. Claude Code 2.1.280 and later tolerate the duplicate and load the file once (verified in the 2.1.280 and 2.1.281 binaries). The key has been there since 0.47.0 ([#221](https://github.com/Parslee-ai/neo/pull/221)). It is now removed, and the hook still registers from the standard path. ([#243](https://github.com/Parslee-ai/neo/pull/243))
+
+  **Existing installs pick this up only through this version bump.** Claude Code caches plugins by version, so run `/plugin update` (or `claude plugin update neo@<marketplace>`) to move to 0.53.1.
+
+  **A correction to the 0.47.0 entry's guidance:** `claude plugin details` reports the components on disk, not whether the plugin loaded — it printed the full inventory for a plugin that had failed. `claude plugin list` (or the `/plugin` view) is the check that reports load state.
+
+## [0.53.0] - 2026-09-15
+
+The one learning path that works — transcript mining by the background observer — was silently losing episodes, the observer's own status was wrong, and half of the memory neo put into prompts was stale suggestion residue. All found by auditing a live install; all fixed in [#239](https://github.com/Parslee-ai/neo/pull/239).
+
+### Fixed
+
+- **An LM failure was recorded as "this episode has no lessons".** `_lm_json` swallowed every exception (and unparseable output), so the episode's watermark advanced and it was never mined. A live observer logged **610** such failures during a DNS outage — each one an episode lost for good, and unrecoverable, since nothing records which. A failure now leaves the episode unconsumed, and is charged to the episode only when an answer from the provider vouches for it — two failures in a row with no answer stop the pass and the sweep with nothing charged, whatever the error class (a revoked key, disabled billing or quota exhaustion fails every episode alike). Per-episode caps (3 non-transient, 20 transient) keep a poison episode from being retried forever, and all of an episode's LM calls run before its first admission.
+- **A budget-stopped pass stranded the rest of older transcripts.** The skip-unchanged-files gate used the watermark file's mtime, which is rewritten after every consumed episode, so a pass stopped by the 8-episode budget armed the skip against the transcript still holding its backlog. Measured: **152 of 1,800** episodes stranded. The gate now uses a per-directory drain mark (`min(pass start, earliest unconsumed episode timestamp)`); existing watermarks parse once on upgrade, which recovers the stranded episodes.
+- **One dropped connection failed a whole run.** The gpt-5/codex Responses path was a bare `httpx.post` with no retry, and a 503 surfaced as an untyped `ValueError`. It now goes through the OpenAI SDK client: connection errors, 429 and 5xx are retried, errors arrive typed, the SDK's 5-second connect timeout is kept, and error messages no longer carry the model's partial output. The CLI's `NetworkTimeout` envelope — which never fired for SDK timeouts — now does, without the fixed `timeout_seconds: 300` that matched no adapter.
+- **`neo memory observer status` reported a running observer as `stopped`.** When car-runtime cannot reach the car-server daemon's supervisor — car-runtime 0.50.0 speaks wire protocol v2, a CarHost 0.52.1 daemon requires v3 — `agents_list` silently falls back to manifest rows, so status said `stopped` for an observer nine days into sweeping, and stop/kick did nothing. neo now cross-checks CAR against the observer's single-instance lock: status reads `unverified` with the routing error, and start/stop/kick refuse rather than act on the wrong supervisor. Fix it by upgrading car-runtime to match the daemon.
+- **Half of the memory in every prompt was stale suggestion residue.** Before the episode ledger replaced immediate fact-writing, every feature suggestion was stored as an unverified, never-decaying DECISION fact. **238 of them were 49% of all memory injected into prompts over 30 days, and ~4% of those injections were used** — the most-injected were drill prompts. They are retired on the next start (tombstoned with `invalidation_reason=legacy_unverified_suggestion`).
+
+### Added
+
+- Observer log lines (`~/.car/logs/neo-observer.*.log`) carry timestamps.
+
+### Changed
+
+- **`base_url` for gpt-5/codex models follows the OpenAI SDK convention and must end in `/v1`**, as the chat-completions path always required. The old Responses path appended `/v1` itself, so a bare-host `base_url` that worked there only now needs the suffix.
+
 ## [0.52.1] - 2026-08-30
 
 Documentation only. **Retracts a measurement claim published in 0.52.0.** No code changed; no behaviour changed.

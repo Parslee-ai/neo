@@ -202,9 +202,11 @@ class NeoConfig:
     #              the daemon is reachable; fall back to the static provider above
     #              on absence or runtime failure. CAR is optional but used when
     #              present.
-    # Default is "static" (gpt-5.6) until a CAR release verifies the router's
-    # quality behavior — CAR's released router cost-biases to mini models, a
-    # measured regression. Flip to "auto" once a verified CAR build is deployed.
+    # Default is "static" until a CAR release passes `tools/ab_car_router.py`.
+    # On 0.56.1 the old mini-model routing is fixed (6/6 prompts served by a
+    # frontier model), but the served model lost 6/6 head-to-heads on real neo
+    # prompts by inventing APIs past truncated context
+    # (docs/car-router-eval-2026-10-07.md). Flip to "auto" only on a passing run.
     inference_mode: str = "static"
 
     # Reasoning tier: "auto" gates multi-agent deliberation on novelty + CAR +
@@ -219,7 +221,8 @@ class NeoConfig:
     default_temperature: float = 0.7
     default_max_tokens: int = 4096
 
-    # Reasoning effort (OpenAI gpt-5* only). Acts as an upper bound on the
+    # Reasoning effort (OpenAI adapter; sent to every model, which drops or
+    # lowers what it does not support). Acts as an upper bound on the
     # memory-driven effort selected per-query. None = no cap.
     # Valid: "none", "low", "medium", "high", "xhigh".
     reasoning_effort_cap: Optional[str] = None

@@ -398,3 +398,40 @@ class TestJsonDryRunKeepsItsContract:
         for line in result.stderr.splitlines():
             if line.startswith("{"):
                 json.loads(line)  # every `{`-prefixed line is a real event
+
+
+class TestNoDaemonSideEffects:
+    """A dry run must not register the observer or join the Lattice.
+
+    Both run from `cli.main` before dispatch whenever car-server is reachable,
+    so `neo --dry-run` used to upsert + start the global observer and join the
+    repository's Lattice: real daemon mutations from an inspection command.
+    """
+
+    def _calls(self, monkeypatch, argv):
+        import neo.lattice
+        import neo.memory.observer
+        from neo import cli
+
+        seen = []
+        monkeypatch.setattr(neo.memory.observer, "maybe_autostart_observer",
+                            lambda: seen.append("observer"))
+        monkeypatch.setattr(neo.lattice, "maybe_autojoin",
+                            lambda *a, **k: seen.append("lattice"))
+        monkeypatch.setenv("NEO_SKIP_UPDATE_CHECK", "1")
+        monkeypatch.setattr(sys, "argv", ["neo", *argv])
+        try:
+            cli.main()
+        except SystemExit:
+            pass
+        return seen
+
+    def test_control_an_ordinary_command_reaches_both(self, monkeypatch, capsys):
+        # Without this the assertion below could pass because the probe never
+        # sees anything at all.
+        assert self._calls(monkeypatch, ["memory", "learning-stats"]) == ["observer", "lattice"]
+
+    def test_dry_run_reaches_neither(self, monkeypatch, tmp_path, capsys):
+        (tmp_path / "app.py").write_text("def handler():\n    return 1\n")
+        argv = ["--dry-run", "fix the handler", "--cwd", str(tmp_path)]
+        assert self._calls(monkeypatch, argv) == []

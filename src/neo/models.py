@@ -450,7 +450,8 @@ class LMAdapter(ABC):
         """Generate a response from the model.
 
         `reasoning_effort` (one of "none", "low", "medium", "high", "xhigh")
-        controls thinking budget on OpenAI gpt-5* models. None means the
+        controls thinking budget on OpenAI models (the adapter drops or lowers
+        it for a model that does not take that level). None means the
         provider's default. Adapters that don't support reasoning effort
         accept and ignore the parameter.
         """

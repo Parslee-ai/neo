@@ -921,6 +921,69 @@ def _print_supplied_files(context_files) -> None:
         )
 
 
+def _is_network_timeout(exc: BaseException) -> bool:
+    """True when ``exc`` is a network timeout from any LM transport.
+
+    Two shapes: httpx's own, and the openai SDK's ``APITimeoutError``, which
+    wraps httpx's and is what every OpenAI and Azure call raises. Checking only
+    httpx left the ``NetworkTimeout`` envelope unreachable for both, so a
+    timeout was reported as a generic ``ProcessingError``.
+    """
+    timeout_types: list[type] = []
+    try:
+        import httpx
+        # The base class: WriteTimeout and PoolTimeout are timeouts too.
+        timeout_types.append(httpx.TimeoutException)
+    except ImportError:
+        pass
+    try:
+        import openai
+        timeout_types.append(openai.APITimeoutError)
+    except ImportError:
+        pass
+    return bool(timeout_types) and isinstance(exc, tuple(timeout_types))
+
+
+# One-word prompts that are almost certainly a mistyped command, mapped to
+# the command meant. Any other prompt, including any question of two or more
+# words, goes to inference as before.
+_COMMAND_WORDS = {
+    "version": "neo --version",
+    "help": "neo --help",
+    "status": "neo workspace status",
+    "index": "neo --index",
+    "config": "neo --config list",
+    "upgrade": "neo update",
+    "init": "neo --help",
+    "stats": "neo memory learning-stats",
+}
+_SUBCOMMANDS = (
+    "contribute", "update", "serve", "car", "construct", "memory",
+    "prompt", "hook", "workspace", "lattice",
+)
+
+
+def bare_command_hint(prompt):
+    """The command a one-word prompt most likely meant, or None.
+
+    `neo version` used to take "version" as a question and start a paid
+    reasoning run (#278). A single word that exactly names a flag or a
+    subcommand (any case, ignoring leading dashes and trailing punctuation) is
+    refused with the right command instead. There is no fuzzy matching: it
+    refused real words such as "server", "updates" and "prompts". Only an argv
+    prompt reaches this; stdin input is never checked.
+    """
+    word = (prompt or "").strip()
+    if not word or any(ch.isspace() for ch in word):
+        return None
+    key = word.lower().lstrip("-").rstrip("?.!,;:")
+    if key in _COMMAND_WORDS:
+        return _COMMAND_WORDS[key]
+    if key in _SUBCOMMANDS:
+        return f"neo {key}"
+    return None
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # The host-hook recorder fires on every editor tool call, so it dispatches
@@ -932,8 +995,30 @@ def main():
         from neo.hook import run_hook
         return run_hook(sys.argv[2:])
 
+    if len(sys.argv) > 1 and sys.argv[1] == "workspace":
+        from neo.workspace import run_workspace
+        return run_workspace(sys.argv[2:])
+
+    # The lattice node is a long-running CAR-supervised process; like the
+    # hook, it must not trigger the update check or the observer autostart.
+    if len(sys.argv) > 1 and sys.argv[1] == "lattice":
+        from neo.lattice import cli_main
+        return cli_main(sys.argv[2:])
+
     # Parse arguments
     args = parse_args()
+
+    # A one-word prompt that names a command is a typo, not a question: refuse
+    # it before the update check, the observer autostart or any inference.
+    hint = bare_command_hint(getattr(args, "prompt", None))
+    if hint and not getattr(args, "command", None):
+        print(
+            f"neo: '{args.prompt.strip()}' looks like a command, not a question. "
+            f"Did you mean `{hint}`? To ask Neo about it, phrase a question of "
+            "more than one word.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Configure logging early so all subsequent code can log
     _configure_logging(args)
@@ -967,10 +1052,14 @@ def main():
     # Auto-start the single global memory observer when CAR is present (no
     # per-project opt-in). Non-blocking, silent, never raises; opt out with
     # NEO_OBSERVER_AUTOSTART=0. Skipped for explicit `memory observer` commands
-    # (the handler manages the agent) and version/config short-circuits.
+    # (the handler manages the agent), version/config short-circuits, and
+    # `--dry-run`: an inspection must not register agents with the daemon or
+    # join the Lattice, and a test running `neo --dry-run` under a fake $HOME
+    # left an orphan observer bound to that throwaway home.
     if not (
         (hasattr(args, 'version') and args.version)
         or (hasattr(args, 'config') and args.config)
+        or getattr(args, 'dry_run', False)
         or (
             getattr(args, 'memory_action', None)
             in {
@@ -984,6 +1073,13 @@ def main():
             maybe_autostart_observer()
         except Exception as e:
             logger.debug(f"Observer autostart failed: {e}")
+        # Same condition, same contract: with CAR present, the repository
+        # neo is being used in gets a read-only neo player on the Lattice.
+        try:
+            from neo.lattice import maybe_autojoin
+            maybe_autojoin()
+        except Exception as e:
+            logger.debug(f"Lattice autojoin failed: {e}")
 
     # Handle global flags first (exist on all parsers, must check before subcommand-specific attributes)
 
@@ -1288,6 +1384,10 @@ def main():
         if not args.dry_run:
             _print_neo_greeting(prompt, working_dir)
 
+    # Structured hosts explicitly opt into the same bounded file selection as
+    # the text CLI. Existing JSON consumers keep their supplied context only.
+    if input_mode != "json" or input_data.get("auto_context") is True:
+        prompt = neo_input.prompt
         # Bound before the branch: `--no-scan` skips the gatherer entirely and
         # the dry-run report below still has to say something truthful.
         gathered = []
@@ -1457,7 +1557,6 @@ def main():
         error_output = {
             "error": "RequestTimeout",
             "message": "LLM request exceeded timeout limit",
-            "timeout_seconds": 300,
             "details": str(e),
             "suggestions": [
                 "Try simplifying your prompt",
@@ -1497,24 +1596,21 @@ def main():
         print(json.dumps(error_output, indent=2))
         sys.exit(1)
     except Exception as e:
-        # Import httpx to check for timeout errors
-        try:
-            import httpx
-            if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout)):
-                error_output = {
-                    "error": "NetworkTimeout",
-                    "message": f"Network request timed out: {str(e)}",
-                    "timeout_seconds": 300,
-                    "suggestions": [
-                        "Check your internet connection",
-                        "Verify API endpoint is accessible",
-                        "Try again in a moment"
-                    ]
-                }
-                print(json.dumps(error_output, indent=2))
-                sys.exit(1)
-        except ImportError:
-            pass
+        # No `timeout_seconds` in this envelope (or RequestTimeout's): the
+        # limit is per-adapter, and the fixed 300 both used to report matched
+        # none of them — the OpenAI SDK reads for 600s.
+        if _is_network_timeout(e):
+            error_output = {
+                "error": "NetworkTimeout",
+                "message": f"Network request timed out: {str(e)}",
+                "suggestions": [
+                    "Check your internet connection",
+                    "Verify API endpoint is accessible",
+                    "Try again in a moment"
+                ]
+            }
+            print(json.dumps(error_output, indent=2))
+            sys.exit(1)
 
         # Generic error handler. The message is scrubbed on the way out: this
         # goes to a HOST, which may log or forward it, and an exception string
@@ -1541,6 +1637,8 @@ def main():
 
     # Serialize output
     try:
+        from neo.workspace import memory_evidence_for
+
         output_dict = {
             "plan": [
                 {
@@ -1574,6 +1672,8 @@ def main():
                     "tool_name": check.tool_name,
                     "diagnostics": check.diagnostics,
                     "summary": check.summary,
+                    "kind": check.kind,
+                    "status": check.status,
                 }
                 for check in output.static_checks
             ],
@@ -1582,6 +1682,7 @@ def main():
             "confidence_basis": output.confidence_basis,
             "notes": output.notes,
             "metadata": output.metadata,
+            "memory_evidence": memory_evidence_for(engine),
             "goal_assessment": (
                 asdict(output.goal_assessment) if output.goal_assessment else None
             ),
@@ -1686,4 +1787,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main() returns the exit status; dropping it made `python -m neo`
+    # report success for every refusal and failure.
+    sys.exit(main())

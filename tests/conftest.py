@@ -108,6 +108,14 @@ def isolate_neo_home(tmp_path, monkeypatch):
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("HOME", str(fake_home))  # Also patch $HOME for expanduser()
+    # `cli.main` autostarts the observer whenever car-server is reachable, and
+    # a fake $HOME does not isolate the daemon: every `python -m neo` subprocess
+    # registered agents with the LIVE car-server, wrote `home/.car/*` into
+    # tmp_path (which a `--cwd tmp_path` test then indexes as repo files), and
+    # left an orphan observer running against the throwaway home. Invisible in
+    # CI and in any venv without car-runtime. Tests that exercise autostart
+    # re-enable it with their own monkeypatch.
+    monkeypatch.setenv("NEO_OBSERVER_AUTOSTART", "0")
 
     # Re-point every path constant captured at import time. Without this the
     # fixture's promise is false for any module already imported — which, at
@@ -144,8 +152,8 @@ _GIT_ENV_VARS = (
 )
 
 
-@pytest.fixture(autouse=True)
-def scrub_ambient_git_env(monkeypatch):
+@pytest.fixture(autouse=True, scope="session")
+def scrub_ambient_git_env():
     """Detach the suite from any git process that spawned it.
 
     Tests and production code both shell out to `git` with `cwd=` pointing at a
@@ -177,9 +185,18 @@ def scrub_ambient_git_env(monkeypatch):
     `GIT_AUTHOR_*` / `GIT_COMMITTER_*` are deliberately left alone: they only
     supply identity, which a temp repo needs anyway, and removing them would
     break commits on machines with no `user.email` configured.
+
+    SESSION-scoped, not function-scoped: pytest builds wider-scoped fixtures
+    first, so a function-scoped scrub ran AFTER every session/module fixture.
+    `test_selection_invariants.fixture_repos` (session) then ran `git add -A`
+    under the `GIT_INDEX_FILE` that `git commit -a` exports to hooks, from the
+    MAIN checkout too, and wrote its fixture files into the commit's index,
+    aborting the commit with "invalid object ... Error building trees".
     """
-    for name in _GIT_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
+    with pytest.MonkeyPatch.context() as mp:
+        for name in _GIT_ENV_VARS:
+            mp.delenv(name, raising=False)
+        yield
 
 
 @pytest.fixture(autouse=True)

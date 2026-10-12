@@ -1,6 +1,7 @@
 # Host hooks for outcome detection
 
-**Status**: recording half shipped; consuming half not started. See *Status* below.
+**Status**: recorder and git-verifying consumer are implemented. The Claude Code
+Mod adds diagnostic identity and lifecycle observations; see *Status* below.
 
 ## The problem, as measured
 
@@ -71,8 +72,10 @@ empirically before any code reads them.
 ## Shape, as shipped
 
 `hooks/hooks.json` at the **plugin root** (not `.claude-plugin/` — see
-`tests/test_host_adapter_parity.py`), declared as `"hooks": "./hooks/hooks.json"`
-in `.claude-plugin/plugin.json`:
+`tests/test_host_adapter_parity.py`), and **not declared in
+`.claude-plugin/plugin.json`**: Claude Code loads that path automatically, and
+naming it in `manifest.hooks` is a duplicate it rejects by failing the whole
+plugin (#242). The key is for *additional* hook files only.
 
 ```json
 {
@@ -145,24 +148,27 @@ with more force, since this one writes to disk.
 
 ## Status
 
-**Shipped (recording half):** `neo hook record`, `hooks/hooks.json`, the
-`"hooks"` declaration in `.claude-plugin/plugin.json`, and `tests/test_hook.py`.
-Verified end to end at **0.06 s** per invocation against `neo --version`'s
-0.36 s, exit 0 on every path, `claude plugin details` reporting
+**Shipped (recording half):** `neo hook record`, `hooks/hooks.json` and
+`tests/test_hook.py`. Verified end to end at **0.06 s** per invocation against
+`neo --version`'s 0.36 s, exit 0 on every path, `claude plugin list` reporting
+`✔ enabled` and `claude plugin details` reporting
 `Hooks (1) PostToolUse (harness-only — no model context cost)`.
 
-**Not shipped (consuming half):** nothing reads `host_events.jsonl` yet.
-`collect_outcomes` still infers acceptance from a repo-wide git diff.
+The `"hooks"` declaration that shipped alongside these in #221 has been
+**removed** (#242) — it named the auto-loaded path and failed the whole plugin.
+Note which command proves what: `details` printed that `Hooks (1)` line for a
+plugin that was not loading at all, so it is evidence the file was FOUND, not
+that the plugin started. `claude plugin list` is the load-state check.
 
-The split is deliberate rather than partial delivery: a ledger is only worth
-reading once it has history, and history cannot be recorded retroactively, so
-the recorder has to land first regardless of when the consumer does. What the
-consumer should claim is narrower than the first draft of this note implied —
-see defect (2). The durable win is that the ledger cannot lose an acceptance
-that git later obscures (a revert, a reformat, a commit that moves the
-timestamp window), because it witnessed the edit rather than reconstructing it.
+**Implemented consumer:** `OutcomeTracker._load_host_edit_events` reads active
+and rotated ledgers once per collection, attributes paths to this repository's
+checkouts and adds eligible edit observations to git-based matching. The ledger
+does not replace content verification or establish independent acceptance.
+Lifecycle events are excluded. Mod session/turn/tool IDs and recent-invocation
+correlation are retained as outcome diagnostics, never promotion authority.
+See `tests/test_host_edit_ledger.py` and [Mod behavior](../claude-code-mods.md).
 
-**The consuming half must be written against a dirty tree.** CLAUDE.md records
+**Consumer tests run against a dirty tree.** CLAUDE.md records
 the precedent exactly: a previous fix here "passed every test because they all
 ran on a pristine tree, the one state neo is never invoked in", and it lost
 acceptances in production anyway.

@@ -93,3 +93,24 @@ def test_factory_pins_distinct_adapters_with_fallback():
     # adapters are cached (built once each)
     factory("coder")
     assert built == ["gpt", "claude"]
+
+
+def test_the_panel_pins_router_ids_as_catalog_ids(monkeypatch):
+    """The router plan's ids reach CarAdapter flagged as catalog ids, so they
+    take the exact `model_id` path whatever their shape."""
+    import neo.adapters as adapters
+    from neo.engine import NeoEngine
+
+    seen = {}
+
+    def fake_create(provider, model=None, **kwargs):
+        seen[model] = (provider, kwargs.get("model_is_catalog_id"))
+        return object()
+
+    monkeypatch.setattr(adapters, "create_adapter", fake_create)
+    route = lambda p, i: '{"model": "parslee/openrouter/open-fast"}'  # noqa: E731
+    engine = NeoEngine.__new__(NeoEngine)
+    engine.lm = object()
+    factory = NeoEngine._build_car_role_factory(engine, route, "q")
+    factory("planner")
+    assert seen == {"parslee/openrouter/open-fast": ("car", True)}

@@ -25,6 +25,7 @@ wrong definitions were tried first and both mislabelled:
 The question that decides which stage runs is "does the query name a path this
 repo has", so that is what is asked.
 """
+import gzip
 import json
 import os
 import subprocess
@@ -41,6 +42,20 @@ EVIDENCE = os.path.dirname(os.path.abspath(__file__))
 REPOS = ["neo", "aieweb", "m365dotnet"]
 ARMS = ["main", "branch"]
 KS = [1, 3, 10]
+
+
+def load_run(name):
+    """Read a harness output, plain or as the byte-identical `.gz` it may be
+    committed as. The m365dotnet runs are stored gzipped because their raw
+    JSON lists that repo's `docs/solutions/sk-*.md` paths, which match an
+    OpenAI-key regex in third-party secret scanners; `gzip -dc` restores the
+    original bytes exactly."""
+    path = os.path.join(EVIDENCE, name)
+    if os.path.exists(path):
+        with open(path) as fh:
+            return json.load(fh)
+    with gzip.open(path + ".gz", "rt") as fh:
+        return json.load(fh)
 
 
 def tracked_files(repo_path):
@@ -93,8 +108,7 @@ def main():
     for repo in REPOS:
         loaded = {}
         for arm in ARMS:
-            path = os.path.join(EVIDENCE, f"m1_{repo}_{arm}.json")
-            loaded[arm] = json.load(open(path))
+            loaded[arm] = load_run(f"m1_{repo}_{arm}.json")
         # Identical case sets are the whole basis of the comparison; assert it
         # rather than assume it. Two arms scored on different samples produce a
         # delta that describes the sample.

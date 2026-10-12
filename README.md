@@ -328,6 +328,35 @@ neo --version
 
 If the CLI/daemon are present but the Python bindings aren't, Neo reports that state cleanly. CAR install options live at [Parslee-ai/car-releases](https://github.com/Parslee-ai/car-releases).
 
+### Join the CAR Lattice
+
+For organization-bound nodes with private storage and native lifecycle ownership,
+see [organization-bound Lattice setup](docs/scoped-lattice.md). The automatic
+registration described below applies to personal nodes.
+
+The Lattice is CAR's collaboration layer: Claude Code, Codex, CAR Coder and other agents on one CAR daemon say what they are good at, find each other by need, and send each other typed messages. With the `[car]` extra installed and `car-server` running, every repository you use Neo in automatically gets a **read-only Neo player**, a CAR-supervised agent named `neo-lattice-<id>`. Nothing to configure.
+
+Other players find it with `lattice_find` / `lattice.find` (for example "code review", "debugging", "project memory", "architecture"), then message it:
+
+| Send (`kind`) | Neo does |
+|---|---|
+| `question` | Answers in prose from the repository, using Neo's normal pipeline. |
+| `question` whose body starts `memory:` | Looks the query up in this repository's Neo memory, with no model call. That memory is mined from Claude Code, Codex, CAR and GitHub-PR history, so a Codex session can draw on lessons learned in a Claude Code session. Only project facts are returned, never other repositories' facts, and a lookup does not age the facts it reads. |
+| `review_request` with a unified diff | Runs deterministic checks on the change (no model call), then reviews it. |
+| `handoff` | Declines. Neo writes no files and never claims work, so it points the sender at `lattice.find` instead. |
+
+Answers come back as `kind: answer` with `in_reply_to` set to your message id. Neo answers only `question` and `review_request`. Every other kind, and any untyped message that is itself a reply, is acknowledged and dropped. Each sender gets 12 model-backed answers an hour, and a chain of follow-ups to one answer stops after 4, so two auto-responders cannot run up a bill. Both limits are held in the node's memory, so they reset when the node restarts or recycles. The player shows `busy` while it is answering.
+
+The node is registered for the repository's main checkout, even when neo runs inside a linked worktree, so deleting an agent worktree cannot break it. Nodes whose repository has gone, or that have neither answered a peer nor seen neo run beside them in 14 days, are removed automatically. If the CAR daemon does not have the Lattice API yet (CarHost releases before it ships), no node is registered. Neo joins automatically once CAR is updated.
+
+```bash
+neo lattice status   # this repository's node
+neo lattice leave    # take this repository off the Lattice (autostart remembers)
+neo lattice join     # put it back
+```
+
+`NEO_OBSERVER_AUTOSTART=0` turns off every agent Neo registers on its own, this one included. An idle node uses about 35 MB of memory; one that has answered re-execs itself after 10 idle minutes to release the engine.
+
 ### Why use the CAR surfaces
 
 - **Real inference path both ways** — inbound, callers see Neo as a typed A2A tool; outbound, Neo gets local-first inference with automatic remote fallback through one provider-agnostic protocol
@@ -347,6 +376,8 @@ Neo ships as a **Claude Code plugin** with a specialized agent and six slash com
 
 # Install Neo
 /plugin install neo
+# Or install directly in one step on recent Claude Code hosts:
+/plugin install neo --marketplace Parslee-ai/neo
 ```
 
 `Parslee-ai/neo` also carries its own marketplace manifest, so
@@ -355,12 +386,16 @@ without the intermediate repository.
 
 Once installed:
 
+- **Native Neo workspace** (Mods-enabled hosts): `/neo-workspace` opens findings,
+  proposals, checks and read-only project memory. `/neo-ask` starts direct
+  reasoning, `/neo-followup` continues it, and `/neo-cancel` stops the owned run.
+  Requires a matching plugin/CLI build; see [setup and behavior](docs/claude-code-mods.md).
 - **Slash commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
 - **Specialized agent**: invoke with `Use the Neo agent to ...` for delegated semantic reasoning
 - **Shared memory**: same `~/.neo/facts/` store used by the CLI, Codex, and Cursor plugins
 - **Edit-recording hook**: a `PostToolUse` hook records which files Claude Code
-  edited, so Neo can observe whether a suggestion was applied instead of
-  inferring it from a later git diff. It records paths, never file contents, and
+  edited, adding observations to Neo's git-based outcome matching. Host events
+  alone do not prove acceptance. It records paths, never file contents, and
   costs no model context. Opt out with `NEO_HOOKS=0`.
 
 Examples:
@@ -387,8 +422,8 @@ the marketplace entry. **Components live at the repository root, not inside
 `.claude-plugin/`** — [`agents/neo.md`](agents/neo.md) defines the agent,
 [`commands/*.md`](commands/) each slash command, and
 [`hooks/hooks.json`](hooks/hooks.json) the edit-recording hook. Claude Code
-discovers components at the plugin root and reads only manifests from
-`.claude-plugin/`; nested there they are silently not loaded, which is what
+discovers components at the plugin root; `.claude-plugin/` contains manifests
+and generated Mod type declarations. Components nested there are silently not loaded, which is what
 `tests/test_host_adapter_parity.py` now pins.
 
 
@@ -1233,7 +1268,7 @@ After each Neo run, the next invocation diffs your repo against the suggestions 
 
 **Neo improves over time as it learns from experience.** Initial performance depends on available facts. Performance grows as the semantic memory builds up successful solutions, failure learnings, and architectural decisions.
 
-### Memory-Driven Reasoning Effort (gpt-5* models)
+### Memory-Driven Reasoning Effort (OpenAI models)
 
 Neo monetizes its learning into inference cost. Each query's `reasoning.effort`
 parameter is sized from the strength of the memory hit:
@@ -1248,10 +1283,16 @@ parameter is sized from the strength of the memory hit:
 Familiar queries get cheap thinking; novel-and-hard queries get max thinking.
 Cap with `NEO_REASONING_EFFORT={none,low,medium,high,xhigh}` for cost control.
 
-> **Model note:** the effort vocabulary differs by model. gpt-5.6 (the default)
-> accepts the full `none / low / medium / high / xhigh` range. Older
-> `gpt-5-codex` only accepts `low / medium / high` — if you switch back to
-> that model, set `NEO_REASONING_EFFORT=high` to cap the auto-selector.
+> **Model note:** the effort vocabulary differs by model. Neo sends the chosen
+> level to every OpenAI model and learns from the API's own rejection: a model
+> without `reasoning.effort` has it dropped, and a model that tops out lower
+> (older `gpt-5-codex` stops at `high`) is stepped down one level at a time.
+> Either way the retry is paid once per model and remembered in
+> `~/.neo/model_param_compat.json`. The exception is a model whose lowest level
+> is above the one requested (some `-pro` models start at `medium`): nothing can
+> be learned safely from that, so the call runs at the provider default and the
+> extra rejected requests recur each time. `NEO_REASONING_EFFORT` still caps the
+> auto-selector if you want a lower ceiling for cost.
 
 ### Architectural Quality Feedback Loop
 
@@ -1408,8 +1449,10 @@ adapter = OpenAIAdapter(model="gpt-5.6", api_key="sk-...")
 Neo's configured default model is `gpt-5.6` (`NeoConfig.model`), which is what
 the CLI uses. Constructing an adapter directly without a `model` falls back to
 the adapter's own default of `gpt-4`, so pass the model explicitly when you
-bypass `NeoConfig`. GPT-5/Codex models use the `/v1/responses` endpoint
-automatically.
+bypass `NeoConfig`. Every OpenAI model uses the `/v1/responses`
+endpoint. `provider=openai` with a custom `base_url` therefore requires a server
+that implements the responses endpoint; for any other OpenAI-compatible server
+(chat completions only) use `provider=local`.
 
 ### Anthropic
 

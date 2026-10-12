@@ -20,6 +20,8 @@ working leaves no trace until something is already destroyed.
 
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -90,3 +92,29 @@ def test_git_init_targets_cwd_not_an_inherited_gitdir(tmp_path):
     # not passing because nothing happened at all.
     sandbox_log = _git(sandbox, "log", "--oneline").stdout.strip()
     assert sandbox_log.endswith("sandbox-init")
+
+
+@pytest.fixture(scope="session")
+def _git_env_seen_by_a_session_fixture():
+    return {name: os.environ.get(name) for name in _GIT_ENV_VARS}
+
+
+def test_session_fixture_sees_no_git_env(_git_env_seen_by_a_session_fixture):
+    """Pinned through the subprocess test below; trivially true on its own."""
+    assert not any(_git_env_seen_by_a_session_fixture.values())
+
+
+def test_scrub_runs_before_session_scoped_fixtures(tmp_path):
+    """`git commit -a` exports `GIT_INDEX_FILE` to hooks even from the main
+    checkout. A session-scoped fixture is built before any function-scoped
+    one, so a function-scoped scrub let `fixture_repos` write into the
+    commit's index. Re-run the probe above under exactly that environment.
+    """
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_path / "next-index.lock")}
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         f"{Path(__file__)}::test_session_fixture_sees_no_git_env"],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:]

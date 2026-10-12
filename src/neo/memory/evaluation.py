@@ -260,6 +260,9 @@ class LearningLoopEvaluator:
                 suggestion_id=suggestion_id,
                 learning_episode_id=episode_id,
                 repository_revision=episode.repository_revision,
+                # Simulated as applied in place, right away: the change sits on
+                # the revision the advice was asked at.
+                applied_on_revision=episode.repository_revision,
                 candidate_id=candidate_id,
                 candidate_subject=family["subject"],
                 candidate_body=family["body"],

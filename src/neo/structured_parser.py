@@ -5,7 +5,6 @@ Replaces regex-based prose parsing with sentinel-bounded JSON blocks.
 """
 
 import json
-import re
 import logging
 from typing import Any, Optional
 from dataclasses import dataclass
@@ -137,15 +136,82 @@ def extract_block(response: str, kind: str) -> ParseResult:
     )
 
 
+_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+_SMART_QUOTES = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"}
+
+
+def _repair_outside_and_inside_strings(text: str) -> str:
+    """One string-aware pass over model JSON (#259):
+
+    - inside a string literal, escape raw newlines, carriage returns and tabs
+      (models put a literal newline in a value often enough to fail one run in
+      six), and a backslash that sits right before a raw newline;
+    - outside strings, drop a comma whose next non-space character is } or ].
+      A regex did this before and rewrote code inside values ("[1, 2,]").
+
+    Every other control character still fails the parse.
+    """
+    out: list[str] = []
+    in_string = escaped = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+                if ch in _CONTROL_ESCAPES:
+                    # "\" then a raw newline: keep the backslash as a literal.
+                    out.append("\\" + _CONTROL_ESCAPES[ch])
+                    i += 1
+                    continue
+            elif ch == "\\":
+                escaped = True
+                # Defer: whether this backslash escapes something is decided
+                # by the next character.
+                if i + 1 < n and text[i + 1] in _CONTROL_ESCAPES:
+                    out.append("\\")
+                    i += 1
+                    continue
+            elif ch == '"':
+                in_string = False
+            elif ch in _CONTROL_ESCAPES:
+                out.append(_CONTROL_ESCAPES[ch])
+                i += 1
+                continue
+        elif ch == '"':
+            in_string = True
+        elif ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _error_code(error_msg: str) -> str:
+    if "Expecting value" in error_msg or "Unterminated string" in error_msg:
+        return ParseErrorCode.TRUNCATION
+    if "Duplicate" in error_msg:
+        return ParseErrorCode.DUP_KEYS
+    if "Expecting" in error_msg:
+        return ParseErrorCode.BAD_JSON
+    return ParseErrorCode.ESCAPE_ERRORS
+
+
 def tolerant_json_load(json_str: str) -> ParseResult:
     """
     Load JSON with tolerance for common LM quirks.
 
-    Handles:
-    - Trailing commas
-    - Smart quotes
-    - Unescaped newlines in strings
-    - Extra whitespace
+    Tries, in order, stopping at the first that parses:
+    1. the text as given;
+    2. raw newlines/CR/tabs inside strings escaped, and trailing commas
+       outside strings removed (one string-aware pass);
+    3. that plus curly quotes mapped to straight ones. Last, because mapping a
+       curly quote that sits inside a value would end the string early.
 
     Args:
         json_str: JSON string to parse
@@ -153,46 +219,37 @@ def tolerant_json_load(json_str: str) -> ParseResult:
     Returns:
         ParseResult with parsed data or error
     """
-    # Try standard JSON first
     try:
-        data = json.loads(json_str)
-        return ParseResult(success=True, data=data)
+        return ParseResult(success=True, data=json.loads(json_str))
     except json.JSONDecodeError:
-        pass  # Try repairs below
+        pass
 
-    # Common repairs
-    repaired = json_str
-
-    # Fix smart quotes
-    repaired = repaired.replace('"', '"').replace('"', '"')
-    repaired = repaired.replace("'", "'").replace("'", "'")
-
-    # Remove trailing commas before } or ]
-    repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
-
-    # Try again
+    repaired = _repair_outside_and_inside_strings(json_str)
     try:
         data = json.loads(repaired)
         logger.info("JSON repaired successfully")
         return ParseResult(success=True, data=data)
     except json.JSONDecodeError as e:
-        # Check for specific errors
-        error_msg = str(e)
+        # Reported as-is: a later attempt's error would point into text the
+        # operator never sees.
+        step_two_error = str(e)
 
-        if "Expecting value" in error_msg or "Unterminated string" in error_msg:
-            error_code = ParseErrorCode.TRUNCATION
-        elif "Duplicate" in error_msg:
-            error_code = ParseErrorCode.DUP_KEYS
-        elif "Expecting" in error_msg:
-            error_code = ParseErrorCode.BAD_JSON
-        else:
-            error_code = ParseErrorCode.ESCAPE_ERRORS
+    quoted = repaired
+    for curly, straight in _SMART_QUOTES.items():
+        quoted = quoted.replace(curly, straight)
+    if quoted != repaired:
+        try:
+            data = json.loads(_repair_outside_and_inside_strings(quoted))
+            logger.info("JSON repaired successfully (curly quotes)")
+            return ParseResult(success=True, data=data)
+        except json.JSONDecodeError:
+            pass
 
-        return ParseResult(
-            success=False,
-            error_code=error_code,
-            error_message=f"JSON parse error: {error_msg}"
-        )
+    return ParseResult(
+        success=False,
+        error_code=_error_code(step_two_error),
+        error_message=f"JSON parse error: {step_two_error}",
+    )
 
 
 def _normalize_empty_strings(data: Any, schema: dict) -> Any:

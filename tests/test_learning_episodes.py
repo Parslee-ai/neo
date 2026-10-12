@@ -424,7 +424,8 @@ def test_objective_credentials_are_redacted(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(engine, "_car_route_capability", lambda prompt: (False, 0, None))
     monkeypatch.setattr(engine, "_run_static_checks", lambda suggestions, constraints=None: [])
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    # Assembled at runtime: a key-shaped literal in source trips secret scanners.
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
 
     output = engine.process(NeoInput(prompt=f"Use token {secret}"))
 
@@ -616,3 +617,23 @@ class TestSuggestionVerifiability:
         eng = self._engine(tmp_path)
         for bogus in ("", "/", "N/A"):
             assert eng._suggestion_is_verifiable(self._sugg(bogus)) is False
+
+
+def test_applied_on_is_per_suggestion_and_fails_closed():
+    """One episode can mint several candidates; the first acceptance must not
+    answer for another's, and a missing entry is unknown, not ask-time HEAD."""
+    from neo.memory.episodes import LearningEpisode, VerificationEvidence
+
+    episode = LearningEpisode(repository_revision="ask-head")
+    episode.verification.append(VerificationEvidence(
+        kind="user_acceptance", status="passed", repository_revision="legacy"))
+    assert episode.applied_on("anything") == ("legacy", "", "")  # pre-#254 record
+
+    episode.outcome_details["applied_on"] = {
+        "sug-a": {"base": "B", "carrier": "C", "parent": "P"},
+    }
+    assert episode.applied_on("sug-a") == ("B", "C", "P")
+    assert episode.applied_on("sug-b") == ("", "", "")
+
+    reloaded = LearningEpisode.from_dict(episode.to_dict())
+    assert reloaded.applied_on("sug-a") == ("B", "C", "P")

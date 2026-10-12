@@ -58,11 +58,11 @@ class TestGoogleAdapterInitialization:
         from neo.adapters import GoogleAdapter
 
         # Test with explicit API key
-        adapter = GoogleAdapter(api_key="test-api-key")
+        adapter = GoogleAdapter(api_key="example-api-key")
 
         # Verify Client was called with correct API key
-        mock_google_genai['genai'].Client.assert_called_once_with(api_key="test-api-key")
-        assert adapter.api_key == "test-api-key"
+        mock_google_genai['genai'].Client.assert_called_once_with(api_key="example-api-key")
+        assert adapter.api_key == "example-api-key"
         assert adapter.model == "gemini-2.0-flash"
         assert adapter.client == mock_client
 
@@ -100,7 +100,7 @@ class TestGoogleAdapterInitialization:
 
         adapter = GoogleAdapter(
             model="gemini-2.0-flash",
-            api_key="test-key"
+            api_key="example-key"
         )
 
         assert adapter.name() == "google/gemini-2.0-flash"
@@ -132,7 +132,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key", model="gemini-2.0-flash")
+        adapter = GoogleAdapter(api_key="example-key", model="gemini-2.0-flash")
 
         # Test messages
         messages = [
@@ -196,7 +196,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key")
+        adapter = GoogleAdapter(api_key="example-key")
 
         # Call generate
         result = adapter.generate(
@@ -228,7 +228,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key")
+        adapter = GoogleAdapter(api_key="example-key")
 
         # Call generate - should raise ValueError
         with pytest.raises(ValueError, match="API returned empty response"):
@@ -257,7 +257,7 @@ class TestGoogleAdapterGenerate:
         from neo.adapters import GoogleAdapter
 
         # Create adapter
-        adapter = GoogleAdapter(api_key="test-key", model="gemini-2.0-flash")
+        adapter = GoogleAdapter(api_key="example-key", model="gemini-2.0-flash")
 
         # Test 401 unauthorized error
         mock_client.models.generate_content.side_effect = Exception("401 Unauthorized")
@@ -283,3 +283,48 @@ class TestGoogleAdapterGenerate:
         mock_client.models.generate_content.side_effect = Exception("Network connection failed")
         with pytest.raises(ValueError, match="Network error"):
             adapter.generate(messages=[{"role": "user", "content": "Test"}])
+
+
+class _ClientError(Exception):
+    """Stand-in for google.genai.errors.ClientError, which carries the HTTP
+    status as an integer `code`."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class TestGoogleFieldRecovery:
+    """A Gemini model that refuses a config field loses that one field and the
+    call is retried; the learning is remembered (shared `_create_resilient`)."""
+
+    def _adapter(self, mock_google_genai, side_effect):
+        mock_client = Mock()
+        ok = Mock()
+        ok.text = "fine"
+        mock_client.models.generate_content.side_effect = (
+            [*side_effect, ok, ok] if isinstance(side_effect, list) else side_effect)
+        mock_google_genai['genai'].Client.return_value = mock_client
+        from neo.adapters import GoogleAdapter
+        return GoogleAdapter(api_key="example-key", model="gemini-x"), mock_client
+
+    def test_rejected_field_is_dropped_retried_and_remembered(self, mock_google_genai):
+        config = mock_google_genai['types'].GenerateContentConfig
+        adapter, client = self._adapter(mock_google_genai, [_ClientError(
+            400, "400 INVALID_ARGUMENT. Unsupported parameter: 'temperature' for this model")])
+
+        assert adapter.generate([{"role": "user", "content": "hi"}], temperature=0.5) == "fine"
+        assert client.models.generate_content.call_count == 2
+        assert "temperature" in config.call_args_list[0].kwargs
+        assert "temperature" not in config.call_args_list[1].kwargs
+
+        adapter.generate([{"role": "user", "content": "again"}], temperature=0.5)
+        assert "temperature" not in config.call_args_list[-1].kwargs
+        assert client.models.generate_content.call_count == 3  # no second retry
+
+    def test_a_400_that_names_no_sent_field_reraises(self, mock_google_genai):
+        adapter, client = self._adapter(
+            mock_google_genai, _ClientError(400, "400 INVALID_ARGUMENT. contents is empty"))
+        with pytest.raises(_ClientError):
+            adapter.generate([{"role": "user", "content": "hi"}], temperature=0.5)
+        assert client.models.generate_content.call_count == 1

@@ -1225,3 +1225,251 @@ class TestRecycleToBoundRSS:
 
         monkeypatch.setattr(obs.os, "execv", boom)
         obs._reexec_self()  # must not raise
+
+
+class TestSweepStopsOnLMOutage:
+    """An LM outage is global: a live observer logged 591 consecutive
+    `LM call failed` lines as one sweep failed the same first call once per
+    project (and, before that fix, once per episode)."""
+
+    def test_outage_stops_the_sweep_and_defers_the_rest(self, monkeypatch, capsys):
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b", "/c"])
+        swept = []
+
+        def rp(self, root, peer_roots=None, shared_store=None):
+            swept.append(root)
+            self._lm_unavailable = True  # what _ingest_transcripts records
+            return (0, 0, object())
+
+        monkeypatch.setattr(Observer, "_run_project", rp)
+        Observer(global_mode=True)._cycle()
+        assert swept == ["/a"]
+        assert "LM unavailable, stopping; 2 project(s) deferred" in capsys.readouterr().err
+
+    def test_a_stuck_project_cannot_wedge_the_rotation(self, monkeypatch):
+        """A project whose two first episodes always fail with no answer stops
+        the sweep on every visit. If the offset rewound to the batch start, the
+        same batch would re-run in the same order forever and no project past
+        it would ever be swept."""
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer, ObserverConfig
+        roots = ["/stuck", "/b", "/c", "/d", "/e"]
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: roots)
+        swept = []
+
+        def rp(self, root, peer_roots=None, shared_store=None):
+            swept.append(root)
+            self._lm_unavailable = root == "/stuck"
+            return (0, 0, object())
+
+        monkeypatch.setattr(Observer, "_run_project", rp)
+        o = Observer(global_mode=True, config=ObserverConfig(max_projects_per_cycle=2))
+        for _ in range(6):
+            o._cycle()
+        assert set(swept) == set(roots), f"never reached: {set(roots) - set(swept)}"
+
+    def test_ingest_records_the_outage_from_stats(self, monkeypatch, fake_project_id):
+        from neo.memory.observer import Observer
+
+        class _Ingester:
+            def __init__(self, **kw):
+                pass
+
+            def ingest(self, **kw):
+                return {"facts_admitted": 0, "lm_unavailable": True}
+
+        monkeypatch.setattr("neo.memory.transcript.TranscriptIngester", _Ingester)
+        monkeypatch.setattr("neo.adapters.resolve_adapter", lambda cfg: object())
+        o = Observer(global_mode=True)
+        assert o._ingest_transcripts(store=None, root="/tmp/x") == 0
+        assert o._lm_unavailable is True
+
+
+class TestProviderEvidenceAcrossProjects:
+    def test_an_earlier_answer_this_cycle_is_passed_on_and_reset_next_cycle(
+            self, monkeypatch, fake_project_id):
+        import neo.memory.observer as obs
+        from neo.memory.observer import Observer
+        seen = []
+        answers = {"/a": 3, "/b": 0}
+
+        class _Ingester:
+            def __init__(self, codebase_root=None, **kw):
+                self.root = codebase_root
+
+            def ingest(self, provider_known_good=False, **kw):
+                seen.append((self.root, provider_known_good))
+                return {"facts_admitted": 0, "lm_answers": answers[self.root]}
+
+        monkeypatch.setattr("neo.memory.transcript.TranscriptIngester", _Ingester)
+        monkeypatch.setattr("neo.adapters.resolve_adapter", lambda cfg: object())
+        monkeypatch.setattr(obs, "_discover_project_roots", lambda: ["/a", "/b"])
+        monkeypatch.setattr("neo.memory.store.FactStore",
+                            lambda **kw: type("S", (), {"initialize": lambda self: None})())
+        monkeypatch.setattr("neo.memory.scope._compute_project_id", lambda r: r)
+        o = Observer(global_mode=True)
+        o._cycle()
+        o._cycle()
+        assert seen == [("/a", False), ("/b", True), ("/a", False), ("/b", True)]
+
+
+class TestSupervisorBlindSpot:
+    """car-runtime silently falls back to manifest rows (all `stopped`, pid
+    None) when it cannot reach the daemon's supervisor. Live: a wire-protocol
+    v2 client against a v3 daemon printed `stopped` for an observer that had
+    been sweeping for nine days."""
+
+    _SKEW = ("server.handshake rejected by daemon: -32006 protocol version "
+             "mismatch: client requested v2, but this daemon requires v3")
+
+    def _stopped_rows(self, fake_car):
+        from neo.memory.observer import GLOBAL_AGENT_ID
+        fake_car.agents_list.return_value = json.dumps(
+            [{"id": GLOBAL_AGENT_ID, "pid": None, "status": "stopped",
+              "restart_count": 0, "last_exit_code": None}])
+
+    def test_lock_probe_sees_a_real_holder(self, tmp_path, monkeypatch):
+        """No mock: a second open file description cannot flock what the
+        first holds, which is exactly the daemon-vs-status-process case."""
+        import neo.memory.observer as obs
+        monkeypatch.setattr(obs, "_LOCK_PATH", str(tmp_path / "observer.lock"))
+        assert obs._observer_lock_held() is False
+        holder = obs._SingleInstanceLock(obs._LOCK_PATH)
+        assert holder.acquire()
+        try:
+            assert obs._observer_lock_held() is True
+        finally:
+            holder.release()
+        assert obs._observer_lock_held() is False
+
+    def test_status_is_unverified_and_names_the_routing_error(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        result = obs.observer_status()
+        assert result["status"] == "unverified"
+        assert "protocol version mismatch" in result["message"]
+        assert "car-runtime" in result["message"]
+
+    def test_stop_and_kick_refuse_instead_of_claiming_not_running(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        assert obs.stop_observer()["status"] == "error"
+        assert obs.kick_observer()["status"] == "error"
+        fake_car.agents_restart.assert_not_called()
+        stopped = [c.args for c in fake_car.agents_stop.call_args_list]
+        assert all(a == (obs._ROUTING_PROBE_ID,) for a in stopped), \
+            "only the no-op probe may be sent, never a real stop"
+
+    def test_start_does_not_spawn_a_second_observer(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        assert obs.start_observer()["status"] == "error"
+        fake_car.agents_start.assert_not_called()
+
+    def test_a_live_supervisor_is_trusted_while_the_observer_drains(self, fake_car, monkeypatch):
+        """After `stop`, CAR says stopped while the daemon finishes its episode
+        with the lock still held. A reachable supervisor answers the probe with
+        "not found", and that must read as a normal stop, not a blind spot."""
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(
+            f"agent {obs._ROUTING_PROBE_ID} not found")
+        assert obs.observer_status()["status"] == "stopped"
+
+    def test_method_not_found_is_a_routing_failure_not_a_live_answer(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        for text in ("-32601 method not found: agents.stop",
+                     f"agent {obs._ROUTING_PROBE_ID}: -32601 method not found: agents.stop"):
+            fake_car.agents_stop.side_effect = RuntimeError(text)
+            result = obs.observer_status()
+            assert result["status"] == "unverified", text
+            assert "method not found" in result["message"]
+
+    def test_a_registered_probe_id_is_never_stopped(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        fake_car.agents_list.return_value = json.dumps([
+            {"id": obs.GLOBAL_AGENT_ID, "pid": None, "status": "stopped"},
+            {"id": obs._ROUTING_PROBE_ID, "pid": 1, "status": "running"},
+        ])
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        obs.observer_status()
+        fake_car.agents_stop.assert_not_called()
+
+    def test_start_under_skew_migrates_and_registers_nothing(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: True)
+        fake_car.agents_stop.side_effect = RuntimeError(self._SKEW)
+        assert obs.start_observer()["status"] == "error"
+        fake_car.agents_upsert.assert_not_called()
+        fake_car.agents_remove.assert_not_called()
+
+    def test_no_lock_holder_keeps_the_plain_answer(self, fake_car, monkeypatch):
+        import neo.memory.observer as obs
+        self._stopped_rows(fake_car)
+        monkeypatch.setattr(obs, "_observer_lock_held", lambda: False)
+        assert obs.observer_status()["status"] == "stopped"
+        fake_car.agents_stop.assert_not_called()
+
+
+class TestTimestampedDaemonOutput:
+    """610 `LM call failed` lines in a live observer log could not be placed
+    in time, because nothing it wrote carried a timestamp."""
+
+    _STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} "
+
+    def test_every_line_is_stamped_once_even_across_partial_writes(self):
+        import io
+        import re as _re
+        from neo.memory.observer import _TimestampedStream
+        buf = io.StringIO()
+        out = _TimestampedStream(buf)
+        out.write("first line\nsecond ")
+        out.write("line continues\n")
+        out.write("")
+        out.write("third\n")
+        out.writelines(["fourth\n", "fifth\n"])
+        lines = buf.getvalue().splitlines()
+        assert len(lines) == 5
+        for line, body in zip(lines, ["first line", "second line continues", "third",
+                                      "fourth", "fifth"]):
+            assert _re.fullmatch(self._STAMP + _re.escape(body), line), line
+
+    def test_the_real_daemon_entrypoint_stamps_print_and_logging(self, tmp_path):
+        """Through `python -m neo.memory.observer`, the way CAR launches it:
+        argparse's usage error goes through print, and a logging warning goes
+        through the stdlib's last-resort handler — both must be stamped."""
+        import os
+        import re as _re
+        import subprocess
+        code = (
+            "import logging, runpy, sys; "
+            "sys.argv = ['neo.memory.observer', '--daemon']; "
+            "import neo.memory.observer as o; "
+            "sys.stderr = o._TimestampedStream(sys.stderr); "
+            "logging.getLogger('neo.memory.transcript').warning('probe warning')"
+        )
+        # Absolute, from this file: a relative "src" run from another cwd would
+        # let the editable install supply a different tree's code.
+        from pathlib import Path
+        src = str(Path(__file__).resolve().parents[1] / "src")
+        env = {**os.environ, "PYTHONPATH": src}
+        warn = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                              text=True, env=env, timeout=60)
+        assert _re.search(self._STAMP + "probe warning", warn.stderr), warn.stderr
+        main = subprocess.run(
+            [sys.executable, "-m", "neo.memory.observer", "--daemon"],
+            capture_output=True, text=True, env=env, timeout=60)
+        assert main.returncode == 2
+        assert _re.search(self._STAMP + "observer requires --all or --cwd", main.stderr), main.stderr

@@ -47,13 +47,60 @@
     anyway. Its only reachable trigger was a transient `rev-parse` failure, which
     made BOTH failing promote while ONE failing blocked — load-dependent
     non-determinism in the durable memory path. It now fails closed on a blank
-    revision. Two accepted costs, documented on the predicate: the revision is
-    captured when the episode BEGINS (HEAD when advice was asked for, not the
-    commit the fix landed in), and applying one lesson across several files in a
-    single sitting records ONE revision and promotes nothing (40% of
-    revision-bearing episodes share a HEAD with another). Keying on the
-    acceptance-carrying sha — already walked by `_get_changed_files_since` — is
-    the obvious improvement. That
+    revision. **The revision compared is what the accepted change was APPLIED
+    ON TOP OF** (#254): `Outcome.applied_on_revision` — HEAD of the checkout
+    holding it uncommitted, or the parent of the FIRST local-branch commit
+    whose patch CARRIES the suggestion (same overlap test as ACCEPTED; merely
+    touching the path let an unrelated sibling commit supply its own parent) —
+    plus `carrier_revision`, that commit. Both are stored PER SUGGESTION in
+    `episode.outcome_details["applied_on"]` (one episode can mint several
+    candidates; a free-form dict, so no schema bump — a bump would make older
+    running neo processes quarantine new records), read through
+    `LearningEpisode.applied_on(suggestion_id)`, which returns "" (fail closed)
+    when absent and never falls back to ask-time HEAD; pre-#254 episodes read
+    their first passed `user_acceptance` revision. The entry is FILL-ONCE:
+    `replay_linked_feedback` re-collects, and after a rebase (new carrier) or
+    with HEAD moved under a still-dirty change an overwrite would turn a
+    refused group promotable with no new evidence; a recorded "" base may be
+    filled later ONLY from a found carrier (history), never from a dirty
+    re-read (HEAD at replay time is a guess). Before the span gate,
+    `FactStore._sitting_bases` groups supporting acceptances into SITTINGS as
+    connected components (union-find): linked when they share a base (keeps
+    labelling monotonic — without it a third acceptance continuing one of two
+    parallel ones relabelled only its own component and promoted), when one's
+    base IS the other's carrier (A committed as C1, B applied on C1), or one's base's PARENT is
+    the other's base and the other was seen uncommitted (A edited at H and
+    seen dirty, committed as C1, B on C1 — the usual editor flow, which has no
+    carrier; hence the stored `parent`). Each sitting counts as ONE revision.
+    **Components, not case-by-case folding**: two rounds of ordered folds each
+    left a chain that escaped (a dirty B on a dirty A's commit; a parent link
+    followed by a carrier link). Folding is fail-safe: a real second sitting
+    applied directly on the first's commit, or on one unrelated commit atop a
+    still-uncommitted first application, is grouped too and waits for a later
+    recurrence. The promote path and `learning-stats` share it. Ask-time HEAD was wrong: a CAR Lattice node answers from a
+    main checkout that sits still while peers commit on their own branches, so
+    every episode shared one revision and nothing could promote. **The landing
+    commit is ALSO wrong, and was tried first**: shas are unique per commit, so
+    one sitting seen dirty by one run (H) and committed before the next (C)
+    read as two revisions and promoted — the exact same-operator case the gate
+    exists for. By base both are H, and parallel worktrees branched from one
+    base committing one fix both read that base. Pre-#254 verifications hold
+    ask-time HEAD in the same field, which equals the base for a change applied
+    in place, so no migration. `evaluation.py` sets the field explicitly; any
+    new producer of ACCEPTED outcomes must too, or it silently never promotes.
+    Accepted costs: one lesson applied across several files in one sitting
+    promotes nothing; and a known limit — an uncommitted acceptance takes HEAD
+    at COLLECTION time, so one sitting collected either side of an unrelated
+    commit can still read as two bases. **Acceptance detection also reads
+    other checkouts**: every local branch (`--branches`, never `--all` — a
+    fetched teammate commit is not an acceptance), every linked worktree's
+    dirty files (only those written after the suggestion, since agents keep
+    work in progress uncommitted in the very file they asked about), untracked
+    files and host-ledger edits (attributed to the deepest checkout holding the
+    path). That wider evidence only resolves paths Neo SUGGESTED; INDEPENDENT
+    detection stays on the checkout's own HEAD and tree, or every agent
+    worktree's edits would become candidates, each costing a diff fork. Separate
+    clones share no refs and stay invisible. That
     signature is keyed on the candidate SUBJECT, never the body — the body is the
     LM's run-varying Reasoning/Suggestion prose, and including it (the old
     `generalize(subject+body)`) gave two acceptances of one task different
@@ -445,6 +492,27 @@
   object and never reloads, which is how a suite thorough about attribution
   stayed silent about persistence. **Any new credit path needs its own save,
   and a test that reads the fact back off disk.**
+- **Legacy per-suggestion facts are INVALIDATED on every cold start**
+  (`store.retire_legacy_suggestion_facts`, `invalidation_reason=legacy_unverified_suggestion`).
+  It stamps `last_accessed` before invalidating: `purge_dead_facts` runs later in the same cold
+  start and hard-deletes tombstones untouched 30+ days, and every live match was 58–206 days
+  stale, so without the stamp the audit tombstone never reached disk. It is kept 30 days, then
+  purged like any other.
+  Before episodes replaced immediate fact-writing (`412a174`), every feature suggestion was
+  written straight to the store as an unverified DECISION — a stable kind that bypasses recall
+  decay and that `update_recall` never stamps — and the since-bounded protection ratchet had
+  already lifted them to 0.9–1.0. **Measured on a live install: 238 such facts were 49% of all
+  memory injected into prompts over 30 days (1,217 of 2,477 inclusions), ~4% of those used in
+  reasoning**, the most-injected being drill prompts. Transcript-mined lessons were 1.6%.
+  The match is structural, not a date (first tag `feature`, subject `feature: `, body
+  `Reasoning: `, no `canonical_signature`), because installs kept minting the shape until they
+  upgraded. **Reclassifying them to a decaying kind was built first and is WRONG — do not
+  reintroduce it.** The stale prune skips confidence >= `STALE_MAX_CONFIDENCE` (0.4) and any
+  fact with a success, so 232 of 239 would have sat hidden on disk forever; and a decayed
+  fact's similarity term goes to ~0 while `success_bonus` is similarity-independent, so the 93
+  with a recorded success became constant-score fillers taking the same slots on every query.
+  **That second half is a live ranking hazard for ANY decaying fact with successes**, not just
+  these — today no other fact has one, which is the only reason it is not biting.
 - **A re-accepted durable pattern is reinforced in place, not re-minted.**
   `_promote_repeatedly_supported_candidate` looks for an existing valid PROJECT
   fact at the target signature before calling `add_fact`, and on a hit folds in
@@ -648,7 +716,7 @@
 - Async transcript-mining observer (`memory.observer`): a **single global**
   background process (CAR agent `neo-observer`, daemon `--daemon --all`) that
   **sweeps all discovered projects** each cycle — round-robin/budgeted
-  (`max_projects_per_cycle`, default 25; watermark- AND mtime-gated so unchanged projects do near-zero work (the watermark alone gates only *admission*: sources still parsed every transcript each cycle, measured at 298 MB for one project, which is what drove multi-GB observer RSS. `_unchanged_since` now skips files untouched since the watermark file's mtime minus a 1h skew margin; every error path falls back to parsing, because a wrong skip loses learning silently)) — running transcript mining per project. (It also ran
+  (`max_projects_per_cycle`, default 25; watermark- AND mtime-gated so unchanged projects do near-zero work (the watermark alone gates only *admission*: sources still parsed every transcript each cycle, measured at 298 MB for one project, which is what drove multi-GB observer RSS. `_unchanged_since` skips files untouched since the source's drain mark minus a 1h skew margin; every error path falls back to parsing, because a wrong skip loses learning silently. **The drain mark, never the watermark file's mtime** — that file is rewritten after every consumed episode, so a pass stopped by the 8-episode budget armed the skip against the very transcript still holding its backlog; measured live, 152 of 1,800 episodes were stranded that way. The mark (`transcript._drain_mark`) is `min(pass start, earliest timestamp of any episode still unconsumed)`: safe because a transcript's mtime is never earlier than its records, and it keeps advancing while a backlog drains (a mark set only on a fully-drained pass never moves for a busy project, i.e. full parse every visit). An unreadable pending timestamp leaves the previous mark. Marks are keyed **per transcript directory** (`codebase_root`) inside the project_id-keyed watermark, because two clones share that file and one clone draining must not arm the skip against the other. A legacy watermark has no mark and parses everything once, which also recovers the stranded)). **An LM failure is not "no lessons"** (`transcript.LMUnavailable`): `_lm_json` used to swallow every exception AND treat unparseable output as empty, so each of 610 live DNS failures consumed an episode unmined — unrecoverable, since nothing records which. **A failure is charged to an episode only when an answer vouches for the provider** — an answer during that episode (extract answered, then the judge call failed or the output was unusable) or in a LATER episode of the same pass; an answer from earlier in the pass proves nothing about calls made after it (a key revoked after episode 1 would otherwise strike every remaining episode). Failures wait in `held` until then. Two held failures in a row stop the pass AND the observer's sweep, whatever the error class — a revoked key (401), disabled billing (403) or quota 429 fails every episode alike, and charging per episode wrote off the whole backlog in three cycles. `ingest(provider_known_good=True)` (an earlier project answered this observer cycle; the observer clears it once a project reports unavailable) is the one exception: it charges a lone held failure at the end of a pass, and the two held failures at a stop, since two poison episodes are then likelier than an outage beginning at that instant and would otherwise stop the sweep on every visit. The sweep does NOT rewind its round-robin offset on that stop: a rewind re-ran the same batch in the same order, so two unanswered failures in a project nothing earlier vouched for wedged the sweep at the same place forever. Once charged, `_is_transient_lm_error` (connection/timeout/`gaierror`, SDK connection errors, 408/429/500/502/503/504 via `status_code` or google-genai's `code` on the cause chain — NOT 409/501/505) picks the cap: `MAX_EPISODE_LM_FAILURES` (3) or `MAX_EPISODE_TRANSIENT_FAILURES` (20), so neither a poison episode nor one whose prompt always times out is retried forever. Known limits: a lone failing episode with no evidence either way (overnight, or `--cwd` single-project mode) is never charged — one failing call per visit, and it pins its source's drain mark so that directory is re-parsed every visit; drain-mark safety assumes a transcript's mtime is not earlier than its records, which holds for Claude Code/Codex append-only files and for cp/rsync, not for a clock stepped back past the 1h margin; a Codex rollout that changes owning root when a nested peer leaves discovery can be skipped by the parent's mark; `_aware_epoch` (not `_episode_epoch`, which reads naive times as local) feeds the mark. All of an episode's LM calls run before its first admission — admitting part-way and retrying would re-extract the same lessons in new wording that exact-signature dedup does not catch — running transcript mining per project. (It also ran
   `synthesize_reviews` until that subsystem was removed.) Two roots can share a `project_id` (two
   clones of one remote, e.g. `flyx/fms` + `flyx/fms2`), meaning one fact file and
   one pid-keyed watermark; the sweep keeps a per-cycle `store_cache` so such a
@@ -805,6 +873,9 @@
   real adapters built. It is also the honest scope, since the panel's later prompts
   are built from earlier model responses and cannot be shown without making the calls
   the flag exists to avoid.
+  **A dry run never touches the CAR daemon**: `cli.main` skips observer
+  autostart and Lattice autojoin under `--dry-run` (pinned by
+  `TestNoDaemonSideEffects`, which has a control so it cannot pass vacuously).
   **A dry run does not modify the fact store**, which is narrower than "mutates
   nothing" and is the claim that survives measurement. The old implementation got it
   for free by never constructing a `FactStore`; `FactStore.initialize` runs
@@ -1540,12 +1611,23 @@
   Claude Code discovers `agents/`, `commands/`, `skills/` and `hooks/` at the
   plugin root and reads only manifests (`plugin.json`, `marketplace.json`) out
   of `.claude-plugin/`. Nested there they are silently not loaded: the plugin
-  installs, `claude plugin validate` passes, and nothing fires — `claude plugin
-  details` is the only check that proves a component loaded. This repo shipped
+  installs, `claude plugin validate` passes, and nothing fires. This repo shipped
   the wrong layout, and so did CAR, which is why
   `test_the_manifest_directory_holds_no_components` fails on any non-manifest
   entry rather than merely asserting the components exist at the root (a stray
   copy left behind keeps every other assertion green).
+  **`claude plugin list` is the check, and `claude plugin details` is NOT.**
+  `details` reports the inventory it finds on disk and says nothing about load
+  state — it prints all six skills, the agent and the hook for a plugin that
+  failed to load, verified directly. Only `list` reports load state. This
+  distinction is not pedantic: #221 verified the layout fix with `details`,
+  read `Skills (6) Agents (1)` as success, and shipped a manifest that made
+  the plugin fail to load in every release from 0.47.0 to 0.53.0 (#242).
+  A second rule falls out of that one — **`manifest.hooks` must never name
+  `hooks/hooks.json`**. Claude Code loads that path automatically and rejects
+  the duplicate, failing the WHOLE plugin; the key is for *additional* hook
+  files only. Pinned by
+  `test_the_manifest_does_not_redeclare_the_auto_loaded_hooks_file`.
 - **The edit-recording hook (`neo hook record`, `neo/hook.py`)** is a
   `PostToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit` that appends one
   line to `~/.neo/sessions/host_events.jsonl`: tool, path, host cwd, and HEAD at
@@ -1658,28 +1740,139 @@
   (CAR's *default* profile without it is still latency/cost-biased). Rationale lives on
   `CarAdapter.DEFAULT_INTENT_HINT` in `adapters.py`. Observer floor is car-runtime ≥0.18.0,
   now enforced at runtime by `_require_car_runtime` (version check, not just the `agents_*`
-  attr); latest validated against car-runtime **0.40.0** (full `test_car_adapter`
-  suite including the live calls, against a car-server 0.37.0 daemon). Note the
-  pin `car-runtime>=0.27.0,<1.0` lets the client drift well ahead of a daemon
-  that ships inside CarHost.app, so a client/daemon **version skew is the normal
-  state**, not a fault: car-runtime prints a warning on every invocation, both
-  sides speak wire protocol v1, and neo's usage is unaffected. Updating the
+  attr); latest validated against car-runtime **0.56.1** (full `test_car_adapter`
+  suite including the live calls, plus every other CAR and observer suite, against a CarHost 0.56.1 daemon). Note the
+  pin `car-runtime>=0.27.0,<1.0` lets the client drift from a daemon that ships
+  inside CarHost.app, so a client/daemon **version skew is the normal state**,
+  and it is harmless ONLY while both sides speak the same wire protocol. **It stopped being harmless at the v2→v3 protocol bump**: car-runtime 0.50.0 (v2)
+  against a CarHost 0.52.1 daemon (v3) fails `server.handshake`, and `agents_list`
+  then SILENTLY falls back to the manifest — every agent `stopped`, pid None — so
+  `neo memory observer status` printed `stopped` for an observer nine days into
+  sweeping, and stop/kick returned `not_running` without acting. CarHost updates
+  itself and pipx does not, so this recurs. `observer._supervisor_blind_spot`
+  cross-checks CAR's answer against `~/.neo/observer.lock` (the one liveness signal
+  that does not route through CAR); on disagreement status reads `unverified`,
+  start/stop/kick refuse, and a no-op `agents_stop` on a nonexistent id surfaces
+  car-runtime's routing error — the only place it reports one. A hand-rolled
+  WebSocket client that skips the handshake was rejected: it works today only
+  because the daemon tolerates the missing handshake. Updating the
   daemon means updating CarHost.app — there is no `car` CLI to run and nothing
   neo can do about it. Do not paper over it with `CAR_NO_VERSION_WARNING=1`; the
   warning is accurate.
-- Reasoning-model param compatibility (`adapters.py`): newer models reject standard
-  chat params — Anthropic Opus 4.7+/Sonnet 5/Fable 5 reject `temperature`; OpenAI
-  o-series/gpt-5, Azure reasoning deployments, and OpenAI-compatible reasoners (xAI
-  Grok, DeepSeek) reject `temperature`, and the OpenAI-family require
-  `max_completion_tokens` instead of `max_tokens`. There's no reliable model-string
+- **CAR model pins** (`CarAdapter`, #257/#261/#267): CAR has two pin fields.
+  `model_id` is an exact catalog-id pin — CAR serves only that row and echoes it
+  as `requested_model_id`; `model` is the display-name/alias path, where a short
+  name can resolve to another row and `requested_model_id` is null by design.
+  **Exactness is decided by PROVENANCE, never by the id's shape**: an id CAR's
+  router handed us is passed as `CarAdapter(model_is_catalog_id=True)` (the
+  panel's role factory does this for every router-plan id) and goes out as
+  top-level `model_id` through `infer_tracked_with_request` — car-runtime 0.55's
+  `infer_tracked` has no `model_id` keyword — and is accepted only when
+  `requested_model_id == resolved_model_id == pin`, by equality with no parsing.
+  CAR guarantees `provider/name[:tag]` only for BUILT-IN ids; discovered,
+  gateway and operator ids pass through verbatim (`parslee/openrouter/open-fast`,
+  `:` inside a bare id, possibly no `/`), which is why the first cut's
+  "contains `/`" test was replaced. A name typed into config stays on `model`,
+  with an equality-first check and then an exact NAME match against
+  `resolved_model_id` (`_resolved_id_honors_pin`: provider/tag only when the pin
+  states them). **`model_used` is a DISPLAY name and must never be the
+  evidence when an id is available**: the router's own choice
+  `mlx/qwen3-0.6b:6bit` is served as `Qwen3-0.6B-MLX`, the old fuzzy check
+  refused it, and every panel that drew it fell back to the fast path. The fuzzy
+  `model_used` rule survives only for CAR builds that report no
+  `resolved_model_id`. No echo at all on a `model_id` request means a daemon
+  that predates exact pinning, and fails closed with an "update CarHost" error
+  rather than blaming the pin. **No lenient fallback** (Matt's decision): the
+  `resolved_model_id` format is a CAR-side contract, and tolerating "close
+  enough" ids is how a `gpt-5` pin passed when served `gpt-5.5`. Sending `model`
+  and `model_id` together is rejected by CAR; an unknown either fails `model not
+  found` (CAR sets `strict_model`), never a silent default. Any new caller that
+  holds a router-provided id must pass `model_is_catalog_id=True`.
+- Provider param compatibility (`adapters.py`): providers reject optional request
+  fields model by model — `temperature` (Anthropic Opus 4.7+/Sonnet 5/Fable 5;
+  OpenAI o-series/gpt-5/gpt-6; Azure reasoning deployments; xAI Grok/DeepSeek
+  reasoners), `reasoning.effort` (every non-reasoning model), `max_tokens` (chat
+  completions wants `max_completion_tokens`). There's no reliable model-string
   rule (opus-4-6 accepts `temperature`, opus-4-7 rejects it; Azure `model` is an
-  arbitrary deployment name), so adapters **learn reactively**: catch the 400, drop/
-  rename the param, retry, remember. The learnings persist in `_ModelParamCompat`
-  (`~/.neo/model_param_compat.json`, keyed `"<provider>:<model>" → [flags]`) so the
-  first-call retry penalty isn't re-paid every CLI invocation. Store is best-effort
-  (I/O failure → in-memory only, never breaks inference), merge-on-write + atomic
-  `os.replace`, path resolved at call time (per-test `Path.home()` stubs apply). The
-  OpenAI-family adapters share `_chat_completion_resilient(client, kwargs, provider)`;
-  Anthropic has its own inline learn-and-retry. **Footgun**: recovery keys on HTTP 400
-  (`BadRequestError`); a provider returning 422 for a param error won't be caught.
+  arbitrary deployment name), so **no adapter branches on a model name, and there
+  is no allow-list of reasoning models** — that is how `gpt-6.1-sol` silently lost
+  its effort: the endpoint and fields were picked by `"gpt-5" in model`, and the
+  new name missed the test. Instead ONE helper, `_create_resilient(create, kwargs,
+  provider, model, optional=, renames=, ladders=)`, serves OpenAI (responses),
+  Azure, Local, Anthropic and Google: it sends everything, and when a rejection
+  NAMES a field Neo sent it drops, renames or lowers that one field, retries, and
+  persists the learning in `_ModelParamCompat` (`~/.neo/model_param_compat.json`,
+  `"<provider>:<model>" → [flags]`) so the retry is paid once per model. Flags are
+  `drop_<field>`, `rename_<field>`, `max_<field>:<level>`; the first two are the
+  pre-generalisation spellings, so an old file still loads. **Nothing is persisted
+  until the adapted call has SUCCEEDED**: learnings are collected during the retry
+  walk and written once at the end, because they used to be written before the
+  retry proved them, so a call that then failed (a context-length 400 whose text
+  mentioned temperature) left a false `drop_temperature` on disk. **When the 400
+  carries a structured `body.param`, only the field equal to it can match and the
+  message cannot match a different field** (message text is the fallback only
+  when there is no `param`: Anthropic, Google, client-side TypeError; for a
+  rename field it is still read after `param` matches, where it can only veto);
+  a message that merely mentions a field is not a rejection of it. Never a blanket
+  strip-and-retry, and anything that is not a rejection of a sent field (auth,
+  429, another 400, an unrelated TypeError) re-raises untouched. Bounded by
+  construction: each recovery removes a field, renames it away or lowers a level,
+  and one that changes nothing ends the loop. Three rejection shapes, all handled
+  there: an HTTP 400 naming the field (read `body.param` as well as the message —
+  `Invalid value: 'ultra'. Supported values are…` never names `reasoning.effort`
+  in its text); the SDK refusing the keyword at the signature (a client-side
+  `TypeError`, which is what `anthropic` 1.x does to `temperature`, so a
+  `BadRequestError`-only handler never sees it); and `code`, which separates "this
+  LEVEL is not offered" (`unsupported_value` is what a genuinely unsupported level
+  returns live; `invalid_value` is what a value outside the known vocabulary
+  returns; both → step down `EFFORT_LEVELS` one rung, persisted as
+  `max_reasoning.effort:<level>` only once the call succeeds) from "this field is unsupported" (`unsupported_parameter` or None —
+  `temperature`'s code is None, so `code` alone can never recognise an unsupported
+  field). **A rejected level is never evidence that effort is unsupported, and only
+  a lower level that was ACCEPTED can prove a cap.** Live, `gpt-6.1-sol` refuses
+  level `none` with `unsupported_value` while accepting `xhigh` (its range is
+  `low`..`xhigh`; `gpt-5` and `o3` also refuse `none` but top out at `high`);
+  the walk used to persist `drop_reasoning.effort` at the bottom, after which every
+  later `xhigh` request silently ran at the provider default. A walk that reaches
+  the bottom now removes effort for THAT call (`bottom_<field>` flag) and persists
+  no effort flag at all; only `unsupported_parameter` (what `gpt-4o-mini` returns)
+  persists `drop_reasoning.effort`, and only after the retry succeeds. Known
+  limit: a model whose FLOOR is above the requested level walks to the bottom,
+  runs at the provider default for that call, and pays that discovery on every
+  such call, because nothing false is ever written to disk. That is not only the
+  single-level case (`gpt-5-pro` accepts just `high`): `gpt-5.2-pro`,
+  `gpt-5.4-pro` and `gpt-5.5-pro` accept `medium`..`xhigh`, and the selector does
+  ask for `low` on familiar queries (measured: 3 requests per such call, run at
+  `medium`). A cap also assumes levels are contiguous, which held for all 30
+  models probed; a model with a gap could learn a cap that is too low. Two more
+  accepted limits, neither reachable from Neo's own callers: every `code` other
+  than the two level codes is read as "field unsupported", so an out-of-range
+  value Neo never sends (`temperature=5`) would be remembered as a drop if the
+  retry succeeds; and support that depends on another field is recorded as
+  unconditional (`gpt-5.1`/`gpt-5.2` accept `temperature` only at effort `none`). `stop_sequences` is sent but not droppable: no provider is known to reject
+  it. **`provider=openai` with a custom `base_url` now requires a server that
+  implements the responses endpoint**; `provider=local` is the route for
+  OpenAI-compatible servers that speak only chat completions.
+  **`OpenAIAdapter` never calls chat completions**: every model goes
+  through `client.responses.create`, which is the only endpoint carrying effort;
+  `stop` is accepted and not sent (responses has no stop sequences). Azure and
+  Local deliberately stay on chat completions (deployment API versions lag; most
+  OpenAI-compatible servers speak only chat). Exempt: Ollama (raw HTTP with
+  `options`, which ignores unknown ones), ClaudeCode (shells out to the CLI), CAR
+  and Auto (Auto delegates). CAR is exempt from the RETRY helper, not from the
+  fields: `CarAdapter` sends `params.temperature` through
+  `infer_tracked_with_request` (the keyword `infer_tracked` has no sampling
+  knobs), and CAR drops it per backend itself. Measured on 0.56.1 rather than
+  assumed from "no error", since CAR silently ignores unknown fields: temperature
+  IS forwarded (raw-runtime probes: local and hosted rows deterministic at 0.0,
+  varied at 1.5+; through `CarAdapter` itself the recorded request carries it and
+  output matches the raw request 6/6);
+  `stop` is accepted and NOT applied; there is no effort level and `thinking`
+  has no observable effect. So neither of the last two is sent
+  (car-releases#107/#108).
+  **Footguns**: the 400 test requires `status_code == 400` (google-genai reports
+  it as int `code`), so a fake exception in a test must carry one; and the store
+  is best-effort by design (I/O failure → in-memory only, never breaks inference),
+  merge-on-write + atomic `os.replace`, path resolved at call time. A provider
+  returning 422 for a param error won't be caught.
 - When creating a pull request, always use the PR template included in the repo.

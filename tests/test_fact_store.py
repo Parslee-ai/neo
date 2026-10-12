@@ -219,6 +219,20 @@ class TestRetrieveRelevant:
         store.retrieve_relevant("test", k=1)
         assert fact.metadata.access_count == 1
 
+    def test_record_access_false_leaves_the_fact_untouched(self, store):
+        # A lookup no reasoning run consumes (a Lattice peer's `memory:`)
+        # must not move a fact toward probation exit or demotion.
+        fact = Fact(
+            subject="Looked up",
+            body="Body",
+            metadata=FactMetadata(confidence=0.8, access_count=0),
+        )
+        store._facts.append(fact)
+        before = fact.metadata.last_accessed
+        assert store.retrieve_relevant("test", k=1, record_access=False) == [fact]
+        assert fact.metadata.access_count == 0
+        assert fact.metadata.last_accessed == before
+
     def test_domain_filter_excludes_other_domains(self, store):
         store._facts.append(Fact(
             subject="Testing fact",
@@ -1058,6 +1072,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=suggestion_id,
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: validate input [src/api.py]",
                 candidate_body="Suggestion: validate input before processing",
@@ -1078,7 +1093,7 @@ class TestOutcomeLinkage:
         assert "probation" not in promoted[0].tags
 
     def _accept_episode(self, store, ep_id, subject, body, kind="pattern",
-                        revision=None):
+                        revision=None, applied_on_revision=None, carrier_revision=""):
         """Record one ACCEPTED outcome for a fresh episode (drives the real
         detect_implicit_feedback promotion path).
 
@@ -1089,6 +1104,10 @@ class TestOutcomeLinkage:
         """
         if revision is None:
             revision = f"rev-{ep_id}"
+        if applied_on_revision is None:
+            # The ordinary shape: applied in the checkout Neo ran in, right
+            # away, so the base IS the ask-time HEAD.
+            applied_on_revision = revision
         from neo.memory.episodes import (
             LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
         )
@@ -1106,6 +1125,9 @@ class TestOutcomeLinkage:
             suggestion_id=f"{ep_id}-sug", learning_episode_id=ep_id,
             candidate_id=cand_id, candidate_subject=subject,
             candidate_body=body, candidate_kind=kind,
+            repository_revision=revision,
+            applied_on_revision=applied_on_revision,
+            carrier_revision=carrier_revision,
         )
         with patch.object(store._outcome_tracker, "detect_outcomes",
                           return_value=([outcome], {})):
@@ -1250,6 +1272,111 @@ class TestOutcomeLinkage:
         assert len(promoted) == 1
         assert "durable" in promoted[0].tags
 
+    def test_acceptances_applied_on_distinct_bases_promote(self, store):
+        """#254: a Lattice node's main checkout sits still while peers work on
+        their own branches, so every episode BEGINS at one HEAD. What the
+        change was applied on top of is what distinguishes two acceptances."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        idle_head = "d83659cea51676124f2488f6629e0957302e1c1f"
+        self._accept_episode(store, "base-0", subject, "Reasoning: catch OSError.",
+                             revision=idle_head, applied_on_revision="a" * 40)
+        self._accept_episode(store, "base-1", subject, "Reasoning: catch OSError.",
+                             revision=idle_head, applied_on_revision="b" * 40)
+
+        promoted = [f for f in store.entries if "episode-derived" in f.tags]
+        assert len(promoted) == 1
+
+    def test_acceptances_applied_on_one_base_do_not_promote(self, store):
+        """The converse: advice asked at two HEADs but applied on one base is
+        one sitting (or one fan-out), not recurrence."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "onebase-0", subject, "Reasoning: catch OSError.",
+                             revision="1" * 40, applied_on_revision="c" * 40)
+        self._accept_episode(store, "onebase-1", subject, "Reasoning: catch OSError.",
+                             revision="2" * 40, applied_on_revision="c" * 40)
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_a_base_that_is_another_acceptances_carrier_is_one_sitting(self, store):
+        """One lesson applied to file A and committed as C1, then to file B on
+        top of C1: bases H and C1 differ, but C1 is the first application, not
+        a later snapshot the lesson recurred in."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "chain-0", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="h" * 40,
+                             carrier_revision="1" * 40)
+        self._accept_episode(store, "chain-1", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="1" * 40,
+                             carrier_revision="2" * 40)
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_a_lesson_recurring_past_unrelated_work_still_promotes(self, store):
+        """The collapse follows carriers only. A base that moved past the first
+        application through unrelated work is the lesson recurring."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "later-0", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="h" * 40,
+                             carrier_revision="1" * 40)
+        self._accept_episode(store, "later-1", subject, "Reasoning: catch OSError.",
+                             revision="x" * 40, applied_on_revision="x" * 40,
+                             carrier_revision="2" * 40)
+
+        assert len([f for f in store.entries if "episode-derived" in f.tags]) == 1
+
+    def test_a_recorded_base_is_not_overwritten_by_a_replay(self, store):
+        """Fill-once. A replay re-collects after a rebase (new carrier sha) or
+        with HEAD moved under a still-dirty change; overwriting would turn a
+        group the gate refused promotable with no new evidence."""
+        from neo.memory.episodes import LearningEpisodeStore
+
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "once-0", subject, "Reasoning: catch OSError.",
+                             revision="h" * 40, applied_on_revision="h" * 40)
+        replayed = Outcome(
+            outcome_type=OutcomeType.ACCEPTED, file_path="util.py",
+            suggestion_id="once-0-sug", learning_episode_id="once-0",
+            candidate_id="once-0-cand", candidate_subject=subject,
+            applied_on_revision="m" * 40,
+        )
+        store._record_attributed_episode_outcome(replayed)
+
+        episode = LearningEpisodeStore(store.project_id).load("once-0")
+        assert episode.applied_on("once-0-sug")[0] == "h" * 40
+
+    def test_an_unknown_base_is_filled_only_from_a_found_carrier(self, store):
+        """A replay may fill a recorded "" — but a dirty change's base read at
+        replay time is HEAD THEN, a guess; only a carrier commit is history."""
+        from neo.memory.episodes import LearningEpisodeStore
+
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "fill-0", subject, "R.",
+                             revision="h" * 40, applied_on_revision="")
+
+        def replay(base, carrier):
+            store._record_attributed_episode_outcome(Outcome(
+                outcome_type=OutcomeType.ACCEPTED, file_path="util.py",
+                suggestion_id="fill-0-sug", learning_episode_id="fill-0",
+                candidate_id="fill-0-cand", candidate_subject=subject,
+                applied_on_revision=base, carrier_revision=carrier,
+            ))
+            return LearningEpisodeStore(store.project_id).load("fill-0").applied_on(
+                "fill-0-sug")
+
+        assert replay("d" * 40, "")[0] == ""            # dirty guess refused
+        assert replay("b" * 40, "c" * 40)[:2] == ("b" * 40, "c" * 40)
+
+    def test_an_unknown_base_is_not_replaced_by_the_ask_time_head(self, store):
+        """A failed lookup records "". Falling back to HEAD at ask time would
+        mix two kinds of revision in one comparison and let them differ."""
+        subject = "bugfix: narrow the stderr handler [progress.py] [fp:deadbeef1234]"
+        self._accept_episode(store, "unknown-0", subject, "Reasoning: catch OSError.",
+                             revision="1" * 40, applied_on_revision="c" * 40)
+        self._accept_episode(store, "unknown-1", subject, "Reasoning: catch OSError.",
+                             revision="2" * 40, applied_on_revision="")
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
     def test_missing_revisions_fail_closed(self, store):
         """No revision recorded is no independence evidence. There is
         deliberately no session-id fallback: `session_id` is a per-episode uuid4
@@ -1345,6 +1472,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=suggestion_id,
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: validate input [src/api.py]",
                 candidate_body="Suggestion: validate input before processing",
@@ -1417,7 +1545,7 @@ class TestOutcomeLinkage:
             episode_store.save(episode)
             outcome = Outcome(
                 outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
-                suggestion_id=f"{prefix}-sug-{index}", learning_episode_id=ep_id,
+                suggestion_id=f"{prefix}-sug-{index}", learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}",
                 candidate_id=cand_id, candidate_subject=subject,
                 candidate_body=body, candidate_kind="pattern",
             )
@@ -1720,7 +1848,7 @@ class TestOutcomeLinkage:
             episode_store.save(ep)
             return Outcome(
                 outcome_type=OutcomeType.ACCEPTED, file_path="a.py",
-                suggestion_id=sug_id, learning_episode_id=ep_id, candidate_id=cand_id,
+                suggestion_id=sug_id, learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}", candidate_id=cand_id,
                 candidate_subject=subject, candidate_body=body, candidate_kind="pattern")
 
         # First acceptance: not enough to promote -> no cross-project scan.
@@ -1773,6 +1901,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=suggestion_id,
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: validate input [src/api.py]",
                 candidate_body="Suggestion: validate input before processing",
@@ -1848,6 +1977,7 @@ class TestOutcomeLinkage:
                 file_path="src/api.py",
                 suggestion_id=f"failed-suggestion-{index}",
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="pattern: skip validation [src/api.py]",
                 candidate_body="Suggestion: remove the required validation",
@@ -1891,6 +2021,7 @@ class TestOutcomeLinkage:
                 outcome_type=OutcomeType.ACCEPTED,
                 file_path="src/service.py",
                 learning_episode_id=episode_id,
+                applied_on_revision=f"rev-{episode_id}",
                 candidate_id=candidate_id,
                 candidate_subject="architecture: split the service",
                 candidate_body="Suggestion: introduce a new service boundary",
@@ -1932,7 +2063,7 @@ class TestOutcomeLinkage:
                 es.save(ep)
                 outcome = Outcome(
                     outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
-                    suggestion_id=sid, learning_episode_id=ep_id, candidate_id=cid,
+                    suggestion_id=sid, learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}", candidate_id=cid,
                     candidate_subject=subject, candidate_body=body, candidate_kind="pattern")
                 with patch.object(st._outcome_tracker, "detect_outcomes",
                                   return_value=([outcome], {})):
@@ -2002,6 +2133,7 @@ class TestOutcomeLinkage:
                 outcome = Outcome(
                     outcome_type=otype, file_path="src/sh.py",
                     suggestion_id=f"{prefix}s{i}", learning_episode_id=f"{prefix}-{i}",
+                    applied_on_revision=f"rev-{prefix}-{i}",
                     candidate_id=f"{prefix}c{i}", candidate_subject=subject,
                     candidate_body=body, candidate_kind="pattern")
                 with patch.object(st._outcome_tracker, "detect_outcomes",
@@ -2055,6 +2187,7 @@ class TestOutcomeLinkage:
                 outcome = Outcome(
                     outcome_type=otype, file_path="src/sh.py",
                     suggestion_id=f"{prefix}s{i}", learning_episode_id=f"{prefix}-{i}",
+                    applied_on_revision=f"rev-{prefix}-{i}",
                     candidate_id=f"{prefix}c{i}", candidate_subject=subject,
                     candidate_body=body, candidate_kind="pattern")
                 with patch.object(st._outcome_tracker, "detect_outcomes",
@@ -2128,6 +2261,7 @@ class TestOutcomeLinkage:
                     file_path="src/private.py",
                     suggestion_id=suggestion_id,
                     learning_episode_id=episode_id,
+                    applied_on_revision=f"rev-{episode_id}",
                     candidate_id=candidate_id,
                     candidate_subject=subject,
                     candidate_body=body,
@@ -2214,7 +2348,7 @@ class TestOutcomeLinkage:
                 episode_store.save(episode)
                 outcome = Outcome(
                     outcome_type=OutcomeType.ACCEPTED, file_path="x.py",
-                    suggestion_id=f"sug-{project}-{index}", learning_episode_id=ep_id,
+                    suggestion_id=f"sug-{project}-{index}", learning_episode_id=ep_id, applied_on_revision=f"rev-{ep_id}",
                     candidate_id=cand_id, candidate_subject=subject,
                     candidate_body=body, candidate_kind="pattern",
                 )
@@ -3715,3 +3849,66 @@ class TestBuildContextCaching:
         counts_after = [f.metadata.access_count for f in result.valid_facts]
 
         assert counts_after == counts_before
+
+
+class TestRetireLegacySuggestionFacts:
+    """238 per-suggestion facts minted as never-decaying DECISIONs were 49% of
+    the memory injected into prompts over 30 days on a live install, with ~4%
+    of those injections used."""
+
+    @staticmethod
+    def _legacy(fid="legacy", **over):
+        kw = dict(
+            id=fid, subject="feature: Write a Python one-liner that returns the sum of s",
+            body="Reasoning: use sum()\nSuggestion: sum(xs)", kind=FactKind.DECISION,
+            scope=FactScope.PROJECT, org_id="testorg", project_id="testproj1234",
+            tags=["feature"],
+            metadata=FactMetadata(confidence=1.0, created_at=time.time() - 120 * 86400),
+        )
+        kw.update(over)
+        return Fact(**kw)
+
+    def test_legacy_shape_is_retired_and_stays_retired_on_reload(self, store):
+        store._facts.append(self._legacy())
+        assert store.retire_legacy_suggestion_facts() == 1
+        store.load()
+        [fact] = [f for f in store._facts if f.id == "legacy"]
+        assert fact.is_valid is False
+        assert fact.invalidation_reason == "legacy_unverified_suggestion"
+
+    def test_a_retired_fact_with_successes_cannot_fill_prompts(self, store):
+        """The reclassify-to-REVIEW version turned facts with a recorded
+        success into constant-score fillers; a retired fact is not retrievable."""
+        fact = self._legacy(metadata=FactMetadata(
+            confidence=1.0, success_count=2, created_at=time.time() - 120 * 86400))
+        store._facts.append(fact)
+        store.retire_legacy_suggestion_facts(save=False)
+        assert all(f.id != "legacy" for f in store._facts if f.is_valid)
+
+    def test_near_misses_are_untouched(self, store):
+        promoted = self._legacy("promoted", canonical_signature="sig")
+        real_decision = self._legacy("decision", body="We chose SQLite for the content index.")
+        other_task = self._legacy("refactor", tags=["refactor"], subject="refactor: split module",
+                                  kind=FactKind.ARCHITECTURE)
+        store._facts.extend([promoted, real_decision, other_task])
+        assert store.retire_legacy_suggestion_facts() == 0
+        assert all(f.is_valid for f in store._facts)
+
+    def test_idempotent_and_runs_on_cold_start(self, store, tmp_path):
+        """With a REAL stale last_accessed: every live match was last touched
+        58-206 days ago, and purge_dead_facts runs later in the same cold start.
+        The default last_accessed (now) is what let the first version of this
+        test pass while the tombstone was being hard-deleted."""
+        stale = time.time() - 120 * 86400
+        store._facts.append(self._legacy(metadata=FactMetadata(
+            confidence=1.0, created_at=stale, last_accessed=stale)))
+        store.save()
+        from neo.memory.store import FactStore
+        fresh = FactStore(codebase_root=store.codebase_root)  # cold start runs the chain
+        [fact] = [f for f in fresh._facts if f.id == "legacy"]
+        assert fact.is_valid is False
+        assert fact.invalidation_reason == "legacy_unverified_suggestion"
+        fresh.load()
+        assert [f.invalidation_reason for f in fresh._facts if f.id == "legacy"] == [
+            "legacy_unverified_suggestion"], "the tombstone must reach disk"
+        assert fresh.retire_legacy_suggestion_facts() == 0

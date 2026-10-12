@@ -7,6 +7,10 @@
 Measured **once, at the final base**, per the plan's measurement discipline. The
 raw harness output is committed under `evidence/`, so every table here is
 reproducible rather than transcribed.
+The m365dotnet runs (`m1_m365dotnet_*.json`, `g9_m1_m365dotnet.json`) are committed
+gzipped and byte-identical to the harness output (`gzip -dc` restores them): their
+file lists contain `docs/solutions/sk-*.md` paths, which third-party secret
+scanners misread as OpenAI keys.
 
 ```bash
 export platform_root=/path/to/parslee-knowledge

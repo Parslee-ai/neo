@@ -22,7 +22,8 @@ from neo import adapters  # noqa: E402,F401
 
 
 class _BadRequestError(Exception):
-    """Stand-in for anthropic.BadRequestError."""
+    """Stand-in for anthropic.BadRequestError (an HTTP 400)."""
+    status_code = 400
 
 
 @pytest.fixture
@@ -116,6 +117,21 @@ def test_unrelated_400_reraises(_fake_anthropic):
 
     assert adapter.client.messages.create.call_count == 1
     assert not adapters._PARAM_COMPAT.has("anthropic", "claude-opus-4-8", "drop_temperature")
+
+
+def test_stop_sequences_error_is_not_a_droppable_field(_fake_anthropic):
+    adapter = _fake_anthropic(model="claude-opus-4-8", api_key="k")
+    adapter.client = MagicMock()
+    adapter.client.messages.create.side_effect = _BadRequestError(
+        "stop_sequences: each stop sequence must contain non-whitespace"
+    )
+
+    with pytest.raises(_BadRequestError):
+        adapter.generate([{"role": "user", "content": "hi"}], stop=[" "])
+
+    assert adapter.client.messages.create.call_count == 1
+    assert "stop_sequences" in adapter.client.messages.create.call_args.kwargs
+    assert not adapters._PARAM_COMPAT.flags("anthropic", "claude-opus-4-8")
 
 
 # ------------------------------------------------- the SDK dropping the keyword

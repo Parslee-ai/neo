@@ -21,26 +21,25 @@ except ImportError:
     pass
 
 from neo.models import LMAdapter
+from neo.reasoning_effort import EFFORT_LEVELS
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Reasoning-model parameter compatibility (OpenAI-SDK adapters)
+# Provider parameter compatibility (every adapter that calls a provider SDK)
 # ============================================================================
 #
-# Newer reasoning models reject standard chat-completions parameters:
-#   - `temperature` is rejected (OpenAI o-series / gpt-5, xAI Grok and DeepSeek
-#     reasoners behind an OpenAI-compatible endpoint, Azure reasoning deploys,
-#     Anthropic Opus 4.7+ / Sonnet 5 / Fable 5).
-#   - `max_tokens` must be sent as `max_completion_tokens` (OpenAI-family).
-# There is no reliable model-string rule — and on Azure `model` is an arbitrary
-# deployment name — so we learn each adaptation from the API's own 400. The
-# learnings are persisted (see `_ModelParamCompat`) so the first-call retry
-# penalty isn't re-paid on every short-lived CLI invocation.
-
-# Adaptation flags recorded per model.
-_ADAPT_DROP_TEMPERATURE = "drop_temperature"
+# Providers reject optional request fields model by model, and there is no
+# reliable model-string rule for which: `temperature` is refused by o-series /
+# gpt-5 / gpt-6, xAI Grok and DeepSeek reasoners, Azure reasoning deployments
+# (where `model` is an arbitrary deployment name) and Anthropic Opus 4.7+ /
+# Sonnet 5 / Fable 5; `reasoning.effort` is refused by non-reasoning models and
+# accepted only up to some level by the rest; chat completions wants
+# `max_completion_tokens` where it used to take `max_tokens`. So `_create_resilient`
+# sends everything and learns from the rejection: it drops, renames or lowers the
+# ONE field the error names, retries, and persists the learning (see
+# `_ModelParamCompat`) so a short-lived CLI process does not re-pay the retry.
 
 
 def _sdk_rejects_keyword(exc: TypeError, param: str) -> bool:
@@ -63,7 +62,6 @@ def _sdk_rejects_keyword(exc: TypeError, param: str) -> bool:
     """
     message = str(exc)
     return "unexpected keyword argument" in message and f"'{param}'" in message
-_ADAPT_RENAME_MAX_TOKENS = "rename_max_tokens"
 
 
 class _ModelParamCompat:
@@ -72,6 +70,9 @@ class _ModelParamCompat:
     Backed by ``~/.neo/model_param_compat.json`` as ``{"<provider>:<model>":
     ["<flag>", ...]}``. Keyed by provider so a bare model name (e.g. ``gpt-4``)
     behind a Local endpoint can't collide with the same name on Azure/OpenAI.
+    Flags are ``drop_<field>``, ``rename_<field>`` and ``max_<field>:<value>``
+    (a level cap); the first two spellings predate this class's generalisation
+    and keep their meaning, so an old file loads unchanged.
 
     - The path is resolved at call time so per-test ``Path.home()`` stubs apply
       (mirrors ``neo.memory.metrics._metrics_path``).
@@ -116,18 +117,21 @@ class _ModelParamCompat:
             self._data = self._read(path)
             self._path = path
 
-    def has(self, provider: str, model: str, adaptation: str) -> bool:
+    def flags(self, provider: str, model: str) -> set[str]:
         # Totally guarded: a compat cache must never propagate a failure into
         # the inference path. Any error (unreadable ~/.neo, no resolvable home,
-        # …) degrades to "not learned" so the caller sends the param as usual.
+        # …) degrades to "nothing learned" so the caller sends fields as usual.
         try:
             path = self._resolve()
             with self._lock:
                 self._ensure_loaded(path)
-                return adaptation in self._data.get(f"{provider}:{model}", ())
+                return set(self._data.get(f"{provider}:{model}", ()))
         except Exception:
-            logger.debug("param-compat has() failed; assuming not-learned", exc_info=True)
-            return False
+            logger.debug("param-compat flags() failed; assuming not-learned", exc_info=True)
+            return set()
+
+    def has(self, provider: str, model: str, adaptation: str) -> bool:
+        return adaptation in self.flags(provider, model)
 
     def learn(self, provider: str, model: str, adaptation: str) -> None:
         try:
@@ -172,83 +176,147 @@ class _ModelParamCompat:
 _PARAM_COMPAT = _ModelParamCompat()
 
 
-def _chat_completion_resilient(client, kwargs: dict, provider: str):
-    """Call ``client.chat.completions.create(**kwargs)``, recovering from the
-    reasoning-model parameter rejections described above.
+def _locate(kwargs: dict, path: str) -> tuple[Optional[dict], str]:
+    """Resolve a dotted field path (``reasoning.effort``) to its parent dict."""
+    *parents, key = path.split(".")
+    node: Optional[dict] = kwargs
+    for p in parents:
+        node = node.get(p) if isinstance(node, dict) else None
+    return (node if isinstance(node, dict) else None), key
 
-    Adaptations already learned for ``provider``/model are applied up front;
-    anything new is discovered from the 400, applied, remembered, and retried.
-    A 400 for any other reason re-raises untouched. Loop is bounded implicitly:
-    each adaptation removes the key it keys on, so it can fire at most once
-    (worst case: temperature + max_tokens + success = 3 calls). ``kwargs`` is
-    copied, not mutated, so callers may safely pass a shared/cached dict.
 
-    Scope of each adaptation:
-      - `temperature` drop is broad — o-series / gpt-5, Azure reasoning
-        deployments, and OpenAI-compatible reasoners (xAI Grok, DeepSeek) all
-        reject it.
-      - `max_completion_tokens` rename is OpenAI-family only (OpenAI + Azure,
-        which share the `openai` SDK's error text). Grok/DeepSeek accept
-        `max_tokens`, so they never hit that branch.
+def _is_sent(kwargs: dict, path: str) -> bool:
+    node, key = _locate(kwargs, path)
+    return node is not None and key in node
+
+
+def _rank(ladder: tuple, value: object) -> int:
+    """Position on an ordered ladder; an unknown value ranks above every rung,
+    so the first step down from it is the top rung."""
+    return ladder.index(value) if value in ladder else len(ladder)
+
+
+def _apply_flag(kwargs: dict, flag: str, renames: dict, ladders: dict) -> bool:
+    """Apply one learned adaptation in place. True when it changed `kwargs`,
+    which is what bounds the retry loop: a flag that changes nothing ends it."""
+    kind, _, rest = flag.partition("_")
+    path, _, cap = rest.partition(":")
+    if not _is_sent(kwargs, path):
+        return False
+    node, key = _locate(kwargs, path)
+    if kind in ("drop", "bottom"):  # "bottom": dropped to get an answer, never persisted
+        del node[key]
+        parent, _, _ = path.rpartition(".")
+        if parent:  # don't leave an empty `reasoning: {}` behind
+            holder, pkey = _locate(kwargs, parent)
+            if holder is not None and not holder[pkey]:
+                del holder[pkey]
+    elif kind == "rename" and path in renames:
+        node[renames[path]] = node.pop(key)
+    elif kind == "max" and path in ladders:
+        if _rank(ladders[path], node[key]) <= _rank(ladders[path], cap):
+            return False
+        node[key] = cap
+    else:
+        return False
+    return True
+
+
+def _rejection(exc: Exception, kwargs: dict, optional: tuple, renames: dict,
+               ladders: dict) -> Optional[str]:
+    """The adaptation flag for the one field `exc` rejects, or None when `exc`
+    is anything else (auth, rate limit, an unrelated 400, an unrelated
+    TypeError) and must re-raise untouched.
+
+    A field is only ever named by the rejection itself: the SDK refusing the
+    keyword at the signature (TypeError), or an HTTP 400. When the 400 carries
+    a structured `param` (OpenAI), only the field equal to it can match, since
+    a message that merely mentions a field is not a rejection of it; the
+    message is the fallback only when there is no `param` (Anthropic, Google),
+    and for a rename field it is still read after `param` matches, where it
+    can only veto. `code` separates the two shapes that name the
+    same ladder field: `unsupported_value` (a level this model does not offer)
+    or `invalid_value` (a level outside the known vocabulary) means the field
+    exists and the LEVEL is the problem (step down); anything else means the
+    field itself is unsupported (drop it). A level rejected at the bottom rung
+    returns `bottom_<field>`: "rejected" does not mean "too high", so that
+    removal serves this call only and is never persisted.
     """
-    import openai
+    present = [p for p in optional if _is_sent(kwargs, p)]
+    if isinstance(exc, TypeError):
+        return next((f"drop_{p}" for p in present if _sdk_rejects_keyword(exc, p)), None)
+    status = getattr(exc, "status_code", None)
+    if status is None and isinstance(getattr(exc, "code", None), int):
+        status = exc.code  # google-genai reports the HTTP status as `code`
+    if status != 400:
+        return None
+    body = getattr(exc, "body", None)
+    body = body if isinstance(body, dict) else {}
+    code, param = body.get("code"), body.get("param")
+    structured = param if isinstance(param, str) and param else None
+    text = str(exc).lower()
+    for path in present:
+        if (path != structured) if structured else (path.lower() not in text):
+            continue
+        if path in ladders and code in ("invalid_value", "unsupported_value"):
+            node, key = _locate(kwargs, path)
+            rung = _rank(ladders[path], node[key])
+            return f"bottom_{path}" if rung == 0 else f"max_{path}:{ladders[path][rung - 1]}"
+        if code == "invalid_value":
+            continue  # a bad value for a supported field, not an unsupported field
+        if path in renames and not any(
+            w in text for w in (renames[path], "unsupported", "not supported")
+        ):
+            continue  # plain value error on a field we would only rename
+        return f"{'rename' if path in renames else 'drop'}_{path}"
+    return None
 
-    kwargs = dict(kwargs)  # own our copy — never mutate the caller's dict
-    model = kwargs.get("model", "")
-    if _PARAM_COMPAT.has(provider, model, _ADAPT_DROP_TEMPERATURE):
-        kwargs.pop("temperature", None)
-    if _PARAM_COMPAT.has(provider, model, _ADAPT_RENAME_MAX_TOKENS) and "max_tokens" in kwargs:
-        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
 
+def _create_resilient(create, kwargs: dict, provider: str, model: str, *,
+                      optional: tuple = (), renames: Optional[dict] = None,
+                      ladders: Optional[dict] = None):
+    """Call ``create(**kwargs)``, recovering from a provider rejecting an
+    optional field.
+
+    `optional` lists the dotted field paths Neo may send that a model might
+    refuse; `renames` maps a field to its replacement name; `ladders` maps a
+    field to its ordered levels, lowest first. Adaptations already learned for
+    ``provider``/``model`` are applied up front; a new rejection is applied and
+    retried, and what was learned is persisted only once a call has SUCCEEDED
+    (a call that ends in an exception persists nothing). A cap on a ladder
+    field whose level walk ended in removal is not persisted either: nothing
+    proved it. Anything that is not a rejection of a field Neo sent re-raises.
+    The loop is bounded by construction: every recovery removes a field,
+    renames it away, or lowers a level, and one that changes nothing ends the
+    loop. ``kwargs`` is copied, not mutated.
+    """
+    renames, ladders = renames or {}, ladders or {}
+    kwargs = {k: dict(v) if isinstance(v, dict) else v for k, v in kwargs.items()}
+    for flag in _PARAM_COMPAT.flags(provider, model):
+        _apply_flag(kwargs, flag, renames, ladders)
+    learned: list[str] = []
     while True:
         try:
-            return client.chat.completions.create(**kwargs)
-        except TypeError as e:
-            # The SDK refusing the keyword at the signature, not the API
-            # refusing it over HTTP. `anthropic` 1.0.0 did exactly this with
-            # `temperature`; the same hole existed here and is closed at the
-            # same time rather than waiting for the openai SDK to do it too.
-            if "temperature" not in kwargs or not _sdk_rejects_keyword(e, "temperature"):
+            response = create(**kwargs)
+            break
+        except Exception as e:
+            flag = _rejection(e, kwargs, optional, renames, ladders)
+            if flag is None or not _apply_flag(kwargs, flag, renames, ladders):
                 raise
-            _PARAM_COMPAT.learn(provider, model, _ADAPT_DROP_TEMPERATURE)
-            kwargs.pop("temperature", None)
-            logger.debug(
-                "%s SDK does not accept `temperature` for model %s; dropped it "
-                "and retrying", provider, model,
-            )
-            continue
-        except openai.BadRequestError as e:
-            msg = str(e).lower()
-            # NOTE: we can't distinguish "temperature is deprecated/unsupported"
-            # from an out-of-range value error ("temperature must be <= 2") by
-            # message alone. That's fine here: neo only ever sends in-range
-            # temperatures, so a `temperature` 400 always means rejection.
-            if "temperature" in kwargs and "temperature" in msg:
-                _PARAM_COMPAT.learn(provider, model, _ADAPT_DROP_TEMPERATURE)
-                kwargs.pop("temperature", None)
-                logger.debug(
-                    "Model %s/%s rejected `temperature`; dropped it and retrying",
-                    provider, model,
-                )
-                continue
-            # Rename trigger: the message references `max_tokens` and signals
-            # the param is unsupported (either by naming the replacement or by
-            # an unsupported/not-supported phrase — robust to minor OpenAI
-            # wording changes). A plain value error on max_tokens carries none
-            # of these and correctly re-raises.
-            if "max_tokens" in kwargs and "max_tokens" in msg and (
-                "max_completion_tokens" in msg
-                or "unsupported" in msg
-                or "not supported" in msg
-            ):
-                _PARAM_COMPAT.learn(provider, model, _ADAPT_RENAME_MAX_TOKENS)
-                kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
-                logger.debug(
-                    "Model %s/%s requires `max_completion_tokens`; renamed and "
-                    "retrying", provider, model,
-                )
-                continue
-            raise
+            learned.append(flag)
+            logger.debug("%s/%s rejected a field (%s); adapted and retrying",
+                         provider, model, flag)
+    bottomed = {f.partition("_")[2] for f in learned if f.startswith("bottom_")}
+    for flag in learned:
+        path = flag.partition("_")[2].partition(":")[0]
+        if not flag.startswith("bottom_") and path not in bottomed:
+            _PARAM_COMPAT.learn(provider, model, flag)
+    return response
+
+
+# Chat-completions adapters (Azure, Local) share one field policy.
+_CHAT_FIELDS = {"optional": ("temperature", "max_tokens"),
+                "renames": {"max_tokens": "max_completion_tokens"}}
 
 
 # ============================================================================
@@ -256,7 +324,7 @@ def _chat_completion_resilient(client, kwargs: dict, provider: str):
 # ============================================================================
 
 class OpenAIAdapter(LMAdapter):
-    """Adapter for OpenAI models (GPT-4, GPT-5, etc.)."""
+    """Adapter for OpenAI models, all via /v1/responses (GPT-4, GPT-5, GPT-6, o-series)."""
 
     def __init__(
         self,
@@ -296,66 +364,72 @@ class OpenAIAdapter(LMAdapter):
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
         ):
-            # gpt-5* and codex models use /v1/responses endpoint
-            if "codex" in self.model.lower() or "gpt-5" in self.model.lower():
-                import httpx
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-                base_url = self.base_url or "https://api.openai.com"
-                url = f"{base_url}/v1/responses"
+            # Every model goes through /v1/responses: it is the one endpoint
+            # that carries `reasoning.effort`, and choosing the endpoint (or
+            # the fields) from the model NAME left each new family (gpt-6.1-sol)
+            # silently losing its effort until someone edited a substring test.
+            # Fields a model refuses are learned from its own 400 instead —
+            # `temperature` is refused by the reasoning families, `reasoning.effort`
+            # by the others, and an effort LEVEL a model does not offer is
+            # lowered one rung at a time (see `_create_resilient`).
+            #
+            # `stop` is accepted for the ABC and not sent: /v1/responses has no
+            # stop sequences and the SDK refuses the keyword client-side.
+            payload: dict = {
+                "model": self.model,
+                "input": messages,
+                "max_output_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            if reasoning_effort is not None:
+                payload["reasoning"] = {"effort": reasoning_effort}
 
-                payload: dict = {
-                    "model": self.model,
-                    "input": messages,
-                    "max_output_tokens": max_tokens,
-                }
-                # gpt-5* and codex models reject `temperature` on /v1/responses
-                # with a 400 ("Unsupported parameter"). Their reasoning behavior
-                # is steered by `reasoning.effort` instead. Don't include it.
-                if reasoning_effort is not None:
-                    payload["reasoning"] = {"effort": reasoning_effort}
+            # Through the SDK client, never a bare httpx.post: the SDK
+            # retries connection errors, 408/409/429 and 5xx with backoff
+            # (honouring Retry-After) and raises a typed APIStatusError
+            # carrying status_code. The raw post had neither, so a single
+            # `Connection reset by peer` failed the whole neo run, and a
+            # 503 surfaced as an untyped ValueError no caller could tell
+            # apart from a malformed response. base_url follows the SDK's
+            # convention (ends in /v1); the raw post appended /v1 itself.
+            #
+            # No `timeout=` here: the client default is already
+            # Timeout(connect=5, read=600), and a bare float would raise
+            # connect to 600 too, so a blackholed connect hung ten minutes
+            # per attempt. `to_dict(warnings=False)` rather than
+            # model_dump(): it omits unset fields (the dict matches the
+            # raw JSON this parser was written against) and does not print
+            # a pydantic serialization warning to stderr — the --json
+            # event stream — when the API adds an output item type.
+            response = _create_resilient(
+                self.client.responses.create, payload, "openai", self.model,
+                optional=("temperature", "reasoning.effort"),
+                ladders={"reasoning.effort": EFFORT_LEVELS},
+            )
+            data = response.to_dict(warnings=False)
+            self._emit_usage_metric(data.get("usage", {}))
 
-                response = httpx.post(url, headers=headers, json=payload, timeout=600.0)  # 10 minutes for complex queries
-                if response.status_code != 200:
-                    raise ValueError(f"API error {response.status_code}: {response.text}")
-                data = response.json()
-                self._emit_usage_metric(data.get("usage", {}))
+            # Extract text from output array
+            for item in data.get("output", []):
+                if item.get("type") == "message" and item.get("status") == "completed":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            return c.get("text", "")
 
-                # Extract text from output array
-                output = data.get("output", [])
-                for item in output:
-                    if item.get("type") == "message" and item.get("status") == "completed":
-                        content = item.get("content", [])
-                        for c in content:
-                            if c.get("type") == "output_text":
-                                return c.get("text", "")
-
-                raise ValueError(f"No completed message in response: {data}")
-            else:
-                # Standard chat completions for other models. Route through the
-                # resilient helper so o-series (and other reasoning models that
-                # aren't matched above) recover from `temperature` /
-                # `max_tokens` rejections instead of erroring.
-                response = _chat_completion_resilient(self.client, {
-                    "model": self.model,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "stop": stop,
-                }, provider="openai")
-                self._emit_usage_metric(getattr(response, "usage", None))
-                return response.choices[0].message.content
+            # Name the response, not its content: the whole dict carries the
+            # model's partial output, which lands in episode error text and
+            # observer logs. `incomplete_details` is what diagnoses the
+            # common case (max_output_tokens spent on reasoning).
+            summary = {k: data.get(k) for k in
+                       ("id", "status", "incomplete_details", "error")}
+            raise ValueError(f"No completed message in response: {summary}")
 
     def _emit_usage_metric(self, usage: object) -> None:
         """Record per-call token usage to metrics.jsonl.
 
-        Handles both response shapes the OpenAI client surfaces:
-          - /v1/chat/completions: response.usage.prompt_tokens,
-            completion_tokens, prompt_tokens_details.cached_tokens
-          - /v1/responses (gpt-5*/codex): usage dict with input_tokens,
-            output_tokens, input_tokens_details.cached_tokens
+        Reads the /v1/responses usage dict (input_tokens, output_tokens,
+        input_tokens_details.cached_tokens), and tolerates the chat-style
+        prompt_tokens / completion_tokens names in dict or object form.
 
         cache_hit_rate = cached / (prompt_or_input + cached) — same
         normalization shape as AnthropicAdapter so the metric is
@@ -428,8 +502,8 @@ class AnthropicAdapter(LMAdapter):
     Newer Claude models (Opus 4.7+, Sonnet 5, Fable 5) reject the `temperature`
     sampling parameter with a 400. There's no clean model-string rule (opus-4-6
     accepts it, opus-4-7 rejects it), so rather than hardcode a taxonomy that
-    goes stale on the next release, we learn it from the API's own error and
-    remember it via the persistent `_PARAM_COMPAT` store.
+    goes stale on the next release, `_create_resilient` learns it from the
+    rejection and remembers it via the persistent `_PARAM_COMPAT` store.
     """
 
     def __init__(self, model: str = "claude-sonnet-4-5-20250929", api_key: Optional[str] = None):
@@ -470,20 +544,14 @@ class AnthropicAdapter(LMAdapter):
             "model": self.model,
             "messages": formatted_messages,
             "max_tokens": max_tokens,
+            "temperature": temperature,
         }
-        # Only send `temperature` to models not already known to reject it
-        # (Opus 4.7+, Sonnet 5, Fable 5). The learn-and-retry below records
-        # rejections into the persistent `_PARAM_COMPAT` store.
-        if not _PARAM_COMPAT.has("anthropic", self.model, _ADAPT_DROP_TEMPERATURE):
-            kwargs["temperature"] = temperature
-
         if system_message:
             kwargs["system"] = system_message
 
         if stop:
             kwargs["stop_sequences"] = stop
 
-        import anthropic
         from neo.memory.metrics import capture_lm_call_failure
         with capture_lm_call_failure(
             provider="anthropic",
@@ -491,35 +559,13 @@ class AnthropicAdapter(LMAdapter):
             max_tokens=max_tokens,
             temperature=temperature,
         ):
-            try:
-                response = self.client.messages.create(**kwargs)
-            except anthropic.BadRequestError as e:
-                # Newer Claude models reject `temperature` with a 400. Learn
-                # the model, drop the param, and retry once so the call still
-                # succeeds. A 400 for any other reason re-raises untouched.
-                if "temperature" not in kwargs or "temperature" not in str(e).lower():
-                    raise
-                _PARAM_COMPAT.learn("anthropic", self.model, _ADAPT_DROP_TEMPERATURE)
-                kwargs.pop("temperature", None)
-                logger.debug(
-                    "Anthropic model %s rejected `temperature`; dropped it "
-                    "and retrying", self.model,
-                )
-                response = self.client.messages.create(**kwargs)
-            except TypeError as e:
-                # The SDK, not the API: `anthropic` 1.0.0 dropped `temperature`
-                # from the signature, so this raises before any request. Same
-                # remedy, same persistent learning — but it can never be a 400,
-                # so the branch above cannot reach it.
-                if "temperature" not in kwargs or not _sdk_rejects_keyword(e, "temperature"):
-                    raise
-                _PARAM_COMPAT.learn("anthropic", self.model, _ADAPT_DROP_TEMPERATURE)
-                kwargs.pop("temperature", None)
-                logger.debug(
-                    "Anthropic SDK does not accept `temperature` for model %s; "
-                    "dropped it and retrying", self.model,
-                )
-                response = self.client.messages.create(**kwargs)
+            # `temperature` is rejected two ways (a 400 from the API, or a
+            # client-side TypeError once the SDK dropped the keyword);
+            # `_create_resilient` handles both and remembers the model.
+            response = _create_resilient(
+                self.client.messages.create, kwargs, "anthropic", self.model,
+                optional=("temperature",),
+            )
             self._emit_usage_metric(response)
             return response.content[0].text
 
@@ -609,19 +655,22 @@ class GoogleAdapter(LMAdapter):
                 "parts": [msg["content"]],
             })
 
-        # Create generation config using types
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            stop_sequences=stop,
-        )
-
-        try:
-            # Generate content using new SDK interface
-            response = self.client.models.generate_content(
+        # Fields a model refuses (e.g. `temperature`) are dropped on the
+        # rejection that names them, then remembered; see `_create_resilient`.
+        def create(**fields):
+            return self.client.models.generate_content(
                 model=self.model,
                 contents=formatted_messages,
-                config=config,
+                config=types.GenerateContentConfig(**fields),
+            )
+
+        try:
+            response = _create_resilient(
+                create,
+                {"temperature": temperature, "max_output_tokens": max_tokens,
+                 "stop_sequences": stop},
+                "google", self.model,
+                optional=("temperature",),
             )
 
             # Handle missing or None response text
@@ -685,16 +734,17 @@ class LocalAdapter(LMAdapter):
     ) -> str:
         """Generate response using local API."""
         # OpenAI-compatible endpoints front many providers (vLLM, llama.cpp,
-        # xAI Grok, DeepSeek); resilient helper recovers if the model behind
-        # the endpoint is a reasoning model that rejects `temperature` /
-        # `max_tokens`.
-        response = _chat_completion_resilient(self.client, {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stop": stop,
-        }, provider="local")
+        # xAI Grok, DeepSeek) and mostly speak only chat completions, so this
+        # stays off /v1/responses; the helper recovers if the model behind the
+        # endpoint is a reasoning model that rejects `temperature` / `max_tokens`.
+        response = _create_resilient(
+            self.client.chat.completions.create, {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stop": stop,
+            }, "local", self.model, **_CHAT_FIELDS)
         return response.choices[0].message.content
 
     def name(self) -> str:
@@ -815,14 +865,16 @@ class AzureOpenAIAdapter(LMAdapter):
         # Azure `model` is an arbitrary deployment name, so reasoning models
         # (gpt-5 / o-series deployments) can't be detected by string — they
         # reject `temperature` and require `max_completion_tokens` instead of
-        # `max_tokens`. The resilient helper learns both from the 400.
-        response = _chat_completion_resilient(self.client, {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stop": stop,
-        }, provider="azure")
+        # `max_tokens`. The helper learns both from the 400. Stays on chat
+        # completions: deployment API versions lag the public responses API.
+        response = _create_resilient(
+            self.client.chat.completions.create, {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stop": stop,
+            }, "azure", self.model, **_CHAT_FIELDS)
         return response.choices[0].message.content
 
     def name(self) -> str:
@@ -907,13 +959,22 @@ class ClaudeCodeAdapter(LMAdapter):
             system_prompt_file = f.name
 
         try:
-            # Build Claude Code CLI arguments
+            # Plain inference, isolated from the user's Claude Code setup
+            # (#260): no tools (a structured-output prompt answered with a tool
+            # call used up the one turn and exited 1, and ran commands in the
+            # working tree), no MCP servers, no user/project settings or hooks,
+            # and no saved session transcript per call. Not --bare: that skips
+            # the keychain read subscription login needs.
             args = [
                 self.cli_path,
                 "--system-prompt-file", system_prompt_file,
                 "--output-format", "stream-json",
                 "--model", self.model,
                 "--max-turns", "1",
+                "--tools", "",
+                "--strict-mcp-config",
+                "--setting-sources", "",
+                "--no-session-persistence",
                 "--verbose",
                 "-p",
             ]
@@ -926,7 +987,6 @@ class ClaudeCodeAdapter(LMAdapter):
             }
             env.pop("ANTHROPIC_API_KEY", None)
 
-            # Run Claude Code CLI
             process = subprocess.Popen(
                 args,
                 stdin=subprocess.PIPE,
@@ -935,52 +995,96 @@ class ClaudeCodeAdapter(LMAdapter):
                 env=env,
                 text=True,
             )
+            # communicate() drains both pipes together, so a chatty stderr
+            # cannot block the child, and the timeout covers the whole call
+            # rather than only the wait after stdout closes.
+            try:
+                stdout, stderr = process.communicate(
+                    json.dumps(conversation_messages), timeout=self.timeout
+                )
+            except subprocess.TimeoutExpired:
+                self._reap(process)
+                raise RuntimeError(
+                    f"Claude Code did not finish within {self.timeout}s"
+                )
+            except BaseException:
+                # Interrupted (Ctrl-C included): never leave the child running.
+                self._reap(process)
+                raise
 
-            # Write messages to stdin
-            process.stdin.write(json.dumps(conversation_messages))
-            process.stdin.close()
-
-            # Parse streaming JSON output
             response_text = ""
-            for line in process.stdout:
+            result_chunk: dict = {}
+            for line in stdout.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-
                 try:
                     chunk = json.loads(line)
-
-                    if chunk.get("type") == "assistant":
-                        message = chunk.get("message", {})
-                        for content in message.get("content", []):
-                            if content.get("type") == "text":
-                                response_text += content.get("text", "")
-
-                    if chunk.get("type") == "assistant":
-                        message = chunk.get("message", {})
-                        if message.get("stop_reason"):
-                            content = message.get("content", [{}])[0]
-                            if content.get("text", "").startswith("API Error"):
-                                stderr = process.stderr.read()
-                                raise RuntimeError(
-                                    f"Claude Code error: {content['text']}\n{stderr}"
-                                )
-
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("type") == "assistant":
+                    message = chunk.get("message", {})
+                    for content in message.get("content", []):
+                        if content.get("type") == "text":
+                            response_text += content.get("text", "")
+                    if message.get("stop_reason"):
+                        first = (message.get("content") or [{}])[0]
+                        if first.get("text", "").startswith("API Error"):
+                            raise RuntimeError(
+                                f"Claude Code error: {first['text']}\n{stderr}"
+                            )
+                elif chunk.get("type") == "result":
+                    result_chunk = chunk
 
-            return_code = process.wait(timeout=self.timeout)
-
-            if return_code != 0:
-                stderr = process.stderr.read()
+            # The CLI reports its own failures (max turns, auth, unknown model)
+            # as the stream-json `result` line on stdout. `is_error` is the
+            # field to trust: an unknown model reports subtype "success" with
+            # is_error true.
+            failed = process.returncode != 0 or bool(result_chunk.get("is_error"))
+            if not failed and not result_chunk:
+                failed = True  # output ended without a result line: cut short
+            if failed:
+                subtype = str(result_chunk.get("subtype") or "")
+                detail = "; ".join(
+                    part for part in (
+                        "" if subtype == "success" else subtype,
+                        ", ".join(str(e) for e in result_chunk.get("errors") or []),
+                        str(result_chunk.get("result") or "")
+                        if result_chunk.get("is_error") else "",
+                        (stderr or "").strip(),
+                        "" if result_chunk else "no result line in the output",
+                    ) if part
+                ) or "no error detail"
+                if "unknown option" in (stderr or ""):
+                    detail += " (this Claude Code is too old for neo's isolation flags; upgrade it)"
                 raise RuntimeError(
-                    f"Claude Code exited with code {return_code}: {stderr}"
+                    f"Claude Code failed (exit {process.returncode}): {detail}"
                 )
+
+            # The CLI has no stop-sequence option; cut at the first one, as a
+            # provider that honours `stop` would.
+            if stop:
+                cut = min(
+                    (i for i in (response_text.find(s) for s in stop if s) if i >= 0),
+                    default=-1,
+                )
+                if cut >= 0:
+                    response_text = response_text[:cut]
 
             return response_text.strip()
 
         finally:
             Path(system_prompt_file).unlink(missing_ok=True)
+
+    @staticmethod
+    def _reap(process) -> None:
+        """Kill the child and collect it, without waiting forever on pipes a
+        grandchild may still hold."""
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
     def name(self) -> str:
         return f"claude-code/{self.model}"
@@ -1039,6 +1143,34 @@ def _model_pin_honored(requested: str, used: str) -> bool:
     return r in u or u in r
 
 
+def _split_model_id(model_id: str) -> tuple[str, str, str]:
+    """``provider/name:tag`` -> (provider, name, tag), lowercased; parts may be ""."""
+    model_id = model_id.strip().lower()
+    provider, _, rest = model_id.rpartition("/")
+    name, _, tag = rest.partition(":")
+    return provider, name, tag
+
+
+def _resolved_id_honors_pin(requested: str, resolved: str) -> bool:
+    """Exact pin check against CAR's ``resolved_model_id``.
+
+    The resolved id is a catalog id in the pin's own namespace —
+    ``anthropic/claude-sonnet-4-6:latest``, ``mlx/qwen3-0.6b:6bit`` (captured
+    live from CAR 0.55) — so no fuzzy matching is needed, and the fuzzy rule
+    is unsound here: ``gpt-5`` "contains" into ``openai/gpt-5.5``, the very
+    substitution this guard exists to catch. The NAME must match exactly; the
+    provider and tag only when the pin states them, since a bare
+    ``claude-sonnet-4-6`` pin is legitimately served as ``...:latest``.
+    """
+    r_provider, r_name, r_tag = _split_model_id(requested)
+    u_provider, u_name, u_tag = _split_model_id(resolved)
+    if not r_name or r_name != u_name:
+        return False
+    if r_provider and r_provider != u_provider:
+        return False
+    return not r_tag or r_tag == u_tag
+
+
 def _names_model(message: str, model: str) -> bool:
     """Does ``message`` name ``model`` itself, not merely contain it as a prefix?
 
@@ -1095,17 +1227,33 @@ class CarAdapter(LMAdapter):
         model: Optional[str] = None,
         intent_hint: Optional[dict] = None,
         runtime: Optional[object] = None,
+        model_is_catalog_id: bool = False,
+        scoped_consumer=None,
     ):
         self.model = model
+        # True when `model` is a catalog id CAR handed us (the panel's router
+        # plan), so it is pinned exactly through `model_id`. Decided by WHERE
+        # the id came from, never by its shape: only built-in ids follow
+        # `provider/name[:tag]`; discovered, gateway and operator-registered
+        # ids pass through verbatim (`parslee/openrouter/open-fast`, bare ids
+        # containing `:`), so a shape test would send real catalog ids down
+        # the alias path. A name a human typed into config stays `model`.
+        self.model_is_catalog_id = model_is_catalog_id
         # Caller-supplied intent wins; otherwise default to the coding workload.
         self.intent_hint = dict(intent_hint) if intent_hint else dict(self.DEFAULT_INTENT_HINT)
         # Give large-context inference room to finish before CAR's FFI read
         # timeout cuts it off (a quality remote can take ~140s on neo's context).
-        _apply_car_daemon_timeout_default()
-        if runtime is None:
+        if scoped_consumer is None:
+            _apply_car_daemon_timeout_default()
+        if scoped_consumer is not None:
+            if runtime is not None and runtime is not scoped_consumer.runtime:
+                raise ValueError("Scoped adapter requires its admitted consumer runtime")
+            runtime = scoped_consumer.runtime
+        elif runtime is None:
             from neo.car_inference import get_runtime
             runtime = get_runtime()
         self._rt = runtime
+        self.scoped_consumer = scoped_consumer
 
     @staticmethod
     def _messages_to_prompt(messages) -> str:
@@ -1126,7 +1274,19 @@ class CarAdapter(LMAdapter):
                 parts.append(str(m))
         return "\n\n".join(parts)
 
-    def generate(
+    def generate(self, messages, stop=None, max_tokens: int = 4096,
+                 temperature: float = 0.7, reasoning_effort: Optional[str] = None) -> str:
+        from neo.memory.metrics import scoped_metrics
+        if self.scoped_consumer is not None:
+            self.scoped_consumer.authorize()
+        with scoped_metrics(self.scoped_consumer.state_root / "metrics.jsonl"
+                            if self.scoped_consumer is not None else None):
+            result = self._generate(messages, stop, max_tokens, temperature, reasoning_effort)
+            if self.scoped_consumer is not None:
+                self.scoped_consumer.authorize()
+            return result
+
+    def _generate(
         self,
         messages,
         stop: Optional[list] = None,
@@ -1134,13 +1294,28 @@ class CarAdapter(LMAdapter):
         temperature: float = 0.7,
         reasoning_effort: Optional[str] = None,
     ) -> str:
-        # ``temperature``, ``stop``, ``reasoning_effort`` are accepted for
-        # LMAdapter ABC compatibility. CAR's infer_tracked does not expose
-        # them as kwargs — backend defaults win. Future: translate
-        # reasoning_effort∈{"high","xhigh"} to intent_hint["require"]=
-        # ["reasoning"] so CAR's router escalates accordingly (see
-        # github.com/Parslee-ai/car-releases/issues/52).
+        # Every call goes through the request-shaped `infer_tracked_with_request`
+        # when the runtime has it, because only that path carries
+        # `params.temperature`; the keyword `infer_tracked` exposes no sampling
+        # knobs at all. Measured on car-runtime 0.56.1: CAR FORWARDS temperature
+        # (local mlx/qwen3-4b and hosted openai/gpt-4.1-mini are deterministic at
+        # 0.0 and vary at 1.5+) and drops it without error for backends that
+        # reject it (Opus 4.8, gpt-5.6-sol), so sending it is safe.
+        # Deliberately NOT sent, because the daemon was measured to discard them
+        # and a request carrying them would look configured while doing nothing:
+        # `stop` (accepted, the output still contains the sequence) and any
+        # effort level (`GenerateParams` has none; `thinking` showed no token or
+        # latency delta and `usage` has no reasoning-token field) -- see
+        # Parslee-ai/car-releases#107 and #108.
+        request_path = hasattr(self._rt, "infer_tracked_with_request")
         kwargs: dict = {"max_tokens": int(max_tokens)}
+        # A catalog id CAR handed us is pinned EXACTLY through `model_id`,
+        # which CAR serves only from that row and echoes back; a name a human
+        # typed goes as `model`, where CAR may resolve an alias. `infer_tracked`
+        # has no `model_id` keyword, so a runtime without the request path keeps
+        # the keyword call and the `model` field for both.
+        exact_pin = bool(self.model) and self.model_is_catalog_id and request_path
+        # Keyword-call fields, for runtimes without the request path.
         if self.model:
             kwargs["model"] = self.model
         if self.intent_hint is not None:
@@ -1161,10 +1336,36 @@ class CarAdapter(LMAdapter):
             model=self.model or "router",
             input_shape=input_shape,
             max_tokens=int(max_tokens),
-            intent_task=(self.intent_hint or {}).get("task") if self.intent_hint else None,
+            intent_task=(
+                (self.intent_hint or {}).get("task")
+                if self.intent_hint and not exact_pin else None
+            ),
         ):
             try:
-                if isinstance(messages, str):
+                if request_path:
+                    params: dict = {"max_tokens": int(max_tokens)}
+                    if temperature is not None:
+                        params["temperature"] = float(temperature)
+                    request: dict = {"params": params}
+                    if exact_pin:
+                        request["model_id"] = self.model
+                    elif self.model:
+                        request["model"] = self.model
+                    # The intent only steers ROUTING, which an exact
+                    # `model_id` pin bypasses.
+                    if self.intent_hint is not None and not exact_pin:
+                        request["intent"] = dict(self.intent_hint)
+                    if isinstance(messages, list):
+                        request["messages"] = messages
+                        request["prompt"] = next(
+                            (m.get("content", "") for m in messages
+                             if isinstance(m, dict) and m.get("role") == "user"),
+                            "",
+                        )
+                    else:
+                        request["prompt"] = str(messages)
+                    result_raw = self._rt.infer_tracked_with_request(json.dumps(request))
+                elif isinstance(messages, str):
                     result_raw = self._rt.infer_tracked(messages, **kwargs)
                 elif isinstance(messages, list):
                     kwargs["messages_json"] = json.dumps(messages)
@@ -1230,11 +1431,49 @@ class CarAdapter(LMAdapter):
         # falls back to a default instead of erroring — so a typo'd or retired
         # pin would run against the wrong model unnoticed. Router mode
         # (model=None) intentionally skips this.
+        #
+        # Judge against `resolved_model_id` whenever CAR reports it: that is
+        # the catalog id the request was served by, in the same namespace as
+        # the pin. `model_used` is a DISPLAY name, and for local models the
+        # two share no substring once normalized — CAR's own router assigned a
+        # panel role `mlx/qwen3-0.6b:6bit`, served it as `Qwen3-0.6B-MLX`, and
+        # this check rejected the model it had just been routed to, so the
+        # whole panel fell back to the fast path. The display-name heuristic
+        # remains for CAR builds that do not report the resolved id; against
+        # the resolved id the match is exact (`_resolved_id_honors_pin`).
         model_used = result.get("model_used") or ""
-        if self.model and model_used and not _model_pin_honored(self.model, model_used):
+        resolved = result.get("resolved_model_id") or ""
+        if exact_pin:
+            # The `model_id` contract: CAR echoes the pin and serves that row.
+            # Nothing to parse — anything but an exact echo is a substitution.
+            # No echo at all means a daemon older than this binding, which
+            # ignored `model_id` and routed freely. Client/daemon skew is the
+            # normal state here (CarHost updates on its own schedule), so say
+            # THAT rather than blame the pin for a substitution it may not be.
+            if not result.get("requested_model_id"):
+                raise RuntimeError(
+                    f"CAR daemon did not acknowledge exact pin '{self.model}' "
+                    f"(no requested_model_id in its response; it served "
+                    f"'{resolved or model_used or 'unknown'}'). The daemon predates "
+                    f"`model_id` pinning — update CarHost."
+                )
+            honored = result.get("requested_model_id") == self.model == resolved
+        elif self.model and resolved == self.model:
+            # Equality first: a full id typed into config resolves to itself,
+            # and comparing for equality needs no knowledge of the id's shape.
+            honored = True
+        else:
+            honored = (
+                _resolved_id_honors_pin(self.model, resolved) if resolved
+                else _model_pin_honored(self.model, model_used)
+            ) if self.model and (resolved or model_used) else True
+        if not honored:
+            served = f"{resolved} ({model_used})" if resolved and model_used else (
+                resolved or model_used
+            )
             raise RuntimeError(
                 f"CAR did not honor pinned model '{self.model}': it routed to "
-                f"'{model_used}' instead. Unknown or unavailable model ids "
+                f"'{served}' instead. Unknown or unavailable model ids "
                 f"silently fall back to a default — pin a model CAR knows, or "
                 f"use router mode (model=None)."
             )
@@ -1428,7 +1667,7 @@ def _adapter_kwargs_for_config(config) -> dict:
     return adapter_kwargs
 
 
-def resolve_adapter(config) -> LMAdapter:
+def resolve_adapter(config, *, scoped_consumer=None) -> LMAdapter:
     """Build the inference adapter for a NeoConfig, honoring ``inference_mode``.
 
     Default ("auto"): prefer CAR's dynamic router when car-runtime is importable
@@ -1440,6 +1679,11 @@ def resolve_adapter(config) -> LMAdapter:
     the fallback after a CAR failure) so that a CAR-only install with no static
     provider key configured still works.
     """
+    if scoped_consumer is not None:
+        scoped_consumer.authorize()
+        # Scoped refusal never enters AutoAdapter's personal provider fallback.
+        return CarAdapter(runtime=scoped_consumer.runtime, scoped_consumer=scoped_consumer)
+
     def build_static() -> LMAdapter:
         return create_adapter(
             config.provider,

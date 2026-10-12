@@ -106,6 +106,20 @@ def _read_auth_token() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+class RpcError(RuntimeError):
+    """The daemon answered a request with a JSON-RPC error."""
+
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def unknown_method(self) -> bool:
+        # The daemon reports an unknown method as text; -32601 alone is
+        # ambiguous because it also means "not allowed for this agent".
+        return "unknown method" in str(self)
+
+
 class DaemonClient:
     """Single-purpose JSON-RPC WS client for the a2ui surface.
 
@@ -120,11 +134,18 @@ class DaemonClient:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._notif_handlers: dict[str, Callable[[dict], Awaitable[None]]] = {}
+        self._request_handlers: dict[str, Callable[[dict], Awaitable[Any]]] = {}
         self._recv_task: Optional[asyncio.Task] = None
         self._closed = False
 
-    async def connect(self) -> None:
+    async def connect(self, auth: Optional[dict] = None) -> Any:
         """Open the WS, run the auth handshake, start the recv loop.
+
+        ``auth`` overrides the ``session.auth`` params. A CAR-supervised
+        agent passes ``{"token": CAR_AGENT_TOKEN, "agent_id": CAR_AGENT_ID}``
+        to bind the connection to its agent identity; without it the
+        connection authenticates with the daemon-wide token and has no peer
+        address. Returns the ``session.auth`` result (None when skipped).
 
         Raises on connection failure — callers wrap this so the
         "daemon not up" path doesn't propagate up.
@@ -134,11 +155,48 @@ class DaemonClient:
         self._ws = await websockets.connect(self.url)
         self._recv_task = asyncio.create_task(self._recv_loop())
 
-        token = _read_auth_token()
-        if token:
+        if auth is None:
+            token = _read_auth_token()
+            auth = {"token": token} if token else None
+        if auth:
             # session.auth must be the first frame on every connection
             # when the daemon has auth enabled (the default since 2026-05).
-            await self._call("session.auth", {"token": token})
+            try:
+                return await self._call("session.auth", auth)
+            except BaseException:
+                # The socket and receive task are already live; a caller that
+                # retries auth would otherwise leak one of each per attempt.
+                await self.close()
+                raise
+        return None
+
+    async def call(self, method: str, params: dict, timeout: Optional[float] = None) -> Any:
+        """Issue one JSON-RPC request and return its result.
+
+        Raises ``RuntimeError`` for a JSON-RPC error reply (the daemon
+        answered: no), ``ConnectionError`` when the request could not be
+        sent or the socket closed, and ``asyncio.TimeoutError`` when no reply
+        arrived within ``timeout`` seconds. The last two say nothing about
+        the request itself, so a caller may retry them on a new connection.
+        """
+        return await self._call(method, params, timeout=timeout)
+
+    def on_request(
+        self, method: str, handler: Callable[[dict], Awaitable[Any]]
+    ) -> None:
+        """Register an async handler for a daemon-to-client REQUEST.
+
+        Unlike a notification, a request carries an ``id`` and the daemon
+        waits for the reply — ``agent.peer_message`` is acknowledged this way.
+        The handler's return value is sent back as ``result``; if it raises,
+        the reply is a JSON-RPC error. Keep handlers quick: they run on the
+        receive loop, so a slow one stalls every other frame.
+        """
+        self._request_handlers[method] = handler
+
+    @property
+    def connected(self) -> bool:
+        return self._recv_task is not None and not self._recv_task.done()
 
     async def close(self) -> None:
         self._closed = True
@@ -160,22 +218,31 @@ class DaemonClient:
         """
         self._notif_handlers[method] = handler
 
-    async def _call(self, method: str, params: dict) -> Any:
+    async def _call(self, method: str, params: dict, timeout: Optional[float] = None) -> Any:
         if not self._ws:
-            raise RuntimeError("daemon client not connected")
+            raise ConnectionError("daemon client not connected")
         self._next_id += 1
         req_id = self._next_id
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
 
         msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-        await self._ws.send(json.dumps(msg))
-        response = await fut
+        try:
+            await self._ws.send(json.dumps(msg))
+        except Exception as e:  # noqa: BLE001 — any send failure is a dead socket
+            self._pending.pop(req_id, None)
+            raise ConnectionError(f"sending {method} failed: {e}") from e
+        try:
+            response = await asyncio.wait_for(fut, timeout) if timeout else await fut
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise
 
         if "error" in response:
-            raise RuntimeError(
-                f"jsonrpc {method} failed: "
-                f"{response['error'].get('message', response['error'])}"
+            error = response["error"]
+            raise RpcError(
+                f"jsonrpc {method} failed: {error.get('message', error)}",
+                code=error.get("code") if isinstance(error, dict) else None,
             )
         return response.get("result")
 
@@ -190,7 +257,13 @@ class DaemonClient:
                     logger.debug("ignoring non-json frame")
                     continue
 
-                if "id" in msg and msg["id"] in self._pending:
+                # A frame with BOTH `method` and `id` is the daemon calling us,
+                # and is tested first: its id is the daemon's own counter, so
+                # it can collide with one of ours and must never resolve a
+                # pending call of ours.
+                if "method" in msg and msg.get("id") is not None:
+                    await self._answer_request(msg)
+                elif "id" in msg and msg["id"] in self._pending:
                     self._pending.pop(msg["id"]).set_result(msg)
                 elif "method" in msg:  # notification
                     handler = self._notif_handlers.get(msg["method"])
@@ -213,6 +286,26 @@ class DaemonClient:
                 if not fut.done():
                     fut.set_exception(ConnectionError("daemon connection closed"))
             self._pending.clear()
+
+    async def _answer_request(self, msg: dict) -> None:
+        """Reply to a daemon-to-client request. Every request gets a reply —
+        an unanswered one leaves the daemon waiting out its timeout."""
+        handler = self._request_handlers.get(msg["method"])
+        if handler is None:
+            reply: dict = {"jsonrpc": "2.0", "id": msg["id"], "error": {
+                "code": -32601, "message": f"method not found: {msg['method']}",
+            }}
+        else:
+            try:
+                result = await handler(msg.get("params") or {})
+                reply = {"jsonrpc": "2.0", "id": msg["id"], "result": result}
+            except Exception as e:  # noqa: BLE001 — reported to the caller
+                logger.warning("request handler for %s raised: %s", msg["method"], e)
+                reply = {"jsonrpc": "2.0", "id": msg["id"], "error": {
+                    "code": -32603, "message": str(e),
+                }}
+        if self._ws is not None:
+            await self._ws.send(json.dumps(reply))
 
     # Convenience wrappers around the a2ui.* surface --------------------------
 

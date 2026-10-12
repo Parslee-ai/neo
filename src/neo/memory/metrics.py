@@ -43,6 +43,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -99,6 +100,21 @@ def _enabled() -> bool:
     return _profile() != PROFILE_OFF
 
 
+_SCOPED_METRICS = ContextVar("neo_scoped_metrics", default=None)
+
+
+@contextmanager
+def scoped_metrics(path):
+    if path is None:
+        yield
+        return
+    token = _SCOPED_METRICS.set(Path(path))
+    try:
+        yield
+    finally:
+        _SCOPED_METRICS.reset(token)
+
+
 def _metrics_path() -> Path:
     """Resolve ~/.neo/metrics.jsonl at call time so per-test HOME stubs apply.
 
@@ -106,7 +122,7 @@ def _metrics_path() -> Path:
     conftest's monkeypatched Path.home() fixture fires, polluting the real
     user's home with test events.
     """
-    return Path.home() / ".neo" / "metrics.jsonl"
+    return _SCOPED_METRICS.get() or Path.home() / ".neo" / "metrics.jsonl"
 
 
 # The log was append-only with no bound — 17 MB and growing on a live install.
