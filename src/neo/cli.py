@@ -601,26 +601,51 @@ def read_prompt_from_argv_or_stdin(args):
 
 
 def _format_refresh_report(result: dict, index) -> list:
-    """What `neo --index --update` did, in words. A refresh a budget cut short
-    says so; a complete one prints only what changed (#217)."""
+    """What `neo --index --update` did, in words. Each line past the first is
+    conditional, so a complete, clean refresh prints one line (#217)."""
+    from neo.index.project_index import REFRESH_BUDGET_MS, REFRESH_MAX_CHUNKS
+
+    def n(count: int, noun: str) -> str:
+        return f"{count} {noun}{'' if count == 1 else 's'}"
+
     files = result['refreshed'] + result['added'] + result['removed']
+    totals = f"{len(index.chunks)} chunks, {len(index.edges)} edges"
     if not files:
-        lines = [f"[Neo] Index is up to date: {len(index.chunks)} chunks, {len(index.edges)} edges"]
+        lines = [f"[Neo] Index is up to date: {totals}"]
     else:
-        parts = [f"{n} {label}" for n, label in (
+        parts = [f"{count} {label}" for count, label in (
             (result['refreshed'], "changed"), (result['added'], "new"),
-            (result['removed'], "deleted")) if n]
-        lines = [f"[Neo] Updated index: {', '.join(parts)} file{'s' if files != 1 else ''}, "
-                 f"{result['chunks_embedded']} chunks re-embedded; now "
-                 f"{len(index.chunks)} chunks, {len(index.edges)} edges"]
+            (result['removed'], "removed")) if count]
+        lines = [f"[Neo] Updated index: {', '.join(parts)} "
+                 f"file{'' if files == 1 else 's'}, "
+                 f"{n(result['chunks_embedded'], 'chunk')} embedded; now {totals}"]
+    if result['chunks_embedded'] < result['chunks_extracted']:
+        lines.append(
+            f"[Neo] Warning: {result['chunks_extracted'] - result['chunks_embedded']} "
+            "extracted chunks were not embedded (no embedding model), so semantic "
+            "re-rank cannot find them.")
+    if result['failed']:
+        shown = ", ".join(result['failed'][:5])
+        more = f" and {len(result['failed']) - 5} more" if len(result['failed']) > 5 else ""
+        lines.append(
+            f"[Neo] Warning: could not read or parse {n(len(result['failed']), 'file')} "
+            f"({shown}{more}); their previous entries were kept.")
+    if result['skipped_duplicate']:
+        lines.append(
+            f"[Neo] Skipped {n(result['skipped_duplicate'], 'new file')} whose content "
+            "is already catalogued.")
+    if result['skipped_cap']:
+        lines.append(
+            f"[Neo] Skipped {n(result['skipped_cap'], 'new file')}: the catalog is at "
+            f"its --max-files={result['max_files']} limit. Run 'neo --index' to "
+            "re-rank which files it holds.")
     if result['bound']:
-        from neo.index.project_index import REFRESH_BUDGET_MS, REFRESH_MAX_CHUNKS
         budget = (f"{REFRESH_BUDGET_MS / 1000:g} s time" if result['bound'] == 'time'
                   else f"{REFRESH_MAX_CHUNKS}-chunk")
         lines.append(
-            f"[Neo] Stopped at the {budget} budget with {len(result['remaining'])} "
-            "stale files left. Run 'neo --index --update' again to continue, or "
-            "'neo --index' to rebuild.")
+            f"[Neo] Stopped at the {budget} budget with "
+            f"{n(len(result['remaining']), 'stale file')} left. Run 'neo --update' "
+            "again to continue, or 'neo --index' to rebuild.")
     if not result['tracks_new_files']:
         lines.append(
             "[Neo] This catalog predates new-file tracking, so files added since "
@@ -1094,7 +1119,9 @@ def main():
 
     # Handle --index flag. `--update` implies it: read only inside this
     # branch, a bare `neo --update` used to fall through to reasoning (#217).
-    if getattr(args, 'update', False):
+    # Only at the top level: `neo update` (the self-upgrade) and other
+    # subcommands inherit the flag and must not be hijacked by it.
+    if getattr(args, 'update', False) and not getattr(args, 'command', None):
         args.index = True
     if args.index:
         from neo.index.project_index import ProjectIndex
