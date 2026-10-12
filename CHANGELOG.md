@@ -1,6 +1,25 @@
 # Changelog
 
-## [Unreleased]
+## [0.57.0] - 2026-10-12
+
+### Added
+
+- **Neo joins in without being asked** ([#295](https://github.com/Parslee-ai/neo/pull/295)). The Claude Code mod now runs Neo at four moments:
+  - **A prompt you type:** `neo recall` adds up to three lessons Neo learned in earlier sessions that match it. It makes no model call and never loads the embedding model: it asks the observer's resident embedder once, with a 1 s deadline, and says nothing otherwise. It writes nothing, and it leaves out what Claude already has (rule files, its own memory files, git history) along with generic seed and community patterns.
+  - **A turn that edited files ends:** Neo reviews the edits, and the turn continues with his fix only when it carries a diff or code. New and untracked files are reviewed as whole-file additions.
+  - **A test, build or lint command fails:** Neo diagnoses it in the background, and Claude gets the diagnosis at the next main-thread hook.
+  - **A plan leaves plan mode:** Neo checks it before the work starts.
+  - These are real model calls on your configured provider, bounded by deduplication rather than a switch: one review per distinct diff, one diagnosis per distinct failure (one running at a time, six per session), one check per plan. They run in `learn` mode, so a suggestion Claude applies can be confirmed by git and promoted. Subagents never trigger a diagnosis or consume findings meant for the main thread. A failed or timed-out run adds nothing and never blocks a turn. See `docs/claude-code-mods.md`.
+- **Neo's personality reaches the mod, and stays situational.** Findings ask Claude to quote Neo's lines as written, since his phrasing is set by how much he remembers. Personality beats now appear in the pane and every text form; the mod used to drop them. Recall opens with a beat chosen by what it recalled: a past failure, a proven lesson, one from another project, a strong or faint match. Each recall beat speaks only at the memory stages it lists, so his lines change as he learns, and silence is the default. The mod remembers the beats Neo spoke recently and passes them back, so he doesn't repeat himself within a session. Automatic runs choose beats from what you last typed, not the mod's own wording. The engine reports `orchestrator.beat_id`, and accepts `beat_context` (`ask`, `recent_beats`) on `--stdin-json`.
+
+### Fixed
+
+- **A code fence inside a JSON string no longer cuts a structured response short** ([#292](https://github.com/Parslee-ai/neo/issues/292)). Every structured call stopped at the first ```` ``` ````. Providers that honour stop sequences, and the `claude-code` provider (which cuts client-side), ended any response that quoted Markdown or a `.md` diff before its end marker, so it failed `missing_end_sentinel` and the repair call was cut the same way. OpenAI never sends stop sequences, so it was unaffected. A fence wrapping the whole block (any info string, three or more backticks, or tildes) is now unwrapped, and a fence inside a string is left as content. The repair prompt also named `<<<END>>>`, which the parser never accepted.
+
+### Documentation
+
+- **`CLAUDE.md` went from 149k to 8k characters** ([#293](https://github.com/Parslee-ai/neo/pull/293)), under Claude Code's instruction-file limit. The detailed engineering notes moved verbatim to `docs/engineering-notes/`.
+
 
 ### Fixed
 
