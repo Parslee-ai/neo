@@ -13,6 +13,9 @@ import sys
 from typing import BinaryIO
 
 
+# Complete installed consumer and guardian closures can exceed 8,192 pins.
+MAX_OWNER_PINS = 32768
+
 # Installed guardian inventories can contain thousands of full path/hash pins.
 MAX_GUARDIAN_REQUEST_BYTES = 8 * 1024 * 1024
 
@@ -37,7 +40,7 @@ def _config(value):
         if not isinstance(value[field], str) or not Path(value[field]).is_absolute():
             raise ValueError("Absolute native owner paths required")
     pins = value["pins"]
-    if not isinstance(pins, dict) or not 4 <= len(pins) <= 8192:
+    if not isinstance(pins, dict) or not 4 <= len(pins) <= MAX_OWNER_PINS:
         raise ValueError("Pinned guardian and child package identity required")
     needed = {value["guardian_python"], value["child_python"], value["child_sdk"],
               str(Path(value["guardian_scripts"]) / "supervised-owner.py")}

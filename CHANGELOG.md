@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A lattice node exits when its CAR supervisor dies, instead of reconnecting forever.** A node is spawned directly by `car-server`. A daemon that died without stopping its children (SIGKILL, a crash, or a test daemon torn down) left the node reparented to launchd and retrying the dead daemon indefinitely: one machine had 55 of them, about 1.1 GB. The node records its parent at start and exits within one backoff (at most 30 s) once that parent changes.
+- **Native owner pins:** the limit rises from 8,192 to 32,768. A complete installed consumer and guardian closure can exceed the old limit, and each pin is still hash-checked.
+
 ### Added
 
 - **Cursor plugin** (`plugins/cursor-neo/`, contributed by Joe Rinehart in [#236](https://github.com/Parslee-ai/neo/pull/236)). It provides the same six skills as the Codex plugin, invoked as `/neo`, `/neo-review` and so on in Cursor's Agent chat, plus a `neo-agent` subagent with a visible boundary, like Claude Code's Neo agent. Install it locally (`~/.cursor/plugins/local`) or import this repository as a team marketplace (`.cursor-plugin/marketplace.json`). Each Cursor skill is tested against its Codex counterpart, paragraph by paragraph, so a privacy fix to one cannot be left out of the other. The README lists what is weaker on Cursor: a skill cannot write the shell approval's description, and the subagent inherits every tool.
