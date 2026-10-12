@@ -153,3 +153,42 @@ def test_recall_stays_off_the_slow_path():
     dispatch = body.index('sys.argv[1] == "recall"')
     for expensive in ("FactStore(", "check_for_updates", "maybe_autostart_observer", "parse_args()"):
         assert expensive not in body[:dispatch], expensive
+
+
+# ------------------------------------------------------------- Neo's voice
+
+
+def test_the_opener_follows_the_stage_his_memory_has_reached(tmp_path):
+    """One weak fact is a Sleeper's memory: he hedges. The engine phrases its
+    summary by the same stage, so recall must sound like the same Neo."""
+    import yaml
+
+    from neo.memory.store import memory_level_of, memory_stage
+
+    _seed(tmp_path, _fact("lesson", tags=["transcript-derived"]))
+    text = recall("q", str(tmp_path), embed=_embed({"q": _unit(0)}))
+    deck = yaml.safe_load(
+        (Path(recall_mod.__file__).parent / "config" / "beats" / "neo_matrix.yaml").read_text())
+    stage = memory_stage(memory_level_of(recall_mod._load_facts(str(tmp_path))))
+    assert stage == 1
+    opener = deck["orchestrator_voice"]["stages"][1]["recall_opener"]
+    assert text.splitlines()[0] == f"Neo memory: {opener}"
+
+
+def test_every_stage_has_a_recall_opener():
+    import yaml
+
+    deck = yaml.safe_load(
+        (Path(recall_mod.__file__).parent / "config" / "beats" / "neo_matrix.yaml").read_text())
+    stages = deck["orchestrator_voice"]["stages"]
+    assert sorted(stages) == [1, 2, 3, 4, 5]
+    openers = [stages[s].get("recall_opener") for s in sorted(stages)]
+    assert all(openers) and len(set(openers)) == 5
+
+
+def test_recall_and_the_engine_share_one_stage_rule():
+    from neo.engine import NeoEngine
+    from neo.memory.store import memory_stage
+
+    for level in (0.0, 0.19, 0.2, 0.45, 0.6, 0.79, 0.8, 0.99):
+        assert NeoEngine._memory_level_to_stage(None, level) == memory_stage(level)

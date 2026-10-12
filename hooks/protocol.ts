@@ -99,6 +99,8 @@ export function resultText(result: Document): string {
   const o = object(result.orchestrator);
   return [
     "Neo: " + text(o.summary),
+    // An earned in-voice beat; empty unless the run found something.
+    text(o.personality),
     ...strings(o.cautions).map((c) => "Caution: " + c),
     text(result.notes),
     ...rows(result.code_suggestions).map(

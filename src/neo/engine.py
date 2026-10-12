@@ -3320,16 +3320,9 @@ RULES:
 
     def _memory_level_to_stage(self, memory_level: float) -> int:
         """Convert memory level (0.0-1.0) to personality stage (1-5)."""
-        if memory_level < 0.2:
-            return 1  # Sleeper
-        elif memory_level < 0.4:
-            return 2  # Glitch
-        elif memory_level < 0.6:
-            return 3  # Unplugged
-        elif memory_level < 0.8:
-            return 4  # Training
-        else:
-            return 5  # The One
+        from neo.memory.store import memory_stage
+
+        return memory_stage(memory_level)
 
     def _select_beat(self, context: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Select the best matching beat from the beat deck based on context."""

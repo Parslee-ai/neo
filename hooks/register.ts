@@ -1,6 +1,7 @@
 import type {
   EngineInterface,
   HookStream,
+  On,
   ProcessSpawnChunk,
   ProcessSpawnResult,
   Register,
@@ -21,6 +22,22 @@ import {
   validationText,
 } from "./protocol.js";
 import type { Document } from "./protocol.js";
+import {
+  AUTO_DEADLINE,
+  EDIT_TOOLS,
+  MAX_DIAGNOSES,
+  RECALL_TIMEOUT,
+  architectPrompt,
+  autoPayload,
+  debugPrompt,
+  fingerprint,
+  hasFindings,
+  hasVerifiableSuggestion,
+  injection,
+  isCheckCommand,
+  recallInjection,
+  reviewPrompt,
+} from "./auto.js";
 
 const PANE = "neo-workspace";
 const DEADLINE = 240000;
@@ -495,6 +512,8 @@ function render(
     if (current?.error) children.push(label(current.error, "error"));
     if (result) {
       children.push(label(text(object(result.orchestrator).summary)));
+      const beat = text(object(result.orchestrator).personality);
+      if (beat) children.push(label(beat, "subtle"));
       for (const caution of strings(object(result.orchestrator).cautions))
         children.push(label("! " + caution, "warning"));
       if (result.notes) children.push(label(text(result.notes)));
@@ -713,10 +732,282 @@ function render(
   return Box({ flexDirection: "column", gap: 1, children });
 }
 
+// ---------------------------------------------- Neo joining in (see auto.ts)
+
+const field = (value: unknown, key: string): string =>
+  text(object(value)[key]);
+
+const autoEdited = new Set<string>();
+const reviewed = new Set<string>();
+const diagnosed = new Set<string>();
+const planned = new Set<string>();
+let pending: string[] = [];
+let recallMissing = false;
+/** Diagnoses running now and started this session: a batch of different
+ * failing commands must not fan out into parallel paid runs. */
+let diagnosing = 0,
+  diagnoses = 0;
+/** Bumped by resetAuto: background work started under an older value belongs
+ * to a session that has ended and must not deliver into this one. */
+let autoGeneration = 0;
+
+async function autoNeo(
+  $: EngineInterface,
+  cwd: string,
+  session: string,
+  prompt: string,
+): Promise<Document | undefined> {
+  try {
+    const run = await $.process.run(
+      [binary, "--stdin-json", "--json", "--mode", "learn"],
+      {
+        cwd,
+        stdin: JSON.stringify(
+          autoPayload(prompt, cwd, session, crypto.randomUUID()),
+        ),
+        timeoutMs: AUTO_DEADLINE,
+      },
+    );
+    if (run.exitCode !== 0) return undefined;
+    const result = JSON.parse(run.stdout) as Document;
+    return result && !result.error ? result : undefined;
+  } catch {
+    return undefined; // Neo joining in must never break the session.
+  }
+}
+
+async function autoRecall($: EngineInterface, cwd: string, prompt: string) {
+  if (recallMissing) return "";
+  try {
+    const run = await $.process.run([binary, "recall", "--cwd", cwd], {
+      stdin: prompt,
+      timeoutMs: RECALL_TIMEOUT,
+    });
+    // An older CLI without `recall` answers with an argparse error (exit 2).
+    if (run.exitCode === 2) recallMissing = true;
+    return run.exitCode === 0 ? run.stdout.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+/** What one edited path changed: its diff against HEAD, or, for a file git
+ * does not track (new, outside a repository, or a repository with no
+ * commits), its whole content as an addition. "" when it matches HEAD. */
+async function autoDiffOf($: EngineInterface, cwd: string, path: string) {
+  try {
+    const tracked = await $.process.run(["git", "diff", "HEAD", "--", path], {
+      cwd,
+      timeoutMs: 10000,
+    });
+    if (tracked.exitCode === 0 && tracked.stdout.trim()) return tracked.stdout;
+    // `--no-index` exits 1 when the files differ, which is the normal case.
+    const added = await $.process.run(
+      ["git", "diff", "--no-index", "--", "/dev/null", path],
+      { cwd, timeoutMs: 10000 },
+    );
+    if (added.exitCode === 1 && added.stdout.trim()) {
+      // A tracked file that matches HEAD also differs from /dev/null; only an
+      // untracked or out-of-repository file is a real addition.
+      const known = await $.process.run(
+        ["git", "ls-files", "--error-unmatch", "--", path],
+        { cwd, timeoutMs: 10000 },
+      );
+      return known.exitCode === 0 ? "" : added.stdout;
+    }
+  } catch {
+    /* no diff for this path */
+  }
+  return "";
+}
+
+function autoDrain(): string[] {
+  const out = pending;
+  pending = [];
+  return out;
+}
+
+function withAutoContext<R extends { additionalContext?: string[] }>(
+  result: R,
+  extra: string[],
+): R {
+  return extra.length
+    ? {
+        ...result,
+        additionalContext: [...(result.additionalContext ?? []), ...extra],
+      }
+    : result;
+}
+
+/** Called from the mod's one `classic.PostToolUse` hook, after the rest of the
+ * chain has answered: the engine allows one unmatched hook per event per
+ * module. Optional work never costs the chain its answer. */
+async function afterTool(
+  $: EngineInterface,
+  e: {
+    tool_name: string;
+    tool_input: unknown;
+    tool_response?: unknown;
+    cwd: string;
+    session_id: string;
+    agent_id?: string;
+  },
+  result: { additionalContext?: string[] },
+) {
+  try {
+    if (EDIT_TOOLS.includes(e.tool_name)) {
+      // A subagent's edits are part of the turn the main thread reviews.
+      const path =
+        field(e.tool_input, "file_path") ||
+        field(e.tool_input, "notebook_path");
+      if (path) autoEdited.add(path);
+    }
+    // Findings belong to the main thread: a subagent must not consume them.
+    if (e.agent_id) return result;
+    const extra = autoDrain();
+    if (e.tool_name === "ExitPlanMode") {
+      let plan =
+        field(e.tool_response, "plan") || field(e.tool_input, "plan");
+      const file = field(e.tool_response, "filePath");
+      if (!plan.trim() && file) {
+        try {
+          plan = String(await $.fs.read(file));
+        } catch {
+          plan = "";
+        }
+      }
+      const key = fingerprint(plan);
+      if (plan.trim() && !planned.has(key)) {
+        planned.add(key);
+        $.ui.status("Neo: reading the plan…");
+        const found = await autoNeo($, e.cwd, e.session_id, architectPrompt(plan));
+        $.ui.status(undefined);
+        if (found && hasFindings(found))
+          extra.push(injection("architect", found));
+      }
+    }
+    return withAutoContext(result, extra);
+  } catch {
+    return result;
+  }
+}
+
+/** A new session starts with nothing reviewed, diagnosed or pending. */
+function resetAuto() {
+  autoGeneration++;
+  autoEdited.clear();
+  reviewed.clear();
+  diagnosed.clear();
+  planned.clear();
+  pending = [];
+  recallMissing = false;
+  diagnosing = 0;
+  diagnoses = 0;
+}
+
+function registerAuto(on: On) {
+  on("classic.UserPromptSubmit", async ($, e, next) => {
+    const result = await next(e);
+    try {
+      // Only prompts a person typed get memory: task notifications and other
+      // machine-injected turns are not questions.
+      if ((e.source ?? "user") !== "user") return result;
+      const extra = autoDrain();
+      const memory = await autoRecall($, e.cwd, e.prompt);
+      if (memory) extra.push(recallInjection(memory));
+      return withAutoContext(result, extra);
+    } catch {
+      return result;
+    }
+  }).catch(async ($, e, next) => next(e));
+
+  on("classic.PostToolUseFailure", async ($, e, next) => {
+    const result = await next(e);
+    try {
+      const command = field(e.tool_input, "command");
+      const key = command + "\n" + fingerprint(e.error.slice(-2000));
+      if (
+        e.tool_name !== "Bash" ||
+        e.agent_id ||
+        e.is_interrupt ||
+        !isCheckCommand(command) ||
+        diagnosed.has(key) ||
+        diagnosing > 0 ||
+        diagnoses >= MAX_DIAGNOSES
+      )
+        return withAutoContext(result, e.agent_id ? [] : autoDrain());
+      diagnosed.add(key);
+      diagnosing++;
+      diagnoses++;
+      const prompt = debugPrompt(command, e.error);
+      const owner = autoGeneration;
+      // In the background: the failure is delivered now, the diagnosis at the
+      // next main-thread hook. Work that outlives this dispatch runs from a
+      // timer; a call left in flight when the hook returns is aborted.
+      $.clock.after(0, () => {
+        void autoNeo($, e.cwd, e.session_id, prompt)
+          .then(
+            (found) => {
+              if (owner === autoGeneration && found && hasFindings(found))
+                pending.push(injection("debug", found, command));
+            },
+            () => {},
+          )
+          .finally(() => {
+            if (owner === autoGeneration) diagnosing--;
+          });
+      });
+      return withAutoContext(result, autoDrain());
+    } catch {
+      return result;
+    }
+  }).catch(async ($, e, next) => next(e));
+
+  on("classic.Stop", async ($, e, next) => {
+    const result = await next(e);
+    try {
+      // Once any Stop hook has continued the turn, let it end; the edits
+      // stay recorded and are reviewed at the next Stop that is not a
+      // continuation, so nothing goes unreviewed for being continued.
+      if (e.stop_hook_active || !autoEdited.size) return result;
+      const files = [...autoEdited].sort();
+      autoEdited.clear();
+      const diffs: string[] = [];
+      for (const path of files) {
+        const diff = await autoDiffOf($, e.cwd, path);
+        if (diff) diffs.push(diff);
+      }
+      // Nothing changed against HEAD (an edit undone): nothing to review.
+      if (!diffs.length) return result;
+      const diff = diffs.join("\n");
+      const key = fingerprint(diff);
+      if (reviewed.has(key)) return result;
+      reviewed.add(key);
+      $.ui.status("Neo: reading this turn's changes…");
+      const found = await autoNeo($, e.cwd, e.session_id, reviewPrompt(files, diff));
+      $.ui.status(undefined);
+      // Only a concrete change continues a finishing turn; prose waits.
+      if (!found || !hasVerifiableSuggestion(found)) return result;
+      return {
+        ...result,
+        block: [
+          ...(result.block ? [result.block] : []),
+          injection("review", found),
+          "Address what holds up, or say briefly why not, then finish.",
+        ].join("\n\n"),
+      };
+    } catch {
+      return result;
+    }
+  }).catch(async ($, e, next) => next(e));
+}
+
 export const register: Register = (on, options) => {
   binary = typeof options.executable === "string" ? options.executable : "neo";
+  registerAuto(on);
   on("session.start", async ($, e, next) => {
     generation++;
+    resetAuto();
     current = undefined;
     previous = undefined;
     snapshot = {};
@@ -955,7 +1246,7 @@ export const register: Register = (on, options) => {
         agent_id: e.agent_id,
         recent_invocation_id: lastInvocation,
       });
-    return next(e);
+    return afterTool($, e, await next(e));
   }).catch(async ($, e, next) => next(e));
   on("session.end", async ($, e, next) => {
     generation++;

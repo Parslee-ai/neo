@@ -105,6 +105,30 @@ def _load_facts(root: str) -> list:
     return facts
 
 
+_RECALL_OPENER_FALLBACK = "I remember this. From earlier sessions:"
+
+
+def _recall_opener(facts: list) -> str:
+    """Neo's opener for the stage his memory has reached, from the beat deck.
+
+    The engine phrases its summary by the same stage (`memory_stage` of
+    `memory_level_of` the loaded facts), so recall sounds like the Neo whose
+    findings follow it. A missing or malformed deck degrades to the
+    Unplugged line rather than failing the prompt."""
+    import yaml
+
+    from neo.memory.store import memory_level_of, memory_stage
+
+    try:
+        deck_path = Path(__file__).parent / "config" / "beats" / "neo_matrix.yaml"
+        deck = yaml.safe_load(deck_path.read_text()) or {}
+        stages = deck.get("orchestrator_voice", {}).get("stages", {})
+        stage = stages.get(memory_stage(memory_level_of(facts))) or {}
+        return str(stage.get("recall_opener") or _RECALL_OPENER_FALLBACK)
+    except Exception:
+        return _RECALL_OPENER_FALLBACK
+
+
 def recall(prompt: str, cwd: str,
            embed: Optional[Callable[[str], object]] = None) -> str:
     """Text block of relevant learned lessons, or "" when there are none."""
@@ -122,8 +146,9 @@ def recall(prompt: str, cwd: str,
         return ""
     query = np.asarray(vector, dtype=np.float32)
 
+    facts = _load_facts(_project_root(cwd))
     candidates = [
-        fact for fact in _load_facts(_project_root(cwd))
+        fact for fact in facts
         if fact.is_valid
         and fact.embedding is not None
         and np.shape(fact.embedding) == query.shape  # a foreign model's vector
@@ -140,7 +165,7 @@ def recall(prompt: str, cwd: str,
     if not hits:
         return ""
 
-    lines = ["Neo memory: lessons learned in earlier sessions that match this request."]
+    lines = [f"Neo memory: {_recall_opener(facts)}"]
     for fact in hits:
         body = " ".join(truncate_marked(fact.body, MAX_BODY_CHARS).split())
         lines.append(f"- {fact.subject} [{fact.kind.value}, {fact.scope.value}]: {body}")

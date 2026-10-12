@@ -29,30 +29,35 @@ orchestrator_voice:
       hedge: ", maybe"
       confidence_lead: "Confidence"
       terse: false
+      recall_opener: "Don't know this code well. Something from before might apply, maybe:"
     2:  # Glitch — sensing a pattern, still unsure
       opener_solo: "Something here feels familiar."
       opener_panel: "Wanted other eyes on this."
       hedge: ", I think"
       confidence_lead: "Confidence"
       terse: false
+      recall_opener: "This feels familiar. From earlier sessions, I think:"
     3:  # Unplugged — direct, sees it
       opener_solo: "I read it."
       opener_panel: "I didn't work this alone."
       hedge: ""
       confidence_lead: "Confidence"
       terse: false
+      recall_opener: "I remember this. From earlier sessions:"
     4:  # Training — knows the shape, sees the break coming
       opener_solo: "I know this shape."
       opener_panel: "Ran it past the others anyway."
       hedge: ""
       confidence_lead: "Confidence"
       terse: false
+      recall_opener: "I know this shape. Last time:"
     5:  # The One — certain, minimal
       opener_solo: ""
       opener_panel: "Not alone."
       hedge: ""
       confidence_lead: ""
       terse: true
+      recall_opener: "Remembered:"
 
   # Fact templates. `terse` stages drop the connective prose and keep the nouns.
   lines:
