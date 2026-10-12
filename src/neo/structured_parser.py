@@ -6,6 +6,7 @@ Replaces regex-based prose parsing with sentinel-bounded JSON blocks.
 
 import json
 import logging
+import re
 from typing import Any, Optional
 from dataclasses import dataclass
 
@@ -52,19 +53,30 @@ class ParseErrorCode:
     OFF_POLICY_EXPLANATION = "off_policy_explanation"
 
 
+# A fence OPENING line: 3+ backticks or tildes, optional info string.
+_FENCE_OPEN = re.compile(r"^(`{3,}|~{3,})[^`\n]*$")
+
+
+def _is_fence_opener(text: str) -> bool:
+    return bool(_FENCE_OPEN.match(text.strip()))
+
+
 def _unwrap_fence(block: str) -> str:
     """Strip one code fence that wraps the WHOLE block between the sentinels.
 
-    Only a fence opening on the block's first line and closing on its last is
-    wrapping; a fence anywhere else is content and is left untouched.
+    Only a fence opening on the block's first line and closed on its last line
+    by the same delimiter is wrapping; a fence anywhere else is content and is
+    left untouched. Anything else is returned unchanged, so the caller can
+    still classify it as markdown wrapping.
     """
-    if not (block.startswith("```") and block.endswith("```") and "\n" in block):
+    lines = block.splitlines()
+    if len(lines) < 3:
         return block
-    first_line, rest = block.split("\n", 1)
-    inner = rest[:-3].strip()
-    if "```" in first_line[3:] or not inner:
+    opener = _FENCE_OPEN.match(lines[0].strip())
+    if not opener or lines[-1].strip() != opener.group(1):
         return block
-    return inner
+    inner = "\n".join(lines[1:-1]).strip()
+    return inner or block
 
 
 def extract_block(response: str, kind: str) -> ParseResult:
@@ -144,7 +156,9 @@ def extract_block(response: str, kind: str) -> ParseResult:
     before_text = response[:response.index(start_sentinel)].strip()
     after_text = response[response.index(end_sentinel) + len(end_sentinel):].strip()
 
-    if before_text and len(before_text) > 10:  # Allow small whitespace
+    # A fence opener before the sentinels wraps an intact block; tolerate it
+    # whatever its info string, rather than judging it by length.
+    if before_text and len(before_text) > 10 and not _is_fence_opener(before_text):
         logger.warning(f"Stray text before sentinel: {before_text[:50]}...")
         return ParseResult(
             success=False,

@@ -125,6 +125,23 @@ def test_an_unstrippable_fence_stays_markdown_wrapped(block):
     assert result.error_code == ParseErrorCode.MARKDOWN_WRAPPED
 
 
+@pytest.mark.parametrize("response", [
+    f"```javascript\n<<<NEO:SCHEMA=v3:KIND=plan>>>\n{_PLAN_JSON}\n<<<END:plan>>>\n```",
+    f"<<<NEO:SCHEMA=v3:KIND=plan>>>\n````json\n{_PLAN_JSON}\n````\n<<<END:plan>>>",
+    f"<<<NEO:SCHEMA=v3:KIND=plan>>>\n~~~json\n{_PLAN_JSON}\n~~~\n<<<END:plan>>>",
+])
+def test_any_complete_fence_wrapper_parses(response):
+    """The wrapper's info string or delimiter length does not decide the outcome."""
+    result = parse_plan_steps(response)
+    assert result.success, result.error_code
+    assert result.data[0]["id"] == "ps_1"
+
+
+def test_mismatched_fence_lengths_are_not_partially_stripped():
+    response = f"<<<NEO:SCHEMA=v3:KIND=plan>>>\n````json\n{_PLAN_JSON}\n```\n<<<END:plan>>>"
+    assert parse_plan_steps(response).error_code == ParseErrorCode.MARKDOWN_WRAPPED
+
+
 def test_fence_inside_a_json_string_is_content():
     """#292: a quoted Markdown plan or a .md diff carries fences in a string."""
     description = "Config:\\n```json\\n{}\\n```\\nthen review."
