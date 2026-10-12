@@ -375,3 +375,16 @@ def test_tests_cannot_reach_the_real_daemon():
     from tests.conftest import REAL_HOME
 
     assert not es.socket_path().is_relative_to(REAL_HOME / ".neo")
+
+
+def test_an_observer_that_cannot_serve_still_clears_a_stale_socket(monkeypatch, sock):
+    """A killed observer's socket plus a successor that holds the lock but
+    cannot load a model made every run wait RECOVER_S."""
+    from neo.memory import observer
+
+    _stale(sock)
+    monkeypatch.setattr(es, "socket_path", lambda: sock)
+    monkeypatch.setattr(es, "_server_process", False)
+    monkeypatch.setattr(store, "build_resilient_embedder", lambda **k: None)
+    assert observer._start_embed_service() is None
+    assert not sock.exists()

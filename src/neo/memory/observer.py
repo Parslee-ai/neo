@@ -1379,6 +1379,7 @@ def _start_embed_service():
         from neo.memory.store import DEFAULT_EMBED_MODEL, build_resilient_embedder
 
         embed_service.mark_server_process()
+        embed_service.clear_stale()  # before anything that can fail
         embedder = build_resilient_embedder(log_prefix="Observer")
         if embedder is None:
             return None

@@ -786,14 +786,17 @@
   works**: requests are batched (64 texts, 16 KB) and the server embeds one
   text at a time, so a short query waits for one text, not another run's
   batch (64 texts of 800 chars hold the model ~15 s; one 32,000-char text
-  33-75 s, since attention is quadratic). The deadline (30 s plus 3 ms per
+  33-75 s, since attention is quadratic). The deadline (90 s, above the worst
+  single text, plus 3 ms per
   character) covers the whole exchange, so a trickling peer cannot stretch
   it. Texts are cut at 64K chars, past the model's 8,192-token window.
   Transport failures are retried for `RECOVER_S` (15 s) when they look like a
   recycle (socket gone) or a full backlog (refused while the observer's flock
   is held); a refusal with no observer alive is a socket left by a killed
   one and is abandoned at once, or every run would pay the wait. The backlog
-  is `SOMAXCONN` (5 refused the sixth concurrent hello on macOS). A silent or
+  is `SOMAXCONN` (5 refused the sixth concurrent hello on macOS). The observer
+  clears a stale socket before anything that can fail, so a successor that
+  cannot load a model does not leave runs waiting on its predecessor's. A silent or
   incompatible server, or one that stays gone, ends in the run loading the
   model itself, once; a process that has loaded its own keeps it (an ONNX
   session's memory does not reliably go back to the OS), and a failed local

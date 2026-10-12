@@ -25,6 +25,12 @@ itself, exactly as it did before this module existed. Loading locally costs
   plus model load) is retried until `RECOVER_S` has passed before the run
   gives up on the server.
 
+A run that starts while the socket is missing (mid-recycle, ~2-6 s every
+15 minutes) loads its own model rather than waiting: an observer that never
+serves (fastembed broken) would otherwise cost every run the wait. And a
+server's error reply is final for the process like any other failure; error
+replies come only from client or server bugs, not from load.
+
 Once a process has loaded its own model it keeps it: dropping an ONNX session
 does not reliably return memory to the OS, so switching back would cost a
 reconnect and save nothing. A failed local load is remembered too, so a broken
@@ -70,7 +76,11 @@ HELLO_TIMEOUT_S = 2.0
 # (attention is quadratic in length). So the deadline is a queueing allowance
 # plus a per-character term that covers the worst case; the same compute would
 # cost a local run just as long, plus 1.3 GB.
-EMBED_TIMEOUT_S = 30.0
+# The base sits above the worst single text measured: the server interleaves
+# per text, so a short query can wait for one long text (the observer's own
+# sweep embeds up to 32,000 chars), and waiting beats loading 1.3 GB to do the
+# same work.
+EMBED_TIMEOUT_S = 90.0
 EMBED_TIMEOUT_PER_CHAR_S = 0.003
 # How long a transport failure is retried before the run loads its own model.
 # A recycle is exec, imports, the lock and a model load: ~2 s on an idle
@@ -158,6 +168,9 @@ def _worth_waiting(error: _Transport) -> bool:
     if not error.refused:
         return True
     try:
+        # The probe takes the observer's lock for an instant. A starting
+        # observer that collides with it retries its acquire (ten tries, 1 s
+        # apart, in `_daemon_main`); keep that a retry, never single-shot.
         from neo.memory.observer import _observer_lock_held
         return _observer_lock_held()
     except Exception:
@@ -404,6 +417,22 @@ class EmbedServer:
             self.path.unlink()
         except FileNotFoundError:
             pass
+
+
+def clear_stale(path: Optional[Path] = None) -> None:
+    """Remove a socket nothing answers on. The observer calls this first,
+    before anything that can fail: a socket left by a killed predecessor,
+    with a live observer holding the lock but unable to serve, would make
+    every neo run wait out `RECOVER_S` on it. Never raises."""
+    path = path or socket_path()
+    try:
+        if path.exists() or path.is_symlink():
+            try:
+                _call(path, {"v": PROTOCOL_VERSION, "op": "hello"}, HELLO_TIMEOUT_S)
+            except Exception:
+                path.unlink()
+    except Exception as e:
+        logger.warning("Could not clear a stale embedder socket at %s: %s", path, e)
 
 
 def serve(embedder, model_name: str, path: Optional[Path] = None) -> Optional[EmbedServer]:
