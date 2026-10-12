@@ -56,6 +56,15 @@ STALENESS_THRESHOLD = 0.1  # 10% of files changed triggers full reindex warning
 REFRESH_BUDGET_MS = 5000  # Max 5s for opportunistic refresh
 REFRESH_MAX_CHUNKS = 100  # Max chunks to update during opportunistic refresh
 
+# Catalogs built on Windows before keys were POSIX hold `pkg\\mod.py`. Only
+# there is a backslash a separator; on POSIX it is a legal filename character.
+_BACKSLASH_IS_SEPARATOR = os.sep == "\\"
+
+
+def _stored_key(rel_path: str) -> str:
+    """A catalog key as stored on disk, in the POSIX form the walk uses."""
+    return rel_path.replace("\\", "/") if _BACKSLASH_IS_SEPARATOR else rel_path
+
 # Which paths exist and are eligible is answered in ONE place — `neo.eligibility`
 # — which this module, prompt assembly and the architecture scan all call. A
 # second ignore list AND a second walk used to sit here, and the duplication
@@ -204,13 +213,8 @@ class ProjectIndex:
                 known = {f.name for f in fields(IndexSnapshot)}
                 self.snapshot = IndexSnapshot(
                     **{k: v for k, v in snapshot_dict.items() if k in known})
-
-            if self.walk_record_path.exists():
-                with open(self.walk_record_path) as f:
-                    record = json.load(f)
-                self.walk_patterns = list(record["file_patterns"])
-                self.walk_max_files = record.get("max_files")
-                self.walked = set(record["walked_paths"])
+                self.snapshot.file_hashes = {
+                    _stored_key(k): v for k, v in self.snapshot.file_hashes.items()}
 
             # Load chunks
             if self.chunks_path.exists():
@@ -223,7 +227,7 @@ class ProjectIndex:
                             embedding = np.array(chunk_dict['embedding'], dtype=np.float32)
 
                         chunk = CodeChunk(
-                            file_path=chunk_dict['file_path'],
+                            file_path=_stored_key(chunk_dict['file_path']),
                             chunk_id=chunk_dict['chunk_id'],
                             content=chunk_dict['content'],
                             chunk_type=chunk_dict['chunk_type'],
@@ -241,6 +245,9 @@ class ProjectIndex:
             if self.edges_path.exists():
                 with open(self.edges_path) as f:
                     self.edges = json.load(f)
+                for edge in self.edges:
+                    if isinstance(edge.get('source_file'), str):
+                        edge['source_file'] = _stored_key(edge['source_file'])
                 logger.info(f"Loaded {len(self.edges)} edges")
 
             # Load FAISS index if available
@@ -257,6 +264,31 @@ class ProjectIndex:
             self.edges = []
             self.snapshot = None
             self.faiss_index = None
+            return
+        self._load_walk_record()
+
+    def _load_walk_record(self) -> None:
+        """Load `walked.json` if it belongs to THIS build. It is stamped with
+        the snapshot's `created_at`, which every build rewrites; an older neo
+        rebuilds without touching it, and a record describing a different
+        build would make the next refresh remove that build's files as
+        ineligible. A missing, foreign or unreadable record means "no record"
+        (no new-file detection), never a lost catalog."""
+        if not self.walk_record_path.exists():
+            return
+        try:
+            with open(self.walk_record_path) as f:
+                record = json.load(f)
+            if record.get("built_at") != self.snapshot.created_at:
+                logger.info("walked.json belongs to another build; ignoring it")
+                return
+            patterns = [str(p) for p in record["file_patterns"]]
+            walked = {_stored_key(str(p)) for p in record["walked_paths"]}
+            max_files = record.get("max_files")
+        except Exception as e:
+            logger.warning(f"Ignoring unreadable {self.walk_record_path.name}: {e}")
+            return
+        self.walk_patterns, self.walked, self.walk_max_files = patterns, walked, max_files
 
     def _save(self):
         """Save index to disk with atomic write."""
@@ -274,6 +306,7 @@ class ProjectIndex:
             self._atomic_write_json(self.snapshot_path, self.snapshot.__dict__)
             if self.walk_patterns is not None:
                 self._atomic_write_json(self.walk_record_path, {
+                    "built_at": self.snapshot.created_at,
                     "file_patterns": self.walk_patterns,
                     "max_files": self.walk_max_files,
                     "walked_paths": sorted(self.walked),
@@ -689,17 +722,19 @@ class ProjectIndex:
         all_chunks = []
         all_edges = []
         for file_path, file_hash in files_to_index:
-            rel_path = file_path.relative_to(self.repo_root)
-            chunks = self._extract_chunks_from_file(file_path, str(rel_path))
+            # POSIX keys, like every walk path they are compared against; a
+            # backslash key on Windows matched nothing in the walk (#217).
+            rel_path = file_path.relative_to(self.repo_root).as_posix()
+            chunks = self._extract_chunks_from_file(file_path, rel_path)
             all_chunks.extend(chunks)
 
             # Extract edges
-            edges = self._extract_edges_from_file(file_path, str(rel_path))
+            edges = self._extract_edges_from_file(file_path, rel_path)
             all_edges.extend(edges)
 
             # Hash was computed during selection (it is what rejects
             # duplicate content), so reuse it rather than re-reading.
-            self.snapshot.file_hashes[str(rel_path)] = file_hash
+            self.snapshot.file_hashes[rel_path] = file_hash
 
         # Limit total chunks. Round-robin across files rather than slicing,
         # for exactly the reason the file budget is apportioned rather than
@@ -987,6 +1022,11 @@ class ProjectIndex:
 
         result['chunks_extracted'] = len(updated_chunks)
         result['chunks_embedded'] = self._embed_chunks(updated_chunks)
+        # A file whose chunks did not embed is not fresh: an empty hash never
+        # matches, so the next refresh tries it again.
+        for chunk in updated_chunks:
+            if chunk.embedding is None:
+                hashes[chunk.file_path] = ""
         if dirty:
             # Deletions shift chunk positions too, so the vector index is
             # rebuilt and the catalog saved whenever anything changed, not

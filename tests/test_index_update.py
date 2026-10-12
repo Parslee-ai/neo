@@ -206,3 +206,65 @@ def test_a_catalog_from_an_older_version_says_it_cannot_see_new_files(tmp_path):
     assert result["added"] == 0 and result["tracks_new_files"] is False
     assert any("predates new-file tracking" in line
                for line in _format_refresh_report(result, index))
+
+
+def test_a_windows_catalog_with_backslash_keys_survives_an_unchanged_refresh(tmp_path, monkeypatch):
+    """Windows builds stored `pkg\\m.py` while the walk speaks `pkg/m.py`;
+    comparing the two classed every nested file as ineligible and wiped it."""
+    import neo.index.project_index as pi
+
+    _write(tmp_path, "pkg/m.py", "def m():\n    return 1\n")
+    _build(tmp_path)
+    neo_dir = tmp_path / ".neo"
+    for name in ("index.json", "chunks.json"):
+        path = neo_dir / name
+        path.write_text(path.read_text().replace("pkg/m.py", "pkg\\\\m.py"))
+    monkeypatch.setattr(pi, "_BACKSLASH_IS_SEPARATOR", True)
+    result, _ = _refresh(tmp_path)
+    assert result["removed"] == 0
+    assert set(_chunks(tmp_path)) == {"pkg/m.py"}
+
+
+def test_a_walk_record_from_another_build_is_ignored(tmp_path):
+    """An older neo rebuilds without touching walked.json; that record's
+    patterns must not make the next refresh remove the new build's files."""
+    _write(tmp_path, "a.py", "def a():\n    return 1\n")
+    _build(tmp_path)
+    record = tmp_path / ".neo" / "walked.json"
+    data = json.loads(record.read_text())
+    data["file_patterns"] = ["**/*.cs"]
+    data["built_at"] -= 1  # a different build
+    record.write_text(json.dumps(data))
+
+    result, _ = _refresh(tmp_path)
+    assert result["removed"] == 0 and result["tracks_new_files"] is False
+    assert set(_chunks(tmp_path)) == {"a.py"}
+
+
+@pytest.mark.parametrize("body", ['{"file_patterns": ["**/*.py"]}', '{"file_pat'])
+def test_a_broken_walk_record_costs_new_file_detection_not_the_catalog(tmp_path, body):
+    _write(tmp_path, "a.py", "def a():\n    return 1\n")
+    _build(tmp_path)
+    (tmp_path / ".neo" / "walked.json").write_text(body)
+    index = ProjectIndex(str(tmp_path))
+    assert index.snapshot is not None and index.walk_patterns is None
+    assert set(_chunks(tmp_path)) == {"a.py"}
+
+
+def test_chunks_that_failed_to_embed_are_retried(tmp_path):
+    class Broken:
+        def embed(self, texts):
+            raise RuntimeError("onnx exploded")
+
+    _write(tmp_path, "a.py", "def a():\n    return 1\n")
+    _build(tmp_path)
+    _write(tmp_path, "b.py", "def b():\n    return 2\n")
+    index = ProjectIndex(str(tmp_path))
+    index.embedding_model = Broken()
+    result = index.refresh_changed_files()
+    assert (result["added"], result["chunks_embedded"]) == (1, 0)
+    assert any("next refresh retries them" in line
+               for line in _format_refresh_report(result, index))
+
+    result, _ = _refresh(tmp_path)
+    assert result["refreshed"] == 1 and result["chunks_embedded"] == 1

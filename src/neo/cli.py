@@ -622,8 +622,8 @@ def _format_refresh_report(result: dict, index) -> list:
     if result['chunks_embedded'] < result['chunks_extracted']:
         lines.append(
             f"[Neo] Warning: {result['chunks_extracted'] - result['chunks_embedded']} "
-            "extracted chunks were not embedded (no embedding model), so semantic "
-            "re-rank cannot find them.")
+            "extracted chunks were not embedded (no embedding model, or embedding "
+            "failed); their files stay stale and the next refresh retries them.")
     if result['failed']:
         shown = ", ".join(result['failed'][:5])
         more = f" and {len(result['failed']) - 5} more" if len(result['failed']) > 5 else ""
