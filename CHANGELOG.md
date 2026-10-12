@@ -37,6 +37,15 @@
 
 ### Fixed
 
+- **Raw newlines in a model's JSON no longer fail the run** ([#259](https://github.com/Parslee-ai/neo/issues/259)). About one run in six died with `[escape_errors] … Invalid control character` when a model put a literal newline or tab inside a JSON string. `tolerant_json_load` now makes one string-aware pass, stopping at the first attempt that parses:
+  - **Inside strings:** raw newlines, carriage returns and tabs are escaped, and so is a backslash right before a raw newline.
+  - **Outside strings:** trailing commas are removed. Before, a regex did this anywhere, so code in a value such as `[1, 2,]` was rewritten.
+  - **Last resort:** curly quotes are mapped to straight ones.
+  Other control characters still fail, and the error reported is from the text as shown.
+- **The curly-quote repair works.** It had been replacing ASCII quotes with themselves.
+
+The plan's model-based repair is still not used for simulation or code-suggestion parsing. That repair shows the formatter only the first 1000 characters, so a "repaired" code suggestion could come back as a truncated or invented diff. The deterministic repairs above cover the reported failure.
+
 - **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
   - **Memory paging:** **Next** stops at the last page, so **Previous** responds at once. Before, it counted past the end and needed as many presses back.
   - **Use selection:** with no selection visible to Claude Code, it keeps the context that is there and says so, instead of silently clearing it. Typing context by hand clears that notice.
