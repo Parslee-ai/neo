@@ -517,11 +517,17 @@ Once installed:
 The plugin wraps the local `neo` CLI (`pip install neo-reasoner[…]` + provider
 key). It is intentionally skills + agent, not an MCP server.
 
-Two boundaries are weaker than on the other hosts, by construction. Cursor has
-no approval flow for shell commands, so a skill *tells* the model to name the
-provider and data before a network call, where Codex makes it part of the
-approval the user sees. And a Cursor subagent inherits every tool of its parent
-(Claude's Neo agent is limited to Bash, Read, Grep and Glob). The
+Two boundaries are weaker than on the other hosts. Cursor's shell approval
+(its Auto-review run mode) shows the command, but a skill cannot write the
+approval's description the way a Codex skill does, and under Run Everything or
+an allowlisted `neo` there is no prompt at all. So each skill *tells* the model
+to name the provider and data before the call. Cursor's sandbox also blocks
+network access by default, so the first `neo` call may need the provider's
+domain allowed. And a Cursor subagent inherits every tool of its parent
+(Claude's Neo agent is limited to Bash, Read, Grep and Glob). Cursor's
+`readonly: true` would remove edit tools, but it also blocks state-changing
+shell commands, and a `neo` run writes logs and metrics under `~/.neo`, so the
+agent does not set it. The
 Claude Code-only features, the Mods pane (`/neo-workspace`, `/neo-ask`) and the
 `executable` override, have no Cursor equivalent; the Cursor skills run the
 `neo` on `PATH`.

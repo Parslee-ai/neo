@@ -4,7 +4,7 @@
 
 ### Added
 
-- **Cursor plugin** (`plugins/cursor-neo/`, contributed by Joe Rinehart in [#236](https://github.com/Parslee-ai/neo/pull/236)). It provides the same six skills as the Codex plugin, invoked as `/neo`, `/neo-review` and so on in Cursor's Agent chat, plus a `neo-agent` subagent with a visible boundary, like Claude Code's Neo agent. Install it locally (`~/.cursor/plugins/local`) or import this repository as a team marketplace (`.cursor-plugin/marketplace.json`). Each Cursor skill is tested against its Codex counterpart, paragraph by paragraph, so a privacy fix to one cannot be left out of the other. The README lists what is weaker on Cursor: there is no shell approval flow, and the subagent inherits every tool.
+- **Cursor plugin** (`plugins/cursor-neo/`, contributed by Joe Rinehart in [#236](https://github.com/Parslee-ai/neo/pull/236)). It provides the same six skills as the Codex plugin, invoked as `/neo`, `/neo-review` and so on in Cursor's Agent chat, plus a `neo-agent` subagent with a visible boundary, like Claude Code's Neo agent. Install it locally (`~/.cursor/plugins/local`) or import this repository as a team marketplace (`.cursor-plugin/marketplace.json`). Each Cursor skill is tested against its Codex counterpart, paragraph by paragraph, so a privacy fix to one cannot be left out of the other. The README lists what is weaker on Cursor: a skill cannot write the shell approval's description, and the subagent inherits every tool.
 
 ### Fixed
 

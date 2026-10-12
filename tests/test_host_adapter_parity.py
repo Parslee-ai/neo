@@ -327,9 +327,9 @@ def _paragraphs(text: str) -> list[str]:
 
 def _codex_to_cursor(text: str) -> str:
     """The ONLY differences a Cursor skill may have from its Codex twin: the
-    invocation sigil, the host name, and how network consent is asked for
-    (Codex has an approval flow; Cursor's Shell tool does not, so the skill
-    names provider and data before the call instead)."""
+    invocation sigil, the host name, and how network consent is asked for (a
+    Codex skill writes the approval's description; a Cursor skill cannot, so
+    it names provider and data before the call instead)."""
     text = text.replace("$neo", "/neo").replace("Codex", "Cursor")
     text = re.sub(
         r"Use\s+Cursor's approval flow when the\s+command needs network access\.\s+"
@@ -356,6 +356,30 @@ def test_cursor_skills_carry_every_paragraph_of_their_codex_twin(name):
     missing = [p for p in _paragraphs(_codex_to_cursor(_skill_body(_codex_skill(name))))
                if p not in cursor]
     assert not missing, f"{name}: Cursor skill lacks {missing[:2]}"
+
+
+# Paragraphs a Cursor skill has that its Codex twin does not. Listed, so an
+# addition that contradicts the twin ("omit --no-memory") cannot slip in
+# unreviewed: containment alone is a floor, and this is the ceiling.
+CURSOR_ONLY_PARAGRAPHS = {
+    "neo": {"For a longer delegated session with a visible boundary, prefer the "
+            "**Neo agent** over this mid-loop skill."},
+}
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_cursor_skills_add_nothing_beyond_their_codex_twin_but_the_listed(name):
+    codex = set(_paragraphs(_codex_to_cursor(_skill_body(_codex_skill(name)))))
+    extra = {p for p in _paragraphs(_skill_body(_cursor_skill(name))) if p not in codex}
+    assert extra == CURSOR_ONLY_PARAGRAPHS.get(name, set()), f"{name}: unlisted {extra}"
+
+
+@pytest.mark.parametrize("name", CAPABILITIES)
+def test_cursor_skills_never_promise_an_approval_description(name):
+    """If Codex wording drifts past `_codex_to_cursor`'s two shapes, the blanket
+    Codex->Cursor rename would ask for "Cursor's approval flow" here; this
+    makes that failure point at the mapping instead of the skill."""
+    assert "approval" not in _cursor_skill(name).lower(), name
 
 
 @pytest.mark.parametrize("name", [name for name in CAPABILITIES if name != "neo-pattern"])
