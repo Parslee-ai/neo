@@ -416,6 +416,9 @@ class Observer:
                         if self._lock is not None:
                             self._lock.release()
                         _reexec_self()  # returns only when the exec failed
+                        # Start the count over, or every cycle would retry the
+                        # exec and bounce the server clients depend on.
+                        self._cycles_total = 0
                         self._embed_server = await loop.run_in_executor(
                             None, _start_embed_service)
 

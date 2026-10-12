@@ -16,8 +16,11 @@ itself, exactly as it did before this module existed. Loading locally costs
 
 - requests are split into batches (`BATCH_TEXTS`), so no request holds the
   server's model for long and no reply is large;
-- a deadline covers a whole request, generous because a request may queue
-  behind other clients and the observer's own sweep, which share one model;
+- a deadline covers a whole request: a queueing allowance plus a term per
+  character, because long texts are expensive (one of 32,000 characters takes
+  33-75 s on CPU) and a request may queue behind others on the one model;
+- the server embeds one text at a time, so a short query interleaves with a
+  long batch instead of waiting behind all of it;
 - a transport failure (refused, gone, reset: an observer recycle, ~2 s of exec
   plus model load) is retried until `RECOVER_S` has passed before the run
   gives up on the server.
@@ -62,15 +65,25 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 HELLO_TIMEOUT_S = 2.0
-# A request may wait behind other clients' batches and the sweep: the deadline
-# is mostly queueing allowance, not compute (a batch computes in well under it).
+# Measured on the real model (Apple Silicon CPU): a short query 0.16 s, 64 texts
+# of 800 chars 14.6 s, one 8,000-char text 4.8 s, one 32,000-char text 33-75 s
+# (attention is quadratic in length). So the deadline is a queueing allowance
+# plus a per-character term that covers the worst case; the same compute would
+# cost a local run just as long, plus 1.3 GB.
 EMBED_TIMEOUT_S = 30.0
+EMBED_TIMEOUT_PER_CHAR_S = 0.003
 # How long a transport failure is retried before the run loads its own model.
-# An observer recycle is exec plus a ~0.3 s model load from a warm cache.
-RECOVER_S = 5.0
+# A recycle is exec, imports, the lock and a model load: ~2 s on an idle
+# machine, measured past 6 s on a loaded one. Refused connections with no
+# observer alive are not retried at all (see `_worth_waiting`), so this only
+# bounds waiting through a real recycle.
+RECOVER_S = 15.0
 RETRY_PAUSE_S = 0.25
 BATCH_TEXTS = 64
-BATCH_CHARS = 512 * 1024
+BATCH_CHARS = 16 * 1024
+# Past the model's 8,192-token window anyway; cut on the client so one huge
+# text can never exceed the server's request cap.
+MAX_TEXT_CHARS = 64 * 1024
 # Server-side caps: a client batches well below them, so hitting one means a
 # client that does not, and it is refused rather than allowed to hold the model.
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
@@ -130,6 +143,26 @@ class _Transport(Exception):
     """The server could not be reached or went away mid-request. Worth
     retrying: this is what an observer recycle looks like from outside."""
 
+    def __init__(self, message: str, refused: bool = False):
+        super().__init__(message)
+        self.refused = refused
+
+
+def _worth_waiting(error: _Transport) -> bool:
+    """A refused connection with no observer holding its lock is a socket left
+    by a killed observer (SIGKILL, jetsam, a native crash skip every cleanup):
+    nothing will ever answer, so waiting would only cost every run
+    `RECOVER_S`. A missing socket is a recycle in progress (the observer
+    unlinks it just before exec), and a refusal with the lock held is a full
+    backlog: both are worth the wait."""
+    if not error.refused:
+        return True
+    try:
+        from neo.memory.observer import _observer_lock_held
+        return _observer_lock_held()
+    except Exception:
+        return True
+
 
 def _call(path: Path, request: dict, timeout: float) -> dict:
     """One request, bounded by a deadline over the whole exchange (a peer that
@@ -162,7 +195,8 @@ def _call(path: Path, request: dict, timeout: float) -> dict:
                 if chunk.endswith(b"\n"):
                     break
     except (FileNotFoundError, ConnectionError) as e:
-        raise _Transport(f"{type(e).__name__}: {e}") from e
+        raise _Transport(f"{type(e).__name__}: {e}",
+                         refused=isinstance(e, ConnectionRefusedError)) from e
     if not chunks:
         raise _Transport("connection closed before a reply")
     reply = json.loads(b"".join(chunks))
@@ -211,7 +245,7 @@ class RemoteEmbedder:
         self._lock = threading.Lock()
 
     def embed(self, texts: Iterable[str]):
-        texts = list(texts)
+        texts = [t[:MAX_TEXT_CHARS] for t in texts]
         if self._local is None and not self._local_failed:
             try:
                 return iter(self._remote(texts))
@@ -229,10 +263,11 @@ class RemoteEmbedder:
             give_up = time.monotonic() + RECOVER_S
             while True:
                 try:
-                    reply = _call(self.path, request, EMBED_TIMEOUT_S)
+                    reply = _call(self.path, request, EMBED_TIMEOUT_S
+                                  + EMBED_TIMEOUT_PER_CHAR_S * sum(map(len, batch)))
                     break
-                except _Transport:
-                    if time.monotonic() >= give_up:
+                except _Transport as e:
+                    if time.monotonic() >= give_up or not _worth_waiting(e):
                         raise
                     time.sleep(RETRY_PAUSE_S)
             vectors.extend(_vectors(reply, len(batch), self.dim))
@@ -265,7 +300,7 @@ def connect(model_name: str, local_factory: Callable[[], object],
         except _Transport as e:
             # Refused or gone (a recycle under way): worth a few more tries
             # before paying 1.3 GB. A server that is up but silent is not.
-            if time.monotonic() >= give_up:
+            if time.monotonic() >= give_up or not _worth_waiting(e):
                 logger.warning("Resident embedder at %s did not answer (%s); loading "
                                "the model in this process", path, e)
                 _record("local", reason="unreachable")
@@ -289,7 +324,9 @@ def connect(model_name: str, local_factory: Callable[[], object],
     except Exception as e:
         reason = f"{type(e).__name__}: {e}"
     if reason:
-        logger.info("Resident embedder at %s not used: %s", path, reason)
+        # A warning: the user should learn that the memory saving is off
+        # (typically a dev venv whose fastembed differs from the observer's).
+        logger.warning("Resident embedder at %s not used: %s", path, reason)
         _record("local", reason="incompatible")
         return None
     _record("remote")
@@ -322,8 +359,11 @@ class _Handler(socketserver.StreamRequestHandler):
                     raise ValueError("texts must be a list of strings")
                 if len(texts) > MAX_TEXTS:
                     raise ValueError(f"over {MAX_TEXTS} texts in one request")
-                matrix = np.asarray([np.asarray(v, dtype=np.float32)
-                                     for v in server.embedder.embed(texts)],
+                # One text at a time: each call takes the model's lock, so a
+                # short query from another run waits for one text, never for a
+                # whole batch (64 texts can hold the model for 15 s).
+                matrix = np.asarray([np.asarray(next(iter(server.embedder.embed([t]))),
+                                                dtype=np.float32) for t in texts],
                                     dtype=np.float32).reshape(len(texts), server.dim)
                 reply = {"v": PROTOCOL_VERSION, "dim": server.dim, "n": len(texts),
                          "vectors": base64.b64encode(matrix.tobytes()).decode()}

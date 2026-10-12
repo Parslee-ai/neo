@@ -112,12 +112,39 @@ def test_build_resilient_embedder_uses_the_server_and_never_builds(server, sock,
     assert list(emb.embed(["x"]))[0][0] == 1.0
 
 
-def test_large_requests_are_batched(server, sock):
-    _, fake = server
-    texts = [f"t{i}" for i in range(200)]
+def test_large_requests_are_batched(server, sock, monkeypatch):
+    sent = []
+    real_call = es._call
+
+    def recording(path, request, timeout):
+        if request.get("op") == "embed":
+            sent.append(request["texts"])
+        return real_call(path, request, timeout)
+
+    monkeypatch.setattr(es, "_call", recording)
+    texts = [f"t{i}" for i in range(200)] + ["x" * 9000] * 3
     remote = es.connect(MODEL, _local_never, sock)
     assert [v.tolist() for v in remote.embed(texts)] == expected(texts)
-    assert max(fake.batches[1:]) <= es.BATCH_TEXTS  # [0] is serve()'s probe
+    assert max(len(b) for b in sent) <= es.BATCH_TEXTS
+    assert all(len(b) == 1 or sum(map(len, b)) <= es.BATCH_CHARS for b in sent)
+
+
+def test_a_short_query_is_not_stuck_behind_another_runs_batch(sock):
+    """The server takes the model per text, so one run's long batch cannot
+    hold it for the whole batch while another run's query times out."""
+    fake = Fake(delay=0.2)
+    srv = es.serve(store._Serialized(fake), MODEL, sock)
+    try:
+        a = es.connect(MODEL, _local_never, sock)
+        b = es.connect(MODEL, _local_never, sock)
+        threading.Thread(target=lambda: list(a.embed([f"t{i}" for i in range(20)]))).start()
+        time.sleep(0.3)
+        start = time.time()
+        assert list(b.embed(["q"]))[0][0] == 1.0
+        assert time.time() - start < 1.0  # one text's wait, not twenty
+    finally:
+        time.sleep(4.5)
+        srv.close()
 
 
 def test_rows_are_writable_like_fastembeds(server, sock):
@@ -184,13 +211,39 @@ def test_an_unusable_hello_means_no_remote_never_an_exception(sock, hello):
         listener.close()
 
 
-def test_a_stale_socket_is_not_used_and_a_new_server_replaces_it(sock, monkeypatch):
-    monkeypatch.setattr(es, "RECOVER_S", 0.3)
-    sock.parent.mkdir(parents=True)
+def _stale(sock):
+    sock.parent.mkdir(parents=True, exist_ok=True)
     dead = socket.socket(socket.AF_UNIX)
     dead.bind(str(sock))
-    dead.close()  # file left behind, nobody listening
+    dead.close()  # file left behind, nobody listening: a SIGKILLed observer
+
+
+def test_a_stale_socket_with_no_observer_alive_is_abandoned_at_once(sock):
+    """A killed observer leaves its socket; waiting RECOVER_S on it would cost
+    every neo run that much until an observer came back."""
+    _stale(sock)
+    start = time.time()
     assert es.connect(MODEL, _local_never, sock) is None
+    assert time.time() - start < 1.0
+
+
+def test_a_refusal_while_the_observer_lives_is_waited_out(sock, monkeypatch):
+    from neo.memory import observer
+
+    monkeypatch.setattr(es, "RECOVER_S", 1.0)
+    _stale(sock)
+    lock = observer._SingleInstanceLock(observer._LOCK_PATH)
+    assert lock.acquire()
+    try:
+        start = time.time()
+        assert es.connect(MODEL, _local_never, sock) is None
+        assert time.time() - start >= 1.0
+    finally:
+        lock.release()
+
+
+def test_a_stale_socket_is_replaced_by_a_new_server(sock):
+    _stale(sock)
     srv = es.serve(Fake(), MODEL, sock)
     assert srv is not None
     srv.close()
@@ -304,6 +357,12 @@ def _raw(sock, request: dict) -> dict:
 
 def test_wire_errors_are_reported_not_raised(server, sock):
     assert "embeds with" in _raw(sock, {"v": 1, "op": "embed", "model": "nope", "texts": []})["error"]
+
+
+def test_one_huge_text_is_cut_to_the_models_window_not_refused(server, sock):
+    remote = es.connect(MODEL, _local_never, sock)
+    huge = "\U0001F600" * 700_000  # 8.4 MB of JSON, past the server's cap
+    assert next(remote.embed([huge]))[0] == es.MAX_TEXT_CHARS
 
 
 def test_an_oversized_request_is_refused(server, sock):
