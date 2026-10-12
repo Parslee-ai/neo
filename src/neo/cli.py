@@ -107,7 +107,7 @@ def parse_args():
     global_parser.add_argument('--regenerate-embeddings', action='store_true', help='Regenerate all embeddings with current model (safe, with automatic backup)')
     global_parser.add_argument('--index', action='store_true', help='Optional cache-warmer: build the embedding catalog for this repo. File selection works without it (the walk and the keyword index refresh themselves on every call); once built, the catalog re-ranks every call with no flag')
     global_parser.add_argument('--languages', metavar='CSV', help='Languages to index (e.g., python,csharp,typescript)')
-    global_parser.add_argument('--update', action='store_true', help="Re-embed already-catalogued files whose contents changed. Use WITH --index ('neo --index --update'); this flag is only read inside that branch. New files are not picked up — the staleness check walks the snapshot's own hashes — and the refresh stops at 5s/100 chunks, so a partial refresh still reports the full chunk total")
+    global_parser.add_argument('--update', action='store_true', help="Refresh the embedding catalog: re-embed changed and new files and drop deleted ones (implies --index). Stops at 5 s or 100 chunks and says so when it does; run it again to continue")
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
@@ -600,6 +600,34 @@ def read_prompt_from_argv_or_stdin(args):
     sys.exit(2)
 
 
+def _format_refresh_report(result: dict, index) -> list:
+    """What `neo --index --update` did, in words. A refresh a budget cut short
+    says so; a complete one prints only what changed (#217)."""
+    files = result['refreshed'] + result['added'] + result['removed']
+    if not files:
+        lines = [f"[Neo] Index is up to date: {len(index.chunks)} chunks, {len(index.edges)} edges"]
+    else:
+        parts = [f"{n} {label}" for n, label in (
+            (result['refreshed'], "changed"), (result['added'], "new"),
+            (result['removed'], "deleted")) if n]
+        lines = [f"[Neo] Updated index: {', '.join(parts)} file{'s' if files != 1 else ''}, "
+                 f"{result['chunks_embedded']} chunks re-embedded; now "
+                 f"{len(index.chunks)} chunks, {len(index.edges)} edges"]
+    if result['bound']:
+        from neo.index.project_index import REFRESH_BUDGET_MS, REFRESH_MAX_CHUNKS
+        budget = (f"{REFRESH_BUDGET_MS / 1000:g} s time" if result['bound'] == 'time'
+                  else f"{REFRESH_MAX_CHUNKS}-chunk")
+        lines.append(
+            f"[Neo] Stopped at the {budget} budget with {len(result['remaining'])} "
+            "stale files left. Run 'neo --index --update' again to continue, or "
+            "'neo --index' to rebuild.")
+    if not result['tracks_new_files']:
+        lines.append(
+            "[Neo] This catalog predates new-file tracking, so files added since "
+            "it was built are not picked up. Run 'neo --index' once to rebuild it.")
+    return lines
+
+
 def _format_selection_report(report: Optional[dict]) -> list[str]:
     """Render what the index cap left out, as `[Neo] ` console lines.
 
@@ -1064,7 +1092,10 @@ def main():
             print(f"\u2717 Regeneration failed: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # Handle --index flag
+    # Handle --index flag. `--update` implies it: read only inside this
+    # branch, a bare `neo --update` used to fall through to reasoning (#217).
+    if getattr(args, 'update', False):
+        args.index = True
     if args.index:
         from neo.index.project_index import ProjectIndex
 
@@ -1077,9 +1108,8 @@ def main():
                 if not index.snapshot:
                     print("[Neo] No existing index found. Run 'neo --index' first.", file=sys.stderr)
                     sys.exit(1)
-                index.refresh_changed_files()
-                status = index.status()
-                print(f"[Neo] Updated index: {status['total_chunks']} chunks, {status.get('total_edges', 0)} edges")
+                for line in _format_refresh_report(index.refresh_changed_files(), index):
+                    print(line)
                 sys.exit(0)
             except Exception as e:
                 print(f"[Neo] Failed to update index: {e}", file=sys.stderr)

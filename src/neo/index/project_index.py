@@ -119,6 +119,15 @@ class IndexSnapshot:
     # File tracking (for staleness detection)
     file_hashes: Dict[str, str] = field(default_factory=dict)  # rel_path -> hash
 
+    # New-file detection (#217): the last full build's walk patterns, and every
+    # path that walk found, catalogued or not (a file the cap or dedup passed
+    # over was seen, not missed). A path walked now that is in neither this
+    # list nor `file_hashes` was created after the build. Both are empty in a
+    # catalog built before they existed, which cannot tell a new file from a
+    # passed-over one and so reports no new files.
+    file_patterns: List[str] = field(default_factory=list)
+    walked_paths: List[str] = field(default_factory=list)
+
 
 def _chunk_embed_text(chunk: CodeChunk) -> str:
     """Build a structured text from a chunk for embedding.
@@ -271,12 +280,14 @@ class ProjectIndex:
 
             self._atomic_write_json(self.chunks_path, chunks_data)
 
-            # Edges
-            if self.edges:
-                self._atomic_write_json(self.edges_path, self.edges)
+            # Edges. Written even when empty: a refresh that removed the
+            # last edge must not leave the previous list on disk to reload.
+            self._atomic_write_json(self.edges_path, self.edges)
 
-            # FAISS index
-            if FAISS_AVAILABLE and self.faiss_index:
+            # FAISS index (likewise removed, not left stale, when there is none)
+            if FAISS_AVAILABLE and self.faiss_index is None:
+                self.faiss_path.unlink(missing_ok=True)
+            elif FAISS_AVAILABLE and self.faiss_index:
                 fd, tmp_name = tempfile.mkstemp(dir=self.faiss_path.parent, suffix=".tmp")
                 os.close(fd)
                 try:
@@ -405,6 +416,18 @@ class ProjectIndex:
             kept.extend(group[: allocation.get(path, 0)])
         return kept
 
+    def _walk(self, file_patterns: List[str]):
+        """The shared eligibility walk under `file_patterns`. Through the walk
+        cache, so the build and every later staleness check share one walk."""
+        from neo.eligibility import WalkPolicy
+        from neo.index.walk_cache import cached_walk
+
+        return cached_walk(
+            str(self.repo_root),
+            WalkPolicy(match_globs=tuple(file_patterns)),
+            record=False,
+        )
+
     def _select_files(
         self, file_patterns: List[str], max_files: int
     ) -> Tuple[List[Tuple[Path, str]], Dict[str, Any]]:
@@ -418,8 +441,6 @@ class ProjectIndex:
         printed "Built index" and exited 0 whether it had indexed the
         repository or 83 files of a stale worktree copy.
         """
-        from neo.eligibility import WalkPolicy
-        from neo.index.walk_cache import cached_walk
         from neo.languages import language_for_path
 
         # One walk, shared with prompt assembly. It prunes ignored directories
@@ -436,11 +457,7 @@ class ProjectIndex:
         # Through the shared walk cache: `--index` is the documented
         # cache-warmer, so it must warm the walk as well as the catalog, and
         # on a repository the gatherer has already visited it costs nothing.
-        walked = cached_walk(
-            str(self.repo_root),
-            WalkPolicy(match_globs=tuple(file_patterns)),
-            record=False,
-        )
+        walked = self._walk(file_patterns)
         excluded = walked.excluded
 
         by_language: Dict[str, List[Path]] = {}
@@ -631,6 +648,10 @@ class ProjectIndex:
         files_to_index, selection = self._select_files(file_patterns, max_files)
         self.selection_report = selection
         self.snapshot.total_files = len(files_to_index)
+        self.snapshot.file_patterns = list(file_patterns)
+        self.snapshot.walked_paths = sorted(
+            e.rel_path for e in self._walk(file_patterns).paths
+        )
 
         # Extract chunks and edges from each file
         all_chunks = []
@@ -804,6 +825,7 @@ class ProjectIndex:
         # unchanged tree cannot disagree about the list.
         stale = set(moved) | set(gone)
         changed_files = [rel_path for rel_path in tracked if rel_path in stale]
+        changed_files += self._new_files()
 
         # Calculate staleness ratio
         total_files = len(tracked)
@@ -812,73 +834,99 @@ class ProjectIndex:
 
         return is_stale, staleness_ratio, changed_files
 
-    def refresh_changed_files(self, budget_ms: int = REFRESH_BUDGET_MS, max_chunks: int = REFRESH_MAX_CHUNKS):
-        """
-        Opportunistic refresh: re-embed only changed files within time budget.
+    def _new_files(self) -> List[str]:
+        """Eligible files created since the last full build, in walk order.
+        Empty for a catalog that predates new-file tracking (see
+        `IndexSnapshot.walked_paths`)."""
+        if not self.snapshot or not self.snapshot.file_patterns:
+            return []
+        known = set(self.snapshot.file_hashes) | set(self.snapshot.walked_paths)
+        return [e.rel_path for e in self._walk(self.snapshot.file_patterns).paths
+                if e.rel_path not in known]
 
-        This is called during LLM wait time to keep index fresh without blocking.
+    def refresh_changed_files(self, budget_ms: int = REFRESH_BUDGET_MS,
+                              max_chunks: int = REFRESH_MAX_CHUNKS) -> Dict[str, Any]:
+        """Re-extract and re-embed changed, new and deleted files, within a
+        time and chunk budget.
 
-        Args:
-            budget_ms: Time budget in milliseconds
-            max_chunks: Maximum chunks to update
+        Returns what the refresh actually did, so a caller can tell a complete
+        refresh from one a budget cut short (#217): `refreshed` (changed files
+        re-extracted), `added` (new files), `removed` (deleted files),
+        `chunks_embedded`, `remaining` (stale files not reached), `bound`
+        (`"time"`, `"chunks"` or None) and `tracks_new_files` (False for a
+        catalog that predates new-file tracking).
         """
         start_time = time.time()
         budget_s = budget_ms / 1000.0
+        result: Dict[str, Any] = {
+            'refreshed': 0, 'added': 0, 'removed': 0, 'chunks_embedded': 0,
+            'remaining': [], 'bound': None,
+            'tracks_new_files': bool(self.snapshot and self.snapshot.file_patterns),
+        }
 
-        is_stale, ratio, changed_files = self.check_staleness()
+        _, _, changed_files = self.check_staleness()
         if not changed_files:
             logger.debug("No changes detected, index is fresh")
-            return
+            return result
 
         logger.info(f"Refreshing {len(changed_files)} changed files (budget: {budget_ms}ms)")
 
-        updated_chunks = []
-        for rel_path in changed_files:
-            # Check budget
+        updated_chunks: List[CodeChunk] = []
+        dirty = False
+        for position, rel_path in enumerate(changed_files):
             if time.time() - start_time > budget_s:
-                logger.info("Refresh budget exceeded, stopping early")
+                result['bound'] = 'time'
+            elif len(updated_chunks) >= max_chunks:
+                result['bound'] = 'chunks'
+            if result['bound']:
+                result['remaining'] = changed_files[position:]
+                logger.info(f"Refresh stopped at the {result['bound']} budget")
                 break
 
-            if len(updated_chunks) >= max_chunks:
-                logger.info(f"Max chunks reached ({max_chunks}), stopping early")
-                break
+            # Whatever happens to the file, its old chunks and edges go.
+            self.chunks = [c for c in self.chunks if c.file_path != rel_path]
+            self.edges = [e for e in self.edges if e.get('source_file') != rel_path]
+            dirty = True
 
-            # Re-extract chunks from changed file
             file_path = self.repo_root / rel_path
-            if not file_path.exists():
-                # File deleted, remove chunks
-                self.chunks = [c for c in self.chunks if c.file_path != rel_path]
-                if rel_path in self.snapshot.file_hashes:
-                    del self.snapshot.file_hashes[rel_path]
+            new_hash = self._compute_file_hash(file_path) if file_path.exists() else ""
+            if not new_hash:
+                # Deleted (or unreadable): forget it entirely, so a file later
+                # created at the same path is seen as new.
+                self.snapshot.file_hashes.pop(rel_path, None)
+                if rel_path in self.snapshot.walked_paths:
+                    self.snapshot.walked_paths.remove(rel_path)
+                result['removed'] += 1
                 continue
 
-            # Extract new chunks
+            is_new = rel_path not in self.snapshot.file_hashes
             new_chunks = self._extract_chunks_from_file(file_path, rel_path)
-
-            # Remove old chunks for this file
-            self.chunks = [c for c in self.chunks if c.file_path != rel_path]
-
-            # Add new chunks
             self.chunks.extend(new_chunks)
             updated_chunks.extend(new_chunks)
-
-            # Update file hash
-            new_hash = self._compute_file_hash(file_path)
+            self.edges.extend(self._extract_edges_from_file(file_path, rel_path))
             self.snapshot.file_hashes[rel_path] = new_hash
+            if is_new:
+                if self.snapshot.file_patterns and rel_path not in self.snapshot.walked_paths:
+                    self.snapshot.walked_paths.append(rel_path)
+                result['added'] += 1
+            else:
+                result['refreshed'] += 1
 
-        # Re-embed updated chunks
         if updated_chunks:
             self._embed_chunks(updated_chunks)
-
-            # Rebuild FAISS index
+        if dirty:
+            # Deletions shift chunk positions too, so the vector index is
+            # rebuilt and the catalog saved whenever anything changed, not
+            # only when something was re-embedded.
+            self.snapshot.total_files = len(self.snapshot.file_hashes)
             if FAISS_AVAILABLE:
                 self._build_faiss_index()
-
-            # Save changes
             self._save()
+        result['chunks_embedded'] = len(updated_chunks)
 
         elapsed_ms = (time.time() - start_time) * 1000
         logger.info(f"Refreshed {len(updated_chunks)} chunks in {elapsed_ms:.0f}ms")
+        return result
 
     def _extract_chunks_from_file(self, file_path: Path, rel_path: str) -> List[CodeChunk]:
         """
@@ -1051,6 +1099,7 @@ class ProjectIndex:
 
         if not embeddings:
             logger.warning("No embeddings available, skipping FAISS index")
+            self.faiss_index = None  # never leave the previous catalog's vectors behind
             return
 
         # Build index
@@ -1145,6 +1194,7 @@ class ProjectIndex:
             'commit_hash': self.snapshot.commit_hash[:7] if self.snapshot.commit_hash else 'unknown',
             'last_updated': self.snapshot.last_updated,
             'total_edges': len(self.edges),
+            'tracks_new_files': bool(self.snapshot.file_patterns),
             'embedding_model': self.snapshot.embedding_model,
             'embedding_dim': self.snapshot.embedding_dim
         }
