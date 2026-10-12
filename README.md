@@ -117,6 +117,10 @@ applies learned patterns, generates solutions, and stores new facts for continuo
 
 1. Jina's embeddings model (open source) is downloaded automatically when you first run Neo.
     This model runs locally on your machine to generate vector embeddings.
+    It takes about 1.3 GB of memory once loaded. When the background observer
+    is running, it holds the one copy and each neo run borrows it over a
+    private local socket (`~/.neo/run/embed.sock`), so a run needs about 200 MB
+    instead. Without the observer, each run loads its own copy.
 
 
 
@@ -1001,7 +1005,7 @@ stays silent.
 (car-runtime ≥ 0.18.0). Logs land in
 `~/.car/logs/neo-observer.{stdout,stderr}.log`. Tunables:
 `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
-(default 60), `NEO_OBSERVER_RECYCLE_CYCLES` (default 48 — the daemon re-execs
+(default 60), `NEO_OBSERVER_RECYCLE_CYCLES` (default 3, ~15 min — the daemon re-execs
 itself to bound RSS drift; 0 disables). See
 [the observer design note](docs/solutions/async-observer.md).
 
@@ -1420,7 +1424,7 @@ export NEO_ALLOW_PLAINTEXT_API_KEY=1              # permit storing api_key in co
 export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer (put in ~/.zshenv, not ~/.zshrc)
 export NEO_OBSERVER_INTERVAL_SECONDS=300          # sweep interval
 export NEO_OBSERVER_COOLDOWN=60                   # per-process cooldown between cycles
-export NEO_OBSERVER_RECYCLE_CYCLES=48             # re-exec after N cycles to bound RSS (0 disables)
+export NEO_OBSERVER_RECYCLE_CYCLES=3              # re-exec after N cycles to bound RSS (0 disables)
 ```
 
 ### Install Sanity

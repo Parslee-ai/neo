@@ -756,7 +756,7 @@
   all operate on the single global agent. (A2UI per-project inspector is skipped
   in global mode.)
   **RSS bounding**: the daemon re-execs itself every
-  `NEO_OBSERVER_RECYCLE_CYCLES` cycles (default 48, ~4h; 0 disables). Its RSS is
+  `NEO_OBSERVER_RECYCLE_CYCLES` cycles (default 3, ~15 min; 0 disables). Its RSS is
   peak working set plus CPython arena fragmentation — each sweep deserializes a
   multi-MB fact file (79% of whose rows are tombstones retained by the 30-day
   policy) and the allocator never returns those arenas. Nothing leaks; RSS
@@ -771,6 +771,40 @@
   never take it — it exits as "contended" and the machine is left with no
   observer. That failure was measured directly. The floor is one cycle's working
   set (~380 MB), so recycling caps drift, not baseline.
+  **Resident embedder** (`memory.embed_service`, #211): the observer also loads
+  the embedding model at start and serves it over `~/.neo/run/embed.sock`
+  (0600, in a 0700 dir; newline JSON, protocol v1; hello carries model, dim and
+  the fastembed/onnxruntime versions, all of which must match the client's, since a
+  different preprocessing would drift query vectors from stored ones silently).
+  The model is ~1.3 GB resident and WAS a neo run's whole memory floor:
+  measured on a 2,209-fact store, a dry run peaked at 1,439 MB loading it and
+  190 MB borrowing it. The observer therefore sits ~1.3 GB above the figures
+  above, by design, and reloads the model (~0.3 s) on every recycle. The sweep
+  shares the instance (`build_resilient_embedder` returns the process's one
+  embedder, in `_Serialized` because server threads and the sweep call it
+  concurrently). **Falling back costs 1.3 GB, so the client waits where waiting
+  works**: requests are batched (64 texts, 16 KB) and the server embeds one
+  text at a time, so a short query waits for one text, not another run's
+  batch (64 texts of 800 chars hold the model ~15 s; one 32,000-char text
+  33-75 s, since attention is quadratic). The deadline (90 s, above the worst
+  single text, plus 3 ms per
+  character) covers the whole exchange, so a trickling peer cannot stretch
+  it. Texts are cut at 64K chars, past the model's 8,192-token window.
+  Transport failures are retried for `RECOVER_S` (15 s) when they look like a
+  recycle (socket gone) or a full backlog (refused while the observer's flock
+  is held); a refusal with no observer alive is a socket left by a killed
+  one and is abandoned at once, or every run would pay the wait. The backlog
+  is `SOMAXCONN` (5 refused the sixth concurrent hello on macOS). The observer
+  clears a stale socket before anything that can fail, so a successor that
+  cannot load a model does not leave runs waiting on its predecessor's. A silent or
+  incompatible server, or one that stays gone, ends in the run loading the
+  model itself, once; a process that has loaded its own keeps it (an ONNX
+  session's memory does not reliably go back to the OS), and a failed local
+  load is remembered so a broken cache is healed once, not per call. Each
+  process records `embedder_source` (remote / local / fallback) in metrics.
+  The server is stopped in a `finally`, and restarted if a re-exec fails. The
+  serving process never borrows from itself (`mark_server_process`). POSIX
+  only; Windows always loads locally.
   Lifecycle: `neo memory observer {start|stop|status|kick}` — `kick` maps to
   `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
   CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |

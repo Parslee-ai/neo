@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- **A neo run borrows the observer's embedding model instead of loading its own** ([#211](https://github.com/Parslee-ai/neo/issues/211)). The model was a run's whole memory floor, about 1.3 GB of the 1.4 GB peak. The observer now holds the one copy and serves it over a private Unix socket (`~/.neo/run/embed.sock`). Measured on a 2,209-fact store, a dry run's peak fell from 1,439 MB to 195 MB, with wall time unchanged. When the observer isn't running, a run loads the model as before, and so it does when the observer's server is stale, hung or gone. The observer itself is now about 1.3 GB larger, by design. POSIX only.
+
 - **`neo --update` works, sees new files, and says when it stopped early** ([#217](https://github.com/Parslee-ai/neo/issues/217)).
   - **Reachable:** `--update` now implies `--index`. A bare `neo --update` used to fall through to the reasoning path and refresh nothing.
   - **New files:** an eligible file the last full build never saw is now picked up. A copy the build skipped as a duplicate is not. New files follow the build's rules: content already catalogued is skipped, and nothing is added beyond the build's `--max-files`. The build records every path it saw in `.neo/walked.json`, so a file the cap passed over is not mistaken for a new one. A catalog built by an older version reports no new files and says to run `neo --index` once.
