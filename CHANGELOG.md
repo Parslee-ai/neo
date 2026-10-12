@@ -2,11 +2,26 @@
 
 ## [Unreleased]
 
-### Changed
+### Added
+
+- **Cursor plugin** (`plugins/cursor-neo/`, contributed by Joe Rinehart in [#236](https://github.com/Parslee-ai/neo/pull/236)). It provides the same six skills as the Codex plugin, invoked as `/neo`, `/neo-review` and so on in Cursor's Agent chat, plus a `neo-agent` subagent with a visible boundary, like Claude Code's Neo agent. Install it locally (`~/.cursor/plugins/local`) or import this repository as a team marketplace (`.cursor-plugin/marketplace.json`). Each Cursor skill is tested against its Codex counterpart, paragraph by paragraph, so a privacy fix to one cannot be left out of the other. The README lists what is weaker on Cursor: a skill cannot write the shell approval's description, and the subagent inherits every tool.
+
+### Fixed
 
 - **A neo run borrows the observer's embedding model instead of loading its own** ([#211](https://github.com/Parslee-ai/neo/issues/211)). The model was a run's whole memory floor, about 1.3 GB of the 1.4 GB peak. The observer now holds the one copy and serves it over a private Unix socket (`~/.neo/run/embed.sock`). Measured on a 2,209-fact store, a dry run's peak fell from 1,439 MB to 195 MB, with wall time unchanged. When the observer isn't running, a run loads the model as before, and so it does when the observer's server is stale, hung or gone. The observer itself is now about 1.3 GB larger, by design. POSIX only.
 
-### Fixed
+- **`neo --update` works, sees new files, and says when it stopped early** ([#217](https://github.com/Parslee-ai/neo/issues/217)).
+  - **Reachable:** `--update` now implies `--index`. A bare `neo --update` used to fall through to the reasoning path and refresh nothing.
+  - **New files:** an eligible file the last full build never saw is now picked up. A copy the build skipped as a duplicate is not. New files follow the build's rules: content already catalogued is skipped, and nothing is added beyond the build's `--max-files`. The build records every path it saw in `.neo/walked.json`, so a file the cap passed over is not mistaken for a new one. A catalog built by an older version reports no new files and says to run `neo --index` once.
+  - **Deleted and ignored files:** a file deleted, or newly matched by `.gitignore`, now leaves the catalog, and the deletion is saved.
+  - **Honest report:** the refresh says how many changed, new and removed files it handled and how many chunks it actually embedded. When the time or chunk budget stops it, it says how many stale files are left. A file it cannot read or parse is named, and its previous entries are kept.
+  - **Found along the way:**
+    - A refresh never updated edges.
+    - Emptied edge and vector files were left on disk and reloaded.
+    - A semantic hit could return the wrong chunk whenever any chunk lacked an embedding.
+    - An unknown key in `.neo/index.json` (written by a newer neo) made the whole catalog unreadable. It is now ignored.
+    - Catalog paths are now stored with forward slashes on every platform, and Windows catalogs with backslash paths are read correctly.
+    - Chunks that fail to embed leave their file stale, so the next refresh retries them.
 
 - **The parameter-compatibility store no longer learns false facts about a model** ([#266](https://github.com/Parslee-ai/neo/issues/266)).
   - **Value errors:** a rejection whose code says a value is out of range (for example `decimal_above_max_value` on `temperature=5`) is no longer remembered as "field unsupported", so a later valid value is still sent. Only OpenAI's own value-range codes are treated this way; any other code still teaches a drop, so OpenAI-compatible servers with their own codes (vLLM's integer `400`, xAI's free-text codes) keep recovering.
