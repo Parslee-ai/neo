@@ -117,6 +117,10 @@ applies learned patterns, generates solutions, and stores new facts for continuo
 
 1. Jina's embeddings model (open source) is downloaded automatically when you first run Neo.
     This model runs locally on your machine to generate vector embeddings.
+    It takes about 1.3 GB of memory once loaded. When the background observer
+    is running, it holds the one copy and each neo run borrows it over a
+    private local socket (`~/.neo/run/embed.sock`), so a run needs about 200 MB
+    instead. Without the observer, each run loads its own copy.
 
 
 
@@ -392,7 +396,7 @@ Once installed:
   Requires a matching plugin/CLI build; see [setup and behavior](docs/claude-code-mods.md).
 - **Slash commands**: `/neo`, `/neo-review`, `/neo-optimize`, `/neo-architect`, `/neo-debug`, `/neo-pattern`
 - **Specialized agent**: invoke with `Use the Neo agent to ...` for delegated semantic reasoning
-- **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Codex plugin
+- **Shared memory**: same `~/.neo/facts/` store used by the CLI, Codex, and Cursor plugins
 - **Edit-recording hook**: a `PostToolUse` hook records which files Claude Code
   edited, adding observations to Neo's git-based outcome matching. Host events
   alone do not prove acceptance. It records paths, never file contents, and
@@ -450,7 +454,7 @@ plugin**, which looks like success and provides no skills. The subcommand is
 Once installed:
 
 - **Skills**: `$neo`, `$neo-review`, `$neo-optimize`, `$neo-architect`, `$neo-debug`, `$neo-pattern`
-- **Shared memory**: same `~/.neo/facts/` store used by the CLI and the Claude Code plugin
+- **Shared memory**: same `~/.neo/facts/` store used by the CLI, Claude Code, and Cursor plugins
 - **Explicit context boundary**: Codex selects the relevant excerpts and every
   skill invokes `neo --no-scan`, so Neo cannot silently add files or project
   instruction documents from the current directory
@@ -484,15 +488,62 @@ both retrieved-fact and persistence effects before provider approval.
 
 Plugin sources live under [`plugins/neo/`](plugins/neo/) — see the manifest and skill definitions.
 
-Both plugins consume the **same host-neutral contract**: the skills invoke
+
+## Cursor Plugin
+
+Neo ships as a **Cursor plugin** with the same six skills plus a dedicated Neo
+agent, packaged under [`plugins/cursor-neo/`](plugins/cursor-neo/) and listed in
+the in-repo marketplace [`.cursor-plugin/marketplace.json`](.cursor-plugin/marketplace.json).
+
+**Local install (recommended for development):**
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+ln -s "$(pwd)/plugins/cursor-neo" ~/.cursor/plugins/local/neo
+# Then: Developer: Reload Window
+```
+
+**Team / repo marketplace:** import this repository as a Cursor team marketplace
+(it reads `.cursor-plugin/marketplace.json`, named `neo-cursor`), then install
+the `neo` plugin. Official [Cursor Marketplace](https://cursor.com/marketplace)
+listing is optional and separate.
+
+Once installed:
+
+- **Skills** (mid-loop, `/` in Agent chat): `/neo`, `/neo-review`, `/neo-optimize`,
+  `/neo-architect`, `/neo-debug`, `/neo-pattern` — same Codex privacy defaults
+  (`--no-scan`, advise `--no-memory`)
+- **Neo agent** (visible boundary): delegate with “use the Neo agent…” or
+  `/neo-agent` (named apart from the `/neo` skill) — Claude-style
+  `neo --json --mode advise` without mandatory `--no-scan` / `--no-memory`
+- **Shared memory**: same `~/.neo/facts/` store as the CLI, Claude Code, and Codex plugins
+
+The plugin wraps the local `neo` CLI (`pip install neo-reasoner[…]` + provider
+key). It is intentionally skills + agent, not an MCP server.
+
+Two boundaries are weaker than on the other hosts. Cursor's shell approval
+(its Auto-review run mode) shows the command, but a skill cannot write the
+approval's description the way a Codex skill does, and under Run Everything or
+an allowlisted `neo` there is no prompt at all. So each skill *tells* the model
+to name the provider and data before the call. Cursor's sandbox also blocks
+network access by default, so the first `neo` call may need the provider's
+domain allowed. And a Cursor subagent inherits every tool of its parent
+(Claude's Neo agent is limited to Bash, Read, Grep and Glob). Cursor's
+`readonly: true` would remove edit tools, but it also blocks state-changing
+shell commands, and a `neo` run writes logs and metrics under `~/.neo`, so the
+agent does not set it. The
+Claude Code-only features, the Mods pane (`/neo-workspace`, `/neo-ask`) and the
+`executable` override, have no Cursor equivalent; the Cursor skills run the
+`neo` on `PATH`.
+
+All three host adapters consume the **same host-neutral contract**: they invoke
 `neo --json` and read the `orchestrator` envelope described under
-[Orchestrator output](#orchestrator-output). Neither hosts its own output
+[Orchestrator output](#orchestrator-output). None hosts its own output
 format, and `tests/test_host_adapter_parity.py` fails if one surface teaches a
-contract the other does not. The difference is role, not protocol — under
-Claude Code, Neo is usually a delegated subagent with a visible boundary;
-under Codex, Neo is a step inside the same coding loop, which is why the Codex
-skills insist on explicit attribution and on continuing the task rather than
-treating Neo's answer as the deliverable.
+contract the others do not. Role differs: Claude Code and the Cursor **agent**
+are delegated specialists with a visible boundary; Codex and Cursor **skills**
+are mid-loop steps that insist on explicit attribution and on continuing the
+task rather than treating Neo's answer as the deliverable.
 
 
 ## Works Alongside Your AI Tools
@@ -526,7 +577,8 @@ use:**
 
 - **Claude Code** users get the deepest integration via the [Claude Code Plugin](#claude-code-plugin), but neo runs standalone too.
 - **Codex CLI** users get parity via the [Codex Plugin](#codex-plugin) — same six skills, packaged for Codex. Neo also automatically picks up `AGENTS.md` (the cross-tool standard Codex co-led) plus anything under `.codex/`.
-- **Cursor / Windsurf / Aider / Continue / Augment** users — the rules dirs you've curated land in every neo session's context.
+- **Cursor** users get the same six capabilities via the [Cursor Plugin](#cursor-plugin), plus a Neo agent (see that section for what differs from Claude Code); project rules under `.cursor/rules/` still land in every neo session's context.
+- **Windsurf / Aider / Continue / Augment** users — the rules dirs you've curated land in every neo session's context.
 - **GitHub Copilot** users — `.github/copilot-instructions.md` is read on every invocation.
 - **Spec Kit** projects — your specs are folded into neo's reasoning context, no manual paste.
 
@@ -675,9 +727,9 @@ neo --cwd /path/to/project "optimize this function"
 # keyword index refresh themselves on every call.
 neo --index
 
-# Re-embed catalogued files whose contents changed. Must be passed WITH --index;
-# new files are not picked up, so a repo that grew needs a full build.
-neo --index --update
+# Refresh the catalog: re-embed changed and new files, drop deleted ones.
+# Bounded at 5 s / 100 chunks; it says so when it stops early.
+neo --update
 
 # Preview the assembled context without making an LLM call
 neo --dry-run "your query"
@@ -953,7 +1005,7 @@ stays silent.
 (car-runtime ≥ 0.18.0). Logs land in
 `~/.car/logs/neo-observer.{stdout,stderr}.log`. Tunables:
 `NEO_OBSERVER_INTERVAL_SECONDS` (default 300), `NEO_OBSERVER_COOLDOWN`
-(default 60), `NEO_OBSERVER_RECYCLE_CYCLES` (default 48 — the daemon re-execs
+(default 60), `NEO_OBSERVER_RECYCLE_CYCLES` (default 3, ~15 min — the daemon re-execs
 itself to bound RSS drift; 0 disables). See
 [the observer design note](docs/solutions/async-observer.md).
 
@@ -1256,10 +1308,10 @@ Cap with `NEO_REASONING_EFFORT={none,low,medium,high,xhigh}` for cost control.
 > without `reasoning.effort` has it dropped, and a model that tops out lower
 > (older `gpt-5-codex` stops at `high`) is stepped down one level at a time.
 > Either way the retry is paid once per model and remembered in
-> `~/.neo/model_param_compat.json`. The exception is a model whose lowest level
-> is above the one requested (some `-pro` models start at `medium`): nothing can
-> be learned safely from that, so the call runs at the provider default and the
-> extra rejected requests recur each time. `NEO_REASONING_EFFORT` still caps the
+> `~/.neo/model_param_compat.json`. Each refused level is remembered on its own,
+> so a model whose lowest level is above the request (some `-pro` models start at
+> `medium`) pays the walk once; later calls drop effort in one request and run at
+> the provider default. `NEO_REASONING_EFFORT` still caps the
 > auto-selector if you want a lower ceiling for cost.
 
 ### Architectural Quality Feedback Loop
@@ -1372,7 +1424,7 @@ export NEO_ALLOW_PLAINTEXT_API_KEY=1              # permit storing api_key in co
 export NEO_OBSERVER_AUTOSTART=0                   # do not autostart the observer (put in ~/.zshenv, not ~/.zshrc)
 export NEO_OBSERVER_INTERVAL_SECONDS=300          # sweep interval
 export NEO_OBSERVER_COOLDOWN=60                   # per-process cooldown between cycles
-export NEO_OBSERVER_RECYCLE_CYCLES=48             # re-exec after N cycles to bound RSS (0 disables)
+export NEO_OBSERVER_RECYCLE_CYCLES=3              # re-exec after N cycles to bound RSS (0 disables)
 ```
 
 ### Install Sanity

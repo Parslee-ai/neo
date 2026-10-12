@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -224,11 +225,89 @@ def scope_file_lock(path: "Path"):
             fd.close()
 
 
+#: One embedder per (model, cache dir) per process. The model is 614 MB on
+#: disk and ~1.3 GB resident once loaded, and one reasoning run used to build
+#: it twice: once for the gatherer's history boost and again for the engine's
+#: FactStore, 0.33 s each, plus the catalog's own for semantic re-rank. A
+#: failure (None) is remembered as well, so a broken install pays its init
+#: and its one cache-heal attempt once, not once per caller (#211).
+_EMBEDDERS: dict = {}
+_EMBEDDERS_LOCK = threading.Lock()
+
+DEFAULT_EMBED_MODEL = "jinaai/jina-embeddings-v2-base-code"
+
+
+class _FairLock:
+    """A FIFO (ticket) lock. `threading.Lock` makes no fairness promise, and on
+    Linux a thread that releases it and immediately re-acquires usually wins:
+    one run's batch, embedded text by text, then holds the model end to end
+    while another run's short query times out behind it."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._next = 0
+        self._serving = 0
+
+    def __enter__(self):
+        with self._cond:
+            ticket = self._next
+            self._next += 1
+            while self._serving != ticket:
+                self._cond.wait()
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._serving += 1
+            self._cond.notify_all()
+
+
+class _Serialized:
+    """One model, called from several threads: the observer's sweep and the
+    requests its resident embedder serves. `embed` is materialized under a
+    fair lock rather than trusting the tokenizer and session to be
+    re-entrant, so callers take turns in arrival order."""
+
+    def __init__(self, embedder):
+        self._embedder = embedder
+        self._lock = _FairLock()
+
+    def embed(self, texts):
+        with self._lock:
+            return iter(list(self._embedder.embed(list(texts))))
+
+
 def build_resilient_embedder(
-    model_name: str = "jinaai/jina-embeddings-v2-base-code",
+    model_name: str = DEFAULT_EMBED_MODEL,
     cache_dir: Optional[Path] = None,
     log_prefix: str = "",
 ):
+    """The process's shared embedder for `model_name` (see `_EMBEDDERS`).
+
+    Borrowed from the resident embedder when the observer is serving one
+    (`neo.memory.embed_service`), else built here by `_build_embedder` on
+    first use. Either way every caller in the process gets the same object."""
+    if not FASTEMBED_AVAILABLE:
+        return None
+    if cache_dir is None:
+        _env = os.environ.get("NEO_FASTEMBED_CACHE_DIR")
+        cache_dir = Path(_env) if _env else FASTEMBED_CACHE_DIR
+    key = (model_name, str(cache_dir))
+    with _EMBEDDERS_LOCK:
+        if key not in _EMBEDDERS:
+            from neo.memory import embed_service
+
+            def local():
+                built = _build_embedder(model_name, cache_dir, log_prefix)
+                return _Serialized(built) if built is not None else None
+
+            remote = None
+            if not embed_service.is_server_process():
+                remote = embed_service.connect(model_name, local_factory=local)
+            _EMBEDDERS[key] = remote if remote is not None else local()
+        return _EMBEDDERS[key]
+
+
+def _build_embedder(model_name: str, cache_dir: Path, log_prefix: str):
     """Build a fastembed ``TextEmbedding`` pinned to a stable cache dir, healing
     a stale cache. Returns the embedder, or ``None`` if fastembed is
     unavailable or init fails after one recovery attempt.
@@ -247,11 +326,6 @@ def build_resilient_embedder(
     a process with an isolated ``$HOME`` (the test harness) can point at the
     real, already-downloaded model instead of re-fetching ~400 MB.
     """
-    if not FASTEMBED_AVAILABLE:
-        return None
-    if cache_dir is None:
-        _env = os.environ.get("NEO_FASTEMBED_CACHE_DIR")
-        cache_dir = Path(_env) if _env else FASTEMBED_CACHE_DIR
     p = f"{log_prefix}: " if log_prefix else ""
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:

@@ -107,7 +107,7 @@ def parse_args():
     global_parser.add_argument('--regenerate-embeddings', action='store_true', help='Regenerate all embeddings with current model (safe, with automatic backup)')
     global_parser.add_argument('--index', action='store_true', help='Optional cache-warmer: build the embedding catalog for this repo. File selection works without it (the walk and the keyword index refresh themselves on every call); once built, the catalog re-ranks every call with no flag')
     global_parser.add_argument('--languages', metavar='CSV', help='Languages to index (e.g., python,csharp,typescript)')
-    global_parser.add_argument('--update', action='store_true', help="Re-embed already-catalogued files whose contents changed. Use WITH --index ('neo --index --update'); this flag is only read inside that branch. New files are not picked up — the staleness check walks the snapshot's own hashes — and the refresh stops at 5s/100 chunks, so a partial refresh still reports the full chunk total")
+    global_parser.add_argument('--update', action='store_true', help="Refresh the embedding catalog: re-embed changed and new files and drop deleted ones (implies --index). Stops at 5 s or 100 chunks and says so when it does; run it again to continue")
     global_parser.add_argument('--cwd', metavar='PATH', help='Working directory override')
     global_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging (INFO level) to stderr')
     global_parser.add_argument('--debug', action='store_true', help='Enable debug logging (DEBUG level) to stderr')
@@ -600,6 +600,64 @@ def read_prompt_from_argv_or_stdin(args):
     sys.exit(2)
 
 
+def _format_refresh_report(result: dict, index) -> list:
+    """What `neo --index --update` did, in words. Each line past the first is
+    conditional, so a complete, clean refresh prints one line (#217)."""
+    from neo.index.project_index import REFRESH_BUDGET_MS, REFRESH_MAX_CHUNKS
+
+    def n(count: int, noun: str) -> str:
+        return f"{count} {noun}{'' if count == 1 else 's'}"
+
+    files = result['refreshed'] + result['added'] + result['removed']
+    totals = f"{len(index.chunks)} chunks, {len(index.edges)} edges"
+    if not files:
+        lines = [f"[Neo] Index is up to date: {totals}"]
+    else:
+        parts = [f"{count} {label}" for count, label in (
+            (result['refreshed'], "changed"), (result['added'], "new"),
+            (result['removed'], "removed")) if count]
+        lines = [f"[Neo] Updated index: {', '.join(parts)} "
+                 f"file{'' if files == 1 else 's'}, "
+                 f"{n(result['chunks_embedded'], 'chunk')} embedded; now {totals}"]
+    missing = result['chunks_extracted'] - result['chunks_embedded']
+    if missing and result.get('embedding_model'):
+        lines.append(
+            f"[Neo] Warning: {missing} extracted chunks failed to embed; their files "
+            "stay stale and the next refresh retries them.")
+    elif missing:
+        lines.append(
+            f"[Neo] Warning: {missing} extracted chunks were not embedded because no "
+            "embedding model is available (install fastembed), so semantic re-rank "
+            "cannot find them.")
+    if result['failed']:
+        shown = ", ".join(result['failed'][:5])
+        more = f" and {len(result['failed']) - 5} more" if len(result['failed']) > 5 else ""
+        lines.append(
+            f"[Neo] Warning: could not read or parse {n(len(result['failed']), 'file')} "
+            f"({shown}{more}); their previous entries were kept.")
+    if result['skipped_duplicate']:
+        lines.append(
+            f"[Neo] Skipped {n(result['skipped_duplicate'], 'new file')} whose content "
+            "is already catalogued.")
+    if result['skipped_cap']:
+        lines.append(
+            f"[Neo] Skipped {n(result['skipped_cap'], 'new file')}: the catalog is at "
+            f"its --max-files={result['max_files']} limit. Run 'neo --index' to "
+            "re-rank which files it holds.")
+    if result['bound']:
+        budget = (f"{REFRESH_BUDGET_MS / 1000:g} s time" if result['bound'] == 'time'
+                  else f"{REFRESH_MAX_CHUNKS}-chunk")
+        lines.append(
+            f"[Neo] Stopped at the {budget} budget with "
+            f"{n(len(result['remaining']), 'stale file')} left. Run 'neo --update' "
+            "again to continue, or 'neo --index' to rebuild.")
+    if not result['tracks_new_files']:
+        lines.append(
+            "[Neo] This catalog predates new-file tracking, so files added since "
+            "it was built are not picked up. Run 'neo --index' once to rebuild it.")
+    return lines
+
+
 def _format_selection_report(report: Optional[dict]) -> list[str]:
     """Render what the index cap left out, as `[Neo] ` console lines.
 
@@ -944,6 +1002,46 @@ def _is_network_timeout(exc: BaseException) -> bool:
     return bool(timeout_types) and isinstance(exc, tuple(timeout_types))
 
 
+# One-word prompts that are almost certainly a mistyped command, mapped to
+# the command meant. Any other prompt, including any question of two or more
+# words, goes to inference as before.
+_COMMAND_WORDS = {
+    "version": "neo --version",
+    "help": "neo --help",
+    "status": "neo workspace status",
+    "index": "neo --index",
+    "config": "neo --config list",
+    "upgrade": "neo update",
+    "init": "neo --help",
+    "stats": "neo memory learning-stats",
+}
+_SUBCOMMANDS = (
+    "contribute", "update", "serve", "car", "construct", "memory",
+    "prompt", "hook", "workspace", "lattice",
+)
+
+
+def bare_command_hint(prompt):
+    """The command a one-word prompt most likely meant, or None.
+
+    `neo version` used to take "version" as a question and start a paid
+    reasoning run (#278). A single word that exactly names a flag or a
+    subcommand (any case, ignoring leading dashes and trailing punctuation) is
+    refused with the right command instead. There is no fuzzy matching: it
+    refused real words such as "server", "updates" and "prompts". Only an argv
+    prompt reaches this; stdin input is never checked.
+    """
+    word = (prompt or "").strip()
+    if not word or any(ch.isspace() for ch in word):
+        return None
+    key = word.lower().lstrip("-").rstrip("?.!,;:")
+    if key in _COMMAND_WORDS:
+        return _COMMAND_WORDS[key]
+    if key in _SUBCOMMANDS:
+        return f"neo {key}"
+    return None
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # The host-hook recorder fires on every editor tool call, so it dispatches
@@ -967,6 +1065,18 @@ def main():
 
     # Parse arguments
     args = parse_args()
+
+    # A one-word prompt that names a command is a typo, not a question: refuse
+    # it before the update check, the observer autostart or any inference.
+    hint = bare_command_hint(getattr(args, "prompt", None))
+    if hint and not getattr(args, "command", None):
+        print(
+            f"neo: '{args.prompt.strip()}' looks like a command, not a question. "
+            f"Did you mean `{hint}`? To ask Neo about it, phrase a question of "
+            "more than one word.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Configure logging early so all subsequent code can log
     _configure_logging(args)
@@ -1064,7 +1174,12 @@ def main():
             print(f"\u2717 Regeneration failed: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # Handle --index flag
+    # Handle --index flag. `--update` implies it: read only inside this
+    # branch, a bare `neo --update` used to fall through to reasoning (#217).
+    # Only at the top level: `neo update` (the self-upgrade) and other
+    # subcommands inherit the flag and must not be hijacked by it.
+    if getattr(args, 'update', False) and not getattr(args, 'command', None):
+        args.index = True
     if args.index:
         from neo.index.project_index import ProjectIndex
 
@@ -1077,9 +1192,8 @@ def main():
                 if not index.snapshot:
                     print("[Neo] No existing index found. Run 'neo --index' first.", file=sys.stderr)
                     sys.exit(1)
-                index.refresh_changed_files()
-                status = index.status()
-                print(f"[Neo] Updated index: {status['total_chunks']} chunks, {status.get('total_edges', 0)} edges")
+                for line in _format_refresh_report(index.refresh_changed_files(), index):
+                    print(line)
                 sys.exit(0)
             except Exception as e:
                 print(f"[Neo] Failed to update index: {e}", file=sys.stderr)
@@ -1735,4 +1849,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main() returns the exit status; dropping it made `python -m neo`
+    # report success for every refusal and failure.
+    sys.exit(main())

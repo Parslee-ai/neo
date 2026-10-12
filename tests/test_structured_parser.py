@@ -5,6 +5,7 @@ Fuzzing tests for structured parser.
 Tests parser robustness against malformed inputs.
 """
 
+
 from neo.structured_parser import (
     parse_plan_steps,
     parse_simulation_traces,
@@ -409,3 +410,73 @@ if __name__ == "__main__":
 
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(0 if failed == 0 else 1)
+
+class TestTolerantJsonLoadRepairs:
+    """#259: models put raw control characters and curly quotes in JSON."""
+
+    def test_raw_newline_and_tab_inside_strings_are_repaired(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "line1\nline2", "b": "x\ty"}')
+        assert r.success, r.error_message
+        assert r.data == {"a": "line1\nline2", "b": "x\ty"}
+
+    def test_newlines_between_tokens_are_left_alone(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{\n  "a": "v",\n}')
+        assert r.success and r.data == {"a": "v"}
+
+    def test_other_control_characters_still_fail(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "bad\x00"}')
+        assert not r.success
+        assert r.error_code == "escape_errors"
+
+    def test_curly_quote_delimiters_are_mapped(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load("{“a”: “b”}")
+        assert r.success and r.data == {"a": "b"}
+
+    def test_curly_quotes_inside_a_value_survive(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "he said “hi”"}')
+        assert r.success and r.data == {"a": "he said “hi”"}
+
+    def test_escaped_quote_does_not_end_the_string(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": "say \\"x\\"\nnext"}')
+        assert r.success and r.data == {"a": 'say "x"\nnext'}
+
+
+class TestRepairKeepsStringContents:
+    def test_trailing_comma_inside_a_code_string_survives(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"code": "items = [1, 2,]", "b": "y\nz",}')
+        assert r.success, r.error_message
+        assert r.data == {"code": "items = [1, 2,]", "b": "y\nz"}
+
+    def test_comma_brace_inside_a_string_survives(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"code": "f(a, }", "x": 1,}')
+        assert r.success and r.data == {"code": "f(a, }", "x": 1}
+
+    def test_backslash_before_a_raw_newline_is_kept(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"sh": "make \\\nall"}')
+        assert r.success, r.error_message
+        assert r.data == {"sh": "make \\\nall"}
+
+    def test_the_reported_error_is_from_the_text_shown(self):
+        from neo.structured_parser import tolerant_json_load
+
+        r = tolerant_json_load('{"a": \u201cb"')
+        assert not r.success
+        assert "char" in r.error_message

@@ -756,7 +756,7 @@
   all operate on the single global agent. (A2UI per-project inspector is skipped
   in global mode.)
   **RSS bounding**: the daemon re-execs itself every
-  `NEO_OBSERVER_RECYCLE_CYCLES` cycles (default 48, ~4h; 0 disables). Its RSS is
+  `NEO_OBSERVER_RECYCLE_CYCLES` cycles (default 3, ~15 min; 0 disables). Its RSS is
   peak working set plus CPython arena fragmentation — each sweep deserializes a
   multi-MB fact file (79% of whose rows are tombstones retained by the 30-day
   policy) and the allocator never returns those arenas. Nothing leaks; RSS
@@ -771,6 +771,40 @@
   never take it — it exits as "contended" and the machine is left with no
   observer. That failure was measured directly. The floor is one cycle's working
   set (~380 MB), so recycling caps drift, not baseline.
+  **Resident embedder** (`memory.embed_service`, #211): the observer also loads
+  the embedding model at start and serves it over `~/.neo/run/embed.sock`
+  (0600, in a 0700 dir; newline JSON, protocol v1; hello carries model, dim and
+  the fastembed/onnxruntime versions, all of which must match the client's, since a
+  different preprocessing would drift query vectors from stored ones silently).
+  The model is ~1.3 GB resident and WAS a neo run's whole memory floor:
+  measured on a 2,209-fact store, a dry run peaked at 1,439 MB loading it and
+  190 MB borrowing it. The observer therefore sits ~1.3 GB above the figures
+  above, by design, and reloads the model (~0.3 s) on every recycle. The sweep
+  shares the instance (`build_resilient_embedder` returns the process's one
+  embedder, in `_Serialized` because server threads and the sweep call it
+  concurrently). **Falling back costs 1.3 GB, so the client waits where waiting
+  works**: requests are batched (64 texts, 16 KB) and the server embeds one
+  text at a time, so a short query waits for one text, not another run's
+  batch (64 texts of 800 chars hold the model ~15 s; one 32,000-char text
+  33-75 s, since attention is quadratic). The deadline (90 s, above the worst
+  single text, plus 3 ms per
+  character) covers the whole exchange, so a trickling peer cannot stretch
+  it. Texts are cut at 64K chars, past the model's 8,192-token window.
+  Transport failures are retried for `RECOVER_S` (15 s) when they look like a
+  recycle (socket gone) or a full backlog (refused while the observer's flock
+  is held); a refusal with no observer alive is a socket left by a killed
+  one and is abandoned at once, or every run would pay the wait. The backlog
+  is `SOMAXCONN` (5 refused the sixth concurrent hello on macOS). The observer
+  clears a stale socket before anything that can fail, so a successor that
+  cannot load a model does not leave runs waiting on its predecessor's. A silent or
+  incompatible server, or one that stays gone, ends in the run loading the
+  model itself, once; a process that has loaded its own keeps it (an ONNX
+  session's memory does not reliably go back to the OS), and a failed local
+  load is remembered so a broken cache is healed once, not per call. Each
+  process records `embedder_source` (remote / local / fallback) in metrics.
+  The server is stopped in a `finally`, and restarted if a re-exec fails. The
+  serving process never borrows from itself (`mark_server_process`). POSIX
+  only; Windows always loads locally.
   Lifecycle: `neo memory observer {start|stop|status|kick}` — `kick` maps to
   `agents_restart` since CAR has no signal-passthrough primitive. Status surfaces
   CAR's raw state verbatim (`running` | `stopped` | `starting` | `backoff` |
@@ -1691,39 +1725,45 @@
   in README; `hooks.json` deliberately does NOT wrap the command in
   `|| true`, because that reintroduces the shell dependency (and `2>/dev/null`
   is invalid in `cmd.exe`) that choosing a subcommand was meant to avoid.
-- **Host adapters must stay in parity.** There are TWO checked-in integration
+- **Host adapters must stay in parity.** There are THREE checked-in integration
   surfaces, and they are easy to miss: the Claude Code plugin (manifests in
   `.claude-plugin/`; agent, 6 slash commands and the hook at the REPO ROOT —
-  see the layout rule above) and **`plugins/neo/`** (Codex CLI plugin + 6
-  skills, manifest at
-  `plugins/neo/.codex-plugin/plugin.json`, registered by
-  `.agents/plugins/marketplace.json`). `.agents/skills/` holds RELEASE
+  see the layout rule above), **`plugins/neo/`** (Codex CLI plugin + 6 skills,
+  manifest at `plugins/neo/.codex-plugin/plugin.json`, registered by
+  `.agents/plugins/marketplace.json`), and **`plugins/cursor-neo/`** (Cursor
+  plugin + 6 skills + Neo agent, manifest at
+  `plugins/cursor-neo/.cursor-plugin/plugin.json`, registered by
+  `.cursor-plugin/marketplace.json`). `.agents/skills/` holds RELEASE
   maintenance skills, not the Neo capabilities — looking there and concluding
-  the Codex plugin is missing is a documented wrong turn. Neither adapter owns
-  an output format: both invoke `neo --json` and read the same `orchestrator`
-  envelope. When the contract changes, BOTH change — the Codex skills sat on
+  the Codex or Cursor plugin is missing is a documented wrong turn. No adapter
+  owns an output format: all invoke `neo --json` and read the same `orchestrator`
+  envelope. When the contract changes, ALL change — the Codex skills sat on
   "parse the four structured sections: CONFIDENCE, PLAN, SIMULATIONS, CODE
   SUGGESTIONS" while the Claude side had already moved to `--json`.
-  `tests/test_host_adapter_parity.py` pins it: both surfaces expose the same
+  `tests/test_host_adapter_parity.py` pins it: all three surfaces expose the same
   six capabilities, invoke `--json`, teach `orchestrator.summary`/`cautions`,
   document the error shape and attribution, and use phase/event names that
-  actually exist in `events.py`. It also pins that both plugin manifests match
+  actually exist in `events.py`. It also pins that all plugin manifests match
   the `pyproject.toml` version — `prepare-release` documents bumping them, but
   a documented step with no enforcement gets skipped (they had reached 0.19.0 /
   0.37.0 / 0.41.0). **The version is now single-sourced**: `pyproject.toml` is
   the truth and `tools/sync_version.py` (`make sync-version`) propagates it to
-  `src/neo/__init__.py` and both manifests. Release bumps edit ONE file; never
-  hand-edit the derived three. `--check` reports drift without writing. Edits
-  are surgical regex replacements, not `json.dumps` re-serialization — a
-  version bump must stay a one-line diff or it becomes unreviewable — and only
-  the FIRST `"version"` key is rewritten so a nested one can't be clobbered.
+  `src/neo/__init__.py` and the Claude / Codex / Cursor manifests. Release bumps
+  edit ONE file; never hand-edit the derived files. `--check` reports drift
+  without writing. Edits are surgical regex replacements, not `json.dumps`
+  re-serialization — a version bump must stay a one-line diff or it becomes
+  unreviewable — and only the FIRST `"version"` key is rewritten so a nested
+  one can't be clobbered.
   `tools/` is now covered by lint; it never was, which is why a dead import sat
   in `ab_controlled.py`. The ruff invocation is duplicated in `Makefile`
   (`lint` + `ci-local`), `.github/workflows/ci.yml` and `.githooks/pre-commit`
-  — all four MUST stay identical or local green stops predicting CI green. Role differs even though protocol does not: Claude Code
-  delegates to Neo as a subagent (visible boundary), Codex calls Neo mid-loop
-  (no boundary), so the Codex skills carry stronger attribution wording and an
-  explicit "Neo's result is an input, not the deliverable".
+  — all four MUST stay identical or local green stops predicting CI green. Role
+  differs even though protocol does not: Claude Code (and the Cursor **agent**)
+  delegates to Neo as a subagent (visible boundary); Codex and Cursor **skills**
+  call Neo mid-loop (no boundary), so those skills carry stronger attribution
+  wording and an explicit "Neo's result is an input, not the deliverable".
+  Cursor mid-loop skills use Codex's `--no-scan` / advise `--no-memory` defaults;
+  the Cursor agent keeps Claude's looser advise invoke.
 - CarAdapter defaults `intent_hint={"task":"code","prefer_quality":True}` so CAR's router
   routes neo to the most capable model, not the chat/cost default. This is the *intended*
   router API, not a hack:
@@ -1797,8 +1837,14 @@
   NAMES a field Neo sent it drops, renames or lowers that one field, retries, and
   persists the learning in `_ModelParamCompat` (`~/.neo/model_param_compat.json`,
   `"<provider>:<model>" → [flags]`) so the retry is paid once per model. Flags are
-  `drop_<field>`, `rename_<field>`, `max_<field>:<level>`; the first two are the
-  pre-generalisation spellings, so an old file still loads. **Nothing is persisted
+  `drop_<field>` / `rename_<field>` (optionally `@<ladder field>=<level>`: a drop
+  learned while effort was sent holds only at that level) and
+  `refuse_<field>:<level>` (that one level is refused; step down past it, levels
+  are never assumed contiguous). Stored refusals are applied to a fixed point
+  BEFORE drops, so a conditional drop is judged against the level actually sent.
+  Older `max_` caps are ignored; a 400 whose code is one of OpenAI's value-range
+  codes (`_VALUE_ERROR_CODES`) is a bad value, never a drop — a denylist, because
+  vLLM/xAI behind LocalAdapter send their own codes. **Nothing is persisted
   until the adapted call has SUCCEEDED**: learnings are collected during the retry
   walk and written once at the end, because they used to be written before the
   retry proved them, so a call that then failed (a context-length 400 whose text
@@ -1820,30 +1866,25 @@
   LEVEL is not offered" (`unsupported_value` is what a genuinely unsupported level
   returns live; `invalid_value` is what a value outside the known vocabulary
   returns; both → step down `EFFORT_LEVELS` one rung, persisted as
-  `max_reasoning.effort:<level>` only once the call succeeds) from "this field is unsupported" (`unsupported_parameter` or None —
-  `temperature`'s code is None, so `code` alone can never recognise an unsupported
-  field). **A rejected level is never evidence that effort is unsupported, and only
-  a lower level that was ACCEPTED can prove a cap.** Live, `gpt-6.1-sol` refuses
-  level `none` with `unsupported_value` while accepting `xhigh` (its range is
-  `low`..`xhigh`; `gpt-5` and `o3` also refuse `none` but top out at `high`);
-  the walk used to persist `drop_reasoning.effort` at the bottom, after which every
-  later `xhigh` request silently ran at the provider default. A walk that reaches
-  the bottom now removes effort for THAT call (`bottom_<field>` flag) and persists
-  no effort flag at all; only `unsupported_parameter` (what `gpt-4o-mini` returns)
-  persists `drop_reasoning.effort`, and only after the retry succeeds. Known
-  limit: a model whose FLOOR is above the requested level walks to the bottom,
-  runs at the provider default for that call, and pays that discovery on every
-  such call, because nothing false is ever written to disk. That is not only the
-  single-level case (`gpt-5-pro` accepts just `high`): `gpt-5.2-pro`,
-  `gpt-5.4-pro` and `gpt-5.5-pro` accept `medium`..`xhigh`, and the selector does
-  ask for `low` on familiar queries (measured: 3 requests per such call, run at
-  `medium`). A cap also assumes levels are contiguous, which held for all 30
-  models probed; a model with a gap could learn a cap that is too low. Two more
-  accepted limits, neither reachable from Neo's own callers: every `code` other
-  than the two level codes is read as "field unsupported", so an out-of-range
-  value Neo never sends (`temperature=5`) would be remembered as a drop if the
-  retry succeeds; and support that depends on another field is recorded as
-  unconditional (`gpt-5.1`/`gpt-5.2` accept `temperature` only at effort `none`). `stop_sequences` is sent but not droppable: no provider is known to reject
+  `refuse_reasoning.effort:<level>` once the call succeeds: the REFUSED level, not a
+  cap, so levels are never assumed contiguous (#266); legacy `max_` caps from
+  older versions are still applied) from "this field is unsupported"
+  (`unsupported_parameter` or None — `temperature`'s code is None, so `code` alone
+  can never recognise an unsupported field). Any other `code` (`decimal_above_max_value`
+  …) is a VALUE error on a supported field and is never learned as a drop (#266).
+  **A rejected level is never evidence that effort is unsupported.** Live,
+  `gpt-6.1-sol` refuses level `none` with `unsupported_value` while accepting
+  `xhigh`; the walk used to persist `drop_reasoning.effort` at the bottom, after
+  which every later `xhigh` request silently ran at the provider default. A
+  refusal at the bottom rung is now `refuse_reasoning.effort:none`, which removes
+  effort only for a request AT that level. A model whose FLOOR is above the
+  request (`gpt-5.2-pro`/`gpt-5.4-pro`/`gpt-5.5-pro` accept `medium`..`xhigh`,
+  `gpt-5-pro` only `high`) therefore pays the walk once and then runs at the
+  provider default in one request (#265). A drop learned while an effort level was
+  sent is conditional on it (`drop_temperature@reasoning.effort=high`), because
+  `gpt-5.1`/`gpt-5.2` accept `temperature` only at effort `none` (#266). Stored
+  flags apply levels first to a fixed point, then renames and drops, and flags
+  naming a field the adapter does not adapt are ignored. `stop_sequences` is sent but not droppable: no provider is known to reject
   it. **`provider=openai` with a custom `base_url` now requires a server that
   implements the responses endpoint**; `provider=local` is the route for
   OpenAI-compatible servers that speak only chat completions.

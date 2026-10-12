@@ -2,6 +2,80 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Cursor plugin** (`plugins/cursor-neo/`, contributed by Joe Rinehart in [#236](https://github.com/Parslee-ai/neo/pull/236)). It provides the same six skills as the Codex plugin, invoked as `/neo`, `/neo-review` and so on in Cursor's Agent chat, plus a `neo-agent` subagent with a visible boundary, like Claude Code's Neo agent. Install it locally (`~/.cursor/plugins/local`) or import this repository as a team marketplace (`.cursor-plugin/marketplace.json`). Each Cursor skill is tested against its Codex counterpart, paragraph by paragraph, so a privacy fix to one cannot be left out of the other. The README lists what is weaker on Cursor: a skill cannot write the shell approval's description, and the subagent inherits every tool.
+
+### Fixed
+
+- **A neo run borrows the observer's embedding model instead of loading its own** ([#211](https://github.com/Parslee-ai/neo/issues/211)). The model was a run's whole memory floor, about 1.3 GB of the 1.4 GB peak. The observer now holds the one copy and serves it over a private Unix socket (`~/.neo/run/embed.sock`). Measured on a 2,209-fact store, a dry run's peak fell from 1,439 MB to 195 MB, with wall time unchanged. When the observer isn't running, a run loads the model as before, and so it does when the observer's server is stale, hung or gone. The observer itself is now about 1.3 GB larger, by design. POSIX only.
+
+- **`neo --update` works, sees new files, and says when it stopped early** ([#217](https://github.com/Parslee-ai/neo/issues/217)).
+  - **Reachable:** `--update` now implies `--index`. A bare `neo --update` used to fall through to the reasoning path and refresh nothing.
+  - **New files:** an eligible file the last full build never saw is now picked up. A copy the build skipped as a duplicate is not. New files follow the build's rules: content already catalogued is skipped, and nothing is added beyond the build's `--max-files`. The build records every path it saw in `.neo/walked.json`, so a file the cap passed over is not mistaken for a new one. A catalog built by an older version reports no new files and says to run `neo --index` once.
+  - **Deleted and ignored files:** a file deleted, or newly matched by `.gitignore`, now leaves the catalog, and the deletion is saved.
+  - **Honest report:** the refresh says how many changed, new and removed files it handled and how many chunks it actually embedded. When the time or chunk budget stops it, it says how many stale files are left. A file it cannot read or parse is named, and its previous entries are kept.
+  - **Found along the way:**
+    - A refresh never updated edges.
+    - Emptied edge and vector files were left on disk and reloaded.
+    - A semantic hit could return the wrong chunk whenever any chunk lacked an embedding.
+    - An unknown key in `.neo/index.json` (written by a newer neo) made the whole catalog unreadable. It is now ignored.
+    - Catalog paths are now stored with forward slashes on every platform, and Windows catalogs with backslash paths are read correctly.
+    - Chunks that fail to embed leave their file stale, so the next refresh retries them.
+
+- **The parameter-compatibility store no longer learns false facts about a model** ([#266](https://github.com/Parslee-ai/neo/issues/266)).
+  - **Value errors:** a rejection whose code says a value is out of range (for example `decimal_above_max_value` on `temperature=5`) is no longer remembered as "field unsupported", so a later valid value is still sent. Only OpenAI's own value-range codes are treated this way; any other code still teaches a drop, so OpenAI-compatible servers with their own codes (vLLM's integer `400`, xAI's free-text codes) keep recovering.
+  - **Effort levels:** each refused level is remembered on its own (`refuse_reasoning.effort:low`), and a request steps down only past refused levels. A model's levels are no longer assumed contiguous, so refusing `low` no longer caps a later `high` request. Caps stored by older versions (`max_…`) are now ignored; a level the model really refuses is relearned in one request. Other flags in an existing `~/.neo/model_param_compat.json` are not migrated: an unconditional `drop_temperature` learned at a high effort level still applies at every level. Delete the file to relearn from scratch.
+  - **Models with a high floor:** a model whose lowest effort level is above the request (`gpt-5.2-pro` accepts `medium` to `xhigh`) used to make 3 requests on every call asked for `low`. Its refused levels are now remembered, so the walk is paid once and later calls are a single request at the provider default ([#265](https://github.com/Parslee-ai/neo/issues/265)).
+  - **Hand-edited flags:** stored flags naming a field the adapter doesn't adapt (such as `drop_model`) are ignored.
+  - **Level-dependent drops:** a drop learned while an effort level was sent applies only at that level (`drop_temperature@reasoning.effort=high`). Some models accept `temperature` at one effort and refuse it at another. A model that refuses a field at every level pays one extra request per level, once.
+
+- **One embedding model per process** ([#211](https://github.com/Parslee-ai/neo/issues/211)). A reasoning run built the 614 MB embedding model twice: once for the history boost in file selection and again for the engine's memory, 0.3 s each. Every caller now shares one instance, which takes about 0.25 s off a run. The model is still about 1.3 GB resident; #211 tracks that.
+
+- **A one-word prompt that names a command no longer starts a paid reasoning run** ([#278](https://github.com/Parslee-ai/neo/issues/278)). `neo version` took "version" as a question, gathered repository context and called the model. A single word that exactly names a flag (`version`, `help`, `status`, `index`, `config`, `upgrade`, `init`, `stats`) or a subcommand exits with status 2 and names the command it meant. Case, leading dashes and trailing punctuation are ignored. The check runs before the update check, the observer autostart and the engine. Every other prompt runs as before, including real words that resemble a command, such as `server` or `updates`.
+- **`python -m neo` and `python -m neo.cli` now return Neo's exit status.** Both module entry points called `main()` and discarded what it returned, so under `python -m` every refusal and failure reported success, and so did the `workspace` and `lattice` subcommands whatever their result. The `neo` console script already passed it through.
+
+- **The `claude-code` provider runs plain, isolated inference** ([#260](https://github.com/Parslee-ai/neo/issues/260)).
+  - **Isolated:** `claude -p` now starts with no tools, no MCP servers, no user or project settings or hooks, and no saved session. Before, a structured-output prompt was sometimes answered with a tool call that ran a command in the working tree, used up the single turn and exited 1. Every call also ran the user's hooks and left a session transcript on disk.
+  - **Real errors:** a failure now shows the error the CLI reports on stdout (for example `error_max_turns: Reached maximum number of turns (1)`) instead of `exited with code 1:` with nothing after it. A result marked `is_error` fails even when the exit code is 0.
+  - **Timeout and pipes:** both output pipes drain together, so the child can't block on stderr. The timeout covers the whole call, not just the wait after output ends.
+  - **Stop sequences:** these now apply to this provider. The CLI has no stop option, so the response is cut at the first one, as with the other providers.
+
+### Changed
+
+- **Mod pane: clearer and more responsive** ([#280](https://github.com/Parslee-ai/neo/issues/280)).
+  - **Form placement:** the question form now comes first, so it stays in reach after a long answer.
+  - **Mode descriptions:** each mode shows a one-line description.
+  - **In-pane feedback:** a refused **Ask** or **Follow up** is reported in the pane, where the button was pressed, instead of in the transcript.
+  - **Follow up** appears only once there is a finished analysis to follow.
+  - **Elapsed time:** a running analysis shows elapsed time against the four-minute deadline, in the pane and in the band above the prompt. A finished one shows how long it took.
+  - **Evidence tab:** shows labelled rows: execution fields, validation, each check with its status, and how much memory was retrieved, included and cited. **Show reasoning**, **Show provenance details** and the new **Show raw evidence** render JSON in the host's code view instead of as one long text.
+  - **Facts about missing files:** for each `pattern: <file>` fact, `neo workspace status` reports the file when this checkout doesn't have it (`missing_file`), plus a `missing_file_count`. The Memory tab marks those facts `[missing file]` and shows the count.
+    - Paths resolve from the repository's top level, so starting in a subdirectory gives the same answer.
+    - History facts are never checked: a record of what a commit touched stays true after the files are gone.
+    - Absolute, `..` and URL-like paths are never looked at, and a path that can't be checked counts as present.
+    - No model call is made and nothing in the store changes.
+  - **Memory tab:** returning to it reuses the last store read. A finished analysis, a different working directory, or **Refresh** reads it again.
+  - **Details toggles:** opening details on one tab no longer opens them on the others, and a new run starts with details closed. Large JSON views are capped so they stay within the host's drawing limit.
+  - **Band and runs:** the band above the prompt offers Cancel only while a run can be cancelled, and keeps its status on one line. A cancel that never completes stops redrawing after ten seconds. Pressing **Ask** twice quickly can no longer start two runs.
+
+### Fixed
+
+- **Raw newlines in a model's JSON no longer fail the run** ([#259](https://github.com/Parslee-ai/neo/issues/259)). About one run in six died with `[escape_errors] … Invalid control character` when a model put a literal newline or tab inside a JSON string. `tolerant_json_load` now makes one string-aware pass, stopping at the first attempt that parses:
+  - **Inside strings:** raw newlines, carriage returns and tabs are escaped, and so is a backslash right before a raw newline.
+  - **Outside strings:** trailing commas are removed. Before, a regex did this anywhere, so code in a value such as `[1, 2,]` was rewritten.
+  - **Last resort:** curly quotes are mapped to straight ones.
+  Other control characters still fail, and the error reported is from the text as shown.
+- **The curly-quote repair works.** It had been replacing ASCII quotes with themselves.
+
+The plan's model-based repair is still not used for simulation or code-suggestion parsing. That repair shows the formatter only the first 1000 characters, so a "repaired" code suggestion could come back as a truncated or invented diff. The deterministic repairs above cover the reported failure.
+
+- **Mod pane: four interaction bugs** ([#279](https://github.com/Parslee-ai/neo/issues/279)).
+  - **Memory paging:** **Next** stops at the last page, so **Previous** responds at once. Before, it counted past the end and needed as many presses back.
+  - **Use selection:** with no selection visible to Claude Code, it keeps the context that is there and says so, instead of silently clearing it. Typing context by hand clears that notice.
+  - **Duplicate findings:** the engine voices each of the first open questions as a caution ("Still open: …"), so every one of them was shown twice. Each is now shown once, in the pane and in the text output. A question only drops when a caution states exactly it.
+  - **Context reuse:** selected context goes with one question, and a follow-up to it, instead of being re-sent unseen with the next unrelated question. A run that fails or is cancelled gives the context back for the retry. While context is attached, the pane shows "Context attached · N characters".
+
 ## [0.56.0] - 2026-10-11
 
 ### Added
