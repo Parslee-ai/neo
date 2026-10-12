@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -224,11 +225,36 @@ def scope_file_lock(path: "Path"):
             fd.close()
 
 
+#: One embedder per (model, cache dir) per process. The model is 614 MB on
+#: disk and ~1.3 GB resident once loaded, and one reasoning run used to build
+#: it twice: once for the gatherer's history boost and again for the engine's
+#: FactStore, 0.33 s each, plus the catalog's own for semantic re-rank. A
+#: failure (None) is remembered as well, so a broken install pays its init
+#: and its one cache-heal attempt once, not once per caller (#211).
+_EMBEDDERS: dict = {}
+_EMBEDDERS_LOCK = threading.Lock()
+
+
 def build_resilient_embedder(
     model_name: str = "jinaai/jina-embeddings-v2-base-code",
     cache_dir: Optional[Path] = None,
     log_prefix: str = "",
 ):
+    """The process's shared embedder for `model_name` (see `_EMBEDDERS`);
+    built by `_build_embedder` on first use."""
+    if not FASTEMBED_AVAILABLE:
+        return None
+    if cache_dir is None:
+        _env = os.environ.get("NEO_FASTEMBED_CACHE_DIR")
+        cache_dir = Path(_env) if _env else FASTEMBED_CACHE_DIR
+    key = (model_name, str(cache_dir))
+    with _EMBEDDERS_LOCK:
+        if key not in _EMBEDDERS:
+            _EMBEDDERS[key] = _build_embedder(model_name, cache_dir, log_prefix)
+        return _EMBEDDERS[key]
+
+
+def _build_embedder(model_name: str, cache_dir: Path, log_prefix: str):
     """Build a fastembed ``TextEmbedding`` pinned to a stable cache dir, healing
     a stale cache. Returns the embedder, or ``None`` if fastembed is
     unavailable or init fails after one recovery attempt.
@@ -247,11 +273,6 @@ def build_resilient_embedder(
     a process with an isolated ``$HOME`` (the test harness) can point at the
     real, already-downloaded model instead of re-fetching ~400 MB.
     """
-    if not FASTEMBED_AVAILABLE:
-        return None
-    if cache_dir is None:
-        _env = os.environ.get("NEO_FASTEMBED_CACHE_DIR")
-        cache_dir = Path(_env) if _env else FASTEMBED_CACHE_DIR
     p = f"{log_prefix}: " if log_prefix else ""
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:
