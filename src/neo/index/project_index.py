@@ -1022,11 +1022,15 @@ class ProjectIndex:
 
         result['chunks_extracted'] = len(updated_chunks)
         result['chunks_embedded'] = self._embed_chunks(updated_chunks)
-        # A file whose chunks did not embed is not fresh: an empty hash never
-        # matches, so the next refresh tries it again.
-        for chunk in updated_chunks:
-            if chunk.embedding is None:
-                hashes[chunk.file_path] = ""
+        # A file whose chunks failed to embed is not fresh: an empty hash
+        # never matches, so the next refresh tries it again. Only when a model
+        # exists; with none there is nothing a retry could change, and every
+        # refresh would rewrite the catalog for nothing.
+        result['embedding_model'] = self.embedding_model is not None
+        if result['embedding_model']:
+            for chunk in updated_chunks:
+                if chunk.embedding is None:
+                    hashes[chunk.file_path] = ""
         if dirty:
             # Deletions shift chunk positions too, so the vector index is
             # rebuilt and the catalog saved whenever anything changed, not

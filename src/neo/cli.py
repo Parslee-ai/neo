@@ -619,11 +619,16 @@ def _format_refresh_report(result: dict, index) -> list:
         lines = [f"[Neo] Updated index: {', '.join(parts)} "
                  f"file{'' if files == 1 else 's'}, "
                  f"{n(result['chunks_embedded'], 'chunk')} embedded; now {totals}"]
-    if result['chunks_embedded'] < result['chunks_extracted']:
+    missing = result['chunks_extracted'] - result['chunks_embedded']
+    if missing and result.get('embedding_model'):
         lines.append(
-            f"[Neo] Warning: {result['chunks_extracted'] - result['chunks_embedded']} "
-            "extracted chunks were not embedded (no embedding model, or embedding "
-            "failed); their files stay stale and the next refresh retries them.")
+            f"[Neo] Warning: {missing} extracted chunks failed to embed; their files "
+            "stay stale and the next refresh retries them.")
+    elif missing:
+        lines.append(
+            f"[Neo] Warning: {missing} extracted chunks were not embedded because no "
+            "embedding model is available (install fastembed), so semantic re-rank "
+            "cannot find them.")
     if result['failed']:
         shown = ", ".join(result['failed'][:5])
         more = f" and {len(result['failed']) - 5} more" if len(result['failed']) > 5 else ""

@@ -268,3 +268,16 @@ def test_chunks_that_failed_to_embed_are_retried(tmp_path):
 
     result, _ = _refresh(tmp_path)
     assert result["refreshed"] == 1 and result["chunks_embedded"] == 1
+
+
+def test_with_no_embedding_model_a_refresh_settles(tmp_path, monkeypatch):
+    import neo.index.project_index as pi
+
+    _write(tmp_path, "a.py", "def a():\n    return 1\n")
+    _build(tmp_path)
+    monkeypatch.setattr(pi, "FASTEMBED_AVAILABLE", False)
+    _write(tmp_path, "a.py", "def a():\n    return 2\n")
+    result, index = _refresh(tmp_path)
+    assert (result["refreshed"], result["chunks_embedded"]) == (1, 0)
+    assert any("install fastembed" in line for line in _format_refresh_report(result, index))
+    assert _refresh(tmp_path)[0]["refreshed"] == 0
