@@ -793,15 +793,16 @@ const subagents = new Set<string>();
 
 const NOTICE_CAP = 400;
 
-/** A row the person sees and the model never reads (`session.append` system). */
+/** A line the person sees in the conversation and the model never reads.
+ * `$.ui.log`, not a `session.append` system row: the terminal stores those as
+ * informational rows and does not draw them, so Neo spoke and nobody saw it
+ * (found in the first live session). */
 async function noticeRow($: EngineInterface, line: string) {
   if (!line.trim()) return;
   try {
-    await $.session.append({
-      message: { type: "system", content: [{ type: "text", text: line }] },
-    });
+    $.ui.log(line);
   } catch {
-    /* a refused notice costs the person a line, never the session */
+    /* a refused line costs the person a line, never the session */
   }
 }
 
@@ -892,8 +893,12 @@ async function autoNeo(
   }
 }
 
-async function autoRecall($: EngineInterface, cwd: string, prompt: string) {
-  if (recallMissing) return "";
+async function autoRecall(
+  $: EngineInterface,
+  cwd: string,
+  prompt: string,
+): Promise<{ text: string; beat: string }> {
+  if (recallMissing) return { text: "", beat: "" };
   try {
     const run = await $.process.run(
       [binary, "recall", "--cwd", cwd, "--json", "--recent-beats", spokenBeats.join(",")],
@@ -901,12 +906,12 @@ async function autoRecall($: EngineInterface, cwd: string, prompt: string) {
     );
     // An older CLI without `recall` answers with an argparse error (exit 2).
     if (run.exitCode === 2) recallMissing = true;
-    if (run.exitCode !== 0 || !run.stdout.trim()) return "";
+    if (run.exitCode !== 0 || !run.stdout.trim()) return { text: "", beat: "" };
     const result = JSON.parse(run.stdout) as Document;
     spokenBeats = rememberBeat(spokenBeats, text(result.beat_id));
-    return text(result.text).trim();
+    return { text: text(result.text).trim(), beat: text(result.beat_id) };
   } catch {
-    return "";
+    return { text: "", beat: "" };
   }
 }
 
@@ -1052,16 +1057,15 @@ function registerAuto(on: On) {
       // its notice row keeps it in the conversation.
       if (finding && ++finding.prompts > 1) finding = undefined;
       const extra = autoDrain();
-      const memory = await autoRecall($, e.cwd, e.prompt);
+      const { text: memory, beat } = await autoRecall($, e.cwd, e.prompt);
       if (memory) {
         extra.push(recallInjection(memory));
         recalled = { text: memory, expanded: false };
         // He speaks in the conversation only when a beat earned a line;
-        // otherwise the lessons wait quietly in the band.
-        const opener = memory.split("\n")[0] ?? "";
-        // Appended now it would sit above the prompt it answers: it waits for
-        // the turn's first step, after the prompt is stored.
-        if (opener.trim() !== "Neo memory:") pendingNotice = opener;
+        // otherwise the lessons wait quietly in the band. Logged now, the line
+        // would sit above the prompt it answers: it waits for the turn's
+        // first step, after the prompt is drawn.
+        if (beat) pendingNotice = memory.split("\n")[0] ?? "";
       }
       redraw($);
       return withAutoContext(result, extra);
@@ -1171,7 +1175,7 @@ function registerAuto(on: On) {
 function presence($: EngineInterface, e: RenderInput<"AbovePrompt">): RenderNode[] {
   const { Box, Text, Button, Markdown } = $.ui.resolve(e);
   const out: RenderNode[] = [];
-  const neo = Text({ children: "Neo", color: "remember" });
+  const neo = Box({ flexShrink: 0, children: [Text({ children: "Neo:", color: "remember" })] });
   for (const a of activities.values())
     out.push(
       Box({
@@ -1197,8 +1201,11 @@ function presence($: EngineInterface, e: RenderInput<"AbovePrompt">): RenderNode
         flexDirection: "row",
         gap: 1,
         children: [
-          Text({ children: opener, color: "remember" }),
-          Text({ children: subjects.join(" · "), dimColor: true, wrap: "truncate-end" }),
+          Box({ flexShrink: 0, children: [Text({ children: opener, color: "remember" })] }),
+          Box({
+            flexShrink: 1,
+            children: [Text({ children: subjects.join(" · "), dimColor: true, wrap: "truncate-end" })],
+          }),
           Button({
             key: "neo-recall-toggle",
             label: recalled.expanded ? "hide" : "lessons",

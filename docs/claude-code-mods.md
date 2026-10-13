@@ -38,10 +38,11 @@ Neo lives in the conversation, not in a panel you have to open:
   just typed (`lessons` expands them), and his latest finding in his own words
   (`d` details, with the proposed diffs; `x` dismiss). It is empty when he has
   nothing to say.
-- **A notice row** in the conversation marks each time he contributes: his
-  line when a review continued the turn, a diagnosis arrived or a plan was
-  checked, and his recall line when a beat earned one. The model never reads
-  these rows.
+- **A line in the conversation** (`$.ui.log`, drawn dim) marks each time he
+  contributes: his line when a review continued the turn, a diagnosis arrived
+  or a plan was checked, and his recall line (`Neo: …`) when a beat earned
+  one. The model never reads these lines. Not a `session.append` system row:
+  the terminal stores those as informational and does not draw them.
 - **The spinner** says `Neo is reading…` while a review or plan check holds
   the turn.
 - **What Claude reads** is separate: findings reach it in a row it reads (for a
