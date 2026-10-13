@@ -95,7 +95,7 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
 
 | When | What Neo does | Model call | How Claude gets it |
 | --- | --- | --- | --- |
-| You type a prompt | `neo recall`: up to 3 learned lessons matching it | none | context on that prompt |
+| You type a prompt | `neo recall`: up to 3 learned lessons and 2 passages from the notes your rule file points to | none | context on that prompt |
 | A turn that edited files is about to end | reviews those edits (`git diff HEAD` per path; a new or untracked file as a whole-file addition) | one, up to 90 s | the turn continues with Neo's fix, only when it carries a diff or code |
 | A test, build or lint command fails | diagnoses the failure, in the background | one | context at the next main-thread hook |
 | A plan leaves plan mode | checks the plan | one, up to 90 s | context as the work starts |
@@ -106,6 +106,14 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
   it writes nothing, and it leaves out what Claude already has (rule files,
   its own memory files, git history) along with generic seed and community
   patterns. It runs only for prompts a person typed, not machine-injected ones.
+- **Notes.** CLAUDE.md is loaded; the notes it says to read are not. Recall
+  offers the passage that matches the prompt from any markdown file or
+  directory the project's rule file names in backticks (here
+  `docs/engineering-notes/`), as `- <path> [note]: …`. The observer embeds
+  them into `~/.neo/notes/<project_id>.json` on each sweep (unchanged files
+  cost a hash); recall only reads that index, and leaves out a note edited
+  since it was embedded. Measured on this repo's last 36 typed prompts: recall
+  answered 27 (11 before notes), at 61 ms median.
 - **Reviews, diagnoses and plan checks** are real inference on Neo's configured
   provider: they send the diff, error output or plan, plus the source and
   memory Neo selects, and incur its normal cost. They are bounded by

@@ -249,3 +249,18 @@ def test_delivered_fact_ids_are_returned(tmp_path):
     result = recall("q", str(tmp_path), embed=_embed({"q": _unit(0)}))
     assert result["fact_ids"] == [lesson.id]
     assert recall("q", str(tmp_path), embed=_embed({"q": _unit(3)}))["fact_ids"] == []
+
+
+def test_a_matching_note_passage_is_offered_with_its_path(tmp_path):
+    from neo.memory.store import DEFAULT_EMBED_MODEL
+    from neo.notes import refresh_index
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "observer.md").write_text("- The drain mark gates re-parsing, not the watermark file's mtime, which moves.\n")
+    (tmp_path / "CLAUDE.md").write_text("Read `docs/observer.md` first.\n")
+    refresh_index(tmp_path, lambda text: _unit(2), DEFAULT_EMBED_MODEL)
+
+    result = recall("q", str(tmp_path), embed=_embed({"q": _unit(2)}))
+    assert "- docs/observer.md [note]: - The drain mark gates re-parsing" in result["text"]
+    assert result["fact_ids"] == []
+    assert recall("q", str(tmp_path), embed=_embed({"q": _unit(5)}))["text"] == ""

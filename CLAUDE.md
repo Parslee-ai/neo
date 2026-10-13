@@ -130,7 +130,8 @@
 - `neo hook record` never fails, stays cheap, records paths not contents.
 - The mod joins in unasked (`hooks/auto.ts`, `docs/claude-code-mods.md`):
   `neo recall` per typed prompt (no model call/load, 1 s embed deadline, writes
-  nothing, never constructs a `FactStore`); `learn`-mode review at Stop,
+  nothing, never constructs a `FactStore`; note passages come from the
+  observer-built `neo.notes` index, never from facts); `learn`-mode review at Stop,
   diagnosis of failing checks, plan check at ExitPlanMode. Cost is bounded by
   dedup, not a toggle; never re-review when `stop_hook_active`. Code calling `$`
   must live in `register.ts` (the validator rejects `$` across imports); work
