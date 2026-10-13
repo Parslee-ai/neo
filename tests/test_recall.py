@@ -44,7 +44,7 @@ def _fact(subject, *, axis=0, kind=FactKind.PATTERN, tags=(), body="Do the caref
 def test_a_matching_learned_lesson_is_returned(tmp_path):
     _seed(tmp_path, _fact("Verify unrelated hook failures", tags=["transcript-derived"]))
     text = recall("hook fails", str(tmp_path), embed=_embed({"hook fails": _unit(0)}))["text"]
-    assert text.startswith("Neo memory:")
+    assert text.startswith("Neo:")
     assert "- Verify unrelated hook failures [pattern, project]: Do the careful thing." in text
 
 
@@ -175,7 +175,7 @@ def test_the_situation_picks_the_beat(tmp_path):
                           tags=["transcript-derived"]))
     result = recall("q", str(tmp_path), embed=_embed({"q": _unit(0)}))
     assert result["beat_id"] == "recall_failure_early"
-    assert result["text"].splitlines()[0] == f"Neo memory: {_beat('recall_failure_early')['line']}"
+    assert result["text"].splitlines()[0] == f"Neo: {_beat('recall_failure_early')['line']}"
 
 
 def test_a_beat_spoken_recently_is_not_repeated(tmp_path):
@@ -195,7 +195,7 @@ def test_with_nothing_distinctive_neo_stays_quiet(tmp_path):
     mid = 0.55 * _unit(0) + np.sqrt(1 - 0.55 ** 2) * _unit(1)
     result = recall("q", str(tmp_path), embed=_embed({"q": mid}))
     assert result["beat_id"] == ""
-    assert result["text"].splitlines()[0] == "Neo memory:"
+    assert result["text"].splitlines()[0] == "Neo:"
 
 
 def test_the_beats_available_change_as_his_memory_grows(monkeypatch, tmp_path):
@@ -238,6 +238,6 @@ def test_the_json_form_reports_the_beat(tmp_path, monkeypatch, capsys):
     import json as _json
 
     monkeypatch.setattr(recall_mod, "recall",
-                        lambda p, c, recent_beats=None: {"text": "Neo memory: x", "beat_id": "b1"})
+                        lambda p, c, recent_beats=None: {"text": "Neo: x", "beat_id": "b1"})
     assert run_recall(["--json", "--recent-beats", "a,b"], stdin=io.StringIO("q")) == 0
-    assert _json.loads(capsys.readouterr().out) == {"text": "Neo memory: x", "beat_id": "b1"}
+    assert _json.loads(capsys.readouterr().out) == {"text": "Neo: x", "beat_id": "b1"}

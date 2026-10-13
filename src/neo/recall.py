@@ -198,7 +198,7 @@ def recall(prompt: str, cwd: str,
         return silent
 
     beat = _recall_beat(facts, scored_hits, recent_beats or set())
-    lines = [f"Neo memory: {beat['line']}" if beat else "Neo memory:"]
+    lines = [f"Neo: {beat['line']}" if beat else "Neo:"]
     for _, fact in scored_hits:
         body = " ".join(truncate_marked(fact.body, MAX_BODY_CHARS).split())
         lines.append(f"- {fact.subject} [{fact.kind.value}, {fact.scope.value}]: {body}")

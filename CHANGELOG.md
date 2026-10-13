@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.58.1] - 2026-10-12
+
+### Fixed
+
+- **Neo's lines in the conversation are now visible.** They were written as `session.append` system rows, which the terminal stores as informational and does not draw, so he spoke and nobody saw it. They are now drawn transcript lines (`$.ui.log`). Found in the first live session.
+- **His recall line reads `Neo: …`**, not `Neo memory: …`, in the band and the conversation.
+- **The band no longer wraps his line**: it keeps its width and the lesson names truncate instead.
+
 ## [0.58.0] - 2026-10-12
 
 ### Changed

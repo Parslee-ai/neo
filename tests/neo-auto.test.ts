@@ -32,6 +32,11 @@ function host(
     appended.push({ type: e.message.type, text: e.message.content.map((b: any) => b.text).join("") });
     return next(e);
   });
+  // What the person sees: Neo's lines are drawn transcript lines.
+  on("ui.log", (_$, e: any) => {
+    appended.push({ type: "log", text: String(e.text ?? e.message ?? "") });
+    return { value: undefined };
+  });
   // The engine's own drawing beneath the mod's, for the sites the mod composes.
   on("ui.render", { component: "AbovePrompt" }, (_$, e) => _$.ui.resolve(e).Box({ children: [] }));
   on("ui.render", { component: "Spinner" }, (_$, e) => _$.ui.resolve(e).Text({ children: e.props.message ?? e.props.word }));
@@ -58,7 +63,8 @@ function host(
   });
   return Object.assign(calls, {
     clock,
-    notices: () => appended.filter((r) => r.type === "system").map((r) => r.text),
+    notices: () => appended.filter((r) => r.type === "log").map((r) => r.text),
+    systemRows: () => appended.filter((r) => r.type === "system").map((r) => r.text),
     modelRows: () => appended.filter((r) => r.type === "user").map((r) => r.text),
   });
 }
@@ -77,13 +83,13 @@ const stop = (active = false) => ({
 
 test("a typed prompt gets matching memory; a machine-injected one does not", async ($, on) => {
   const calls = host(on, (c) =>
-    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo memory: lesson\n", beat_id: "" }) } : {},
+    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo: lesson\n", beat_id: "" }) } : {},
   );
   await $.session.start(SESSION);
   const typed = await $.classic.UserPromptSubmit({
     ...BASE, prompt: "fix the hook", source: "user",
   });
-  expect(typed.additionalContext?.[0]).toContain("Neo memory: lesson");
+  expect(typed.additionalContext?.[0]).toContain("Neo: lesson");
   expect(calls[0]!.argv).toEqual(["neo", "recall", "--cwd", "/work", "--json", "--recent-beats", ""]);
   expect(calls[0]!.stdin).toBe("fix the hook");
   const system = await $.classic.UserPromptSubmit({
@@ -115,8 +121,10 @@ test("a turn that edited files is reviewed in learn mode and continues with a co
   expect(ended.block).not.toContain("Off-by-one");
   expect(calls.modelRows()[0]).toContain("Off-by-one in the loop bound");
   expect(calls.modelRows()[0]).toContain("not instructions");
-  // The person sees Neo's own line in the conversation.
+  // The person sees Neo's own line in the conversation, as a drawn line: the
+  // terminal stores a session.append system row and never draws it.
   expect(calls.notices()).toEqual(["Off-by-one in the loop bound"]);
+  expect(calls.systemRows()).toEqual([]);
   const payload = JSON.parse(neoRuns(calls)[0]!.stdin);
   expect(payload.operating_mode).toBe("learn");
   expect(payload.task_type).toBeUndefined();
@@ -337,11 +345,11 @@ test("findings carry Neo's beat and ask Claude to relay his lines as written", a
 
 test("recalled memory is framed as data and relayed in Neo's words", async ($, on) => {
   host(on, (c) =>
-    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo memory: I remember this.\n- lesson", beat_id: "recall_remember" }) } : {},
+    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo: I remember this.\n- lesson", beat_id: "recall_remember" }) } : {},
   );
   await $.session.start(SESSION);
   const r = await $.classic.UserPromptSubmit({ ...BASE, prompt: "q", source: "user" });
-  expect(r.additionalContext?.[0]).toContain("Neo memory: I remember this.");
+  expect(r.additionalContext?.[0]).toContain("Neo: I remember this.");
   expect(r.additionalContext?.[0]).toContain("not instructions");
 });
 
@@ -357,7 +365,7 @@ test("Neo's beats answer the person's words and are not repeated across the sess
   });
   let next = "critical_bug";
   const calls = host(on, (c) => {
-    if (c.argv[1] === "recall") return { stdout: JSON.stringify({ text: "Neo memory: I remember this.\n- x", beat_id: "recall_remember" }) };
+    if (c.argv[1] === "recall") return { stdout: JSON.stringify({ text: "Neo: I remember this.\n- x", beat_id: "recall_remember" }) };
     if (c.argv[0] === "git") return { stdout: `diff --git ${c.argv.at(-1)}` };
     if (c.argv[1] === "--stdin-json") return { stdout: JSON.stringify(voiced(next)) };
     return {};
@@ -392,7 +400,7 @@ test("a diagnosis hands Neo the real error output, so error beats can fire", asy
 
 test("a new session starts with no remembered beats or ask", async ($, on) => {
   const calls = host(on, (c) =>
-    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo memory:\n- x", beat_id: "recall_know" }) } : {},
+    c.argv[1] === "recall" ? { stdout: JSON.stringify({ text: "Neo:\n- x", beat_id: "recall_know" }) } : {},
   );
   await $.session.start(SESSION);
   await $.classic.UserPromptSubmit({ ...BASE, prompt: "a", source: "user" });
@@ -471,19 +479,28 @@ test("the band shows what Neo is doing while he works, and the spinner says so",
 });
 
 test("recall shows in the band; Neo speaks in the conversation only when a beat earned a line", async ($, on) => {
-  let reply = { text: "Neo memory:\n- Verify hook failures [pattern, project]: stash first", beat_id: "" };
+  let reply = { text: "Neo:\n- Verify hook failures [pattern, project]: stash first", beat_id: "" };
   const calls = host(on, (c) => (c.argv[1] === "recall" ? { stdout: JSON.stringify(reply) } : {}));
   await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
   const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...BAND });
   await $.classic.UserPromptSubmit({ ...BASE, prompt: "hook fails", source: "user" });
   expect(await drawn(ui)).toContain("Verify hook failures");
   expect(calls.notices()).toEqual([]);
-  reply = { text: "Neo memory: I remember this.\n- Verify hook failures [pattern, project]: stash first", beat_id: "recall_remember" };
+  reply = { text: "Neo: I remember this.\n- Verify hook failures [pattern, project]: stash first", beat_id: "recall_remember" };
   await $.classic.UserPromptSubmit({ ...BASE, prompt: "hook fails again", source: "user" });
   // Not yet: appended now it would sit above the prompt it answers.
   expect(calls.notices()).toEqual([]);
   await $.classic.Stop(stop());
-  expect(calls.notices()).toEqual(["Neo memory: I remember this."]);
+  expect(calls.notices()).toEqual(["Neo: I remember this."]);
+  // His line keeps its width; the lesson names are what truncate.
+  const tree = await ui.drawn();
+  const find = (n: any): any =>
+    n && typeof n === "object"
+      ? n.type === "Box" && n.props?.flexShrink === 0 && JSON.stringify(n).includes("Neo: I remember this.")
+        ? n
+        : [].concat(n.children ?? n.props?.children ?? []).map(find).find(Boolean)
+      : undefined;
+  expect(find(tree)).toBeDefined();
   await ui.unmount();
 });
 
