@@ -47,6 +47,7 @@ function host(
   on("classic.PostToolUse", () => ({}));
   on("classic.PostToolUseFailure", () => ({}));
   on("classic.Stop", () => ({}));
+  on("session.end", (_$, e) => ({ sessionId: e.sessionId }));
   on("process.run", async (_$, e) => {
     const call = { argv: [...e.argv], stdin: e.init?.stdin ?? "" };
     if (call.argv[1] !== "hook") calls.push(call);
@@ -479,6 +480,57 @@ test("recall shows in the band; Neo speaks in the conversation only when a beat 
   expect(calls.notices()).toEqual([]);
   reply = { text: "Neo memory: I remember this.\n- Verify hook failures [pattern, project]: stash first", beat_id: "recall_remember" };
   await $.classic.UserPromptSubmit({ ...BASE, prompt: "hook fails again", source: "user" });
+  // Not yet: appended now it would sit above the prompt it answers.
+  expect(calls.notices()).toEqual([]);
+  await $.classic.Stop(stop());
   expect(calls.notices()).toEqual(["Neo memory: I remember this."]);
   await ui.unmount();
+});
+
+test("a finding gives way in the band after the next prompt; its notice row stays", async ($, on) => {
+  const calls = host(on, (c) =>
+    c.argv[0] === "git" ? { stdout: "diff --git a/a.py" } : c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {},
+  );
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...BAND });
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  await $.classic.Stop(stop());
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "ok, fix it", source: "user" });
+  expect(await drawn(ui)).toContain("Off-by-one");
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "something else", source: "user" });
+  expect(await drawn(ui)).not.toContain("Off-by-one");
+  expect(calls.notices()).toEqual(["Off-by-one in the loop bound"]);
+  await ui.unmount();
+});
+
+test("ending the session drops a diagnosis that has not started yet", async ($, on) => {
+  const calls = host(on, (c) => (c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {}));
+  await $.session.start(SESSION);
+  await $.classic.PostToolUseFailure(failure("pytest"));
+  await $.session.end({ sessionId: "session1", reason: "clear" } as any);
+  await calls.clock.advance(1);
+  await calls.clock.settle();
+  expect(neoRuns(calls).length).toBe(0);
+});
+
+test("a subagent's spinner keeps its own words", async ($, on) => {
+  let spinner = "";
+  host(on, async (c) => {
+    if (c.argv[0] === "git") return { stdout: "diff --git a/a.py" };
+    if (c.argv[1] !== "--stdin-json") return {};
+    const spin = await $.ui.mount({
+      plugin: "neo",
+      surface: "terminal",
+      component: "Spinner",
+      requestId: "agent-7",
+      props: { word: "Sauteing", message: null, suffix: "…", mode: "requesting" },
+    } as any);
+    spinner = await drawn(spin);
+    await spin.unmount();
+    return { stdout: JSON.stringify(PROSE) };
+  });
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  await $.classic.PostToolUse({ ...edit("/work/a.py"), agent_id: "agent-7" } as any);
+  await $.classic.Stop(stop());
+  expect(spinner).not.toContain("Neo is");
 });

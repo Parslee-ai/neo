@@ -80,6 +80,7 @@ export function hasFindings(result: Document): boolean {
 }
 
 const LABELS = {
+  answer: "answer to a question the user asked him directly",
   review: "review of the edits in this turn",
   debug: "diagnosis of a failing command",
   architect: "check of the plan",
@@ -216,7 +217,7 @@ export function findingMarkdown(result: Document): string {
 
 /** What Neo is doing right now, for the band and the spinner. */
 export function activityLabel(kind: AutoKind, subject = ""): string {
-  return kind === "review"
+  return kind === "review" || kind === "answer"
     ? "reading this turn's changes"
     : kind === "debug"
       ? `looking at the failing ${subject || "check"}`
@@ -226,7 +227,7 @@ export function activityLabel(kind: AutoKind, subject = ""): string {
 /** The short reason a review continues a finishing turn with, once the
  * findings themselves are in a row Claude reads. */
 export const REVIEW_CONTINUE =
-  "Neo reviewed this turn's changes and proposed a fix; his findings are in the message just before this one. Address what holds up, or say briefly why not, then finish.";
+  "Neo reviewed this turn's changes and proposed a fix; his findings are in the latest message from Neo above. Address what holds up, or say briefly why not, then finish.";
 
 export function elapsed(ms: number): string {
   const seconds = Math.max(0, Math.floor(ms / 1000));
