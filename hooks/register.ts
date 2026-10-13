@@ -1065,7 +1065,9 @@ function registerAuto(on: On) {
         // otherwise the lessons wait quietly in the band. Logged now, the line
         // would sit above the prompt it answers: it waits for the turn's
         // first step, after the prompt is drawn.
-        if (beat) pendingNotice = memory.split("\n")[0] ?? "";
+        // The host already prefixes a logged line with the plugin's name
+        // ("neo: …"), so his own "Neo:" would read twice.
+        if (beat) pendingNotice = (memory.split("\n")[0] ?? "").replace(/^Neo:\s*/, "");
       }
       redraw($);
       return withAutoContext(result, extra);

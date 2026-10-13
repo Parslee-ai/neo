@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.58.2] - 2026-10-12
+
+### Fixed
+
+- **Neo's recall line no longer reads "neo: Neo: …".** Claude Code prefixes a plugin's logged line with the plugin's name, so his own `Neo:` was doubled. The logged line drops it; the band keeps it.
+
 ## [0.58.1] - 2026-10-12
 
 ### Fixed

@@ -491,7 +491,8 @@ test("recall shows in the band; Neo speaks in the conversation only when a beat 
   // Not yet: appended now it would sit above the prompt it answers.
   expect(calls.notices()).toEqual([]);
   await $.classic.Stop(stop());
-  expect(calls.notices()).toEqual(["Neo: I remember this."]);
+  // Logged lines arrive prefixed with the plugin's name, so not "neo: Neo: …".
+  expect(calls.notices()).toEqual(["I remember this."]);
   // His line keeps its width; the lesson names are what truncate.
   const tree = await ui.drawn();
   const find = (n: any): any =>
