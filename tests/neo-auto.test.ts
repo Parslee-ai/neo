@@ -526,6 +526,14 @@ test("the band shows what Neo is doing while he works, and the spinner says so",
   expect(spinner).toContain("Neo is reading this turn's changes");
 });
 
+test("with nothing to say, the band still shows he is there", async ($, on) => {
+  host(on);
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...BAND });
+  expect(await drawn(ui)).toContain("listening");
+  await ui.unmount();
+});
+
 test("recall shows in the band; Neo speaks in the conversation only when a beat earned a line", async ($, on) => {
   let reply = { text: "Neo:\n- Verify hook failures [pattern, project]: stash first", beat_id: "" };
   const calls = host(on, (c) => (c.argv[1] === "recall" ? { stdout: JSON.stringify(reply) } : {}));

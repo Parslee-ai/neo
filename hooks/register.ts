@@ -1190,8 +1190,8 @@ function registerAuto(on: On) {
 }
 
 /** Neo's rows in the band above the prompt: what he is doing, what he
- * remembered for this prompt, and his latest finding. Empty when he has
- * nothing to say, which is most of the time. */
+ * remembered for this prompt, and his latest finding; a dim "listening" line
+ * when he has nothing to say, which is most of the time. */
 function presence($: EngineInterface, e: RenderInput<"AbovePrompt">): RenderNode[] {
   const { Box, Text, Button, Markdown } = $.ui.resolve(e);
   const out: RenderNode[] = [];
@@ -1256,6 +1256,23 @@ function presence($: EngineInterface, e: RenderInput<"AbovePrompt">): RenderNode
     );
     if (finding.expanded) out.push(Markdown({ text: findingMarkdown(finding.result) }));
   }
+  // With nothing to say he is still there: one dim line, so a quiet Neo is
+  // not mistaken for a missing one.
+  if (!out.length)
+    out.push(
+      Box({
+        flexDirection: "row",
+        gap: 1,
+        children: [
+          Box({ flexShrink: 0, children: [Text({ children: "Neo:", dimColor: true })] }),
+          Text({
+            children: recallMissing ? "this CLI has no recall; update neo" : "listening",
+            dimColor: true,
+            wrap: "truncate-end",
+          }),
+        ],
+      }),
+    );
   return out;
 }
 

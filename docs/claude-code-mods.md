@@ -36,8 +36,9 @@ Neo lives in the conversation, not in a panel you have to open:
 - **The band above the prompt** shows what he is doing while he works
   (`reading this turn's changes · 0:12`), what he remembered for the prompt you
   just typed (`lessons` expands them), and his latest finding in his own words
-  (`d` details, with the proposed diffs; `x` dismiss). It is empty when he has
-  nothing to say.
+  (`d` details, with the proposed diffs; `x` dismiss). When he has nothing to
+  say it shows one dim line, `Neo: listening`, so a quiet Neo is not mistaken
+  for a missing one.
 - **A line in the conversation** (`$.ui.log`, drawn dim) marks each time he
   contributes: his line when a review continued the turn, a diagnosis arrived
   or a plan was checked, and his recall line (`Neo: …`) when a beat earned
