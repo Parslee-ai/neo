@@ -39,9 +39,11 @@ MAX_NOTE_BYTES = 512 * 1024
 CHUNK_CHARS = 1200
 MIN_CHUNK_CHARS = 40
 # Bumped when the index layout changes; an index of another version is rebuilt.
-INDEX_VERSION = 2
+INDEX_VERSION = 4
 
 _BACKTICK = re.compile(r"`([^`\s]+)`")
+_FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
+_TITLE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -56,7 +58,8 @@ def note_files(root: Path) -> list[Path]:
             text = (root / name).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        for token in _BACKTICK.findall(text):
+        # A path in a fenced example is an example, not a pointer.
+        for token in _BACKTICK.findall(_FENCE.sub("", text)):
             if "/" not in token and not token.endswith(".md"):
                 continue
             try:
@@ -67,8 +70,13 @@ def note_files(root: Path) -> list[Path]:
                 continue
             candidates = sorted(target.glob("*.md")) if target.is_dir() else [target]
             for path in candidates:
-                if (path.suffix == ".md" and path.is_file() and path not in rules
-                        and path not in found):
+                # A file in a named directory may itself be a symlink out.
+                try:
+                    path = path.resolve()
+                except (OSError, RuntimeError):  # a symlink loop, say
+                    continue
+                if (root in path.parents and path.suffix == ".md" and path.is_file()
+                        and path not in rules and path not in found):
                     found.append(path)
     return found[:MAX_NOTE_FILES]
 
@@ -110,7 +118,18 @@ def index_path(root: Path) -> Optional[Path]:
     from neo.memory.scope import detect_org_and_project
 
     _, project_id = detect_org_and_project(str(root))
-    return NOTES_DIR / f"{project_id}.json" if project_id else None
+    if not project_id:
+        return None
+    # Per checkout, not per project: two clones of one remote share a
+    # project_id, and the observer sweeps both, so one file would be rebuilt
+    # by each in turn and never match either.
+    checkout = _sha(str(root).encode())[:12]
+    return NOTES_DIR / f"{project_id}-{checkout}.json"
+
+
+def _stamp(path: Path) -> list:
+    stat = path.stat()
+    return [stat.st_size, stat.st_mtime_ns]
 
 
 def refresh_index(root: Path, embed: Callable[[str], object], model: str) -> int:
@@ -133,29 +152,41 @@ def refresh_index(root: Path, embed: Callable[[str], object], model: str) -> int
     old_files = previous.get("files") or {}
     old_chunks = previous.get("chunks") or []
 
-    files: dict[str, str] = {}
+    files: dict[str, dict] = {}
     chunks: list[dict] = []
-    embedded = 0
+    embedded = failed = 0
     for path in note_files(root):
         try:
-            data = path.read_bytes()[:MAX_NOTE_BYTES]
+            data = path.read_bytes()
+            stamp = _stamp(path)
         except OSError:
             continue
         rel = str(path.relative_to(root))
-        files[rel] = _sha(data)
-        if old_files.get(rel) == files[rel]:
+        if len(data) > MAX_NOTE_BYTES:
+            logger.info(f"notes: indexing the first {MAX_NOTE_BYTES} of {len(data)} bytes of {rel}")
+            data = data[:MAX_NOTE_BYTES]
+        files[rel] = {"sha": _sha(data), "stamp": stamp}
+        if (old_files.get(rel) or {}).get("sha") == files[rel]["sha"]:
             chunks.extend(c for c in old_chunks if c.get("file") == rel)
             continue
-        for passage in chunk_note(data.decode("utf-8", errors="replace")):
-            vector = embed(f"{rel}: {passage}")
+        text = data.decode("utf-8", errors="replace")
+        # The note's title names the subsystem its bullets never repeat.
+        title = (_TITLE.search(text) or [None, ""])[1].strip()
+        for passage in chunk_note(text):
+            vector = embed(f"{rel} ({title}): {passage}" if title else f"{rel}: {passage}")
             if vector is None:
-                return 0  # no embedder: keep the old index rather than a partial one
+                # One passage the embedder cannot take is skipped; it must
+                # not stop every later edit from being indexed.
+                failed += 1
+                continue
             # base64 float32: recall reads this file on every prompt, and as
             # JSON numbers it was 4x larger (3.8 MB for this repo's notes).
             raw = np.asarray(vector, dtype=np.float32).tobytes()
             chunks.append({"file": rel, "text": passage,
                            "embedding": base64.b64encode(raw).decode("ascii")})
             embedded += 1
+    if failed and not embedded:
+        return 0  # no embedder at all: keep the old index, not an empty one
     if previous and files == old_files and not embedded:
         return 0
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -176,11 +207,17 @@ def load_index(root: Path, model: str) -> list[tuple[str, str, object]]:
     if index.get("model") != model or index.get("version") != INDEX_VERSION:
         return []
     current: set[str] = set()
-    for rel, sha in (index.get("files") or {}).items():
+    for rel, seen in (index.get("files") or {}).items():
         try:
-            if _sha((root / rel).read_bytes()[:MAX_NOTE_BYTES]) == sha:
+            path = (root / rel).resolve()
+            if root not in path.parents:
+                continue
+            # Same size and mtime as embedded: unchanged, without hashing
+            # (this runs on every prompt). Otherwise the content decides.
+            if (seen.get("stamp") == _stamp(path)
+                    or _sha(path.read_bytes()[:MAX_NOTE_BYTES]) == seen.get("sha")):
                 current.add(rel)
-        except OSError:
+        except (OSError, AttributeError):
             continue
     import numpy as np
 
