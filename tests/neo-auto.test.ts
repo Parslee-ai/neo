@@ -19,8 +19,22 @@ const FIX = {
 const PROSE = { ...FIX, code_suggestions: [{ file_path: "a.py", description: "consider" }] };
 
 type Call = { argv: string[]; stdin: string };
-function host(on: On, answer: (call: Call) => { exitCode?: number; stdout?: string } = () => ({})) {
+type Row = { type: string; text: string };
+function host(
+  on: On,
+  answer: (call: Call) => { exitCode?: number; stdout?: string } | Promise<{ exitCode?: number; stdout?: string }> = () => ({}),
+  refuseRows = false,
+) {
   const calls: Call[] = [];
+  const appended: Row[] = [];
+  on("session.append", async (_$, e: any, next: any) => {
+    if (refuseRows) return { deny: "refused in test" };
+    appended.push({ type: e.message.type, text: e.message.content.map((b: any) => b.text).join("") });
+    return next(e);
+  });
+  // The engine's own drawing beneath the mod's, for the sites the mod composes.
+  on("ui.render", { component: "AbovePrompt" }, (_$, e) => _$.ui.resolve(e).Box({ children: [] }));
+  on("ui.render", { component: "Spinner" }, (_$, e) => _$.ui.resolve(e).Text({ children: e.props.message ?? e.props.word }));
   const clock = mock.clock(on);
   on("session.id", () => ({ value: "session1" }));
   on("session.cwd", () => ({ value: "/work" }));
@@ -33,15 +47,20 @@ function host(on: On, answer: (call: Call) => { exitCode?: number; stdout?: stri
   on("classic.PostToolUse", () => ({}));
   on("classic.PostToolUseFailure", () => ({}));
   on("classic.Stop", () => ({}));
-  on("process.run", (_$, e) => {
+  on("session.end", (_$, e) => ({ sessionId: e.sessionId }));
+  on("process.run", async (_$, e) => {
     const call = { argv: [...e.argv], stdin: e.init?.stdin ?? "" };
     if (call.argv[1] !== "hook") calls.push(call);
-    const { exitCode = 0, stdout = "" } = answer(call);
+    const { exitCode = 0, stdout = "" } = await answer(call);
     return {
       value: { exitCode, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false },
     };
   });
-  return Object.assign(calls, { clock });
+  return Object.assign(calls, {
+    clock,
+    notices: () => appended.filter((r) => r.type === "system").map((r) => r.text),
+    modelRows: () => appended.filter((r) => r.type === "user").map((r) => r.text),
+  });
 }
 const neoRuns = (calls: Call[]) => calls.filter((c) => c.argv[1] === "--stdin-json");
 const edit = (path: string) => ({
@@ -91,8 +110,13 @@ test("a turn that edited files is reviewed in learn mode and continues with a co
   await $.session.start(SESSION);
   await $.classic.PostToolUse(edit("/work/a.py"));
   const ended = await $.classic.Stop(stop());
-  expect(ended.block).toContain("Off-by-one in the loop bound");
-  expect(ended.block).toContain("not instructions");
+  // Claude gets the findings in a row it reads; the Stop message stays short.
+  expect(ended.block).toContain("Neo reviewed this turn's changes");
+  expect(ended.block).not.toContain("Off-by-one");
+  expect(calls.modelRows()[0]).toContain("Off-by-one in the loop bound");
+  expect(calls.modelRows()[0]).toContain("not instructions");
+  // The person sees Neo's own line in the conversation.
+  expect(calls.notices()).toEqual(["Off-by-one in the loop bound"]);
   const payload = JSON.parse(neoRuns(calls)[0]!.stdin);
   expect(payload.operating_mode).toBe("learn");
   expect(payload.task_type).toBeUndefined();
@@ -127,7 +151,8 @@ test("a continued turn ends without a review; its edits are reviewed at the next
   expect(neoRuns(calls).length).toBe(0);
   // A typed prompt in between does not forget them.
   await $.classic.UserPromptSubmit({ ...BASE, prompt: "next", source: "user" });
-  expect((await $.classic.Stop(stop())).block).toContain("Off-by-one");
+  expect((await $.classic.Stop(stop())).block).toContain("Neo reviewed this turn's changes");
+  expect(calls.modelRows()[0]).toContain("Off-by-one");
   expect(neoRuns(calls).length).toBe(1);
 });
 
@@ -296,12 +321,14 @@ test("an edit that leaves the file as HEAD has it is not reviewed", async ($, on
 
 test("findings carry Neo's beat and ask Claude to relay his lines as written", async ($, on) => {
   const voiced = { ...FIX, orchestrator: { summary: "I read it. I'd change 1 thing(s) in a.py.", personality: "I've seen this shape before.", cautions: [] } };
-  host(on, (c) =>
+  const calls = host(on, (c) =>
     c.argv[0] === "git" ? { stdout: "diff --git a/a.py" } : c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(voiced) } : {},
   );
   await $.session.start(SESSION);
   await $.classic.PostToolUse(edit("/work/a.py"));
-  const block = (await $.classic.Stop(stop())).block!;
+  await $.classic.Stop(stop());
+  const block = calls.modelRows()[0]!;
+  expect(calls.notices()).toEqual(["I read it. I'd change 1 thing(s) in a.py. I've seen this shape before."]);
   expect(block).toContain("Neo: I read it. I'd change 1 thing(s) in a.py.");
   expect(block).toContain("I've seen this shape before.");
   expect(block).toContain("quote his lines as written");
@@ -372,4 +399,138 @@ test("a new session starts with no remembered beats or ask", async ($, on) => {
   await $.session.start(SESSION);
   await $.classic.UserPromptSubmit({ ...BASE, prompt: "b", source: "user" });
   expect(calls.filter((c) => c.argv[1] === "recall")[1]!.argv.at(-1)).toBe("");
+});
+
+const BAND = {
+  component: "AbovePrompt",
+  requestId: "band",
+  props: {
+    hasSurvey: false,
+    isWorking: false,
+    maxRows: 20,
+    bodyColumns: 100,
+    scroll: { offset: 0, bodyRows: 20, contentRows: 20 },
+    view: {},
+  },
+} as const;
+const drawn = async (ui: any) => JSON.stringify(await ui.drawn());
+
+test("if Claude's row is refused, the findings ride in the Stop message instead", async ($, on) => {
+  host(
+    on,
+    (c) => (c.argv[0] === "git" ? { stdout: "diff --git a/a.py" } : c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {}),
+    true,
+  );
+  await $.session.start(SESSION);
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  expect((await $.classic.Stop(stop())).block).toContain("Off-by-one in the loop bound");
+});
+
+test("the band shows Neo's latest finding, opens its details, and dismisses it", async ($, on) => {
+  host(on, (c) =>
+    c.argv[0] === "git" ? { stdout: "diff --git a/a.py" } : c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {},
+  );
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...BAND });
+  expect(await drawn(ui)).not.toContain("Off-by-one");
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  await $.classic.Stop(stop());
+  expect(await drawn(ui)).toContain("Off-by-one in the loop bound");
+  expect(await drawn(ui)).not.toContain("-<=");
+  await ui.press({ key: "neo-finding-toggle" });
+  expect(await drawn(ui)).toContain("-<=");
+  await ui.press({ key: "neo-finding-dismiss" });
+  expect(await drawn(ui)).not.toContain("Off-by-one");
+  await ui.unmount();
+});
+
+test("the band shows what Neo is doing while he works, and the spinner says so", async ($, on) => {
+  let during = "", spinner = "";
+  host(on, async (c) => {
+    if (c.argv[0] === "git") return { stdout: "diff --git a/a.py" };
+    if (c.argv[1] !== "--stdin-json") return {};
+    const band = await $.ui.mount({ plugin: "neo", surface: "terminal", ...BAND });
+    during = await drawn(band);
+    await band.unmount();
+    const spin = await $.ui.mount({
+      plugin: "neo",
+      surface: "terminal",
+      component: "Spinner",
+      requestId: "main",
+      props: { word: "Sauteing", message: null, suffix: "…", mode: "requesting" },
+    } as any);
+    spinner = await drawn(spin);
+    await spin.unmount();
+    return { stdout: JSON.stringify(PROSE) };
+  });
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  await $.classic.Stop(stop());
+  expect(during).toContain("reading this turn's changes");
+  expect(spinner).toContain("Neo is reading this turn's changes");
+});
+
+test("recall shows in the band; Neo speaks in the conversation only when a beat earned a line", async ($, on) => {
+  let reply = { text: "Neo memory:\n- Verify hook failures [pattern, project]: stash first", beat_id: "" };
+  const calls = host(on, (c) => (c.argv[1] === "recall" ? { stdout: JSON.stringify(reply) } : {}));
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...BAND });
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "hook fails", source: "user" });
+  expect(await drawn(ui)).toContain("Verify hook failures");
+  expect(calls.notices()).toEqual([]);
+  reply = { text: "Neo memory: I remember this.\n- Verify hook failures [pattern, project]: stash first", beat_id: "recall_remember" };
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "hook fails again", source: "user" });
+  // Not yet: appended now it would sit above the prompt it answers.
+  expect(calls.notices()).toEqual([]);
+  await $.classic.Stop(stop());
+  expect(calls.notices()).toEqual(["Neo memory: I remember this."]);
+  await ui.unmount();
+});
+
+test("a finding gives way in the band after the next prompt; its notice row stays", async ($, on) => {
+  const calls = host(on, (c) =>
+    c.argv[0] === "git" ? { stdout: "diff --git a/a.py" } : c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {},
+  );
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...BAND });
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  await $.classic.Stop(stop());
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "ok, fix it", source: "user" });
+  expect(await drawn(ui)).toContain("Off-by-one");
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "something else", source: "user" });
+  expect(await drawn(ui)).not.toContain("Off-by-one");
+  expect(calls.notices()).toEqual(["Off-by-one in the loop bound"]);
+  await ui.unmount();
+});
+
+test("ending the session drops a diagnosis that has not started yet", async ($, on) => {
+  const calls = host(on, (c) => (c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {}));
+  await $.session.start(SESSION);
+  await $.classic.PostToolUseFailure(failure("pytest"));
+  await $.session.end({ sessionId: "session1", reason: "clear" } as any);
+  await calls.clock.advance(1);
+  await calls.clock.settle();
+  expect(neoRuns(calls).length).toBe(0);
+});
+
+test("a subagent's spinner keeps its own words", async ($, on) => {
+  let spinner = "";
+  host(on, async (c) => {
+    if (c.argv[0] === "git") return { stdout: "diff --git a/a.py" };
+    if (c.argv[1] !== "--stdin-json") return {};
+    const spin = await $.ui.mount({
+      plugin: "neo",
+      surface: "terminal",
+      component: "Spinner",
+      requestId: "agent-7",
+      props: { word: "Sauteing", message: null, suffix: "…", mode: "requesting" },
+    } as any);
+    spinner = await drawn(spin);
+    await spin.unmount();
+    return { stdout: JSON.stringify(PROSE) };
+  });
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  await $.classic.PostToolUse({ ...edit("/work/a.py"), agent_id: "agent-7" } as any);
+  await $.classic.Stop(stop());
+  expect(spinner).not.toContain("Neo is");
 });

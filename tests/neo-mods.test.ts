@@ -24,10 +24,15 @@ function host(on: On, log: (text: string) => void = () => {}) {
     log(String(e?.text ?? e?.message ?? JSON.stringify(e)));
     return { value: undefined };
   });
-  on("ui.open", () => ({ value: { isPlaced: true } }));
+  on("ui.open", () => {
+    opens++;
+    return { value: { isPlaced: true } };
+  });
   return clock;
 }
 const SESSION = { cwd: "/work", surface: null, isInteractive: false } as const;
+/** Panes opened in this test: Neo must not open one unasked. */
+let opens = 0;
 const RESULT = {
   orchestrator: {
     summary: "Found an edge case",
@@ -338,7 +343,8 @@ test("provenance opens above the fact list with details on demand", async ($, on
     isInteractive: true,
   });
   const answer = await $.command.run(command("neo-explain", "f"));
-  expect(answer.text).toBe("Neo: provenance opened in Memory.");
+  expect(answer.text).toContain("**Selected fact**");
+  expect(answer.text).toContain("Full fact body");
   const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
   const compact = JSON.stringify(await ui.drawn());
   expect(
@@ -721,4 +727,92 @@ test("facts about files not in this checkout are marked in Memory", async ($, on
   expect(drawn).toContain("[missing file] pattern: src/old.py");
   expect(drawn).not.toContain("[missing file] pattern: src/new.py");
   await ui.unmount();
+});
+
+test("an asked run draws live in its command row, and Claude reads the answer at the next hook", async ($, on) => {
+  const clock = host(on);
+  statusHost(on, 0);
+  const appended: any[] = [];
+  on("session.append", async (_$, e: any, next: any) => {
+    appended.push(e.message);
+    return next(e);
+  });
+  on("ui.render", { component: "CommandOutput" }, (_$, e) => _$.ui.resolve(e).Text({ children: e.props.text }));
+  on("classic.UserPromptSubmit", () => ({}));
+  on("process.spawn", async function* () {
+    yield { stream: "stderr", text: '{"type":"completed","message":"Done"}\n' };
+    yield { stream: "stdout", text: JSON.stringify(RESULT) };
+    return { value: { code: 0, signal: null } };
+  });
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const answer = await $.command.run(command("neo-ask", "why?"));
+  expect(answer.text).toMatch(/^Asked Neo \[[0-9a-f]{8}\]\.$/);
+  const card = await $.ui.mount({
+    plugin: "neo",
+    surface: "terminal",
+    component: "CommandOutput",
+    requestId: "row1",
+    props: { command: "neo-ask", args: "why?", text: answer.text },
+  } as any);
+  await clock.settle();
+  const shown = JSON.stringify(await card.drawn());
+  expect(shown).toContain("Found an edge case");
+  expect(shown).toContain("Return early for empty input");
+  await card.unmount();
+  // Never appended mid-turn: it rides the next hook that can carry context.
+  expect(appended.filter((m) => m.type === "user")).toEqual([]);
+  const next = await $.classic.UserPromptSubmit({
+    session_id: "session1", transcript_path: "/t", cwd: "/work", prompt: "thanks", source: "user",
+  } as any);
+  expect(next.additionalContext?.join("\n")).toContain("Found an edge case");
+});
+
+test("a side-pane ask is not shared with Claude unasked", async ($, on) => {
+  const clock = host(on);
+  statusHost(on, 0);
+  on("classic.UserPromptSubmit", () => ({}));
+  on("process.spawn", async function* () {
+    yield { stream: "stderr", text: '{"type":"completed","message":"Done"}\n' };
+    yield { stream: "stdout", text: JSON.stringify(RESULT) };
+    return { value: { code: 0, signal: null } };
+  });
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const ui = await $.ui.mount({ plugin: "neo", surface: "terminal", ...PANE });
+  await ui.input({ key: "neo-question", text: "why?" });
+  await ui.press({ key: "neo-run" });
+  await clock.settle();
+  await ui.unmount();
+  const next = await $.classic.UserPromptSubmit({
+    session_id: "session1", transcript_path: "/t", cwd: "/work", prompt: "thanks", source: "user",
+  } as any);
+  expect((next.additionalContext ?? []).join("")).not.toContain("Found an edge case");
+});
+
+test("the workspace is a card in the conversation, not an unasked pane", async ($, on) => {
+  host(on);
+  on("ui.render", { component: "CommandOutput" }, (_$, e) => _$.ui.resolve(e).Text({ children: e.props.text }));
+  opens = 0;
+  on("process.run", () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({ schema_version: 1, fact_count: 2, probation_count: 1, facts: [{ id: "a", subject: "Verify hook failures", is_valid: true }] }),
+      stderr: "",
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }));
+  await $.session.start({ ...SESSION, surface: "terminal", isInteractive: true });
+  const answer = await $.command.run(command("neo-workspace"));
+  expect(opens).toBe(0);
+  const card = await $.ui.mount({
+    plugin: "neo",
+    surface: "terminal",
+    component: "CommandOutput",
+    requestId: "row2",
+    props: { command: "neo-workspace", args: "", text: answer.text },
+  } as any);
+  expect(JSON.stringify(await card.drawn())).toContain("Verify hook failures");
+  await card.press({ key: "neo-open-panel" });
+  expect(opens).toBe(1);
+  await card.unmount();
 });

@@ -24,6 +24,11 @@ import {
 import type { Document } from "./protocol.js";
 import {
   AUTO_DEADLINE,
+  REVIEW_CONTINUE,
+  activityLabel,
+  elapsed,
+  findingMarkdown,
+  voiceLine,
   EDIT_TOOLS,
   MAX_DIAGNOSES,
   RECALL_TIMEOUT,
@@ -39,6 +44,7 @@ import {
   recallInjection,
   reviewPrompt,
 } from "./auto.js";
+import type { AutoKind } from "./auto.js";
 
 const PANE = "neo-workspace";
 const DEADLINE = 240000;
@@ -85,11 +91,16 @@ type Run = {
   ticker?: Timer;
   /** The session generation the run started in; a later one owns the pane. */
   generation: number;
+  /** Asked by a command typed in the conversation, not from the side pane. */
+  fromCommand?: boolean;
   started: number;
   elapsed?: number;
   stopped?: string;
 };
 let current: Run | undefined, previous: Run | undefined;
+/** Asked runs by the short id their command row carries, so the row can draw
+ * the run live in the conversation. */
+const askedRuns = new Map<string, Run>();
 let context = "",
   question = "",
   mode = "reason",
@@ -282,6 +293,12 @@ async function consume($: EngineInterface, run: Run, payload: Document) {
     // A finished analysis may have written memory: the next Memory visit reads
     // the store again.
     if (ownsPane && run.result) snapshot = {};
+    // Asked in the conversation and run in the background, the answer reached
+    // the person in its card; Claude gets it at the next hook that can carry
+    // context, never as a row appended mid-turn (which could land between a
+    // tool call and its result). A side-pane ask stays the person's to share.
+    if (ownsPane && run.result && run.fromCommand && interactive && drawable)
+      pending.push(injection("answer", run.result));
     await record($, "event", {
       event: "neo_finished",
       session_id: run.session,
@@ -298,6 +315,7 @@ async function start(
   prompt: string,
   selectedMode = mode,
   followup = false,
+  fromCommand = false,
 ) {
   if (
     starting ||
@@ -333,12 +351,15 @@ async function start(
     mode: selectedMode,
     context: sentContext,
     generation,
+    fromCommand,
     parser: new NeoStream(),
     started: await $.clock.now(),
   };
   nowMs = run.started;
   details = false;
   current = run;
+  askedRuns.set(id.slice(0, 8), run);
+  if (askedRuns.size > 20) askedRuns.delete(askedRuns.keys().next().value!);
   question = prompt;
   mode = selectedMode;
   lastInvocation = id;
@@ -379,11 +400,11 @@ async function start(
   const work = consume($, run, payload);
   if (!interactive || !drawable) await work;
   else void work.catch(() => {}); // The host may unload while cleanup is pending.
-  return !drawable && run.result
+  return (!interactive || !drawable) && run.result
     ? resultText(run.result)
     : run.error
       ? "Neo: " + run.error
-      : "Neo started. /neo-status shows progress; /neo-cancel stops this run.";
+      : `Asked Neo [${id.slice(0, 8)}].`;
 }
 /** Start from the pane (Ask, Follow up or Enter). A refusal is shown where
  * the person asked; a started run shows its own progress line. */
@@ -756,14 +777,87 @@ let autoGeneration = 0;
 let lastAsk = "";
 let spokenBeats: string[] = [];
 
+// ------------------------------------------------ Neo, visible in the session
+/** Runs Neo is doing on his own right now, for the band and the spinner. */
+const activities = new Map<string, { kind: AutoKind; subject: string; started: number }>();
+let activityTicker: Timer | undefined;
+/** His latest finding, shown in the band until dismissed or replaced. */
+let finding:
+  | { kind: AutoKind; result: Document; expanded: boolean; prompts: number }
+  | undefined;
+/** What recall gave this prompt, shown until the next one. */
+let recalled: { text: string; expanded: boolean } | undefined;
+let pendingNotice = "";
+/** Subagent ids seen this session, so their spinners keep their own words. */
+const subagents = new Set<string>();
+
+const NOTICE_CAP = 400;
+
+/** A row the person sees and the model never reads (`session.append` system). */
+async function noticeRow($: EngineInterface, line: string) {
+  if (!line.trim()) return;
+  try {
+    await $.session.append({
+      message: { type: "system", content: [{ type: "text", text: line }] },
+    });
+  } catch {
+    /* a refused notice costs the person a line, never the session */
+  }
+}
+
+/** A row the model reads and the person does not see as typed. False when the
+ * engine refused it, so the caller can deliver another way. */
+async function modelRow($: EngineInterface, body: string): Promise<boolean> {
+  try {
+    const stored = await $.session.append({
+      message: { type: "user", content: [{ type: "text", text: body }] },
+    });
+    return !stored?.deny;
+  } catch {
+    return false;
+  }
+}
+
+/** A notice held until the prompt it answers is stored: flushed at the
+ * turn's first main-thread step, tool call or Stop, whichever comes first. */
+async function flushNotice($: EngineInterface) {
+  if (!pendingNotice) return;
+  const line = pendingNotice;
+  pendingNotice = "";
+  await noticeRow($, line);
+}
+
+/** Neo found something: his line in the conversation, the details in the band. */
+async function present($: EngineInterface, kind: AutoKind, result: Document) {
+  finding = { kind, result, expanded: false, prompts: 0 };
+  const line = voiceLine(result);
+  await noticeRow($, line.length > NOTICE_CAP ? line.slice(0, NOTICE_CAP) + "…" : line);
+  redraw($);
+}
+
 async function autoNeo(
   $: EngineInterface,
   cwd: string,
   session: string,
   prompt: string,
+  kind: AutoKind,
+  subject = "",
   errorTrace = "",
 ): Promise<Document | undefined> {
+  const id = crypto.randomUUID();
   try {
+    activities.set(id, { kind, subject, started: await $.clock.now() });
+    nowMs = await $.clock.now();
+    activityTicker ??= $.clock.every(1000, () => {
+      void $.clock.now().then(
+        (t) => {
+          nowMs = t;
+          redraw($);
+        },
+        () => {},
+      );
+    });
+    redraw($);
     const run = await $.process.run(
       [binary, "--stdin-json", "--json", "--mode", "learn"],
       {
@@ -788,6 +882,13 @@ async function autoNeo(
     return result;
   } catch {
     return undefined; // Neo joining in must never break the session.
+  } finally {
+    activities.delete(id);
+    if (!activities.size) {
+      activityTicker?.cancel();
+      activityTicker = undefined;
+    }
+    redraw($);
   }
 }
 
@@ -881,7 +982,11 @@ async function afterTool(
       if (path) autoEdited.add(path);
     }
     // Findings belong to the main thread: a subagent must not consume them.
-    if (e.agent_id) return result;
+    if (e.agent_id) {
+      subagents.add(e.agent_id);
+      return result;
+    }
+    await flushNotice($);
     const extra = autoDrain();
     if (e.tool_name === "ExitPlanMode") {
       let plan =
@@ -897,11 +1002,13 @@ async function afterTool(
       const key = fingerprint(plan);
       if (plan.trim() && !planned.has(key)) {
         planned.add(key);
-        $.ui.status("Neo: reading the plan…");
-        const found = await autoNeo($, e.cwd, e.session_id, architectPrompt(plan));
-        $.ui.status(undefined);
-        if (found && hasFindings(found))
+        const found = await autoNeo(
+          $, e.cwd, e.session_id, architectPrompt(plan), "architect",
+        );
+        if (found && hasFindings(found)) {
           extra.push(injection("architect", found));
+          await present($, "architect", found);
+        }
       }
     }
     return withAutoContext(result, extra);
@@ -923,6 +1030,13 @@ function resetAuto() {
   diagnoses = 0;
   lastAsk = "";
   spokenBeats = [];
+  activities.clear();
+  activityTicker?.cancel();
+  activityTicker = undefined;
+  finding = undefined;
+  recalled = undefined;
+  pendingNotice = "";
+  subagents.clear();
 }
 
 function registerAuto(on: On) {
@@ -933,9 +1047,23 @@ function registerAuto(on: On) {
       // machine-injected turns are not questions.
       if ((e.source ?? "user") !== "user") return result;
       lastAsk = e.prompt;
+      recalled = undefined;
+      // A finding stays in the band through the next prompt, then gives way:
+      // its notice row keeps it in the conversation.
+      if (finding && ++finding.prompts > 1) finding = undefined;
       const extra = autoDrain();
       const memory = await autoRecall($, e.cwd, e.prompt);
-      if (memory) extra.push(recallInjection(memory));
+      if (memory) {
+        extra.push(recallInjection(memory));
+        recalled = { text: memory, expanded: false };
+        // He speaks in the conversation only when a beat earned a line;
+        // otherwise the lessons wait quietly in the band.
+        const opener = memory.split("\n")[0] ?? "";
+        // Appended now it would sit above the prompt it answers: it waits for
+        // the turn's first step, after the prompt is stored.
+        if (opener.trim() !== "Neo memory:") pendingNotice = opener;
+      }
+      redraw($);
       return withAutoContext(result, extra);
     } catch {
       return result;
@@ -967,11 +1095,14 @@ function registerAuto(on: On) {
       // next main-thread hook. Work that outlives this dispatch runs from a
       // timer; a call left in flight when the hook returns is aborted.
       $.clock.after(0, () => {
-        void autoNeo($, e.cwd, e.session_id, prompt, trace)
+        if (owner !== autoGeneration) return;
+        void autoNeo($, e.cwd, e.session_id, prompt, "debug", command, trace)
           .then(
-            (found) => {
-              if (owner === autoGeneration && found && hasFindings(found))
+            async (found) => {
+              if (owner === autoGeneration && found && hasFindings(found)) {
                 pending.push(injection("debug", found, command));
+                await present($, "debug", found);
+              }
             },
             () => {},
           )
@@ -991,6 +1122,7 @@ function registerAuto(on: On) {
       // Once any Stop hook has continued the turn, let it end; the edits
       // stay recorded and are reviewed at the next Stop that is not a
       // continuation, so nothing goes unreviewed for being continued.
+      await flushNotice($);
       if (e.stop_hook_active || !autoEdited.size) return result;
       const files = [...autoEdited].sort();
       autoEdited.clear();
@@ -1005,17 +1137,26 @@ function registerAuto(on: On) {
       const key = fingerprint(diff);
       if (reviewed.has(key)) return result;
       reviewed.add(key);
-      $.ui.status("Neo: reading this turn's changes…");
-      const found = await autoNeo($, e.cwd, e.session_id, reviewPrompt(files, diff));
-      $.ui.status(undefined);
+      const found = await autoNeo(
+        $, e.cwd, e.session_id, reviewPrompt(files, diff), "review",
+      );
       // Only a concrete change continues a finishing turn; prose waits.
       if (!found || !hasVerifiableSuggestion(found)) return result;
+      await present($, "review", found);
+      // The findings go to Claude in a row it reads, so the Stop message the
+      // person sees stays one line; if the engine refuses that row, they ride
+      // in the Stop message itself.
+      const delivered = await modelRow($, injection("review", found));
       return {
         ...result,
         block: [
           ...(result.block ? [result.block] : []),
-          injection("review", found),
-          "Address what holds up, or say briefly why not, then finish.",
+          ...(delivered
+            ? [REVIEW_CONTINUE]
+            : [
+                injection("review", found),
+                "Address what holds up, or say briefly why not, then finish.",
+              ]),
         ].join("\n\n"),
       };
     } catch {
@@ -1024,12 +1165,153 @@ function registerAuto(on: On) {
   }).catch(async ($, e, next) => next(e));
 }
 
+/** Neo's rows in the band above the prompt: what he is doing, what he
+ * remembered for this prompt, and his latest finding. Empty when he has
+ * nothing to say, which is most of the time. */
+function presence($: EngineInterface, e: RenderInput<"AbovePrompt">): RenderNode[] {
+  const { Box, Text, Button, Markdown } = $.ui.resolve(e);
+  const out: RenderNode[] = [];
+  const neo = Text({ children: "Neo", color: "remember" });
+  for (const a of activities.values())
+    out.push(
+      Box({
+        flexDirection: "row",
+        gap: 1,
+        children: [
+          neo,
+          Text({
+            children: `${activityLabel(a.kind, a.subject)} · ${elapsed(nowMs - a.started)}`,
+            dimColor: true,
+            wrap: "truncate-end",
+          }),
+        ],
+      }),
+    );
+  if (recalled) {
+    const [opener = "", ...lessons] = recalled.text.split("\n");
+    const subjects = lessons
+      .filter((l) => l.startsWith("- "))
+      .map((l) => l.slice(2).split(" [")[0]);
+    out.push(
+      Box({
+        flexDirection: "row",
+        gap: 1,
+        children: [
+          Text({ children: opener, color: "remember" }),
+          Text({ children: subjects.join(" · "), dimColor: true, wrap: "truncate-end" }),
+          Button({
+            key: "neo-recall-toggle",
+            label: recalled.expanded ? "hide" : "lessons",
+            onPress: () => {},
+          }),
+        ],
+      }),
+    );
+    if (recalled.expanded) out.push(Markdown({ text: lessons.join("\n"), dimColor: true }));
+  }
+  if (finding) {
+    out.push(
+      Box({
+        flexDirection: "row",
+        gap: 1,
+        children: [
+          neo,
+          Text({ children: voiceLine(finding.result), wrap: "truncate-end" }),
+          Button({
+            key: "neo-finding-toggle",
+            label: finding.expanded ? "hide" : "details",
+            hotkey: "d",
+            onPress: () => {},
+          }),
+          Button({ key: "neo-finding-dismiss", label: "dismiss", hotkey: "x", onPress: () => {} }),
+        ],
+      }),
+    );
+    if (finding.expanded) out.push(Markdown({ text: findingMarkdown(finding.result) }));
+  }
+  return out;
+}
+
+/** An asked run, drawn live in its command's row: progress, then the answer. */
+function askCard($: EngineInterface, e: RenderInput<"CommandOutput">, run: Run): RenderElement {
+  const { Box, Text, Button, Markdown } = $.ui.resolve(e);
+  const children: RenderNode[] = [
+    Text({ children: "Neo · " + progressLine(run), color: run.error ? "error" : "remember" }),
+  ];
+  if (run.status === "running")
+    children.push(
+      Box({
+        flexDirection: "row",
+        gap: 1,
+        children: [
+          Button({ key: "neo-card-cancel", label: "Cancel", onPress: () => {} }),
+          Text({ children: "/neo-cancel", dimColor: true }),
+        ],
+      }),
+    );
+  if (run.error) children.push(Text({ children: run.error, color: "error" }));
+  if (run.result)
+    children.push(
+      Text({ children: voiceLine(run.result) }),
+      Markdown({ text: findingMarkdown(run.result) }),
+    );
+  return Box({ flexDirection: "column", children });
+}
+
+/** `/neo-workspace`: what Neo knew about this project when it was asked,
+ * inline. Each row keeps its own moment, so an old row does not redraw to
+ * the current state. */
+const workspaceRows = new Map<string, { snapshot: Document; line: string; error: string }>();
+function workspaceCard($: EngineInterface, e: RenderInput<"CommandOutput">): RenderElement {
+  const { Box, Text, Button, Markdown } = $.ui.resolve(e);
+  const id = /\[([0-9a-f]{8})\]/.exec(e.props.text)?.[1] ?? "";
+  const frozen = workspaceRows.get(id);
+  if (!frozen) return Text({ children: e.props.text });
+  const { snapshot, line, error: inspectorError } = frozen;
+  const facts = rows(snapshot.facts).filter((f) => f.is_valid !== false);
+  const lines = [
+    `**${snapshot.fact_count ?? "?"} project facts** · ${snapshot.probation_count ?? "?"} on probation`,
+    ...facts.slice(0, 8).map((f) => `- ${text(f.subject) || text(f.id)}`),
+  ];
+  const children: RenderNode[] = [Text({ children: "Neo", color: "remember" })];
+  if (line) children.push(Text({ children: line }));
+  if (inspectorError) children.push(Text({ children: inspectorError, color: "error" }));
+  children.push(
+    Markdown({ text: lines.join("\n") }),
+    Box({
+      flexDirection: "row",
+      gap: 1,
+      children: [
+        Button({ key: "neo-open-panel", label: "Open panel", onPress: () => {} }),
+        Text({ children: "/neo-workspace panel", dimColor: true }),
+      ],
+    }),
+  );
+  return Box({ flexDirection: "column", children });
+}
+
+/** `/neo-explain`, readable inline. */
+function explanationMarkdown(): string {
+  const x = explanation ?? {};
+  const f = object(x.fact);
+  return [
+    `**${text(f.subject) || text(f.id)}**`,
+    `${f.is_valid === false ? "Invalid" : "Valid"} · ${text(f.provenance)} · ${strings(f.tags).join(", ")}`,
+    `${rows(x.supporting_evidence).length} supporting outcomes · ${rows(x.contradicting_evidence).length} conflicting outcomes`,
+    text(f.body),
+    ...strings(x.cautions).map((c) => `- ${c}`),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 export const register: Register = (on, options) => {
   binary = typeof options.executable === "string" ? options.executable : "neo";
   registerAuto(on);
   on("session.start", async ($, e, next) => {
     generation++;
     resetAuto();
+    askedRuns.clear();
     current = undefined;
     previous = undefined;
     snapshot = {};
@@ -1087,15 +1369,22 @@ export const register: Register = (on, options) => {
     });
     return next(e);
   });
-  on("command.run", { command: "neo-workspace" }, async ($) => {
+  // The workspace is a card in the conversation; `/neo-workspace panel`
+  // still opens the side pane for whoever wants it.
+  on("command.run", { command: "neo-workspace" }, async ($, e) => {
     await inspect($);
-    await open($);
-    return drawable
-      ? {}
-      : {
-          text: statusText() + (inspectorError ? "\n" + inspectorError : ""),
-          exitCode: inspectorError ? 1 : 0,
-        };
+    if (e.args.trim() === "panel") await open($);
+    const id = crypto.randomUUID().slice(0, 8);
+    workspaceRows.set(id, {
+      snapshot,
+      line: finding ? voiceLine(finding.result) : "",
+      error: inspectorError,
+    });
+    if (workspaceRows.size > 20) workspaceRows.delete(workspaceRows.keys().next().value!);
+    return {
+      text: `${statusText()} [${id}]` + (inspectorError ? "\n" + inspectorError : ""),
+      exitCode: inspectorError ? 1 : 0,
+    };
   });
   on("command.run", { command: "neo-status" }, async ($) => {
     if (!current) await inspect($);
@@ -1107,11 +1396,12 @@ export const register: Register = (on, options) => {
   on("command.run", { command: "neo-ask" }, async ($, e) => {
     const first = e.args.trim().split(/\s+/)[0] ?? "",
       selected = MODES.includes(first) ? first : "reason";
-    await open($);
     const answer = await start(
       $,
       selected === first ? e.args.trim().slice(first.length).trim() : e.args,
       selected,
+      false,
+      true,
     );
     return {
       text: answer,
@@ -1120,7 +1410,7 @@ export const register: Register = (on, options) => {
     };
   });
   on("command.run", { command: "neo-followup" }, async ($, e) => {
-    const answer = await start($, e.args, mode, true);
+    const answer = await start($, e.args, mode, true, true);
     return {
       text: answer,
       exitCode:
@@ -1133,13 +1423,10 @@ export const register: Register = (on, options) => {
     if (!snapshot.schema_version) await inspect($);
     await inspect($, e.args.trim());
     tab = "memory";
-    await open($);
     return {
       text:
         inspectorError ||
-        (drawable
-          ? "Neo: provenance opened in Memory."
-          : JSON.stringify(explanation, null, 2)),
+        (drawable ? explanationMarkdown() : JSON.stringify(explanation, null, 2)),
       exitCode: inspectorError ? 1 : 0,
     };
   });
@@ -1152,11 +1439,65 @@ export const register: Register = (on, options) => {
   );
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
     const existing = await next(e);
-    return current?.status === "running" || current?.status === "stopping"
-      ? $.ui
-          .resolve(e)
-          .Box({ flexDirection: "column", children: [existing, render($, e)] })
+    if (e.props.hasSurvey) return existing;
+    const parts: RenderNode[] = [];
+    if (
+      (current?.status === "running" || current?.status === "stopping") &&
+      !current.fromCommand
+    )
+      parts.push(render($, e));
+    parts.push(...presence($, e));
+    return parts.length
+      ? $.ui.resolve(e).Box({ flexDirection: "column", children: [existing, ...parts] })
       : existing;
+  });
+  on("ui.press", { component: "AbovePrompt", element: "neo-finding-toggle" }, async ($, e) => {
+    if (finding) finding.expanded = !finding.expanded;
+    redraw($);
+    return { element: e.element };
+  });
+  on("ui.press", { component: "AbovePrompt", element: "neo-finding-dismiss" }, async ($, e) => {
+    finding = undefined;
+    redraw($);
+    return { element: e.element };
+  });
+  on("ui.press", { component: "AbovePrompt", element: "neo-recall-toggle" }, async ($, e) => {
+    if (recalled) recalled.expanded = !recalled.expanded;
+    redraw($);
+    return { element: e.element };
+  });
+  // While a review or a plan check holds the turn, the working line says so.
+  on("ui.render", { component: "Spinner" }, async ($, e, next) => {
+    const holding = [...activities.values()].find((a) => a.kind !== "debug");
+    // A subagent's spinner is its own.
+    const subagent = subagents.has(e.requestId);
+    return holding && !subagent
+      ? next({
+          ...e,
+          props: { ...e.props, message: "Neo is " + activityLabel(holding.kind, holding.subject) },
+        })
+      : next(e);
+  });
+  // Asked runs draw live in the conversation, where the command was typed.
+  for (const command of ["neo-ask", "neo-followup"])
+    on("ui.render", { component: "CommandOutput", props: { command } }, async ($, e, next) => {
+      const id = /\[([0-9a-f]{8})\]/.exec(e.props.text)?.[1];
+      const run = id ? askedRuns.get(id) : undefined;
+      return run ? askCard($, e, run) : next(e);
+    });
+  on("ui.press", { component: "CommandOutput", element: "neo-card-cancel" }, async ($, e) => {
+    await stop($);
+    return { element: e.element };
+  });
+  on("ui.render", { component: "CommandOutput", props: { command: "neo-workspace" } }, async ($, e) =>
+    workspaceCard($, e),
+  );
+  on("ui.render", { component: "CommandOutput", props: { command: "neo-explain" } }, async ($, e) =>
+    $.ui.resolve(e).Markdown({ text: e.props.text }),
+  );
+  on("ui.press", { component: "CommandOutput", element: "neo-open-panel" }, async ($, e) => {
+    await open($);
+    return { element: e.element };
   });
   on("ui.input", { requestId: PANE }, async ($, e) => {
     if (e.element === "neo-question") question = e.value;
@@ -1243,6 +1584,8 @@ export const register: Register = (on, options) => {
   });
   on("turn.step", async function* ($, e, next) {
     turns.set(e.agentId ?? "main", e.turnId);
+    if (e.agentId) subagents.add(e.agentId);
+    if (!e.agentId) await flushNotice($);
     return yield* next(e);
   });
   on("turn.complete", async ($, e, next) => {
@@ -1272,6 +1615,8 @@ export const register: Register = (on, options) => {
   }).catch(async ($, e, next) => next(e));
   on("session.end", async ($, e, next) => {
     generation++;
+    resetAuto();
+    askedRuns.clear();
     await stop($, "session ended");
     turns.clear();
     current = undefined;

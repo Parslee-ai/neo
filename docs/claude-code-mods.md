@@ -31,16 +31,32 @@ plugin and CLI versions aligned.
 
 ## Use
 
+Neo lives in the conversation, not in a panel you have to open:
+
+- **The band above the prompt** shows what he is doing while he works
+  (`reading this turn's changes · 0:12`), what he remembered for the prompt you
+  just typed (`lessons` expands them), and his latest finding in his own words
+  (`d` details, with the proposed diffs; `x` dismiss). It is empty when he has
+  nothing to say.
+- **A notice row** in the conversation marks each time he contributes: his
+  line when a review continued the turn, a diagnosis arrived or a plan was
+  checked, and his recall line when a beat earned one. The model never reads
+  these rows.
+- **The spinner** says `Neo is reading…` while a review or plan check holds
+  the turn.
+- **What Claude reads** is separate: findings reach it in a row it reads (for a
+  review, the Stop message is then one line), or as hook context.
+
 | Command | Behavior |
 | --- | --- |
-| `/neo-workspace` | Open Results, Memory and Evidence tabs |
-| `/neo-ask [reason\|review\|debug\|architect\|optimize\|pattern] <question>` | Start direct advisory reasoning |
+| `/neo-workspace` | A card in the conversation: project facts, his latest finding. `/neo-workspace panel` opens the side pane |
+| `/neo-ask [reason\|review\|debug\|architect\|optimize\|pattern] <question>` | Ask Neo; the command's row draws the run live, then his answer with diffs, and Claude reads the answer |
 | `/neo-followup <question>` | Link a new analysis to the prior result in this session |
 | `/neo-status` | Show current progress, or read project status without inference |
-| `/neo-explain <project-fact-id-or-prefix>` | Inspect fact provenance and outcome evidence without inference |
-| `/neo-cancel` | Stop the workspace's current invocation |
+| `/neo-explain <project-fact-id-or-prefix>` | Fact provenance and outcome evidence, inline, without inference |
+| `/neo-cancel` | Stop the current asked run |
 
-The pane offers the same six categories, question and context inputs, and a
+The side pane (`/neo-workspace panel`) offers the same six categories, question and context inputs, and a
 **Use selection** control. Neo selects bounded repository context using its
 existing Python gatherer and retrieves memory under its existing rules.
 A follow-up includes a bounded copy of the prior findings and selected context;

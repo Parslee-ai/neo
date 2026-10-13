@@ -1,4 +1,4 @@
-import { object, resultText, rows, text } from "./protocol.js";
+import { object, openQuestions, resultText, rows, strings, text, validationText } from "./protocol.js";
 import type { Document } from "./protocol.js";
 
 /** Neo joins the session on its own, at four moments:
@@ -80,6 +80,7 @@ export function hasFindings(result: Document): boolean {
 }
 
 const LABELS = {
+  answer: "answer to a question the user asked him directly",
   review: "review of the edits in this turn",
   debug: "diagnosis of a failing command",
   architect: "check of the plan",
@@ -178,4 +179,57 @@ export function autoPayload(
       repositories_touched: [cwd],
     },
   };
+}
+
+// ------------------------------------------------- what the person sees
+//
+// Neo is drawn in the conversation, not in a panel someone has to open: a band
+// above the prompt while he works and with his latest finding, a notice row
+// when he contributes, and inline cards for the commands. Every line the
+// person reads that says what Neo found is Neo's own output (his summary,
+// staged by memory, and his earned beat); the mod adds only chrome.
+
+/** Neo's own line for a finished run: his staged summary and, when a beat was
+ * earned, its line. */
+export function voiceLine(result: Document): string {
+  const o = object(result.orchestrator);
+  return [text(o.summary), text(o.personality)].filter(Boolean).join(" ");
+}
+
+/** The details behind a finding, as Markdown: cautions, notes, each proposed
+ * change with its diff, checks, validation and open questions. */
+export function findingMarkdown(result: Document): string {
+  const o = object(result.orchestrator);
+  const parts: string[] = [];
+  for (const c of strings(o.cautions)) parts.push(`- **Caution:** ${c}`);
+  if (text(result.notes)) parts.push(text(result.notes));
+  for (const s of rows(result.code_suggestions)) {
+    parts.push(`**${text(s.file_path)}**: ${text(s.description)}`);
+    const diff = text(s.unified_diff) || text(s.code_block);
+    if (diff.trim()) parts.push("```" + (text(s.unified_diff) ? "diff" : "") + "\n" + diff.replace(/\n$/, "") + "\n```");
+  }
+  for (const c of rows(result.static_checks))
+    parts.push(`- Check ${text(c.tool_name)} (${text(c.status) || "status unavailable"}): ${text(c.summary)}`);
+  parts.push(`_Validation: ${validationText(result)}_`);
+  for (const q of openQuestions(result)) parts.push(`- Open question: ${q}`);
+  return parts.join("\n\n");
+}
+
+/** What Neo is doing right now, for the band and the spinner. */
+export function activityLabel(kind: AutoKind, subject = ""): string {
+  return kind === "review" || kind === "answer"
+    ? "reading this turn's changes"
+    : kind === "debug"
+      ? `looking at the failing ${subject || "check"}`
+      : "reading the plan";
+}
+
+/** The short reason a review continues a finishing turn with, once the
+ * findings themselves are in a row Claude reads. */
+export const REVIEW_CONTINUE =
+  "Neo reviewed this turn's changes and proposed a fix; his findings are in the latest message from Neo above. Address what holds up, or say briefly why not, then finish.";
+
+export function elapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
