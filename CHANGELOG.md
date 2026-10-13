@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.59.0] - 2026-10-13
+
+### Fixed
+
+- **Lessons Neo learns from your sessions now survive.** Mined lessons start on a 3-day probation that only two reads lift, and recall, which is where they reach Claude, writes nothing, so it never counted. 76 of 112 were pruned unseen. The mod now records which lessons recall handed Claude (ids only); a lesson handed over in two sessions leaves probation. It lives while recall keeps using it and ages out after 14 days unused. GitHub-PR facts are excluded.
+
+### Added
+
+- **Recall offers the notes your rule file points to.** CLAUDE.md is loaded; the notes it says to read are not. Up to 2 matching passages from any markdown file or folder that CLAUDE.md or AGENTS.md names in backticks now arrive with your prompt, as `- <path> [note]: …`. The observer indexes them per checkout (`~/.neo/notes/`); recall only reads the index and leaves out a note edited since. On this repo's recent prompts recall answered 30 of 39, up from 11 of 36, at 63 ms median.
+- **Every automatic run is logged** in `~/.neo/sessions/host_events.jsonl` with its kind and outcome (`failed`, `nothing`, `prose`, `change`), so whether Neo's reviews reach Claude is measurable.
+- **`Neo: listening`.** When he has nothing to say the band keeps one dim line, so a quiet Neo is not mistaken for a missing one.
+
 ## [0.58.2] - 2026-10-12
 
 ### Fixed
