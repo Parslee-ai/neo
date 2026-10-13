@@ -161,6 +161,9 @@ PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 # explicit observation (success_count > 0), being re-retrieved
 # (access_count ≥ 2), or surviving the probation window.
 PROBATION_TAG = "probation"
+#: A lesson that left probation because recall kept delivering it. It has no
+#: acceptance signal, so it lives only while recall keeps delivering it.
+RECALL_LIFTED_TAG = "recall-lifted"
 
 #: ``invalidation_reason`` on a fact ``retire_legacy_suggestion_facts`` retired,
 #: so the tombstone says why it died.
@@ -568,6 +571,9 @@ class FactStore:
             # Defer each step's save and flush once at the end — a cold start on
             # a multi-MB fact file otherwise pays 4 full merge-on-save rewrites.
             changed = self.retire_legacy_suggestion_facts(save=False)
+            # Before the prune: a lesson recall kept handing Claude must not
+            # die on the probation clock.
+            changed += self.lift_probation_by_recall(save=False)
             changed += self.prune_stale_facts(save=False)
             changed += self.demote_unhelpful_facts(save=False)
             changed += self.purge_dead_facts(save=False)
@@ -2749,6 +2755,9 @@ class FactStore:
             # and flush once here. (REVIEW->PATTERN synthesis used to lead this
             # chain; it was removed — see the note on PROTECTED_TAGS.)
             changed = self.retire_legacy_suggestion_facts(save=False)
+            # Before the prune: a lesson recall kept handing Claude must not
+            # die on the probation clock.
+            changed += self.lift_probation_by_recall(save=False)
             changed += self.prune_stale_facts(save=False)
             changed += self.demote_unhelpful_facts(save=False)
             changed += self.purge_dead_facts(save=False)
@@ -3163,6 +3172,10 @@ class FactStore:
         ours_success = om.success_count
         om.success_count = max(om.success_count, dm.success_count)
         om.access_count = max(om.access_count, dm.access_count)
+        # Probation is only ever added at mint, so its removal is one-way: a
+        # peer that lifted it must not have the lift undone by our stale tags.
+        if disk.is_valid and PROBATION_TAG in ours.tags and PROBATION_TAG not in disk.tags:
+            ours.tags = [t for t in ours.tags if t != PROBATION_TAG]
         if disk.is_valid and dm.success_count > ours_success:
             om.confidence = max(om.confidence, dm.confidence)
         return ours
@@ -3340,6 +3353,93 @@ class FactStore:
             logger.info(f"Slimmed {stripped} tombstone(s)")
         return stripped
 
+    def lift_probation_by_recall(self, save: bool = True) -> int:
+        """Lift probation from facts `neo recall` delivered in enough sessions.
+
+        Recall is where mined lessons reach Claude, and it writes nothing, so
+        its deliveries never reached ``access_count``: every transcript lesson
+        that a full Neo run did not happen to retrieve twice was pruned at
+        ``PROBATION_AGE_DAYS`` (measured: 76 of 112, every one with zero
+        accesses; all 13 with two survived). The mod records each delivery as
+        a ``recall_delivered`` event in the host ledger; a fact delivered in
+        ``PROBATION_PROMOTE_ACCESS`` distinct sessions leaves probation.
+
+        A lifted fact is tagged ``RECALL_LIFTED_TAG`` and its
+        ``last_accessed`` follows its latest delivery; ``prune_stale_facts``
+        drops it once recall has not delivered it for ``STALE_MIN_AGE_DAYS``.
+        "Delivered" proves the text matched prompts, not that it helped, so a
+        lifted lesson earns time, never permanence.
+
+        Deliveries do NOT count as accesses. ``demote_unhelpful_facts`` reads
+        ``access_count`` as "retrieved but never accepted", and a recalled
+        lesson has no acceptance signal at all (transcript outcomes stay
+        UNVERIFIED), so counting them would trade the probation cliff for the
+        demotion one. Derived from the ledger on every cold start rather than
+        counted, so it is idempotent across processes and needs no watermark.
+
+        Returns the number of facts changed.
+        """
+        if not any(
+            PROBATION_TAG in f.tags or RECALL_LIFTED_TAG in f.tags
+            for f in self._facts if f.is_valid
+        ):
+            return 0
+        sessions: dict[str, set] = {}
+        latest: dict[str, float] = {}
+        try:
+            from neo.hook import HOOK_LEDGER
+        except Exception:  # pragma: no cover - import guard only
+            return 0
+        # Both generations: rotation moves the recent records into `.1`.
+        for ledger in (HOOK_LEDGER.with_name(HOOK_LEDGER.name + ".1"), HOOK_LEDGER):
+            try:
+                with ledger.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        if '"recall_delivered"' not in line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(record, dict) or record.get("event") != "recall_delivered":
+                            continue
+                        session = record.get("session_id")
+                        ids = record.get("fact_ids")
+                        ts = record.get("ts")
+                        if (not isinstance(session, str) or not isinstance(ids, list)
+                                or not isinstance(ts, (int, float))):
+                            continue
+                        for fact_id in ids:
+                            if isinstance(fact_id, str):
+                                sessions.setdefault(fact_id, set()).add(session)
+                                latest[fact_id] = max(latest.get(fact_id, 0.0), ts)
+            except OSError:
+                continue
+        changed = 0
+        for fact in self._facts:
+            if not fact.is_valid or fact.id not in latest:
+                continue
+            touched = False
+            # Mined transcript lessons only: GitHub-PR facts never earn
+            # anything by recurrence (memory-store.md).
+            if (
+                PROBATION_TAG in fact.tags
+                and "transcript-derived" in fact.tags
+                and "imported:github-pr" not in fact.tags
+                and len(sessions[fact.id]) >= PROBATION_PROMOTE_ACCESS
+            ):
+                fact.tags = [t for t in fact.tags if t != PROBATION_TAG] + [RECALL_LIFTED_TAG]
+                touched = True
+            if RECALL_LIFTED_TAG in fact.tags and latest[fact.id] > fact.metadata.last_accessed:
+                fact.metadata.last_accessed = latest[fact.id]
+                touched = True
+            changed += touched
+        if changed:
+            if save:
+                self.save()
+            logger.info(f"Recall deliveries updated {changed} fact(s)")
+        return changed
+
     def prune_stale_facts(self, save: bool = True) -> int:
         """Remove valid-but-useless facts: low confidence, zero successes, old enough.
 
@@ -3364,6 +3464,15 @@ class FactStore:
                 continue
             # Trusted-internal (tag) or promoted (structural) facts are protected
             if self._is_protected(fact):
+                continue
+
+            # Lifted by recall deliveries alone: alive while recall keeps
+            # delivering it (`lift_probation_by_recall`), whatever its confidence.
+            if RECALL_LIFTED_TAG in fact.tags:
+                alive_since = max(fact.metadata.created_at, fact.metadata.last_accessed)
+                if (now - alive_since) >= default_stale_age:
+                    self._invalidate(fact)
+                    pruned += 1
                 continue
 
             is_independent = "independent" in fact.tags

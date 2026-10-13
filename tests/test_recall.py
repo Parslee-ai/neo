@@ -241,3 +241,11 @@ def test_the_json_form_reports_the_beat(tmp_path, monkeypatch, capsys):
                         lambda p, c, recent_beats=None: {"text": "Neo: x", "beat_id": "b1"})
     assert run_recall(["--json", "--recent-beats", "a,b"], stdin=io.StringIO("q")) == 0
     assert _json.loads(capsys.readouterr().out) == {"text": "Neo: x", "beat_id": "b1"}
+
+
+def test_delivered_fact_ids_are_returned(tmp_path):
+    lesson = _fact("Verify unrelated hook failures", tags=["transcript-derived"])
+    _seed(tmp_path, lesson)
+    result = recall("q", str(tmp_path), embed=_embed({"q": _unit(0)}))
+    assert result["fact_ids"] == [lesson.id]
+    assert recall("q", str(tmp_path), embed=_embed({"q": _unit(3)}))["fact_ids"] == []

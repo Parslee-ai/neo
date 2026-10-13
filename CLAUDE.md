@@ -48,13 +48,16 @@
 - REVIEW→PATTERN similarity synthesis was REMOVED; do not reintroduce an
   unverified clustering route.
 - `_invalidate` is the single invalidation choke point and strips embeddings +
-  bulk text (keeps subject/tags/metadata). Cold start runs prune → demote →
-  purge → strip with `save=False` and one save.
+  bulk text (keeps subject/tags/metadata). Cold start runs recall-lift → prune →
+  demote → purge → strip with `save=False` and one save.
 - `project_id` = hash of the normalized git remote URL (path hash fallback).
 - Retrieval rank formula lives only in `memory.models.rank_score`; audit
   `ContextAssembler._score_facts` when changing it. Four-layer context assembly
   must preserve the StateBench decision-accuracy contract.
 - GitHubPRSource facts enter as REVIEW on probation and never promote by recurrence.
+- Recall deliveries (ledger `recall_delivered`) lift probation for mined lessons
+  but are NOT accesses; a `recall-lifted` fact lives only while recall keeps
+  delivering it. Never feed deliveries into `access_count`.
 
 ### Learning loop — `learning-loop.md`
 - Pending sessions are RETAINED per suggested path, not cleared; the session log

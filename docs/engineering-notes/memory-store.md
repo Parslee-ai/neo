@@ -235,6 +235,23 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
     plausible-new-file rule had granted because their parent IS the repo root.
   - Probation: new non-curated facts enter with a `probation` tag and a 3-day stale window
     (vs 7/14); promoted automatically on access_count ≥2 or success_count >0.
+    **Recall deliveries lift it too** (`lift_probation_by_recall`, cold start,
+    before the prune). `neo recall` is where mined lessons reach Claude, but it
+    writes nothing, so it never touched `access_count`: measured on the live
+    store, 76 of 112 transcript lessons were pruned at day 3 with zero accesses,
+    and all 13 that got two accesses survived. The mod records each delivery as a
+    `recall_delivered` ledger event (ids only); a `transcript-derived` lesson
+    (never `imported:github-pr`) delivered in ≥ `PROBATION_PROMOTE_ACCESS`
+    distinct sessions leaves probation tagged `recall-lifted`. Derived from the
+    ledger every cold start (idempotent, no watermark; 18 ms on a full 2×8 MB
+    ledger). **Deliveries are NOT accesses**: `demote_unhelpful_facts` reads
+    access as retrieved-but-never-accepted, and a recalled lesson has no
+    acceptance signal, so counting them would trade the probation cliff for the
+    demotion one. **Delivered ≠ helped**, so a `recall-lifted` fact earns time,
+    not permanence: its `last_accessed` follows its latest delivery and
+    `prune_stale_facts` drops it after `STALE_MIN_AGE_DAYS` without one, with no
+    confidence gate (recall only delivers ≥ `STALE_MAX_CONFIDENCE`, so the gate
+    would make it immortal). Probation removal is one-way in `_reconcile_fact`.
   - Independent-outcome facts capped at 5/session (`MAX_INDEPENDENT_OUTCOMES` in
     `outcomes.py`) and 50/project (`MAX_INDEPENDENT_FACTS` in `store.py`).
   - Invalidation choke point: `_invalidate(fact, *, cascade=True)` is the single

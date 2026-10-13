@@ -115,6 +115,12 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
   not reviewed then; its edits are kept and reviewed at the next Stop that is
   not a continuation. Only a review with a concrete change continues a
   turn; a diagnosis never does.
+- **Every automatic run is logged** in `~/.neo/sessions/host_events.jsonl`
+  as `auto_started` / `auto_finished` with its `kind` and what became of it
+  (`failed`, `nothing`, `prose`, `change`; a review reaches Claude only on
+  `change`), and every recall that reached Claude as `recall_delivered` with
+  the lesson ids. Ids and outcomes only, never prompts, diffs or answers. A
+  lesson recalled in two sessions leaves probation.
 - **Subagents** contribute edits to the review but never trigger a diagnosis
   or consume findings meant for the main thread. A diagnosis that finishes
   after its session ended (`/clear`, resume) is dropped.

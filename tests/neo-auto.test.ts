@@ -99,6 +99,54 @@ test("a typed prompt gets matching memory; a machine-injected one does not", asy
   expect(calls.filter((c) => c.argv[1] === "recall").length).toBe(1);
 });
 
+test("what recall delivered is recorded by id, so the lesson can leave probation", async ($, on) => {
+  const hooks: Call[] = [];
+  let reply: object = { text: "Neo:\n- lesson", beat_id: "", fact_ids: ["f1", "f2"] };
+  const calls = host(on, (c) => {
+    if (c.argv[1] === "hook") hooks.push(c);
+    return c.argv[1] === "recall" ? { stdout: JSON.stringify(reply) } : {};
+  });
+  await $.session.start(SESSION);
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "fix the hook", source: "user" });
+  // Not on the prompt's path: recorded once the hook has returned.
+  expect(hooks.some((c) => c.stdin.includes("recall_delivered"))).toBe(false);
+  await calls.clock.advance(0);
+  await calls.clock.settle();
+  const delivered = () =>
+    hooks.map((c) => JSON.parse(c.stdin)).filter((p) => p.event === "recall_delivered");
+  expect(delivered()).toEqual([
+    { event: "recall_delivered", session_id: "session1", cwd: "/work", fact_ids: ["f1", "f2"] },
+  ]);
+  // Nothing delivered, nothing recorded.
+  reply = { text: "", beat_id: "", fact_ids: [] };
+  await $.classic.UserPromptSubmit({ ...BASE, prompt: "unrelated", source: "user" });
+  await calls.clock.advance(0);
+  await calls.clock.settle();
+  expect(delivered().length).toBe(1);
+});
+
+test("each automatic run is logged with what became of it", async ($, on) => {
+  const hooks: Call[] = [];
+  let answer: object = FIX;
+  host(on, (c) => {
+    if (c.argv[1] === "hook") hooks.push(c);
+    if (c.argv[0] === "git") return { stdout: "diff --git " + c.argv.at(-1) };
+    return c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(answer) } : {};
+  });
+  await $.session.start(SESSION);
+  const runs = () =>
+    hooks.map((c) => JSON.parse(c.stdin)).filter((p) => String(p.event).startsWith("auto_"));
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  await $.classic.Stop(stop());
+  const [started, finished] = runs();
+  expect(started).toMatchObject({ event: "auto_started", kind: "review", session_id: "session1", cwd: "/work" });
+  expect(finished).toMatchObject({ event: "auto_finished", kind: "review", status: "change", invocation_id: started.invocation_id });
+  answer = PROSE;
+  await $.classic.PostToolUse(edit("/work/b.py"));
+  await $.classic.Stop(stop());
+  expect(runs().at(-1)).toMatchObject({ kind: "review", status: "prose" });
+});
+
 test("an older CLI without recall is asked once, then left alone", async ($, on) => {
   const calls = host(on, (c) => (c.argv[1] === "recall" ? { exitCode: 2 } : {}));
   await $.session.start(SESSION);

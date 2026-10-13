@@ -846,6 +846,11 @@ async function autoNeo(
   errorTrace = "",
 ): Promise<Document | undefined> {
   const id = crypto.randomUUID();
+  // What became of each run, so "does Neo help?" is answerable from the
+  // ledger: failed, nothing, prose (findings without a diff: a review then
+  // stays silent) or change.
+  let status = "failed";
+  await record($, "event", { event: "auto_started", kind, session_id: session, invocation_id: id, cwd });
   try {
     activities.set(id, { kind, subject, started: await $.clock.now() });
     nowMs = await $.clock.now();
@@ -880,6 +885,7 @@ async function autoNeo(
     const result = JSON.parse(run.stdout) as Document;
     if (!result || result.error) return undefined;
     spokenBeats = rememberBeat(spokenBeats, text(object(result.orchestrator).beat_id));
+    status = hasVerifiableSuggestion(result) ? "change" : hasFindings(result) ? "prose" : "nothing";
     return result;
   } catch {
     return undefined; // Neo joining in must never break the session.
@@ -890,6 +896,7 @@ async function autoNeo(
       activityTicker = undefined;
     }
     redraw($);
+    await record($, "event", { event: "auto_finished", kind, session_id: session, invocation_id: id, cwd, status });
   }
 }
 
@@ -897,8 +904,9 @@ async function autoRecall(
   $: EngineInterface,
   cwd: string,
   prompt: string,
-): Promise<{ text: string; beat: string }> {
-  if (recallMissing) return { text: "", beat: "" };
+): Promise<{ text: string; beat: string; ids: string[] }> {
+  const none = { text: "", beat: "", ids: [] };
+  if (recallMissing) return none;
   try {
     const run = await $.process.run(
       [binary, "recall", "--cwd", cwd, "--json", "--recent-beats", spokenBeats.join(",")],
@@ -906,12 +914,15 @@ async function autoRecall(
     );
     // An older CLI without `recall` answers with an argparse error (exit 2).
     if (run.exitCode === 2) recallMissing = true;
-    if (run.exitCode !== 0 || !run.stdout.trim()) return { text: "", beat: "" };
+    if (run.exitCode !== 0 || !run.stdout.trim()) return none;
     const result = JSON.parse(run.stdout) as Document;
     spokenBeats = rememberBeat(spokenBeats, text(result.beat_id));
-    return { text: text(result.text).trim(), beat: text(result.beat_id) };
+    const ids = Array.isArray(result.fact_ids)
+      ? result.fact_ids.filter((i): i is string => typeof i === "string" && i !== "")
+      : [];
+    return { text: text(result.text).trim(), beat: text(result.beat_id), ids };
   } catch {
-    return { text: "", beat: "" };
+    return none;
   }
 }
 
@@ -1057,9 +1068,16 @@ function registerAuto(on: On) {
       // its notice row keeps it in the conversation.
       if (finding && ++finding.prompts > 1) finding = undefined;
       const extra = autoDrain();
-      const { text: memory, beat } = await autoRecall($, e.cwd, e.prompt);
+      const { text: memory, beat, ids } = await autoRecall($, e.cwd, e.prompt);
       if (memory) {
         extra.push(recallInjection(memory));
+        // What Claude was handed, by id: a lesson delivered across sessions
+        // leaves probation (`FactStore.lift_probation_by_recall`). Recorded
+        // from a timer so the prompt does not wait on a process start.
+        if (ids.length) {
+          const delivered = { event: "recall_delivered", session_id: e.session_id, cwd: e.cwd, fact_ids: ids };
+          $.clock.after(0, () => void record($, "event", delivered));
+        }
         recalled = { text: memory, expanded: false };
         // He speaks in the conversation only when a beat earned a line;
         // otherwise the lessons wait quietly in the band. Logged now, the line

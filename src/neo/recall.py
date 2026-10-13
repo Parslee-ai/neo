@@ -160,8 +160,11 @@ def _recall_beat(facts: list, scored_hits: list, recent: set) -> dict:
 def recall(prompt: str, cwd: str,
            embed: Optional[Callable[[str], object]] = None,
            recent_beats: Optional[set] = None) -> dict:
-    """`{"text", "beat_id"}`: relevant learned lessons, opened by Neo's beat
-    for the situation when one fits. Empty text when nothing is relevant."""
+    """`{"text", "beat_id", "fact_ids"}`: relevant learned lessons, opened by
+    Neo's beat for the situation when one fits. Empty text when nothing is
+    relevant. `fact_ids` lets the host record what it delivered; recall itself
+    still writes nothing (`FactStore.lift_probation_by_recall` reads that
+    record)."""
     import numpy as np
 
     from neo.math_utils import batched_cosine
@@ -169,7 +172,7 @@ def recall(prompt: str, cwd: str,
     from neo.memory.store import MAX_TEXT_LENGTH, STALE_MAX_CONFIDENCE
     from neo.text_budget import truncate_marked
 
-    silent = {"text": "", "beat_id": ""}
+    silent = {"text": "", "beat_id": "", "fact_ids": []}
     if not prompt.strip():
         return silent
     vector = (embed or _resident_embed)(prompt[:MAX_TEXT_LENGTH])
@@ -202,7 +205,11 @@ def recall(prompt: str, cwd: str,
     for _, fact in scored_hits:
         body = " ".join(truncate_marked(fact.body, MAX_BODY_CHARS).split())
         lines.append(f"- {fact.subject} [{fact.kind.value}, {fact.scope.value}]: {body}")
-    return {"text": "\n".join(lines), "beat_id": beat.get("beat_id", "") if beat else ""}
+    return {
+        "text": "\n".join(lines),
+        "beat_id": beat.get("beat_id", "") if beat else "",
+        "fact_ids": [fact.id for _, fact in scored_hits],
+    }
 
 
 def run_recall(argv: list[str], stdin=None) -> int:
