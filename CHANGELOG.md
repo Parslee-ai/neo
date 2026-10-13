@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.58.0] - 2026-10-12
+
+### Changed
+
+- **Neo lives in the conversation, not in a panel you have to open.** The Claude Code mod now draws Neo in the main window:
+  - **The band above the prompt** shows what he is doing while he works (`reading this turn's changes · 0:12`), the lessons he remembered for the prompt you just typed, and his latest finding in his own words, with `d` for the details and proposed diffs and `x` to dismiss. A finding gives way after the next prompt. The band is empty when he has nothing to say.
+  - **A notice row** marks each time he contributes: his line when a review continues a turn, a diagnosis arrives or a plan is checked, and his recall line when a beat earned one. The model never reads these rows.
+  - **The spinner** says `Neo is reading…` while a review or plan check holds the turn; a subagent's spinner keeps its own words.
+  - **What Claude reads is separate.** A review's findings reach Claude in a row it reads, so the Stop message you see is one line (if the engine refuses that row, the findings ride in the Stop message as before). An answer you asked for with `/neo-ask` reaches Claude at the next hook, never mid-turn.
+  - **`/neo-ask` and `/neo-followup` draw live in their command's row** (progress, then his answer with diffs), with no pane and no Share step. **`/neo-workspace` and `/neo-explain` are cards in the conversation**; `/neo-workspace panel` still opens the side pane, and asks made there stay yours to share.
+
 ## [0.57.0] - 2026-10-12
 
 ### Added
