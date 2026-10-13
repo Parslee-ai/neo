@@ -48,13 +48,16 @@
 - REVIEW→PATTERN similarity synthesis was REMOVED; do not reintroduce an
   unverified clustering route.
 - `_invalidate` is the single invalidation choke point and strips embeddings +
-  bulk text (keeps subject/tags/metadata). Cold start runs prune → demote →
-  purge → strip with `save=False` and one save.
+  bulk text (keeps subject/tags/metadata). Cold start runs recall-lift → prune →
+  demote → purge → strip with `save=False` and one save.
 - `project_id` = hash of the normalized git remote URL (path hash fallback).
 - Retrieval rank formula lives only in `memory.models.rank_score`; audit
   `ContextAssembler._score_facts` when changing it. Four-layer context assembly
   must preserve the StateBench decision-accuracy contract.
 - GitHubPRSource facts enter as REVIEW on probation and never promote by recurrence.
+- Recall deliveries (ledger `recall_delivered`) lift probation for mined lessons
+  but are NOT accesses; a `recall-lifted` fact lives only while recall keeps
+  delivering it. Never feed deliveries into `access_count`.
 
 ### Learning loop — `learning-loop.md`
 - Pending sessions are RETAINED per suggested path, not cleared; the session log
@@ -127,7 +130,8 @@
 - `neo hook record` never fails, stays cheap, records paths not contents.
 - The mod joins in unasked (`hooks/auto.ts`, `docs/claude-code-mods.md`):
   `neo recall` per typed prompt (no model call/load, 1 s embed deadline, writes
-  nothing, never constructs a `FactStore`); `learn`-mode review at Stop,
+  nothing, never constructs a `FactStore`; note passages come from the
+  observer-built `neo.notes` index, never from facts); `learn`-mode review at Stop,
   diagnosis of failing checks, plan check at ExitPlanMode. Cost is bounded by
   dedup, not a toggle; never re-review when `stop_hook_active`. Code calling `$`
   must live in `register.ts` (the validator rejects `$` across imports); work

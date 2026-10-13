@@ -758,8 +758,9 @@ class TestJanitorSaveDeferral:
     def test_all_four_janitors_accept_save_flag(self, store):
         """Signature guard: every chained janitor takes save= and defaults True."""
         import inspect
-        for name in ("prune_stale_facts", "demote_unhelpful_facts",
-                     "purge_dead_facts", "strip_tombstone_embeddings"):
+        for name in ("lift_probation_by_recall", "prune_stale_facts",
+                     "demote_unhelpful_facts", "purge_dead_facts",
+                     "strip_tombstone_embeddings"):
             sig = inspect.signature(getattr(store, name))
             assert sig.parameters["save"].default is True
 
@@ -3912,3 +3913,123 @@ class TestRetireLegacySuggestionFacts:
         assert [f.invalidation_reason for f in fresh._facts if f.id == "legacy"] == [
             "legacy_unverified_suggestion"], "the tombstone must reach disk"
         assert fresh.retire_legacy_suggestion_facts() == 0
+
+
+class TestLiftProbationByRecall:
+    """Recall writes nothing, so the mod records what it delivered; a lesson
+    handed to Claude in two sessions must leave probation before the prune."""
+
+    @staticmethod
+    def _ledger(tmp_path, monkeypatch, *deliveries):
+        import json
+
+        from neo import hook
+        ledger = tmp_path / "host_events.jsonl"
+        monkeypatch.setattr(hook, "HOOK_LEDGER", ledger)
+        with ledger.open("w") as out:
+            out.write(json.dumps({"event": "turn_started", "session_id": "s0"}) + "\n")
+            for session, ids in deliveries:
+                out.write(json.dumps({"event": "recall_delivered", "ts": time.time(),
+                                      "session_id": session, "fact_ids": ids}) + "\n")
+            out.write('{"event": "recall_delivered", torn')
+        return ledger
+
+    def _probation_fact(self, store, fact_id):
+        fact = Fact(id=fact_id, subject="Mined lesson", body="b", kind=FactKind.PATTERN,
+                    scope=FactScope.PROJECT, tags=["transcript-derived", "probation"],
+                    metadata=FactMetadata(confidence=0.6))
+        store._facts.append(fact)
+        return fact
+
+    def test_two_sessions_lift_and_the_lift_reaches_disk(self, store, tmp_path, monkeypatch):
+        self._probation_fact(store, "lesson")
+        store.save()
+        self._ledger(tmp_path, monkeypatch, ("s1", ["lesson"]), ("s2", ["lesson", "absent"]))
+        assert store.lift_probation_by_recall() == 1
+        reloaded = FactStore(codebase_root=str(tmp_path), eager_init=False)
+        reloaded.load()
+        fact = next(f for f in reloaded._facts if f.id == "lesson")
+        assert "probation" not in fact.tags
+
+    def test_one_session_is_not_enough(self, store, tmp_path, monkeypatch):
+        fact = self._probation_fact(store, "lesson")
+        self._ledger(tmp_path, monkeypatch, ("s1", ["lesson"]), ("s1", ["lesson"]))
+        assert store.lift_probation_by_recall() == 0
+        assert "probation" in fact.tags
+
+    def test_delivery_is_not_an_access(self, store, tmp_path, monkeypatch):
+        """Demotion reads access_count as retrieved-but-never-accepted."""
+        fact = self._probation_fact(store, "lesson")
+        self._ledger(tmp_path, monkeypatch, ("s1", ["lesson"]), ("s2", ["lesson"]))
+        store.lift_probation_by_recall()
+        assert fact.metadata.access_count == 0
+
+    def test_cold_start_lifts_before_the_prune(self, store, tmp_path, monkeypatch):
+        fact = self._probation_fact(store, "lesson")
+        fact.metadata.created_at = time.time() - 30 * 86400
+        store.save()
+        self._ledger(tmp_path, monkeypatch, ("s1", ["lesson"]), ("s2", ["lesson"]))
+        cold = FactStore(codebase_root=str(tmp_path))
+        survivor = next(f for f in cold._facts if f.id == "lesson")
+        assert survivor.is_valid and "probation" not in survivor.tags
+
+    def test_only_mined_transcript_lessons_lift(self, store, tmp_path, monkeypatch):
+        pr = self._probation_fact(store, "pr")
+        pr.tags.append("imported:github-pr")
+        plain = self._probation_fact(store, "plain")
+        plain.tags.remove("transcript-derived")
+        self._ledger(tmp_path, monkeypatch, ("s1", ["pr", "plain"]), ("s2", ["pr", "plain"]))
+        assert store.lift_probation_by_recall() == 0
+        assert "probation" in pr.tags and "probation" in plain.tags
+
+    def test_a_lifted_lesson_lives_only_while_recall_delivers_it(self, store, tmp_path, monkeypatch):
+        now = time.time()
+        kept = self._probation_fact(store, "kept")
+        dropped = self._probation_fact(store, "dropped")
+        for fact in (kept, dropped):
+            fact.metadata.created_at = now - 60 * 86400
+            fact.metadata.last_accessed = now - 60 * 86400
+        ledger = self._ledger(tmp_path, monkeypatch)
+        import json
+        with ledger.open("a") as out:
+            out.write("\n")
+            for session, ts, ids in (("s1", now - 40 * 86400, ["kept", "dropped"]),
+                                     ("s2", now - 30 * 86400, ["kept", "dropped"]),
+                                     ("s3", now - 86400, ["kept"])):
+                out.write(json.dumps({"event": "recall_delivered", "ts": ts,
+                                      "session_id": session, "fact_ids": ids}) + "\n")
+        store.lift_probation_by_recall(save=False)
+        assert "recall-lifted" in kept.tags and "recall-lifted" in dropped.tags
+        store.prune_stale_facts(save=False)
+        assert kept.is_valid, "a lesson recall still delivers was pruned"
+        assert not dropped.is_valid, "a lifted lesson outlived its deliveries"
+
+    def test_deliveries_split_across_rotation_count(self, store, tmp_path, monkeypatch):
+        import json
+        fact = self._probation_fact(store, "lesson")
+        ledger = self._ledger(tmp_path, monkeypatch, ("s2", ["lesson"]))
+        ledger.with_name(ledger.name + ".1").write_text(json.dumps(
+            {"event": "recall_delivered", "ts": time.time(), "session_id": "s1",
+             "fact_ids": ["lesson"]}) + "\n")
+        assert store.lift_probation_by_recall() == 1
+        assert "probation" not in fact.tags
+
+    def test_missing_ledger_lifts_nothing(self, store, tmp_path, monkeypatch):
+        from neo import hook
+        monkeypatch.setattr(hook, "HOOK_LEDGER", tmp_path / "absent.jsonl")
+        self._probation_fact(store, "lesson")
+        assert store.lift_probation_by_recall() == 0
+
+    def test_a_peer_lift_survives_our_stale_save(self, store, tmp_path):
+        A = store
+        fact = A.add_fact(subject="shared lesson", body="b", kind=FactKind.PATTERN,
+                          scope=FactScope.PROJECT)
+        assert "probation" in fact.tags
+        B = FactStore(codebase_root=str(tmp_path))
+        bfact = next(f for f in B._facts if f.id == fact.id)
+        bfact.tags = [t for t in bfact.tags if t != "probation"]
+        B.save()
+        A.add_fact(subject="other", body="b", kind=FactKind.PATTERN, scope=FactScope.PROJECT)
+        C = FactStore(codebase_root=str(tmp_path))
+        merged = next(f for f in C._facts if f.id == fact.id)
+        assert "probation" not in merged.tags, "peer's probation lift was undone"

@@ -36,8 +36,9 @@ Neo lives in the conversation, not in a panel you have to open:
 - **The band above the prompt** shows what he is doing while he works
   (`reading this turn's changes · 0:12`), what he remembered for the prompt you
   just typed (`lessons` expands them), and his latest finding in his own words
-  (`d` details, with the proposed diffs; `x` dismiss). It is empty when he has
-  nothing to say.
+  (`d` details, with the proposed diffs; `x` dismiss). When he has nothing to
+  say it shows one dim line, `Neo: listening`, so a quiet Neo is not mistaken
+  for a missing one.
 - **A line in the conversation** (`$.ui.log`, drawn dim) marks each time he
   contributes: his line when a review continued the turn, a diagnosis arrived
   or a plan was checked, and his recall line (`Neo: …`) when a beat earned
@@ -95,7 +96,7 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
 
 | When | What Neo does | Model call | How Claude gets it |
 | --- | --- | --- | --- |
-| You type a prompt | `neo recall`: up to 3 learned lessons matching it | none | context on that prompt |
+| You type a prompt | `neo recall`: up to 3 learned lessons and 2 passages from the notes your rule file points to | none | context on that prompt |
 | A turn that edited files is about to end | reviews those edits (`git diff HEAD` per path; a new or untracked file as a whole-file addition) | one, up to 90 s | the turn continues with Neo's fix, only when it carries a diff or code |
 | A test, build or lint command fails | diagnoses the failure, in the background | one | context at the next main-thread hook |
 | A plan leaves plan mode | checks the plan | one, up to 90 s | context as the work starts |
@@ -106,6 +107,14 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
   it writes nothing, and it leaves out what Claude already has (rule files,
   its own memory files, git history) along with generic seed and community
   patterns. It runs only for prompts a person typed, not machine-injected ones.
+- **Notes.** CLAUDE.md is loaded; the notes it says to read are not. Recall
+  offers the passage that matches the prompt from any markdown file or
+  directory the project's rule file names in backticks (here
+  `docs/engineering-notes/`), as `- <path> [note]: …`. The observer embeds
+  them into `~/.neo/notes/<project_id>.json` on each sweep (unchanged files
+  cost a hash); recall only reads that index, and leaves out a note edited
+  since it was embedded. Measured on this repo's last 36 typed prompts: recall
+  answered 27 (11 before notes), at 61 ms median.
 - **Reviews, diagnoses and plan checks** are real inference on Neo's configured
   provider: they send the diff, error output or plan, plus the source and
   memory Neo selects, and incur its normal cost. They are bounded by
@@ -115,6 +124,12 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
   not reviewed then; its edits are kept and reviewed at the next Stop that is
   not a continuation. Only a review with a concrete change continues a
   turn; a diagnosis never does.
+- **Every automatic run is logged** in `~/.neo/sessions/host_events.jsonl`
+  as `auto_started` / `auto_finished` with its `kind` and what became of it
+  (`failed`, `nothing`, `prose`, `change`; a review reaches Claude only on
+  `change`), and every recall that reached Claude as `recall_delivered` with
+  the lesson ids. Ids and outcomes only, never prompts, diffs or answers. A
+  lesson recalled in two sessions leaves probation.
 - **Subagents** contribute edits to the review but never trigger a diagnosis
   or consume findings meant for the main thread. A diagnosis that finishes
   after its session ended (`/clear`, resume) is dropped.

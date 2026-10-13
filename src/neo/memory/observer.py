@@ -506,7 +506,21 @@ class Observer:
             store = FactStore(codebase_root=root, eager_init=False)
             store.initialize()
         mined = self._ingest_transcripts(store, root, peer_roots)
+        self._refresh_notes(store, root)
         return 0, mined, store
+
+    @staticmethod
+    def _refresh_notes(store, root: str) -> None:
+        """Re-embed the notes this project's rule file points to, for recall
+        (`neo.notes`). Unchanged notes cost a hash each; never fails the sweep."""
+        try:
+            from neo.memory.store import DEFAULT_EMBED_MODEL
+            from neo.notes import refresh_index
+
+            refresh_index(Path(root), store._embed_text, DEFAULT_EMBED_MODEL)
+        except Exception as e:
+            print(f"neo observer notes index error: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
 
     def _cycle_one(self) -> None:
         """Per-project pass (also feeds the A2UI inspector). Errors are caught

@@ -20,6 +20,9 @@ model as additional context, so three rules decide its shape:
    because nothing here runs that cold start. Measured on this repo's store,
    19 of 203 valid facts survive, and they are the lessons mined from real
    sessions.
+4. **Notes the rule file points to are offered too** (`neo.notes`): the host
+   loads CLAUDE.md, never the notes it says to read. Their passages come from
+   a sidecar index the observer embeds, scored with the same query vector.
 
 It never fails the host: every error path prints nothing and exits 0.
 """
@@ -39,6 +42,11 @@ from typing import Callable, Optional
 # answer, while unrelated prompts topped out at 0.33.
 MIN_SIMILARITY = 0.45
 MAX_FACTS = 3
+# Note passages (`neo.notes`) are longer and share a vocabulary, so their
+# floor is higher. Calibrated on this repo's notes: passages answering a prompt
+# scored 0.53-0.63; an unrelated prompt ("what's for lunch") topped at 0.43.
+NOTE_MIN_SIMILARITY = 0.52
+MAX_NOTES = 2
 MAX_BODY_CHARS = 400
 # The whole embedding exchange. A short query takes ~0.16 s on an idle server;
 # past this the observer is busy with its own sweep and we stay silent.
@@ -157,11 +165,35 @@ def _recall_beat(facts: list, scored_hits: list, recent: set) -> dict:
         return {}
 
 
+def _note_hits(root: str, query) -> list[tuple[str, str]]:
+    """`(path, passage)` from the notes the rule file points to (`neo.notes`):
+    the best `MAX_NOTES` above `NOTE_MIN_SIMILARITY`, from an index the
+    observer built. [] when there is none or it is for another model."""
+    from neo.math_utils import batched_cosine
+    from neo.memory.store import DEFAULT_EMBED_MODEL
+    from neo.notes import load_index
+
+    try:
+        notes = [n for n in load_index(Path(root), DEFAULT_EMBED_MODEL)
+                 if n[2].shape == query.shape]
+        if not notes:
+            return []
+        scores = batched_cosine([vector for _, _, vector in notes], query)
+        ranked = sorted(zip(scores, notes), key=lambda pair: -pair[0])
+        return [(path, passage) for score, (path, passage, _) in ranked[:MAX_NOTES]
+                if score >= NOTE_MIN_SIMILARITY]
+    except Exception:
+        return []
+
+
 def recall(prompt: str, cwd: str,
            embed: Optional[Callable[[str], object]] = None,
            recent_beats: Optional[set] = None) -> dict:
-    """`{"text", "beat_id"}`: relevant learned lessons, opened by Neo's beat
-    for the situation when one fits. Empty text when nothing is relevant."""
+    """`{"text", "beat_id", "fact_ids"}`: relevant learned lessons, opened by
+    Neo's beat for the situation when one fits. Empty text when nothing is
+    relevant. `fact_ids` lets the host record what it delivered; recall itself
+    still writes nothing (`FactStore.lift_probation_by_recall` reads that
+    record)."""
     import numpy as np
 
     from neo.math_utils import batched_cosine
@@ -169,7 +201,7 @@ def recall(prompt: str, cwd: str,
     from neo.memory.store import MAX_TEXT_LENGTH, STALE_MAX_CONFIDENCE
     from neo.text_budget import truncate_marked
 
-    silent = {"text": "", "beat_id": ""}
+    silent = {"text": "", "beat_id": "", "fact_ids": []}
     if not prompt.strip():
         return silent
     vector = (embed or _resident_embed)(prompt[:MAX_TEXT_LENGTH])
@@ -177,7 +209,8 @@ def recall(prompt: str, cwd: str,
         return silent
     query = np.asarray(vector, dtype=np.float32)
 
-    facts = _load_facts(_project_root(cwd))
+    root = _project_root(cwd)
+    facts = _load_facts(root)
     candidates = [
         fact for fact in facts
         if fact.is_valid
@@ -188,21 +221,29 @@ def recall(prompt: str, cwd: str,
         and not _REDUNDANT_TAGS.intersection(fact.tags)
         and not is_legacy_suggestion_fact(fact)
     ]
-    if not candidates:
-        return silent
-    scores = batched_cosine([fact.embedding for fact in candidates], query)
-    ranked = sorted(zip(scores, candidates), key=lambda pair: -pair[0])
-    scored_hits = [(score, fact) for score, fact in ranked[:MAX_FACTS]
-                   if score >= MIN_SIMILARITY]
-    if not scored_hits:
+    scored_hits = []
+    if candidates:
+        scores = batched_cosine([fact.embedding for fact in candidates], query)
+        ranked = sorted(zip(scores, candidates), key=lambda pair: -pair[0])
+        scored_hits = [(score, fact) for score, fact in ranked[:MAX_FACTS]
+                       if score >= MIN_SIMILARITY]
+    note_hits = _note_hits(root, query)
+    if not scored_hits and not note_hits:
         return silent
 
-    beat = _recall_beat(facts, scored_hits, recent_beats or set())
+    beat = _recall_beat(facts, scored_hits, recent_beats or set()) if scored_hits else {}
     lines = [f"Neo: {beat['line']}" if beat else "Neo:"]
     for _, fact in scored_hits:
         body = " ".join(truncate_marked(fact.body, MAX_BODY_CHARS).split())
         lines.append(f"- {fact.subject} [{fact.kind.value}, {fact.scope.value}]: {body}")
-    return {"text": "\n".join(lines), "beat_id": beat.get("beat_id", "") if beat else ""}
+    for path, passage in note_hits:
+        body = " ".join(truncate_marked(passage, MAX_BODY_CHARS).split())
+        lines.append(f"- {path} [note]: {body}")
+    return {
+        "text": "\n".join(lines),
+        "beat_id": beat.get("beat_id", "") if beat else "",
+        "fact_ids": [fact.id for _, fact in scored_hits],
+    }
 
 
 def run_recall(argv: list[str], stdin=None) -> int:

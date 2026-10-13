@@ -44,6 +44,11 @@ from typing import Optional
 # Import-time home capture: `tests/conftest.py::HOME_PATH_CONSTANTS` must carry
 # this or `test_home_isolation.py` fails, which is the intended outcome.
 HOOK_LEDGER = Path.home() / ".neo" / "sessions" / "host_events.jsonl"
+LIFECYCLE_EVENTS = frozenset({
+    "turn_started", "turn_completed", "neo_started", "neo_finished",
+    "recall_delivered", "auto_started", "auto_finished",
+})
+MAX_RECALL_IDS = 8
 
 # One generation, rotated at 8 MB — smaller than `metrics.jsonl`'s 32 MB because
 # nothing summarises this file yet, so an operator may have to read it by hand.
@@ -232,13 +237,23 @@ def append(record: dict, ledger: Optional[Path] = None) -> None:
 
 def build_lifecycle_record(payload: dict) -> Optional[dict]:
     """Record identity and disposition, never prompts, answers or tool bodies."""
-    if payload.get("event") not in {"turn_started", "turn_completed", "neo_started", "neo_finished"}:
+    if payload.get("event") not in LIFECYCLE_EVENTS:
         return None
     record = {"ts": time.time(), "source": "claude-mod"}
-    for key in ("event", "session_id", "turn_id", "agent_id", "invocation_id", "cwd", "status"):
+    for key in ("event", "session_id", "turn_id", "agent_id", "invocation_id",
+                "cwd", "status", "kind"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             record[key] = value[:4096]
+    # Which lessons recall handed Claude: ids only, never their text.
+    if record["event"] == "recall_delivered":
+        ids = payload.get("fact_ids")
+        record["fact_ids"] = [
+            i[:64] for i in (ids if isinstance(ids, list) else [])
+            if isinstance(i, str) and i
+        ][:MAX_RECALL_IDS]
+        if not record["fact_ids"] or "session_id" not in record:
+            return None
     return record
 
 

@@ -208,3 +208,25 @@ def test_paths_outside_the_checkout_and_unstatable_paths_are_never_flagged(tmp_p
     flagged = {f["id"]: f["missing_file"] for f in status["facts"]}
     assert flagged["abs"] == flagged["up"] == flagged["win"] == flagged["url"] == ""
     assert status["missing_file_count"] in (0, 1)  # the 300-char name may or may not stat
+
+
+def test_recall_delivery_records_ids_only():
+    life = hook.build_lifecycle_record({
+        "event": "recall_delivered", "session_id": "s", "cwd": "/w",
+        "fact_ids": ["a", "", 7, "b" * 100] + [f"x{i}" for i in range(20)],
+        "text": "BODY_MUST_NOT_PERSIST",
+    })
+    assert life["fact_ids"][:2] == ["a", "b" * 64]
+    assert len(life["fact_ids"]) == hook.MAX_RECALL_IDS
+    assert "BODY_MUST_NOT_PERSIST" not in json.dumps(life)
+    assert hook.build_lifecycle_record({"event": "recall_delivered", "session_id": "s"}) is None
+    assert hook.build_lifecycle_record({"event": "recall_delivered", "fact_ids": ["a"]}) is None
+
+
+def test_auto_runs_record_kind_and_outcome():
+    life = hook.build_lifecycle_record({
+        "event": "auto_finished", "kind": "review", "status": "prose",
+        "session_id": "s", "invocation_id": "i", "cwd": "/w", "diff": "BODY_MUST_NOT_PERSIST",
+    })
+    assert life["kind"] == "review" and life["status"] == "prose"
+    assert "BODY_MUST_NOT_PERSIST" not in json.dumps(life)
