@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.60.1] - 2026-10-14
+
+### Fixed
+
+- **A lesson's verdict can no longer be reset by an unverified outcome.** An outcome with no evidence overwrote a lesson's status, even a promoted (durable) one. A reset lesson stopped counting toward promotion across projects, and a reset contradiction stopped retiring the lesson it pointed to. Now only a lesson with no verdict yet is marked unverified (#306).
+
 ## [0.60.0] - 2026-10-14
 
 ### Fixed
