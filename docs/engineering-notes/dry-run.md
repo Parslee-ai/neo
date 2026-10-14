@@ -50,7 +50,16 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   **saves**, and `demote_unhelpful_facts` lowers confidence and invalidates facts — so
   reaching the engine at all meant a "read-only" inspection was aging the store it
   inspected. `FactStore(read_only=True)` makes `save()` a no-op at the single write
-  choke point, which a new caller cannot forget; `dry_run` also skips
+  choke point, which a new caller cannot forget. **It also skips every ingester**
+  (seed, community, constraints, Claude memory, git history): each records "done"
+  outside `save()` — a checksum file, a git watermark — so a read-only run that came
+  first after a CLAUDE.md, memory-file or package change marked it ingested while
+  its facts died with the no-op save, and the real store never got them (Lattice
+  lookups are read-only too, so this was not dry-run-only). A read-only store reads
+  only previously ingested inputs, so a dry run right after editing CLAUDE.md does
+  not show the edit until a writable run ingests it; construction is still not
+  filesystem-pure (directories, legacy renames) and maintenance still runs in
+  memory; `dry_run` also skips
   `detect_implicit_feedback` and `_complete_learning_episode`. Retrieval still marks
   facts accessed in memory, and `metrics.jsonl` still records the run —
   deliberately: the two events it writes (`execution_context_resolved`, `retrieve`)

@@ -12,7 +12,9 @@ from typing import Optional
 import numpy as np
 
 from neo.math_utils import batched_cosine, cosine_similarity
-from neo.memory.models import ContextResult, Fact, FactKind, FactScope, rank_score
+from neo.memory.models import (
+    ContextResult, Fact, FactKind, FactScope, carries_lesson, rank_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ class ContextAssembler:
                 known_unknowns.append(fact)
             elif fact.scope == FactScope.SESSION and fact.is_valid:
                 session_facts.append(fact)
-            elif fact.is_valid:
+            elif fact.is_valid and carries_lesson(fact):
                 valid_candidates.append(fact)
             elif not fact.is_valid and fact.superseded_by:
                 invalidated.append(fact)

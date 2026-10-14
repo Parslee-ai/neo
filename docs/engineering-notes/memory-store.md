@@ -370,6 +370,48 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   `seed`/`community`/`synthesized` tags bypass decay. Branching prompts (CHAIN/SPLIT)
   get per-branch retrieval via `memory.query_routing`; each surfaced EPISODE pulls up to
   2 peer episodes from the same session.
+  - **Recall decay counts in `DECAY_UNIT_DAYS` (30), not days** (`models.rank_score`,
+    `update_recall`). Counted in days — the paper's companion-chat setting — a
+    never-recalled lesson at cosine 0.6, confidence 0.6 ranked 0.028 at 3 days and
+    0.0005 at 7, while a non-decaying seed at the same cosine and confidence kept 0.36. On a live store 65% of
+    685 transcript lessons scored < 0.1 at cosine 0.6, so the memory source with
+    the highest measured use rate (24-26% of injections used) got 19 of 736 engine
+    slots in 21 days. **Footgun, measured when fixing it**: the old decay was also
+    the only thing holding back `history` (git commit subjects, ~2% used); slowing
+    decay alone moved 27 → 117 of 180 replayed slots to commit subjects and left
+    lessons flat (10 → 9). It only works together with the next rule. Stored
+    `g_n` values are reinterpreted, not migrated: on the live store every
+    transcript lesson still had the default 1.0, so nothing learned is lost. 30
+    is a calibration against the prune windows, not a derived constant.
+  - **Only lessons are offered as learned memory** (`models.carries_lesson`, `NO_LESSON_TAGS` =
+    seed / community / outcome / history, plus legacy suggestion facts). Applied to
+    `ContextAssembler`'s valid layer (the engine prompt) and to `neo recall`, which
+    additionally drops the host's own memory files. The facts stay in the store
+    for their other uses, and the constraint / session / known-unknown layers and
+    supersession annotations are untouched — this governs the valid layer only.
+    It also shrinks `valid_facts`, which feeds the reasoning-tier memory signal
+    (`signal_from_facts`) and citation credit. Replayed over 30 recent real objectives with both
+    changes, lessons went from 10 to 57 of 180 slots; the rest were the
+    operator's Claude memory, the one injected source with above-floor use
+    (7.7%). **Honest limit**: the layer still has no relevance floor (`scored[:k]`,
+    `at_least_one=True`), so on a store with lessons it is never empty; filler
+    is replaced by the most similar lesson, weak or not. A floor needs its own
+    calibration on engine-length prompts (recall's 0.45 was calibrated on typed
+    prompts). The community fallback, which injected token-matched community
+    patterns when the store returned nothing (0 of 141 community injections ever
+    used), was removed. **Cost shift, accepted on purpose**: `valid_facts` feeds
+    `signal_from_facts`, so a store with no lessons (a fresh install, a project
+    with only seeds and history) now reads `pattern_count = 0` = novel →
+    higher effort and, with CAR reachable, multi-agent. Before, seed filler made
+    every prompt look "familiar" (86 of 93 recent runs went fast). Live, the
+    shift runs the other way for stores with lessons: dropping low-confidence
+    `outcome` facts raises the average. **Not filtered, deliberately**:
+    `FactStore.retrieve_relevant` keeps every valid fact — Lattice `memory:`
+    serves commit history by design (it strips the patch from commit bodies),
+    and the gatherer's episode-history boost reads only `file:`-tagged episode
+    facts, which decay exactly like history, so the unit change does not shift
+    their balance. Seed and community facts now reach no prompt; their
+    ingesters are candidates for removal.
 - Local storage: per-scope JSON files in `~/.neo/facts/` with inline embeddings. Fine
   while any single scope file stays under ~10k facts; revisit the backend past that.
   `project_id` is `SHA256[:16]` of the **normalized git remote URL** (`scope._compute_project_id`)

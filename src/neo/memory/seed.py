@@ -22,6 +22,14 @@ CHECKSUM_FILE = CHECKSUM_DIR / "checksums.json"
 
 SEED_CONFIDENCE = 0.6
 
+# Checksum key, deliberately NOT the file path. The same seed file is reached
+# through a different absolute path from every install (a pipx venv, a
+# Homebrew site-packages, an editable checkout), and keying on the path made
+# each one ingest its own full copy into the shared global store: a live store
+# held every seed fact three times, and retrieval injected all three copies of
+# one fact into a single prompt.
+SEED_CHECKSUM_KEY = "neo:seed_facts"
+
 KIND_MAP: dict[str, FactKind] = {
     "constraint": FactKind.CONSTRAINT,
     "architecture": FactKind.ARCHITECTURE,
@@ -55,20 +63,12 @@ class SeedIngester:
             return [], []
 
         current_checksum = self._file_checksum(SEED_FILE)
-        stored_checksum = self._checksums.get(str(SEED_FILE), "")
+        stored_checksum = self._checksums.get(SEED_CHECKSUM_KEY, "")
 
         if current_checksum == stored_checksum:
             return [], []
 
         logger.info("Ingesting seed facts from package")
-
-        # Supersede old seed facts
-        superseded_facts: list[Fact] = []
-        for fact in existing_facts:
-            if (fact.is_valid and "seed" in fact.tags
-                    and fact.metadata.source_file == str(SEED_FILE)):
-                fact.is_valid = False
-                superseded_facts.append(fact)
 
         # Parse seed file
         try:
@@ -102,8 +102,21 @@ class SeedIngester:
             )
             new_facts.append(fact)
 
-        self._checksums[str(SEED_FILE)] = current_checksum
-        self._save_checksums()
+        # Supersede every earlier seed generation, whichever install path
+        # minted it (see SEED_CHECKSUM_KEY), only once the replacement parsed:
+        # an unreadable seed file must not retire the generation in use. Only
+        # this ingester mints the tag.
+        superseded_facts: list[Fact] = []
+        for fact in existing_facts:
+            if (fact.is_valid and "seed" in fact.tags
+                    and fact.scope == FactScope.GLOBAL):
+                fact.is_valid = False
+                superseded_facts.append(fact)
+
+        # Recorded in memory now, persisted by `save_checksums` only after the
+        # caller has saved the facts: a checksum on disk for facts that never
+        # reached it would skip this generation forever.
+        self._checksums[SEED_CHECKSUM_KEY] = current_checksum
 
         logger.info(f"Seed facts: {len(new_facts)} loaded")
         return new_facts, superseded_facts
@@ -124,5 +137,6 @@ class SeedIngester:
                 pass
         return {}
 
-    def _save_checksums(self) -> None:
+    def save_checksums(self) -> None:
+        """Persist the ingested generation. Call after the facts are saved."""
         atomic_write_json(CHECKSUM_FILE, self._checksums, indent=2)

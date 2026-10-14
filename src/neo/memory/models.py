@@ -67,6 +67,22 @@ def provenance_bonus(provenance: str) -> float:
 
 SECONDS_PER_DAY = 86400.0
 
+# The time unit recall decay counts in: `g_n` (which starts at 1.0) is a
+# strength measured in these units, and `g_n_update` reads gaps in them too.
+# Counting in DAYS — the paper's companion-chat setting — erased a coding
+# lesson within its first week. As `rank_score` at cosine 0.6 and confidence
+# 0.6, a never-recalled lesson scored 0.028 at 3 days and 0.0005 at 7, against
+# 0.36 forever for a non-decaying seed fact at the same cosine and confidence.
+# Measured on a live store, 65% of the 685 transcript-mined lessons scored
+# under 0.1 at cosine 0.6 (median 0.04), so the memory with the highest
+# measured use rate (24% of injections used, vs 3-8% for every other source)
+# was injected 33 times in 4,846. In 30-day units the same lesson scores 0.40
+# at 3 days, 0.30 at 14 (`STALE_MIN_AGE_DAYS`, when the janitor first may drop
+# it), 0.19 at 30 and 0.03 at 90: dormant lessons still fade, on the timescale
+# they are kept. Strengthening follows the unit too: a re-recall a day later
+# adds tanh(1/60) ~ 0.008 to `g_n`, so only weeks-apart recalls strengthen.
+DECAY_UNIT_DAYS = 30.0
+
 # Tags that mark a fact as curated knowledge — seeded, community-sourced,
 # or distilled by synthesis. Curated facts skip Ebbinghaus decay because
 # their relevance isn't a function of how often the user happens to query
@@ -112,7 +128,7 @@ def rank_score(fact: "Fact", similarity: float, now: Optional[float] = None) -> 
         elapsed_days = max(0.0, ((now if now is not None else time.time()) - ts) / SECONDS_PER_DAY)
         sim = recall_probability(
             similarity,
-            days_since_recall=elapsed_days,
+            days_since_recall=elapsed_days / DECAY_UNIT_DAYS,
             g_n=fact.metadata.g_n,
         )
         eff = fact.metadata.effectiveness_f
@@ -154,6 +170,23 @@ def is_legacy_suggestion_fact(fact: "Fact") -> bool:
     )
 
 
+# Provenance whose facts teach a reasoning prompt nothing: textbook patterns
+# every model already knows (`seed`, `community`), outcome bookkeeping
+# (`outcome`) and git commit subjects (`history`). Measured on a live install
+# over 21 days of engine prompts, these took 462 of 736 injected fact slots at
+# 0-6.6% use, while transcript-mined lessons were used 26% of the time and got
+# 19 slots. The layer still has no relevance floor (top-k, at least one), so
+# what fills it is now the most similar LESSON, weak or not.
+# Shared by `ContextAssembler` (the engine's prompt) and `neo recall`
+# (Claude's, which also drops the host's own memory files).
+NO_LESSON_TAGS = frozenset({"seed", "community", "outcome", "history"})
+
+
+def carries_lesson(fact: "Fact") -> bool:
+    """True iff ``fact`` may be shown to a model as something learned."""
+    return not NO_LESSON_TAGS.intersection(fact.tags) and not is_legacy_suggestion_fact(fact)
+
+
 def update_effectiveness(fact: "Fact", *, outcome: str) -> None:
     """LessonL c/n update on a reuse outcome.
 
@@ -193,7 +226,7 @@ def update_recall(fact: "Fact", now: Optional[float] = None) -> None:
 
     if fact.metadata.last_recall_ts is not None:
         elapsed_days = max(0.0, (now - fact.metadata.last_recall_ts) / SECONDS_PER_DAY)
-        fact.metadata.g_n = g_n_update(fact.metadata.g_n, elapsed_days)
+        fact.metadata.g_n = g_n_update(fact.metadata.g_n, elapsed_days / DECAY_UNIT_DAYS)
 
     fact.metadata.last_recall_ts = now
     fact.metadata.recall_count += 1

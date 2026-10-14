@@ -52,8 +52,11 @@
   demote → purge → strip with `save=False` and one save.
 - `project_id` = hash of the normalized git remote URL (path hash fallback).
 - Retrieval rank formula lives only in `memory.models.rank_score`; audit
-  `ContextAssembler._score_facts` when changing it. Four-layer context assembly
-  must preserve the StateBench decision-accuracy contract.
+  `ContextAssembler._score_facts` when changing it. Decay counts in
+  `DECAY_UNIT_DAYS`; only `carries_lesson` facts enter the engine's valid
+  layer and recall — slowing decay without that filter floods commit
+  subjects. Four-layer context assembly must preserve the StateBench
+  decision-accuracy contract.
 - GitHubPRSource facts enter as REVIEW on probation and never promote by recurrence.
 - Recall deliveries (ledger `recall_delivered`) lift probation for mined lessons
   but are NOT accesses; a `recall-lifted` fact lives only while recall keeps
@@ -96,8 +99,9 @@
 ### Dry run — `dry-run.md`
 - `neo --dry-run` runs the real engine and records the exact prompt via
   `RecordingLM`; it forces the panel off, never touches the CAR daemon, and must
-  not modify the fact store (`FactStore(read_only=True)`). Both exits go through
-  `cli._report_dry_run`. Use it before believing any claim about what Neo saw.
+  not modify the fact store (`FactStore(read_only=True)`, which also skips
+  every ingester: their checksums/watermarks are written outside `save()`).
+  Both exits go through `cli._report_dry_run`. Use it before believing any claim about what Neo saw.
 
 ### Indexing — `indexing.md`
 - Budgets are apportioned, never sliced; selection orders source before tests.
