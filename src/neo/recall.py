@@ -52,15 +52,9 @@ MAX_BODY_CHARS = 400
 # past this the observer is busy with its own sweep and we stay silent.
 EMBED_DEADLINE_S = 1.0
 
-# Provenance the model already has in context, or that carries no lesson.
-_REDUNDANT_TAGS = frozenset({
-    "history",                  # git log subjects
-    "claude-memory",            # the host's own memory files
-    "imported:claude-memory",
-    "seed",                     # generic textbook patterns
-    "community",
-    "outcome",                  # suggestion-outcome bookkeeping
-})
+# Beyond what carries no lesson anywhere (`models.carries_lesson`): the host's
+# own memory files, which it already has in context.
+_HOST_MEMORY_TAGS = frozenset({"claude-memory", "imported:claude-memory"})
 _REDUNDANT_KINDS = frozenset({"constraint", "episode"})
 
 
@@ -197,7 +191,7 @@ def recall(prompt: str, cwd: str,
     import numpy as np
 
     from neo.math_utils import batched_cosine
-    from neo.memory.models import is_legacy_suggestion_fact
+    from neo.memory.models import carries_lesson
     from neo.memory.store import MAX_TEXT_LENGTH, STALE_MAX_CONFIDENCE
     from neo.text_budget import truncate_marked
 
@@ -218,8 +212,8 @@ def recall(prompt: str, cwd: str,
         and np.shape(fact.embedding) == query.shape  # a foreign model's vector
         and fact.metadata.confidence >= STALE_MAX_CONFIDENCE
         and fact.kind.value not in _REDUNDANT_KINDS
-        and not _REDUNDANT_TAGS.intersection(fact.tags)
-        and not is_legacy_suggestion_fact(fact)
+        and not _HOST_MEMORY_TAGS.intersection(fact.tags)
+        and carries_lesson(fact)
     ]
     scored_hits = []
     if candidates:

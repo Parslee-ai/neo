@@ -33,7 +33,7 @@ from neo.events import (
     NullSink,
     safe_emit,
 )
-from neo.text_budget import apportion, elide_middle, shown_of, truncate_marked
+from neo.text_budget import apportion, elide_middle, truncate_marked
 from neo.schemas import STRUCTURED_STOP
 from neo.models import (
     CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE,
@@ -117,11 +117,6 @@ _EXEMPLAR_SOLUTION_CHARS = 100
 # the fix, and naming this one is what keeps them separate.
 UNSCORED_MEMORY_PRIOR = 0.5
 
-# Community-cache fallback, used only when FactStore retrieval finds nothing
-# similar enough. That is precisely when the model has the least other
-# context and leans hardest on what it is handed, so both cuts are marked.
-_COMMUNITY_FALLBACK_FACTS = 2
-_COMMUNITY_BODY_CHARS = 200
 # Substrings that earn the larger cap. Matched against the whole lowercased
 # path, so a source file under a directory named `architecture` also qualifies.
 _IMPORTANT_FILE_PATTERNS = ('readme.md', 'claude.md', 'architecture')
@@ -2027,15 +2022,11 @@ class NeoEngine:
             fact_context = self.fact_store.build_context(prompt_text, environment=context, k=k)
             self._capture_retrieval_context(fact_context, included=True)
             formatted = self.fact_store.format_context_for_prompt(fact_context)
+            # An empty layer means no section. This used to fall back to
+            # community patterns picked by prompt-token overlap; community
+            # facts were used in 0 of 141 injections on a live install.
             if formatted:
                 past_learnings = [formatted]
-            else:
-                # Fallback: FactStore found nothing similar enough. Inject a
-                # small set of community-curated globals so the prompt always
-                # carries some memory-derived context.
-                fallback = self._community_fallback_learnings(prompt_text)
-                if fallback:
-                    past_learnings = [fallback]
 
             # Log retrieval for measurement (Fact-compatible attributes)
             self._log_pattern_retrieval(
@@ -2831,62 +2822,6 @@ RULES:
             item for item in diagnostics
             if NeoEngine._is_actionable_diagnostic(item)
         ]
-
-    def _community_fallback_learnings(self, prompt_text: str) -> str:
-        """Return formatted community facts when the primary store misses.
-
-        Reads ~/.neo/community_facts_cache.json directly and picks facts whose
-        subject contains any token from the prompt. Falls back to the first 2
-        facts if no token match.
-
-        Both cuts here are marked, and the list one is not optional politeness.
-        These are curated global rules presented under a heading that reads as
-        the complete set, so a silent 5-into-2 elision tells the model three
-        rules do not exist. And the body cut feeds `past_learnings`, which
-        `_deliberation_context` apportions and cuts AGAIN — an unmarked cut
-        upstream of a marked one makes the surviving marker report the wrong
-        denominator, which is the nested-cut defect this module exists to
-        remove rather than relocate.
-        """
-        if getattr(self, "scoped_consumer", None) is not None:
-            return ""
-        cache = Path.home() / ".neo" / "community_facts_cache.json"
-        if not cache.exists():
-            return ""
-        try:
-            data = json.loads(cache.read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            logger.debug(f"Community cache unreadable: {e}")
-            return ""
-
-        facts = data.get("data", {}).get("facts", [])
-        if not facts:
-            return ""
-
-        tokens = {t for t in prompt_text.lower().split() if len(t) > 3}
-        scored: list[tuple[int, dict]] = []
-        for f in facts:
-            text = (f.get("subject", "") + " " + f.get("body", "")).lower()
-            hits = sum(1 for t in tokens if t in text)
-            scored.append((hits, f))
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        matching = [f for h, f in scored if h > 0]
-        # `candidates` is what the section is selecting FROM, so the annotation
-        # describes the real omission: on a token match that is the matching
-        # set, and on the no-match fallback it is the whole cache.
-        candidates = matching or [f for _, f in scored]
-        picked = candidates[:_COMMUNITY_FALLBACK_FACTS]
-        if not picked:
-            return ""
-
-        header = "## Community Patterns (fallback)"
-        lines = [header + shown_of(candidates, len(picked))]
-        for f in picked:
-            subject = f.get("subject", "")
-            body = truncate_marked(f.get("body", ""), _COMMUNITY_BODY_CHARS)
-            lines.append(f"- **{subject}**: {body}")
-        return "\n".join(lines)
 
     def _extract_prompt_constraints(self, prompt: str) -> list:
         """Extract verifiable Constraint objects from the prompt (pattern-based).

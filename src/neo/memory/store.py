@@ -553,11 +553,18 @@ class FactStore:
         self._initialized = True
 
         self._maybe_migrate()
-        self._ingest_seed_facts()
-        self._ingest_community_feed()
-        self._ingest_constraints()
-        self._ingest_claude_memory()
-        self._ingest_git_history()
+        # A read-only store ingests nothing. Every ingester records "done"
+        # OUTSIDE save() — a checksum file, a git watermark — while the facts
+        # it minted die with the no-op save, so a `--dry-run` or a Lattice
+        # lookup that happened to run first after a CLAUDE.md, memory-file or
+        # package change marked that change ingested and the real store never
+        # received it. A read-only store shows what is persisted, nothing more.
+        if not self.read_only:
+            self._ingest_seed_facts()
+            self._ingest_community_feed()
+            self._ingest_constraints()
+            self._ingest_claude_memory()
+            self._ingest_git_history()
 
         # Persist capping that load() deferred (save=False)
         if self._cap_pending:
@@ -3997,6 +4004,7 @@ class FactStore:
             self._strip_ingester_tombstones(superseded_facts)
             self._facts.extend(new_facts)
             self.save()
+            ingester.save_checksums()
             logger.info(
                 f"Seed facts: {len(new_facts)} new, {len(superseded_facts)} superseded"
             )

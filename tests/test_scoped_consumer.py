@@ -142,7 +142,7 @@ def test_engine_partitions_fact_and_episode_store(tmp_path):
         ) as facts,
         patch("neo.memory.episodes.LearningEpisodeStore") as episodes,
     ):
-        engine = NeoEngine(
+        NeoEngine(
             resolve_adapter(object(), scoped_consumer=binding),
             codebase_root=str(tmp_path),
             scoped_consumer=binding,
@@ -152,7 +152,6 @@ def test_engine_partitions_fact_and_episode_store(tmp_path):
     assert facts.call_args.kwargs["emit_metrics"] is False
     assert facts.call_args.kwargs["read_only"] is True
     assert episodes.call_args.kwargs["base_dir"] == binding.state_root / "episodes"
-    assert engine._community_fallback_learnings("private prompt") == ""
 
 
 def test_revoked_answerer_does_not_disclose_cached_memory(tmp_path):

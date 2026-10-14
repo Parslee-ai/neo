@@ -251,7 +251,7 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   cases. Before the extraction the defect sat in NINETEEN individual cuts
   across nine prompt builders in six modules. Seventeen were found by the
   first sweep; two more (`_community_fallback_learnings`, one body cut and one
-  list elision) came out of review, and the reason they were missed is worth
+  list elision, since removed with that fallback) came out of review, and the reason they were missed is worth
   keeping: that body cut is a `[:200]` on a `.get()` result rather than on a
   named variable, so it does not pattern-match the other seventeen. A sweep
   that looks for slices on identifiers will miss the same shape again.

@@ -593,3 +593,75 @@ class TestConstraintSelectionIsObservable:
         a = _make_fact(kind=FactKind.CONSTRAINT, subject="a", body="short")
         result = assembler.assemble([a], "query", max_tokens=12000)
         assert result.constraints
+
+
+class TestRecallDecayTimescale:
+    """Recall decay must fade a dormant lesson over weeks, not erase it in
+    days. Counted in days, a week-old never-recalled transcript lesson ranked
+    at 0.001 against 0.36 for a non-decaying seed fact at the SAME similarity,
+    so the most-used memory source could essentially never reach a prompt."""
+
+    NOW = 2_000_000_000.0
+
+    def _lesson(self, age_days):
+        from neo.memory.models import SECONDS_PER_DAY
+
+        fact = _make_fact(kind=FactKind.PATTERN, confidence=0.6)
+        fact.tags = ["transcript-derived"]
+        fact.metadata.created_at = self.NOW - age_days * SECONDS_PER_DAY
+        return fact
+
+    def _seed(self):
+        fact = _make_fact(kind=FactKind.PATTERN, confidence=0.6)
+        fact.tags = ["seed", "auto-ingested"]
+        return fact
+
+    def test_days_old_lesson_outranks_an_equally_similar_seed(self):
+        from neo.memory.models import rank_score
+
+        assert rank_score(self._lesson(3), 0.6, self.NOW) > rank_score(self._seed(), 0.6, self.NOW)
+
+    def test_lesson_still_ranks_when_the_janitor_may_first_drop_it(self):
+        from neo.memory.models import rank_score
+        from neo.memory.store import STALE_MIN_AGE_DAYS
+
+        fresh = rank_score(self._lesson(0), 0.6, self.NOW)
+        at_stale_age = rank_score(self._lesson(STALE_MIN_AGE_DAYS), 0.6, self.NOW)
+        assert at_stale_age >= 0.6 * fresh
+
+    def test_dormant_lessons_still_fade(self):
+        from neo.memory.models import rank_score
+
+        assert rank_score(self._lesson(90), 0.6, self.NOW) < 0.1 * rank_score(self._lesson(0), 0.6, self.NOW)
+
+    def test_recall_strengthening_counts_gaps_in_the_decay_unit(self):
+        """A day-apart re-recall barely strengthens; in day units it added
+        tanh(1/2) ~ 0.46, which would undo the timescale the decay uses."""
+        from neo.memory.models import SECONDS_PER_DAY, update_recall
+
+        fact = self._lesson(0)
+        fact.metadata.last_recall_ts = self.NOW - SECONDS_PER_DAY
+        update_recall(fact, now=self.NOW)
+
+        assert 1.0 < fact.metadata.g_n < 1.02
+
+
+class TestOnlyLessonsReachTheValidLayer:
+    """Textbook seeds, community patterns, outcome bookkeeping and commit
+    subjects took 462 of 736 engine fact slots at 0-6.6% use. They stay in
+    the store but are never offered to the model as something learned."""
+
+    def test_filler_is_left_out_even_when_it_is_the_closest_match(self, assembler):
+        query = np.ones(4, dtype=np.float32)
+        filler = []
+        for tag in ("seed", "community", "outcome", "history"):
+            fact = _make_fact(subject=f"{tag} fact", embedding=query.copy())
+            fact.tags = [tag]
+            filler.append(fact)
+        lesson = _make_fact(subject="mined lesson", embedding=np.array([1, 1, 1, 0], dtype=np.float32))
+        lesson.tags = ["transcript-derived"]
+
+        result = assembler.assemble(filler + [lesson], "q", query_embedding=query, k=5)
+
+        assert [f.subject for f in result.valid_facts] == ["mined lesson"]
+

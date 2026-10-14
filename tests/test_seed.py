@@ -124,8 +124,40 @@ class TestSupersession:
         for f in superseded:
             assert f.is_valid is False
 
+    def test_supersedes_seeds_minted_from_another_install_path(self, ingester):
+        """pipx, Homebrew and an editable checkout each reach the seed file
+        through a different absolute path; one store must hold one copy."""
+        stale = [
+            Fact(
+                subject=f"N+1 query detection ({where})",
+                body="Batch your queries.",
+                scope=FactScope.GLOBAL,
+                metadata=FactMetadata(source_file=f"/{where}/neo/config/seed/seed_facts.json"),
+                tags=["seed", "auto-ingested"],
+            )
+            for where in ("pipx", "homebrew")
+        ]
+
+        new, superseded = ingester.ingest(stale)
+
+        assert len(new) == 2
+        assert {f.subject for f in superseded} == {f.subject for f in stale}
+        assert all(not f.is_valid for f in stale)
+
+    def test_checksum_is_not_keyed_on_install_path(self, ingester, seed_file, tmp_path):
+        """A second install of the same seed content must not re-ingest."""
+        ingester.ingest([])
+        moved = tmp_path / "other_install" / "seed_facts.json"
+        moved.parent.mkdir()
+        moved.write_bytes(seed_file.read_bytes())
+
+        with patch("neo.memory.seed.SEED_FILE", moved):
+            new, superseded = ingester.ingest([])
+
+        assert new == [] and superseded == []
+
     def test_does_not_supersede_non_seed_facts(self, ingester, seed_file):
-        """Only seed-tagged facts from the same file should be superseded."""
+        """Only seed-tagged facts are superseded, whatever their source file."""
         other = Fact(
             subject="user pattern",
             body="unrelated",
@@ -152,6 +184,40 @@ class TestSupersession:
         _, superseded = ingester.ingest([other])
         assert other.is_valid is True
         assert other not in superseded
+
+
+class TestSupersessionScope:
+    def test_project_scoped_seed_tag_is_not_superseded(self, ingester):
+        """Supersession is for the global seed corpus only."""
+        local = Fact(subject="local", body="b", scope=FactScope.PROJECT,
+                     tags=["seed"])
+
+        _, superseded = ingester.ingest([local])
+
+        assert local.is_valid is True
+        assert local not in superseded
+
+
+class TestIngestOrdering:
+    def test_unreadable_seed_file_retires_nothing(self, ingester, seed_file):
+        current = Fact(subject="in use", body="b", scope=FactScope.GLOBAL,
+                       tags=["seed", "auto-ingested"])
+        seed_file.write_text("{not json")
+
+        new, superseded = ingester.ingest([current])
+
+        assert (new, superseded) == ([], [])
+        assert current.is_valid is True
+
+    def test_checksum_reaches_disk_only_when_the_caller_persists(
+        self, ingester, tmp_checksum_dir
+    ):
+        new, _ = ingester.ingest([])
+        assert new
+        assert not (tmp_checksum_dir / "checksums.json").exists()
+
+        ingester.save_checksums()
+        assert (tmp_checksum_dir / "checksums.json").exists()
 
 
 class TestEdgeCases:
@@ -194,3 +260,39 @@ class TestEdgeCases:
         ingester._checksums.clear()
         new, _ = ingester.ingest([])
         assert new[0].kind == FactKind.PATTERN
+
+
+class TestReadOnlyStoreDoesNotIngest:
+    """A read-only store (`--dry-run`, a Lattice lookup) must not record the
+    seed file as ingested: its save() is a no-op, so a recorded checksum with
+    unsaved facts meant the real store never received that seed generation."""
+
+    def _store(self, tmp_path, *, read_only):
+        from contextlib import ExitStack
+
+        from neo.memory.store import FactStore
+
+        checksum_dir = tmp_path / "constraints"
+        checksum_dir.mkdir(exist_ok=True)
+        with ExitStack() as stack:
+            stack.enter_context(patch("neo.memory.store.FACTS_DIR", tmp_path / "facts"))
+            stack.enter_context(patch("neo.memory.store.detect_org_and_project",
+                                      return_value=("testorg", "testproj")))
+            stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
+            for name in ("_ingest_community_feed", "_ingest_constraints",
+                         "_ingest_claude_memory", "_ingest_git_history", "_maybe_migrate"):
+                stack.enter_context(patch.object(FactStore, name))
+            stack.enter_context(patch("neo.memory.seed.CHECKSUM_DIR", checksum_dir))
+            stack.enter_context(patch("neo.memory.seed.CHECKSUM_FILE", checksum_dir / "checksums.json"))
+            return FactStore(codebase_root=str(tmp_path), read_only=read_only)
+
+    @staticmethod
+    def _seeds(store):
+        return [f for f in store._facts if f.is_valid and "seed" in f.tags]
+
+    def test_read_only_store_leaves_the_seed_for_the_real_one(self, tmp_path):
+        assert self._seeds(self._store(tmp_path, read_only=True)) == []
+
+        assert self._seeds(self._store(tmp_path, read_only=False)), (
+            "the real store must still ingest the seed file"
+        )
