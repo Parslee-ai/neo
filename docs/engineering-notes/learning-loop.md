@@ -64,6 +64,53 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   when no link is found; UNVERIFIED never creates a REVIEW. INDEPENDENT writes a
   REVIEW at confidence 0.2. **Footgun**: if you add a new `OutcomeType`, update
   both `outcomes.py` and `store.detect_implicit_feedback`.
+- **ADDRESSED: the file changed at the lines Neo flagged, not as Neo
+  proposed.** A git match whose diff overlap is ≤ 0.3 used to be MODIFIED,
+  which marks the candidate `contradicted`, demotes a linked or derived fact by
+  0.2 and mints an `outcome` REVIEW. Neo's Stop reviews made that the common
+  case for a CORRECT finding: on a live install, the review asking for the new
+  `path.resolve()` in `notes.py` to be guarded was fixed by Claude in that
+  exact spot with its own comment, and recorded as Neo contradicted. Jaccard
+  over change lines cannot see it: the file was new in its commit, so the
+  actual diff is all `+` lines, and `_get_file_diff_since` cuts it to 2000
+  chars anyway.
+  `save_session` records per suggestion `flagged_regions`: for each run of
+  changed lines in each hunk, a `span` (the removed lines plus the nearest
+  context line either side; for a pure addition, the two lines around the
+  insertion point) and `outer` (the hunk's first and last context lines when
+  not in the span), kept only if the file holds them at that moment.
+  `_match_to_suggestions` turns a MODIFIED into ADDRESSED when EVERY region's
+  span is no longer consecutive lines of the file while its outer lines are
+  still present, read in the checkout the suggestion was made in.
+  - The span, not the hunk's ±3 context, because editing any quoted context
+    line made the first version fire on unrelated nearby edits. The span
+    still needs its neighbours: after `strip()` the fix keeps
+    `path = path.resolve()` verbatim and only its neighbours change.
+  - `outer` must survive, so deleting the function or discarding the
+    reviewed change wholesale stays MODIFIED.
+  - Presence at save time is load-bearing: a hunk written against another
+    version, or invented, would otherwise read as "gone, so addressed".
+  - Only the suggesting checkout is read because the region is often
+    uncommitted work there. A fix made in another checkout is missed (stays
+    MODIFIED), and so is a deleted file.
+  - Hunks are parsed by their header counts (a removed `-- comment` is not a
+    file header) and only under a `+++` naming the suggested file.
+  **What it misreads — it is where the file changed, not proof of a fix:**
+  rewording a comment that is a span neighbour, a formatter reflowing a span
+  line, or reverting the reviewed lines while the outer lines remain all read
+  as ADDRESSED; the check reads that checkout's working tree at detection
+  time, not the matched diff, so a branch switch there can too. Misses
+  (stay MODIFIED): a fix elsewhere in the file, an indentation-only fix
+  (lines are stripped), a fix in another checkout.
+  That is why ADDRESSED is neutral: it mutates no fact, mints no REVIEW, never
+  reaches `supporting_episode_ids` or the `applied_on` record (promotion counts
+  acceptances of Neo's change; this was not one). Evidence kind
+  `user_addressed` with status `skipped`, never `passed` (episode verdicts
+  aggregate by status). It ranks 2, below ACCEPTED/MODIFIED/REGRESSION, so it
+  never replaces a stronger `final_outcome`, and the candidate becomes
+  `addressed` only from `observed_unverified`/`unverified`. The cost of a
+  false ADDRESSED is a MODIFIED demotion not applied; it never makes an
+  accept.
 - **"The linked original fact" means the DURABLE fact the suggestion re-applied,
   and the link nearly died in silence.** `suggestion_fact_ids` (file_path →
   fact_id) is the only input to the ACCEPTED reinforcement branch and to

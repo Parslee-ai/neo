@@ -35,6 +35,12 @@ SESSIONS_DIR = Path.home() / ".neo" / "sessions"
 MAX_INDEPENDENT_OUTCOMES = 5
 CODE_OVERLAP_ACCEPTED_THRESHOLD = 0.8
 
+# The code a suggested diff targets, kept per suggestion so a later run can
+# tell a change at the lines Neo flagged (ADDRESSED) from one elsewhere in the
+# file (MODIFIED). Bounded: a session record is rewritten on every retention.
+MAX_FLAGGED_REGIONS = 5
+MAX_FLAGGED_REGION_CHARS = 2000
+
 # Durable suggestion ledger + transcript outcome mining.
 # The session log is consumed (cleared) by git-based outcome detection on the
 # next invocation, so it can't be relied on for asynchronous, transcript-driven
@@ -51,6 +57,7 @@ class OutcomeType(enum.Enum):
     """Classification of what the user did after a neo suggestion."""
     ACCEPTED = "accepted"       # User applied the suggestion (diff overlap > 0.3)
     MODIFIED = "modified"       # User changed the file differently (overlap <= 0.3)
+    ADDRESSED = "addressed"     # Changed at the lines Neo flagged, not as Neo proposed
     REGRESSION = "regression"   # Later evidence showed an accepted change was harmful
     UNVERIFIED = "unverified"   # File changed but no diff to compare
     INDEPENDENT = "independent" # User changed a file neo didn't suggest
@@ -338,6 +345,129 @@ def normalize_suggestion_path(path: str, codebase_root: Optional[str]) -> str:
     return path
 
 
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
+def _diff_names_file(target: str, file_path: str) -> bool:
+    """Does a ``+++`` header name ``file_path``? Either may be absolute."""
+    target = target[2:] if target.startswith("b/") else target
+    if not target or target == "/dev/null":
+        return False
+    a, b = Path(target).as_posix().lstrip("/"), Path(file_path).as_posix().lstrip("/")
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _hunk_regions(hunk: list[tuple[str, str]]) -> list[dict]:
+    """One region per run of changed lines in a hunk.
+
+    ``span`` is what the change targets: the removed lines plus the nearest
+    context line on each side (for a pure addition, just those two neighbours,
+    i.e. the insertion point). ``outer`` is the hunk's first and last context
+    lines when they are not part of the span. The span being broken is the
+    signal; the outer lines still being there is what tells a rewrite of the
+    flagged code from the whole function, or the reviewed change, vanishing.
+    """
+    context = [i for i, (tag, text) in enumerate(hunk) if tag == " " and text]
+    regions: list[dict] = []
+    i = 0
+    while i < len(hunk):
+        if hunk[i][0] == " ":
+            i += 1
+            continue
+        j = i
+        while j < len(hunk) and hunk[j][0] != " ":
+            j += 1
+        before = [c for c in context if c < i][-1:]
+        after = [c for c in context if c >= j][:1]
+        anchors = set(before + after)
+        span = (
+            [hunk[c][1] for c in before]
+            + [text for tag, text in hunk[i:j] if tag == "-" and text]
+            + [hunk[c][1] for c in after]
+        )
+        if len(span) >= 2:
+            outer = [hunk[c][1] for c in dict.fromkeys(context[:1] + context[-1:])
+                     if c not in anchors]
+            regions.append({"span": span, "outer": outer})
+        i = j
+    return regions
+
+
+def flagged_regions(unified_diff: str, file_path: str = "") -> list[dict]:
+    """The code ``unified_diff`` targets in ``file_path``, as regions (see
+    ``_hunk_regions``), lines stripped and blank lines dropped.
+
+    Hunks are read by their header's line counts, so a removed line that
+    starts with ``--`` is not mistaken for a file header, and hunks under a
+    ``+++`` header naming another file are skipped.
+    """
+    regions: list[dict] = []
+    hunk: list[tuple[str, str]] = []
+    old_left = new_left = 0
+    in_file = True
+    for line in unified_diff.splitlines():
+        if old_left > 0 or new_left > 0:
+            tag = line[:1] or " "
+            if tag == "\\":
+                continue
+            if tag in (" ", "-", "+"):
+                if tag != "+":
+                    old_left -= 1
+                if tag != "-":
+                    new_left -= 1
+                hunk.append((tag, line[1:].strip()))
+                continue
+            old_left = new_left = 0  # a miscounted or truncated hunk ends here
+        if hunk:
+            regions.extend(_hunk_regions(hunk))
+            hunk = []
+        if line.startswith("+++ "):
+            in_file = not file_path or _diff_names_file(line[4:].strip(), file_path)
+        elif in_file and (match := _HUNK_HEADER.match(line)):
+            old_left = int(match.group(1) or 1)
+            new_left = int(match.group(2) or 1)
+    if hunk:
+        regions.extend(_hunk_regions(hunk))
+    return regions
+
+
+MAX_FLAGGED_FILE_BYTES = 2_000_000
+
+
+def _read_code_lines(root: str, rel_path: str) -> Optional[list[str]]:
+    """The stripped, non-blank lines of ``rel_path`` under ``root``; None when
+    it is not a regular file inside ``root`` of sane size. The path is
+    model-authored, so this never follows it out of the checkout or reads a
+    device, FIFO or huge file on the request path.
+    """
+    try:
+        base = Path(root).resolve()
+        path = (base / rel_path).resolve()
+        if base not in path.parents or not path.is_file():
+            return None
+        if path.stat().st_size > MAX_FLAGGED_FILE_BYTES:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, RuntimeError):
+        return None
+    return [stripped for line in text.splitlines() if (stripped := line.strip())]
+
+
+def region_present(lines: list[str], code_lines: list[str]) -> bool:
+    """Does ``lines`` occur as consecutive lines of ``code_lines``?"""
+    n = len(lines)
+    return n > 0 and any(
+        code_lines[i:i + n] == lines for i in range(len(code_lines) - n + 1)
+    )
+
+
+def region_rewritten(region: dict, code_lines: list[str]) -> bool:
+    """The span is broken while the code around it is still there."""
+    present = set(code_lines)
+    return (not region_present(region.get("span", []), code_lines)
+            and all(line in present for line in region.get("outer", [])))
+
+
 def suggestion_is_verifiable(
     file_path: str, has_change_text: bool, codebase_root: Optional[str]
 ) -> bool:
@@ -561,12 +691,14 @@ class OutcomeTracker:
                 continue
             suggestion_id = getattr(s, "suggestion_id", "")
             candidate = candidates_by_suggestion.get(suggestion_id, {})
+            unified_diff = getattr(s, "unified_diff", "")
             records.append({
                 "suggestion_id": suggestion_id,
                 "file_path": file_path,
                 "description": getattr(s, "description", "")[:500],
                 "confidence": getattr(s, "confidence", 0.0),
-                "suggested_diff": getattr(s, "unified_diff", "")[:2000],
+                "suggested_diff": unified_diff[:2000],
+                "flagged_regions": self._flagged_regions_present(file_path, unified_diff),
                 "suggested_code": getattr(s, "code_block", "")[:4000],
                 "candidate_id": candidate.get("candidate_id", ""),
                 "candidate_subject": candidate.get("subject", ""),
@@ -666,6 +798,54 @@ class OutcomeTracker:
             return None
 
         return compare(baseline, current)
+
+    def _flagged_regions_present(self, file_path: str, unified_diff: str) -> list[dict]:
+        """The regions ``unified_diff`` targets that the file holds right now.
+
+        Recorded at suggestion time because the outcome check asks whether
+        they were rewritten later, which only means something for code that
+        was there: a hunk written against another version of the file, or
+        invented, is dropped here instead of reading as addressed later.
+        """
+        if not unified_diff or not self.codebase_root:
+            return []
+        code = _read_code_lines(
+            self.codebase_root, normalize_suggestion_path(file_path, self.codebase_root)
+        )
+        if code is None:
+            return []
+        present = set(code)
+        kept: list[dict] = []
+        chars = 0
+        for region in flagged_regions(unified_diff, file_path):
+            size = sum(len(line) for line in region["span"] + region["outer"])
+            if chars + size > MAX_FLAGGED_REGION_CHARS:
+                continue
+            if region_present(region["span"], code) and all(
+                line in present for line in region["outer"]
+            ):
+                kept.append(region)
+                chars += size
+                if len(kept) == MAX_FLAGGED_REGIONS:
+                    break
+        return kept
+
+    def _flagged_code_rewritten(self, sugg: dict, root: str, file_path: str) -> bool:
+        """Was every region this suggestion flagged rewritten in place?
+
+        A heuristic about WHERE the file changed, not proof the finding was
+        fixed: see the ADDRESSED note in docs/engineering-notes/learning-loop.md
+        for what it misreads. Read from the checkout the suggestion was made
+        in only: the regions are often uncommitted work there, which another
+        checkout never held, so its copy would read as rewritten. A fix made
+        in another checkout is therefore missed (it stays MODIFIED), and so is
+        a deleted file.
+        """
+        regions = [r for r in sugg.get("flagged_regions") or [] if isinstance(r, dict)]
+        if not regions or not root:
+            return False
+        code = _read_code_lines(root, file_path)
+        return code is not None and all(region_rewritten(r, code) for r in regions)
 
     def collect_outcomes(
         self, *, clear_processed: bool = True, include_fallback: bool = True
@@ -845,9 +1025,10 @@ class OutcomeTracker:
 
         accepted = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.ACCEPTED)
         modified = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.MODIFIED)
+        addressed = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.ADDRESSED)
         independent = sum(1 for o in all_outcomes if o.outcome_type == OutcomeType.INDEPENDENT)
         logger.info(
-            f"Outcomes total: {accepted} accepted, {modified} modified, "
+            f"Outcomes total: {accepted} accepted, {modified} modified, {addressed} addressed, "
             f"{independent} independent (from {len(sessions)} session(s))"
         )
         return all_outcomes, merged_fact_ids
@@ -976,6 +1157,7 @@ class OutcomeTracker:
             OutcomeType.ACCEPTED: 3,
             OutcomeType.MODIFIED: 3,
             OutcomeType.REGRESSION: 3,
+            OutcomeType.ADDRESSED: 2,
             OutcomeType.INDEPENDENT: 2,
             OutcomeType.UNVERIFIED: 1,
         }
@@ -1644,6 +1826,13 @@ class OutcomeTracker:
 
                 # Determine if user applied our suggestion or did something different
                 outcome_type = self._classify_applied(sugg, diff)
+                # Changed differently AT the code Neo flagged is the finding
+                # acted on (a review fix rewritten Claude's way), not Neo
+                # contradicted.
+                if outcome_type == OutcomeType.MODIFIED and self._flagged_code_rewritten(
+                    sugg, session.codebase_root or self.codebase_root or "", normalized
+                ):
+                    outcome_type = OutcomeType.ADDRESSED
 
                 applied_on_revision, carrier_revision, applied_on_parent = (
                     self._applied_on_revision(

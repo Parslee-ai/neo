@@ -1195,6 +1195,7 @@ def _handle_learning_stats(args) -> None:
             # promotion-gates block below is what separates them.
             "supported_once": "supported_once (not yet promoted)",
             "contradicted": "contradicted (rolled back)",
+            "addressed": "addressed (changed at flagged lines)",
             "rejected_by_verification": "rejected_by_verification (det. failure)",
             "unverified": "unverified",
             "observed_unverified": "observed_unverified (pending)",
@@ -1565,6 +1566,7 @@ def handle_memory(args):
         "linked_updates": 0,
         "accepted": 0,
         "modified": 0,
+        "addressed": 0,
         "unverified": 0,
         "skipped_independent": 0,
         "skipped_unlinked": 0,
@@ -1586,7 +1588,8 @@ def handle_memory(args):
         updates = int(stats.get("linked_updates", 0))
         if updates:
             totals["updated_projects"] += 1
-        for key in ("linked_updates", "accepted", "modified", "unverified", "skipped_independent", "skipped_unlinked"):
+        for key in ("linked_updates", "accepted", "modified", "addressed", "unverified",
+                    "skipped_independent", "skipped_unlinked"):
             totals[key] += int(stats.get(key, 0))
         label = pid or getattr(store, "project_id", "")
         if updates or getattr(args, "verbose", False):
@@ -1594,7 +1597,7 @@ def handle_memory(args):
             print(
                 f"[Neo] {mode} {updates} linked outcome(s) for {label or root} "
                 f"(accepted={stats.get('accepted', 0)}, modified={stats.get('modified', 0)}, "
-                f"unverified={stats.get('unverified', 0)})"
+                f"addressed={stats.get('addressed', 0)}, unverified={stats.get('unverified', 0)})"
             )
 
     mode = "dry run" if getattr(args, "dry_run", False) else "replay"

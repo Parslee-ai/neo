@@ -4033,3 +4033,86 @@ class TestLiftProbationByRecall:
         C = FactStore(codebase_root=str(tmp_path))
         merged = next(f for f in C._facts if f.id == fact.id)
         assert "probation" not in merged.tags, "peer's probation lift was undone"
+
+
+class TestAddressedOutcomeFeedback:
+    """ADDRESSED: the code Neo flagged was rewritten, not as Neo proposed. The
+    finding was acted on, so it must not read as contradicted; Neo's change
+    was not what landed, so nothing earns credit or promotes from it."""
+
+    def _episode(self, store, ep_id, kind="pattern"):
+        from neo.memory.episodes import (
+            LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+        )
+        es = LearningEpisodeStore(store.project_id)
+        episode = LearningEpisode(episode_id=ep_id, project_id=store.project_id,
+                                  repository_revision=f"rev-{ep_id}")
+        episode.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id=f"{ep_id}-cand", suggestion_id=f"{ep_id}-sug",
+            subject="bugfix: guard resolve() [notes.py] [fp:aaaaaaaaaaaa]",
+            body="Reasoning: guard it.", kind=kind,
+        ))
+        es.save(episode)
+        return es
+
+    def _outcome(self, ep_id, outcome_type, used=()):
+        return Outcome(
+            outcome_type=outcome_type, file_path="notes.py",
+            suggestion_id=f"{ep_id}-sug", learning_episode_id=ep_id,
+            repository_revision=f"rev-{ep_id}", applied_on_revision=f"rev-{ep_id}",
+            candidate_id=f"{ep_id}-cand",
+            candidate_subject="bugfix: guard resolve() [notes.py] [fp:aaaaaaaaaaaa]",
+            candidate_body="Reasoning: guard it.", candidate_kind="pattern",
+            used_fact_ids=list(used), retrieved_fact_ids=list(used),
+            diff_summary="+try:",
+        )
+
+    def _feed(self, store, outcome):
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=([outcome], {})):
+            store.detect_implicit_feedback({"prompt": "next"}, [])
+
+    def test_recorded_on_disk_as_addressed_not_contradicted(self, store):
+        es = self._episode(store, "addr-0")
+        self._feed(store, self._outcome("addr-0", OutcomeType.ADDRESSED))
+
+        episode = es.load("addr-0")
+        assert episode.final_outcome == "addressed"
+        assert episode.memory_candidates[0].status == "addressed"
+        assert episode.memory_candidates[0].contradicting_episode_ids == []
+        assert episode.memory_candidates[0].supporting_episode_ids == []
+        [evidence] = [v for v in episode.verification if v.kind == "user_addressed"]
+        # Where the file changed is not a check that passed.
+        assert evidence.status == "skipped"
+
+    def test_mutates_no_fact_and_mints_no_review(self, store):
+        cited = store.add_fact(subject="cited lesson", body="b", kind=FactKind.PATTERN,
+                               confidence=0.6)
+        before = len(store.entries)
+        self._episode(store, "addr-1")
+        self._feed(store, self._outcome("addr-1", OutcomeType.ADDRESSED, used=[cited.id]))
+
+        assert cited.metadata.confidence == pytest.approx(0.6)
+        assert cited.metadata.success_count == 0
+        assert len(store.entries) == before
+
+    def test_never_promotes(self, store):
+        """Two ADDRESSED and one ACCEPTED on one signature is ONE acceptance.
+
+        Held twice over: ADDRESSED never routes to the acceptance branch, and
+        it never records the `applied_on` base the sitting gate needs."""
+        for ep_id, kind in (("p-0", OutcomeType.ADDRESSED), ("p-1", OutcomeType.ADDRESSED),
+                            ("p-2", OutcomeType.ACCEPTED)):
+            self._episode(store, ep_id)
+            self._feed(store, self._outcome(ep_id, kind))
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_does_not_overrule_an_earlier_verdict(self, store):
+        es = self._episode(store, "addr-2")
+        self._feed(store, self._outcome("addr-2", OutcomeType.ACCEPTED))
+        self._feed(store, self._outcome("addr-2", OutcomeType.ADDRESSED))
+
+        episode = es.load("addr-2")
+        assert episode.memory_candidates[0].status == "supported_once"
+        assert episode.final_outcome == "accepted"

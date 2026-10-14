@@ -66,8 +66,10 @@
 - Pending sessions are RETAINED per suggested path, not cleared; the session log
   is merge-on-write under `scope_file_lock`. `replay_linked_feedback` must use
   `consume_sessions_keeping_pending()`; never reintroduce `_clear_session_log`.
-- UNVERIFIED mutates nothing. New `OutcomeType` → update both `outcomes.py` and
-  `store.detect_implicit_feedback`.
+- UNVERIFIED and ADDRESSED mutate nothing. New `OutcomeType` → update both
+  `outcomes.py` and `store.detect_implicit_feedback`. ADDRESSED (changed at the
+  lines Neo flagged) is a location heuristic: never let it feed promotion,
+  `user_acceptance`, a `passed` status or credit.
 - Linked facts resolve via `find_durable_fact_for_candidate` against the FROZEN
   `canonical_signature`; never let an empty target match.
 - **Every credit path must reach a `save()`**, with a test that reloads from disk.

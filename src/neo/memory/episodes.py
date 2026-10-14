@@ -186,7 +186,7 @@ class HypothesisEvidence:
 
 VERIFICATION_KINDS = frozenset({
     "test", "lint", "type_check", "parser", "compile", "neo_static",
-    "user_acceptance", "user_modification", "later_regression",
+    "user_acceptance", "user_modification", "user_addressed", "later_regression",
 })
 VERIFICATION_STATUSES = frozenset({
     "passed", "failed", "warning", "unavailable", "skipped", "pending", "waived",
