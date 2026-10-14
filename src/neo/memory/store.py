@@ -81,6 +81,7 @@ _OUTCOME_RANK = {
     OutcomeType.ACCEPTED: 3,
     OutcomeType.MODIFIED: 3,
     OutcomeType.REGRESSION: 3,
+    OutcomeType.ADDRESSED: 2,
     OutcomeType.INDEPENDENT: 2,
     OutcomeType.UNVERIFIED: 1,
 }
@@ -1341,6 +1342,8 @@ class FactStore:
             status_map = {
                 OutcomeType.ACCEPTED: "passed",
                 OutcomeType.MODIFIED: "failed",
+                # Where the file changed, not a check that passed.
+                OutcomeType.ADDRESSED: "skipped",
                 OutcomeType.REGRESSION: "failed",
                 OutcomeType.UNVERIFIED: "skipped",
                 OutcomeType.INDEPENDENT: "skipped",
@@ -1353,6 +1356,8 @@ class FactStore:
                         if outcome.outcome_type == OutcomeType.REGRESSION
                         else "user_modification"
                         if outcome.outcome_type == OutcomeType.MODIFIED
+                        else "user_addressed"
+                        if outcome.outcome_type == OutcomeType.ADDRESSED
                         else "user_acceptance"
                     ),
                     status=status_map.get(outcome.outcome_type, "skipped"),
@@ -1444,7 +1449,8 @@ class FactStore:
             deterministic_failure = any(
                 evidence.status == "failed"
                 and evidence.kind not in {
-                    "user_acceptance", "user_modification", "later_regression",
+                    "user_acceptance", "user_modification", "user_addressed",
+                    "later_regression",
                 }
                 for evidence in episode.verification
             )
@@ -1484,6 +1490,14 @@ class FactStore:
                         candidate.contradicting_episode_ids.append(episode.episode_id)
                 elif outcome.outcome_type == OutcomeType.UNVERIFIED:
                     candidate.status = "unverified"
+                elif (
+                    outcome.outcome_type == OutcomeType.ADDRESSED
+                    and candidate.status in ("observed_unverified", "unverified")
+                ):
+                    # Its own status, never `supporting_episode_ids`: promotion
+                    # counts acceptances of Neo's change, and this was not one.
+                    # It does not overrule a verdict already reached.
+                    candidate.status = "addressed"
 
             association = outcome.outcome_type.value
             attributed = set(outcome.retrieved_fact_ids)
@@ -2687,9 +2701,12 @@ class FactStore:
                             before_state=before_state,
                             after_state=self._fact_learning_state(contradicted_fact),
                         )
-            elif outcome.outcome_type == OutcomeType.UNVERIFIED:
+            elif outcome.outcome_type in (OutcomeType.UNVERIFIED, OutcomeType.ADDRESSED):
                 # Absence of verification is not success. Preserve the
                 # evidence in the episode but never mutate FactStore.
+                # ADDRESSED likewise: the flagged code was rewritten, but not
+                # as Neo proposed, so no fact earns credit from it; recording
+                # it is what keeps the finding from reading as contradicted.
                 self._record_attributed_episode_outcome(outcome)
                 continue
             elif outcome.outcome_type == OutcomeType.INDEPENDENT:
@@ -2841,6 +2858,7 @@ class FactStore:
             "linked_updates": 0,
             "accepted": 0,
             "modified": 0,
+            "addressed": 0,
             "unverified": 0,
             "recorded_without_update": 0,
             "skipped_unlinked": 0,
@@ -2868,8 +2886,8 @@ class FactStore:
                     original_fact.metadata.success_count += 1
                     update_effectiveness(original_fact, outcome="better")
                     original_fact.metadata.last_accessed = time.time()
-            elif outcome.outcome_type == OutcomeType.UNVERIFIED:
-                stats["unverified"] += 1
+            elif outcome.outcome_type in (OutcomeType.UNVERIFIED, OutcomeType.ADDRESSED):
+                stats[outcome.outcome_type.value] += 1
                 # Missing evidence is not a successful outcome. Replays must
                 # preserve the same invariant as the live feedback path.
                 stats["recorded_without_update"] += 1

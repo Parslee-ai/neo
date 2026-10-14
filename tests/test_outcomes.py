@@ -867,3 +867,188 @@ class TestCrossWorktreeAttribution:
         tracker = OutcomeTracker(codebase_root="/repo/main")
         session = self._session("/other/project", "/other/project/src/a.py")
         assert tracker._match_to_suggestions({"src/b.py"}, session) == []
+
+
+# The real case (neo, 2026-10-13): Neo's Stop review asked for the new
+# `path.resolve()` to be guarded, Claude guarded it with its own comment, and
+# the finding was recorded as MODIFIED, i.e. Neo contradicted.
+_REVIEWED_NOTES = """\
+def note_files(root, candidates, rules, found):
+    for path in candidates:
+        # A file in a named directory may itself be a symlink out.
+        path = path.resolve()
+        if (root in path.parents and path.suffix == ".md" and path.is_file()
+                and path not in rules and path not in found):
+            found.append(path)
+    return found
+"""
+_NEO_FIX = """\
+--- a/src/neo/notes.py
++++ b/src/neo/notes.py
+@@ -2,6 +2,9 @@
+     for path in candidates:
+         # A file in a named directory may itself be a symlink out.
+-        path = path.resolve()
++        try:
++            path = path.resolve()
++        except (OSError, RuntimeError):
++            continue
+         if (root in path.parents and path.suffix == ".md" and path.is_file()
+                 and path not in rules and path not in found):
+             found.append(path)
+"""
+_CLAUDES_FIX = _REVIEWED_NOTES.replace(
+    "        path = path.resolve()\n",
+    "        try:\n"
+    "            path = path.resolve()\n"
+    "        except (OSError, RuntimeError):  # a symlink loop, say\n"
+    "            continue\n",
+)
+# What the git matcher compared against: the file was new in its commit, so
+# the diff is all additions and shares no change line with Neo's patch.
+_COMMIT_DIFF = "\n".join("+" + line for line in _CLAUDES_FIX.splitlines())
+
+
+class TestAddressedOutcome:
+    def _review_then_edit(self, tracker, tmp_path, edited, *, reviewed=_REVIEWED_NOTES,
+                          actual_diff=_COMMIT_DIFF):
+        notes = tmp_path / "src" / "neo" / "notes.py"
+        notes.parent.mkdir(parents=True, exist_ok=True)
+        notes.write_text(reviewed)
+        tracker.save_session(
+            [FakeSuggestion(file_path=str(notes), description="Guard resolve()",
+                            unified_diff=_NEO_FIX)],
+            "review",
+        )
+        if edited is None:
+            notes.unlink()
+        else:
+            notes.write_text(edited)
+        with patch.object(tracker, "_get_changed_files_since",
+                          return_value={"src/neo/notes.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value=actual_diff):
+            outcomes, _ = tracker.detect_outcomes()
+        assert len(outcomes) == 1
+        return outcomes[0].outcome_type
+
+    def test_flagged_code_rewritten_another_way_is_addressed(self, tracker, tmp_path):
+        assert self._review_then_edit(tracker, tmp_path, _CLAUDES_FIX) == OutcomeType.ADDRESSED
+
+    def test_change_elsewhere_in_the_file_stays_modified(self, tracker, tmp_path):
+        elsewhere = _REVIEWED_NOTES.replace("    return found\n", "    return sorted(found)\n")
+        assert self._review_then_edit(
+            tracker, tmp_path, elsewhere, actual_diff="-    return found\n+    return sorted(found)"
+        ) == OutcomeType.MODIFIED
+
+    def test_hunk_the_file_never_held_cannot_read_as_addressed(self, tracker, tmp_path):
+        """A patch written against another version of the file (or invented)
+        targets code that was never there; its absence later proves nothing."""
+        other_version = _REVIEWED_NOTES.replace("path = path.resolve()", "path = path.absolute()")
+        assert self._review_then_edit(
+            tracker, tmp_path, _CLAUDES_FIX, reviewed=other_version
+        ) == OutcomeType.MODIFIED
+
+    def test_deleted_file_stays_modified(self, tracker, tmp_path):
+        assert self._review_then_edit(tracker, tmp_path, None) == OutcomeType.MODIFIED
+
+    def test_session_records_the_flagged_region_not_the_fix(self, tracker, tmp_path):
+        notes = tmp_path / "notes.py"
+        notes.write_text(_REVIEWED_NOTES)
+        tracker.save_session([FakeSuggestion(file_path="notes.py", unified_diff=_NEO_FIX)], "review")
+        [region] = tracker._load_previous_session().suggestions[0]["flagged_regions"]
+        assert region["span"] == [
+            "# A file in a named directory may itself be a symlink out.",
+            "path = path.resolve()",
+            "if (root in path.parents and path.suffix == \".md\" and path.is_file()",
+        ]
+        assert region["outer"] == ["for path in candidates:", "found.append(path)"]
+
+    def test_edit_to_outer_context_stays_modified(self, tracker, tmp_path):
+        """A line Neo only quoted for context is not what it flagged."""
+        nearby = _REVIEWED_NOTES.replace("found.append(path)", "found.append(path)  # keep order")
+        assert self._review_then_edit(tracker, tmp_path, nearby) == OutcomeType.MODIFIED
+
+    def test_function_deleted_stays_modified(self, tracker, tmp_path):
+        assert self._review_then_edit(
+            tracker, tmp_path, "def other():\n    return 1\n"
+        ) == OutcomeType.MODIFIED
+
+    def test_every_flagged_region_must_be_rewritten(self, tracker, tmp_path):
+        reviewed = _REVIEWED_NOTES + "\n\ndef tail(x):\n    y = x\n    z = y\n    return z\n"
+        two_hunks = _NEO_FIX + "@@ -12,3 +15,3 @@\n     y = x\n-    z = y\n+    z = y or 0\n     return z\n"
+        notes = tmp_path / "src" / "neo" / "notes.py"
+        notes.parent.mkdir(parents=True, exist_ok=True)
+        notes.write_text(reviewed)
+        tracker.save_session([FakeSuggestion(file_path=str(notes), unified_diff=two_hunks)], "r")
+        assert len(tracker._load_previous_session().suggestions[0]["flagged_regions"]) == 2
+        notes.write_text(_CLAUDES_FIX + "\n\ndef tail(x):\n    y = x\n    z = y\n    return z\n")
+        with patch.object(tracker, "_get_changed_files_since", return_value={"src/neo/notes.py"}), \
+             patch.object(tracker, "_get_file_diff_since", return_value=_COMMIT_DIFF):
+            [outcome], _ = tracker.detect_outcomes()
+        assert outcome.outcome_type == OutcomeType.MODIFIED
+
+    def test_reads_the_checkout_the_suggestion_was_made_in(self, tmp_sessions_dir, tmp_path):
+        """The reviewed code was uncommitted work in ITS checkout; the
+        detecting run's checkout never held it, so reading there would call
+        anything addressed."""
+        review_root, other_root = tmp_path / "wt", tmp_path / "main"
+        # The detecting checkout holds a rewrite; the reviewing one does not.
+        for root, text in ((review_root, _REVIEWED_NOTES), (other_root, _CLAUDES_FIX)):
+            (root / "src" / "neo").mkdir(parents=True)
+            (root / "src" / "neo" / "notes.py").write_text(text)
+        with patch("neo.memory.outcomes.SESSIONS_DIR", tmp_sessions_dir):
+            reviewer = OutcomeTracker(codebase_root=str(review_root), project_id="shared1234")
+            detector = OutcomeTracker(codebase_root=str(other_root), project_id="shared1234")
+        reviewer.save_session([FakeSuggestion(file_path="src/neo/notes.py",
+                                              unified_diff=_NEO_FIX)], "review")
+        with patch.object(detector, "_get_changed_files_since", return_value={"src/neo/notes.py"}), \
+             patch.object(detector, "_get_file_diff_since", return_value=_COMMIT_DIFF):
+            [outcome], _ = detector.detect_outcomes()
+        assert outcome.outcome_type == OutcomeType.MODIFIED
+
+    def test_path_outside_the_checkout_is_not_read(self, tracker, tmp_path):
+        outside = tmp_path.parent / f"{tmp_path.name}-outside" / "src" / "neo" / "notes.py"
+        outside.parent.mkdir(parents=True)
+        outside.write_text(_REVIEWED_NOTES)
+        tracker.save_session([FakeSuggestion(file_path=str(outside), unified_diff=_NEO_FIX)], "r")
+        assert tracker._load_previous_session().suggestions[0]["flagged_regions"] == []
+
+
+class TestFlaggedRegions:
+    def test_one_region_per_change_with_its_neighbours(self):
+        from neo.memory.outcomes import flagged_regions
+        diff = "@@ -1,4 +1,4 @@\n a = 1\n-b = 2\n+b = 3\n c = 4\n d = 5\n"
+        assert flagged_regions(diff) == [
+            {"span": ["a = 1", "b = 2", "c = 4"], "outer": ["d = 5"]},
+        ]
+
+    def test_pure_addition_targets_its_insertion_point(self):
+        from neo.memory.outcomes import flagged_regions
+        diff = "@@ -1,2 +1,3 @@\n a = 1\n+check()\n b = 2\n"
+        assert flagged_regions(diff) == [{"span": ["a = 1", "b = 2"], "outer": []}]
+
+    def test_removed_line_starting_with_dashes_is_not_a_header(self):
+        from neo.memory.outcomes import flagged_regions
+        diff = "--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,2 @@\n SELECT 1;\n--- stale comment\n SELECT 2;\n"
+        assert flagged_regions(diff, "q.sql") == [
+            {"span": ["SELECT 1;", "-- stale comment", "SELECT 2;"], "outer": []},
+        ]
+
+    def test_no_newline_marker_does_not_end_the_hunk(self):
+        from neo.memory.outcomes import flagged_regions
+        diff = "@@ -1,3 +1,3 @@\n a = 1\n-b = 2\n\\ No newline at end of file\n+b = 3\n c = 4\n"
+        assert flagged_regions(diff) == [{"span": ["a = 1", "b = 2", "c = 4"], "outer": []}]
+
+    def test_hunks_for_another_file_are_skipped(self):
+        from neo.memory.outcomes import flagged_regions
+        diff = ("--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n x = 1\n-y = 2\n+y = 3\n z = 4\n"
+                "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,1 @@\n-import os\n keep = 1\n")
+        assert flagged_regions(diff, "/repo/a.py") == [
+            {"span": ["x = 1", "y = 2", "z = 4"], "outer": []},
+        ]
+
+    def test_region_must_be_consecutive(self):
+        from neo.memory.outcomes import region_present
+        assert region_present(["a", "b"], ["a", "b", "c"])
+        assert not region_present(["a", "c"], ["a", "b", "c"])
+        assert not region_present([], ["a"])
