@@ -352,8 +352,16 @@ def embed_query(text: str, model_name: str, deadline_s: float,
     """One short text from a live, compatible server within `deadline_s`, or
     None. For callers on a latency budget (`neo recall`, on every prompt):
     no retries, no local fallback, no metrics line, never raises."""
+    vectors = embed_queries([text], model_name, deadline_s, path)
+    return vectors[0] if vectors else None
+
+
+def embed_queries(texts: list[str], model_name: str, deadline_s: float,
+                  path: Optional[Path] = None) -> Optional[list]:
+    """`embed_query` for a few texts in ONE request, so a caller needing two
+    vectors pays one round trip and one deadline. None on any failure."""
     path = path or socket_path()
-    if not supported() or not path.exists():
+    if not texts or not supported() or not path.exists():
         return None
     end = time.monotonic() + deadline_s
     try:
@@ -363,9 +371,9 @@ def embed_query(text: str, model_name: str, deadline_s: float,
             return None
         dim = int(hello["dim"])
         reply = _call(path, {"v": PROTOCOL_VERSION, "op": "embed", "model": model_name,
-                             "texts": [text[:MAX_TEXT_CHARS]]},
+                             "texts": [text[:MAX_TEXT_CHARS] for text in texts]},
                       max(0.0, end - time.monotonic()))
-        return _vectors(reply, 1, dim)[0]
+        return _vectors(reply, len(texts), dim)
     except Exception:
         return None
 

@@ -904,13 +904,17 @@ async function autoRecall(
   $: EngineInterface,
   cwd: string,
   prompt: string,
+  transcript: string,
 ): Promise<{ text: string; beat: string; ids: string[] }> {
   const none = { text: "", beat: "", ids: [] };
   if (recallMissing) return none;
   try {
+    // The transcript lets recall read a short follow-up ("fix it") with the
+    // reply it answers. An environment variable, not a flag: an older CLI
+    // ignores it, where an unknown flag exits 2 and switches recall off below.
     const run = await $.process.run(
       [binary, "recall", "--cwd", cwd, "--json", "--recent-beats", spokenBeats.join(",")],
-      { stdin: prompt, timeoutMs: RECALL_TIMEOUT },
+      { stdin: prompt, timeoutMs: RECALL_TIMEOUT, env: { NEO_RECALL_TRANSCRIPT: transcript } },
     );
     // An older CLI without `recall` answers with an argparse error (exit 2).
     if (run.exitCode === 2) recallMissing = true;
@@ -1068,7 +1072,7 @@ function registerAuto(on: On) {
       // its notice row keeps it in the conversation.
       if (finding && ++finding.prompts > 1) finding = undefined;
       const extra = autoDrain();
-      const { text: memory, beat, ids } = await autoRecall($, e.cwd, e.prompt);
+      const { text: memory, beat, ids } = await autoRecall($, e.cwd, e.prompt, e.transcript_path ?? "");
       if (memory) {
         extra.push(recallInjection(memory));
         // What Claude was handed, by id: a lesson delivered across sessions

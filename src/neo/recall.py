@@ -22,7 +22,14 @@ model as additional context, so three rules decide its shape:
    sessions.
 4. **Notes the rule file points to are offered too** (`neo.notes`): the host
    loads CLAUDE.md, never the notes it says to read. Their passages come from
-   a sidecar index the observer embeds, scored with the same query vector.
+   a sidecar index the observer embeds, scored with the prompt's vector.
+5. **A short follow-up is read with the reply it answers.** "fix those next"
+   or "yes" names nothing; what it means is in Claude's last reply. When the
+   host passes its transcript (`NEO_RECALL_TRANSCRIPT`) and the prompt is at
+   most `FOLLOW_UP_MAX_WORDS` words, the lessons the prompt matches alone take
+   the slots first and the reply's tail plus the prompt fills the rest, so
+   context adds lessons and never displaces one. Notes keep the prompt alone:
+   long replies matched unrelated spec tables.
 
 It never fails the host: every error path prints nothing and exits 0.
 """
@@ -32,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -48,9 +56,18 @@ MAX_FACTS = 3
 NOTE_MIN_SIMILARITY = 0.52
 MAX_NOTES = 2
 MAX_BODY_CHARS = 400
-# The whole embedding exchange. A short query takes ~0.16 s on an idle server;
-# past this the observer is busy with its own sweep and we stay silent.
+# The whole embedding exchange: tens of ms on an idle server, for one text or
+# the two a follow-up sends; past this the observer is busy with its own
+# sweep and we stay silent.
 EMBED_DEADLINE_S = 1.0
+# A prompt this short is read with the reply before it (rule 5). Its tail is
+# where the reply's question or proposal sits.
+FOLLOW_UP_MAX_WORDS = 12
+CONTEXT_TAIL_CHARS = 600
+# How much of the transcript's end is read to find that reply. On 1,455 real
+# typed prompts the reply sat 1 KB before the prompt at the median and 381 KB
+# at p99 (attachments and tool results come between); 2 MB reads in ~2 ms.
+TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024
 
 # Beyond what carries no lesson anywhere (`models.carries_lesson`): the host's
 # own memory files, which it already has in context.
@@ -71,11 +88,54 @@ def _project_root(cwd: str) -> str:
     return cwd
 
 
-def _resident_embed(text: str):
+def _resident_embed(texts: list[str]):
     from neo.memory import embed_service
     from neo.memory.store import DEFAULT_EMBED_MODEL
 
-    return embed_service.embed_query(text, DEFAULT_EMBED_MODEL, EMBED_DEADLINE_S)
+    return embed_service.embed_queries(texts, DEFAULT_EMBED_MODEL, EMBED_DEADLINE_S)
+
+
+def last_reply(transcript_path: str) -> str:
+    """The text of the last assistant message in a Claude Code transcript
+    (JSONL), read from the file's last `TRANSCRIPT_TAIL_BYTES`. Subagent
+    (sidechain) messages are not the reply the person is answering. "" on
+    any failure."""
+    if not transcript_path:
+        return ""
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - TRANSCRIPT_TAIL_BYTES))
+            # Split on newline bytes only: `str.splitlines` also breaks on
+            # U+2028 and friends, which Claude Code writes unescaped, and the
+            # pieces of that reply would fail to parse and an older reply
+            # would be returned instead.
+            lines = f.read().split(b"\n")
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            record = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue  # includes the partial first line the seek landed in
+        if (not isinstance(record, dict) or record.get("type") != "assistant"
+                or record.get("isSidechain")):
+            continue
+        message = record.get("message")
+        # Claude Code records its own failures ("API Error: …", "Login
+        # expired", a usage limit) as assistant messages from model
+        # "<synthetic>". Not all carry `isApiErrorMessage`, so key on model.
+        if not isinstance(message, dict) or message.get("model") == "<synthetic>":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        text = " ".join(block.get("text", "") for block in content
+                        if isinstance(block, dict) and isinstance(block.get("text"), str)
+                        and block.get("type") == "text")
+        if text.strip():
+            return text.strip()
+    return ""
 
 
 def _load_facts(root: str) -> list:
@@ -181,13 +241,14 @@ def _note_hits(root: str, query) -> list[tuple[str, str]]:
 
 
 def recall(prompt: str, cwd: str,
-           embed: Optional[Callable[[str], object]] = None,
-           recent_beats: Optional[set] = None) -> dict:
+           embed: Optional[Callable[[list], Optional[list]]] = None,
+           recent_beats: Optional[set] = None,
+           context: str = "") -> dict:
     """`{"text", "beat_id", "fact_ids"}`: relevant learned lessons, opened by
     Neo's beat for the situation when one fits. Empty text when nothing is
     relevant. `fact_ids` lets the host record what it delivered; recall itself
     still writes nothing (`FactStore.lift_probation_by_recall` reads that
-    record)."""
+    record). `context` is the reply the prompt answers (rule 5)."""
     import numpy as np
 
     from neo.math_utils import batched_cosine
@@ -198,10 +259,14 @@ def recall(prompt: str, cwd: str,
     silent = {"text": "", "beat_id": "", "fact_ids": []}
     if not prompt.strip():
         return silent
-    vector = (embed or _resident_embed)(prompt[:MAX_TEXT_LENGTH])
-    if vector is None:
+    texts = [prompt[:MAX_TEXT_LENGTH]]
+    if context.strip() and len(prompt.split()) <= FOLLOW_UP_MAX_WORDS:
+        texts.append(f"{context.strip()[-CONTEXT_TAIL_CHARS:]}\n\n{prompt}"[:MAX_TEXT_LENGTH])
+    vectors = (embed or _resident_embed)(texts)
+    if not vectors or len(vectors) != len(texts) or any(v is None for v in vectors):
         return silent
-    query = np.asarray(vector, dtype=np.float32)
+    queries = [np.asarray(v, dtype=np.float32) for v in vectors]
+    query = queries[0]
 
     root = _project_root(cwd)
     facts = _load_facts(root)
@@ -217,10 +282,20 @@ def recall(prompt: str, cwd: str,
     ]
     scored_hits = []
     if candidates:
-        scores = batched_cosine([fact.embedding for fact in candidates], query)
-        ranked = sorted(zip(scores, candidates), key=lambda pair: -pair[0])
-        scored_hits = [(score, fact) for score, fact in ranked[:MAX_FACTS]
-                       if score >= MIN_SIMILARITY]
+        embeddings = [fact.embedding for fact in candidates]
+
+        def hits(q, skip=()):
+            ranked = sorted(zip(batched_cosine(embeddings, q), candidates),
+                            key=lambda pair: -pair[0])
+            return [(score, fact) for score, fact in ranked
+                    if score >= MIN_SIMILARITY and fact.id not in skip]
+
+        # The prompt's own matches take the slots first; the reply only fills
+        # what is left, so context adds lessons and never displaces one.
+        scored_hits = hits(query)[:MAX_FACTS]
+        if len(queries) > 1:
+            taken = {fact.id for _, fact in scored_hits}
+            scored_hits += hits(queries[1], taken)[:MAX_FACTS - len(scored_hits)]
     note_hits = _note_hits(root, query)
     if not scored_hits and not note_hits:
         return silent
@@ -242,6 +317,9 @@ def recall(prompt: str, cwd: str,
 
 def run_recall(argv: list[str], stdin=None) -> int:
     """`neo recall [--cwd DIR] [--recent-beats IDS] [--json]`, prompt on stdin.
+    The host's transcript comes in `NEO_RECALL_TRANSCRIPT`, not a flag: an
+    older CLI ignores an unknown variable, but exits 2 on an unknown flag, and
+    the mod reads exit 2 as "this CLI has no recall" and stops asking.
     Always exits 0."""
     try:
         logging.disable(logging.WARNING)
@@ -253,7 +331,9 @@ def run_recall(argv: list[str], stdin=None) -> int:
         args = parser.parse_args(argv)
         prompt = (stdin or sys.stdin).read()
         recent = {b for b in args.recent_beats.split(",") if b}
-        result = recall(prompt, args.cwd, recent_beats=recent)
+        context = (last_reply(os.environ.get("NEO_RECALL_TRANSCRIPT", ""))
+                   if len(prompt.split()) <= FOLLOW_UP_MAX_WORDS else "")
+        result = recall(prompt, args.cwd, recent_beats=recent, context=context)
         if args.json:
             print(json.dumps(result))
         elif result["text"]:
