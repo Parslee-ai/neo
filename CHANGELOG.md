@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.60.0] - 2026-10-14
+
+### Fixed
+
+- **Neo's memory puts the lessons it learned from your sessions in front of the model, not filler.** Seed, community, outcome and git-history facts took 462 of 736 memory slots and were used 0–7% of the time, while lessons mined from your sessions (used about 26% of the time) got 19. Lessons also faded within days. Decay now runs on a 30-day scale, and only lessons enter Neo's memory section and Claude's recall. On 30 replayed tasks, slots going to mined lessons rose from 10 to 57 of 180. On a store with no mined lessons yet, prompts now read as new, so Neo spends more effort on them (#303).
+- **Seed facts are stored once.** Each install path (pipx, Homebrew, a checkout) ingested its own copy, so the global store held every seed fact three times. The first run of 0.60.0 removes the extra copies (#303).
+- **Dry runs and Lattice lookups no longer lose memory updates.** A read-only store marked a changed `CLAUDE.md`, memory file or seed file as loaded without saving it, so the real store never got the change (#303).
+- **A review finding fixed Claude's way no longer counts against Neo.** When the file changes at the lines Neo flagged, but not as Neo proposed, the outcome is `addressed`, not `modified`. That lesson is no longer marked contradicted or demoted. `addressed` grants no credit and cannot promote a lesson; it is a location check, not proof of a fix (#304).
+
+### Removed
+
+- **The community fallback**, which injected unrelated community patterns when nothing matched. None of its 141 injections was used (#303).
+
 ## [0.59.0] - 2026-10-13
 
 ### Fixed
