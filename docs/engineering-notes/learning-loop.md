@@ -59,11 +59,19 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   absence of verification is not success, so the evidence is preserved in the
   learning episode (candidate status → `unverified`) and neither confidence nor
   `success_count` moves — the live path and `replay_linked_feedback` share that
-  invariant (`store.py:2148`, `store.py:2301`). MODIFIED also writes a REVIEW at
-  confidence 0.4; ACCEPTED falls back to a REVIEW (`suggestion_confidence + 0.1`)
-  when no link is found; UNVERIFIED never creates a REVIEW. INDEPENDENT writes a
-  REVIEW at confidence 0.2. **Footgun**: if you add a new `OutcomeType`, update
-  both `outcomes.py` and `store.detect_implicit_feedback`.
+  invariant (the UNVERIFIED branches of `detect_implicit_feedback` and
+  `replay_linked_feedback`). Nor does it overrule a verdict: it sets
+  `unverified` only on a candidate still `observed_unverified`; it used to
+  assign unconditionally, so a later UNVERIFIED for the same candidate walked
+  `supported_once`, `contradicted`, `rejected_by_verification` and terminal
+  `durable` back — dropping that support from cross-project promotion and a
+  contradiction from teardown (rare in practice: per-path dedup and dropping
+  resolved paths keep a second outcome away; the guard makes it impossible).
+  MODIFIED also writes a REVIEW at confidence 0.4; ACCEPTED falls back to a
+  REVIEW (`suggestion_confidence + 0.1`) when no link is found; UNVERIFIED never
+  creates a REVIEW. INDEPENDENT writes a REVIEW at confidence 0.2. **Footgun**:
+  if you add a new `OutcomeType`, update both `outcomes.py` and
+  `store.detect_implicit_feedback`.
 - **ADDRESSED: the file changed at the lines Neo flagged, not as Neo
   proposed.** A git match whose diff overlap is ≤ 0.3 used to be MODIFIED,
   which marks the candidate `contradicted`, demotes a linked or derived fact by

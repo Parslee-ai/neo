@@ -4108,6 +4108,35 @@ class TestAddressedOutcomeFeedback:
 
         assert [f for f in store.entries if "episode-derived" in f.tags] == []
 
+    @pytest.mark.parametrize("verdict", [OutcomeType.ACCEPTED, OutcomeType.MODIFIED,
+                                         OutcomeType.ADDRESSED])
+    def test_unverified_never_walks_a_verdict_back(self, store, verdict):
+        """UNVERIFIED is the absence of evidence; it must not replace the
+        status a verified outcome already set (it used to, unconditionally)."""
+        es = self._episode(store, "walk-0")
+        self._feed(store, self._outcome("walk-0", verdict))
+        before = es.load("walk-0").memory_candidates[0].status
+        self._feed(store, self._outcome("walk-0", OutcomeType.UNVERIFIED))
+
+        assert before != "observed_unverified"
+        assert es.load("walk-0").memory_candidates[0].status == before
+
+    def test_unverified_keeps_a_promoted_candidate_durable(self, store):
+        """`durable` is terminal."""
+        stores = [self._episode(store, ep_id) for ep_id in ("dur-0", "dur-1")]
+        for ep_id in ("dur-0", "dur-1"):
+            self._feed(store, self._outcome(ep_id, OutcomeType.ACCEPTED))
+        assert stores[1].load("dur-1").memory_candidates[0].status == "durable"
+
+        self._feed(store, self._outcome("dur-1", OutcomeType.UNVERIFIED))
+
+        assert stores[1].load("dur-1").memory_candidates[0].status == "durable"
+
+    def test_unverified_still_marks_an_unjudged_candidate(self, store):
+        es = self._episode(store, "fresh-0")
+        self._feed(store, self._outcome("fresh-0", OutcomeType.UNVERIFIED))
+        assert es.load("fresh-0").memory_candidates[0].status == "unverified"
+
     def test_does_not_overrule_an_earlier_verdict(self, store):
         es = self._episode(store, "addr-2")
         self._feed(store, self._outcome("addr-2", OutcomeType.ACCEPTED))

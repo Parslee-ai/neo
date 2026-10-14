@@ -1488,7 +1488,16 @@ class FactStore:
                     candidate.status = "contradicted"
                     if episode.episode_id not in candidate.contradicting_episode_ids:
                         candidate.contradicting_episode_ids.append(episode.episode_id)
-                elif outcome.outcome_type == OutcomeType.UNVERIFIED:
+                elif (
+                    outcome.outcome_type == OutcomeType.UNVERIFIED
+                    and candidate.status == "observed_unverified"
+                ):
+                    # Absence of evidence marks only an unjudged candidate. It
+                    # used to assign unconditionally, so any later UNVERIFIED
+                    # for the same candidate walked `supported_once`,
+                    # `contradicted` and even terminal `durable` back to
+                    # "unverified". Per-path dedup and dropping resolved paths
+                    # make that rare today; this keeps it impossible.
                     candidate.status = "unverified"
                 elif (
                     outcome.outcome_type == OutcomeType.ADDRESSED
