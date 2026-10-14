@@ -41,13 +41,11 @@ def store(tmp_facts_dir, tmp_path, tmp_checksum_dir):
         stack.enter_context(patch("neo.memory.store.FACTS_DIR", tmp_facts_dir))
         stack.enter_context(patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")))
         stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
-        stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
-        stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
         stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
         stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
         stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
         # Prevent test pollution of real checksums.json
-        for mod in ("constraints", "seed", "community", "claude_memory"):
+        for mod in ("constraints", "claude_memory"):
             stack.enter_context(patch(f"neo.memory.{mod}.CHECKSUM_DIR", tmp_checksum_dir))
             stack.enter_context(patch(f"neo.memory.{mod}.CHECKSUM_FILE", tmp_checksum_dir / "checksums.json"))
         s = FactStore(codebase_root=str(tmp_path))
@@ -291,8 +289,6 @@ class TestPersistence:
         with patch("neo.memory.store.FACTS_DIR", store._global_path.parent), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
              patch.object(FactStore, "_ingest_constraints"), \
-             patch.object(FactStore, "_ingest_seed_facts"), \
-             patch.object(FactStore, "_ingest_community_feed"), \
              patch.object(FactStore, "_ingest_claude_memory"), \
              patch.object(FactStore, "_maybe_migrate"), \
              patch("neo.memory.store.FASTEMBED_AVAILABLE", False):
@@ -309,8 +305,6 @@ class TestPersistence:
         with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
              patch.object(FactStore, "_ingest_constraints"), \
-             patch.object(FactStore, "_ingest_seed_facts"), \
-             patch.object(FactStore, "_ingest_community_feed"), \
              patch.object(FactStore, "_ingest_claude_memory"), \
              patch.object(FactStore, "_maybe_migrate"), \
              patch("neo.memory.store.FASTEMBED_AVAILABLE", False):
@@ -2748,8 +2742,6 @@ class TestLegacyProjectIdMigration:
             stack.enter_context(patch("neo.memory.scope._get_git_remote_url",
                                      return_value=remote_url))
             stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
-            stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
-            stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
             stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
             stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
             stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
@@ -2777,8 +2769,6 @@ class TestLegacyProjectIdMigration:
             stack.enter_context(patch("neo.memory.scope._get_git_remote_url",
                                      return_value=""))
             stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
-            stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
-            stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
             stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
             stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
             stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
@@ -2807,8 +2797,6 @@ class TestLegacyProjectIdMigration:
             stack.enter_context(patch("neo.memory.scope._get_git_remote_url",
                                      return_value=remote_url))
             stack.enter_context(patch.object(FactStore, "_ingest_constraints"))
-            stack.enter_context(patch.object(FactStore, "_ingest_seed_facts"))
-            stack.enter_context(patch.object(FactStore, "_ingest_community_feed"))
             stack.enter_context(patch.object(FactStore, "_ingest_claude_memory"))
             stack.enter_context(patch.object(FactStore, "_maybe_migrate"))
             stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
@@ -3035,8 +3023,6 @@ class TestConstraintEmbeddings:
         with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
              patch.object(FactStore, "_maybe_migrate"), \
-             patch.object(FactStore, "_ingest_seed_facts"), \
-             patch.object(FactStore, "_ingest_community_feed"), \
              patch.object(FactStore, "_ingest_claude_memory"), \
              patch.object(FactStore, "_embed_text", return_value=fake_emb), \
              patch("neo.memory.constraints.CHECKSUM_DIR", tmp_checksum_dir), \
@@ -3056,8 +3042,6 @@ class TestConstraintEmbeddings:
         with patch("neo.memory.store.FACTS_DIR", tmp_facts_dir), \
              patch("neo.memory.store.detect_org_and_project", return_value=("testorg", "testproj1234")), \
              patch.object(FactStore, "_maybe_migrate"), \
-             patch.object(FactStore, "_ingest_seed_facts"), \
-             patch.object(FactStore, "_ingest_community_feed"), \
              patch.object(FactStore, "_ingest_claude_memory"), \
              patch.object(FactStore, "_embed_text", return_value=fake_emb), \
              patch("neo.memory.constraints.CHECKSUM_DIR", tmp_checksum_dir), \
@@ -4145,3 +4129,119 @@ class TestAddressedOutcomeFeedback:
         episode = es.load("addr-2")
         assert episode.memory_candidates[0].status == "supported_once"
         assert episode.final_outcome == "accepted"
+
+
+def _initialized_store(tmp_path, *, read_only=False, facts=()):
+    """A store whose initialize() really runs, with every ingester but
+    constraints patched out. ``facts`` are written to disk first."""
+    from contextlib import ExitStack
+    checksum_dir = tmp_path / "checksums"
+    checksum_dir.mkdir(exist_ok=True)
+    facts_dir = tmp_path / "facts"
+    with ExitStack() as stack:
+        stack.enter_context(patch("neo.memory.store.FACTS_DIR", facts_dir))
+        stack.enter_context(patch("neo.memory.store.detect_org_and_project",
+                                  return_value=("testorg", "testproj1234")))
+        stack.enter_context(patch("neo.memory.store.FASTEMBED_AVAILABLE", False))
+        for name in ("_ingest_claude_memory", "_ingest_git_history", "_maybe_migrate"):
+            stack.enter_context(patch.object(FactStore, name))
+        for mod in ("constraints", "claude_memory"):
+            stack.enter_context(patch(f"neo.memory.{mod}.CHECKSUM_DIR", checksum_dir))
+            stack.enter_context(patch(f"neo.memory.{mod}.CHECKSUM_FILE",
+                                      checksum_dir / "checksums.json"))
+        if facts:
+            seeder = FactStore(codebase_root=str(tmp_path), eager_init=False)
+            seeder._facts.extend(facts)
+            seeder.save()
+        return FactStore(codebase_root=str(tmp_path), read_only=read_only)
+
+
+class TestReadOnlyStoreDoesNotIngest:
+    """A read-only store (`--dry-run`, a Lattice lookup) must not record a
+    constraint file as ingested: its save() is a no-op, so a recorded
+    checksum with unsaved facts meant the real store never received it."""
+
+    def test_read_only_store_leaves_claude_md_for_the_real_one(self, tmp_path):
+        (tmp_path / "CLAUDE.md").write_text("# Rules\n\n- Never use mocks in production paths.\n")
+
+        def constraints(store):
+            return [f for f in store._facts if f.is_valid and "constraint" in f.tags]
+
+        assert constraints(_initialized_store(tmp_path, read_only=True)) == []
+        assert constraints(_initialized_store(tmp_path)), (
+            "the real store must still ingest CLAUDE.md"
+        )
+
+
+class TestRetireFeedFacts:
+    """The seed and community-feed ingesters are gone; what they minted is
+    PROTECTED_TAGS, so only this retirement removes it from a store."""
+
+    @staticmethod
+    def _fact(subject, tags, scope=FactScope.GLOBAL):
+        return Fact(subject=subject, body="b", kind=FactKind.PATTERN, scope=scope,
+                    tags=tags)
+
+    def test_cold_start_retires_seed_and_community_facts(self, tmp_path):
+        seed = self._fact("seed fact", ["seed", "auto-ingested", "security"])
+        community = self._fact("community fact", ["community", "auto-ingested"])
+
+        store = _initialized_store(tmp_path, facts=[seed, community])
+
+        by_subject = {f.subject: f for f in store._facts}
+        for subject in ("seed fact", "community fact"):
+            assert by_subject[subject].is_valid is False
+            assert by_subject[subject].invalidation_reason == "retired_feed_fact"
+
+    @staticmethod
+    def _on_disk(tmp_path, subject):
+        """The fact as saved, read from the file: reloading through a store
+        would run the retirement again in memory and prove nothing."""
+        import json
+        data = json.loads((tmp_path / "facts" / "facts_global.json").read_text())
+        rows = data["facts"] if isinstance(data, dict) else data
+        return next(row for row in rows if row["subject"] == subject)
+
+    def test_retirement_reaches_disk(self, tmp_path):
+        _initialized_store(tmp_path, facts=[self._fact("seed fact", ["seed", "auto-ingested"])])
+
+        row = self._on_disk(tmp_path, "seed fact")
+        assert row["is_valid"] is False
+        assert row["invalidation_reason"] == "retired_feed_fact"
+
+    def test_tombstone_of_a_long_untouched_fact_survives_the_purge(self, tmp_path):
+        """The purge two steps later deletes invalid facts untouched 30+ days;
+        every live feed fact was that old, so without the access stamp the
+        tombstone, and the record of why it died, never reached disk."""
+        old = self._fact("old seed", ["seed", "auto-ingested"])
+        old.metadata.last_accessed = time.time() - 90 * 86400
+
+        _initialized_store(tmp_path, facts=[old])
+
+        assert self._on_disk(tmp_path, "old seed")["is_valid"] is False
+
+    def test_a_long_lived_store_retires_on_the_outcome_path(self, store):
+        """A process that never cold-starts again still retires a feed fact a
+        peer on an older release wrote back."""
+        resurrected = store.add_fact(subject="resurrected seed", body="b",
+                                     kind=FactKind.PATTERN, scope=FactScope.GLOBAL,
+                                     tags=["seed", "auto-ingested"])
+        outcome = Outcome(outcome_type=OutcomeType.UNVERIFIED, file_path="docs/x.md")
+        with patch.object(store._outcome_tracker, "detect_outcomes",
+                          return_value=([outcome], {})):
+            store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        assert resurrected.is_valid is False
+
+    def test_leaves_facts_it_did_not_mint(self, tmp_path):
+        """Only the ingesters' own tag pair qualifies: a lesson that merely
+        mentions a seed tag, and other auto-ingested feeds, survive."""
+        lesson = self._fact("lesson tagged seed", ["seed", "transcript-derived"],
+                            scope=FactScope.PROJECT)
+        constraint = self._fact("constraint", ["constraint", "auto-ingested"],
+                                scope=FactScope.PROJECT)
+
+        store = _initialized_store(tmp_path, facts=[lesson, constraint])
+
+        valid = {f.subject for f in store._facts if f.is_valid}
+        assert {"lesson tagged seed", "constraint"} <= valid

@@ -12,8 +12,8 @@ has actually produced on a live install:
 - 30 days of real traffic: **108 episodes, 58 stuck at
   `suggested_pending_downstream_outcome`, zero `accepted` outcomes ever**.
 - Across **6,613 valid facts in every project, zero have ever reached
-  `success_count >= 3`**, so `find_contributable` has never returned a fact and
-  `neo contribute` has never been reachable.
+  `success_count >= 3`**, so `find_contributable` never returned a fact and
+  `neo contribute` was never reachable (both removed in 0.61.0).
 - `neo --version` on this machine still prints *"No patterns yet"*.
 
 Every gate downstream of acceptance has been audited, fixed and pinned. The

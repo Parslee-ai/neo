@@ -410,8 +410,11 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
     serves commit history by design (it strips the patch from commit bodies),
     and the gatherer's episode-history boost reads only `file:`-tagged episode
     facts, which decay exactly like history, so the unit change does not shift
-    their balance. Seed and community facts now reach no prompt; their
-    ingesters are candidates for removal.
+    their balance. Seed and community facts reached no prompt after this;
+    0.61.0 removed both ingesters, `neo contribute` and the feed file, and
+    `retire_feed_facts` invalidates what they minted on cold start (they are
+    `PROTECTED_TAGS`, so no janitor would otherwise remove them from the
+    GLOBAL cap).
 - Local storage: per-scope JSON files in `~/.neo/facts/` with inline embeddings. Fine
   while any single scope file stays under ~10k facts; revisit the backend past that.
   `project_id` is `SHA256[:16]` of the **normalized git remote URL** (`scope._compute_project_id`)

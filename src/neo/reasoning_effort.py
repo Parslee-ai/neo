@@ -22,8 +22,8 @@ EFFORT_LEVELS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
 DEFAULT_EFFORT = "medium"  # Matches the gpt-5.x API default when field omitted.
 
 # Thresholds for the memory-driven heuristic.
-# Tuned to align with the existing 0.8-confidence / 3-success contribution
-# threshold used elsewhere in neo (see FactStore promotion logic).
+# 0.8 matches the bar the old community-contribution gate used for a
+# trusted pattern.
 _HIGH_CONFIDENCE = 0.8
 _LOW_CONFIDENCE = 0.5
 _MIN_PATTERNS_FOR_LOW = 3

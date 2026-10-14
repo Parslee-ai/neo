@@ -756,7 +756,6 @@ Neo is one binary with a plain-text prompt plus a handful of subcommands. Run
 | `neo car status` | Report detected CAR CLI / server / Python bindings / daemon |
 | `neo serve` | Host Neo as an A2A endpoint (`--a2a-bind`, `--public-url`, `--agent-name`) |
 | `neo prompt <action>` | Prompt-effectiveness tooling: `analyze`, `enhance`, `patterns`, `suggest`, `history`, `stats` |
-| `neo contribute` | Export high-confidence patterns for community contribution |
 | `neo update` | Update the installed `neo` package in place |
 
 **Global flags**
@@ -1085,8 +1084,7 @@ Stage: Sleeper | Memory: 0.0%
 ```
 
 Once memory has built up, the quote, the stage (`Sleeper` → `Glitch` →
-`Unplugged` → `Training` → `The One`), and the bar all move, and a line about
-patterns approaching community contribution appears:
+`Unplugged` → `Training` → `The One`) and the bar all move:
 
 ```bash
 $ neo --version
@@ -1099,8 +1097,6 @@ CAR: python binding car_runtime | daemon running
 Stage: Unplugged | Memory: 49.7%
 ███████████████████░░░░░░░░░░░░░░░░░░░░░
 521 patterns | 0.64 avg confidence
-
-⚡ 6 pattern(s) approaching contribution (need 0.8 confidence + 3 successes)
 ```
 
 ### Load Program - Training Neo's Memory
@@ -1167,7 +1163,7 @@ Neo uses a **scoped, supersession-based fact store** with **Jina Code v2** embed
 1. **Typed Facts**: Eight kinds — CONSTRAINT, ARCHITECTURE, DECISION, PATTERN, REVIEW, FAILURE, KNOWN_UNKNOWN, and EPISODE (instance-specific events with `{when, where, why, with_whom}` context).
 2. **Scoped Organization**: Facts are scoped to global, organization, or project level, with per-scope valid-fact caps (200 / 100 / 500 / 50). Org and project are auto-detected from git remotes.
 3. **Supersession & Pre-Write Dedup**: New facts with cosine similarity ≥ 0.85 to an existing fact short-circuit (bump the existing fact's access count) or supersede it. The pre-write canonical-signature check uses entity abstraction + verb-synonym folding to catch near-duplicates before they hit the store.
-4. **Confidence + Effectiveness Ranking**: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f + provenance_bonus`. The Ebbinghaus recall-probability transform gives frequently-recalled facts slower decay; LessonL-style effectiveness (`c/n` over reuse outcomes) multiplies the success bonus. Curated facts (CONSTRAINT/ARCHITECTURE/DECISION and `seed`/`community`/`synthesized`-tagged facts) bypass decay. (Nothing mints the `synthesized` tag anymore — facts carrying it predate the removal of REVIEW→PATTERN synthesis and keep their immunity.)
+4. **Confidence + Effectiveness Ranking**: `rank_score = recall_decay(sim)·confidence + success_bonus·effectiveness_f + provenance_bonus`. The Ebbinghaus recall-probability transform gives frequently-recalled facts slower decay; LessonL-style effectiveness (`c/n` over reuse outcomes) multiplies the success bonus. Curated facts (CONSTRAINT/ARCHITECTURE/DECISION and `synthesized`-tagged facts) bypass decay. (Nothing mints the `synthesized` tag anymore — facts carrying it predate the removal of REVIEW→PATTERN synthesis and keep their immunity.)
 5. **Hybrid Retrieval**: 0.7·dense (Jina) + 0.3·BM25. Half the result slots ranked by full `rank_score`, half by raw cosine — novel-but-relevant facts aren't crowded out by validated winners.
 6. **Evidence-Gated Promotion**: a suggestion is recorded as a *candidate*, not a fact. It only becomes a durable PATTERN after **two independent, git-verified acceptances** whose task prompt and diff shape agree (`_episode_signature` for project scope, the path-agnostic `_global_signature` for cross-repo lessons), and only when its kind is promotable — `algorithm` / `bugfix` classify to `pattern`; `feature`, `refactor`, and `explanation` deliberately do not. Unverifiable suggestions (no path a diff could ever name) are downgraded to non-promotable `review` at mint. There is **no** similarity-clustered promotion path: the older REVIEW→PATTERN synthesis (`synthesize_reviews`, with its triple-trigger gate, Hebbian bump, and global decay) was removed after four months in which it minted 114 facts and not one PATTERN. See [evidence-learning episodes](docs/solutions/evidence-learning-episodes.md).
 7. **Dual-Buffer Probation**: New non-curated facts enter with a `probation` tag and a 3-day stale window (vs 7/14 normal); promoted automatically on `access_count ≥ 2` or `success_count > 0` — quietly evicts noise while keeping real signal.

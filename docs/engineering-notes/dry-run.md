@@ -51,7 +51,7 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   reaching the engine at all meant a "read-only" inspection was aging the store it
   inspected. `FactStore(read_only=True)` makes `save()` a no-op at the single write
   choke point, which a new caller cannot forget. **It also skips every ingester**
-  (seed, community, constraints, Claude memory, git history): each records "done"
+  (constraints, Claude memory, git history): each records "done"
   outside `save()` — a checksum file, a git watermark — so a read-only run that came
   first after a CLAUDE.md, memory-file or package change marked it ingested while
   its facts died with the no-op save, and the real store never got them (Lattice

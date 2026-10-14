@@ -135,8 +135,9 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   one link per suggestion, then 9 consecutive sessions from 2026-07-19 carried
   zero, and **no fact's `success_count` moved again in 90 days** (`learning-stats`
   reinforcements = 0). Across 6,613 valid facts in every project, **zero have
-  ever reached `success_count >= 3`**, so `find_contributable` has never once
-  returned a fact and `neo contribute` has never been reachable.
+  ever reached `success_count >= 3`**, so `find_contributable` never once
+  returned a fact and `neo contribute` was never reachable (both removed in
+  0.61.0).
   **That absence had a SECOND, independent cause, and restoring the link alone
   would not have lifted it** — the cited-credit path reached no `save()` at all,
   so the one mechanism that can carry a fact past the 2 that promotion writes
@@ -243,21 +244,16 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   PROTECTION_CEILING_PER_SUCCESS · success_count)`. Verified outcomes may still
   carry a fact above that line; the comparison is strictly `>` so protection can
   never claw back confidence it did not grant. **This is why the contribution
-  banner had it backwards**: confidence was the half satisfied almost
+  (since removed) banner had it backwards**: confidence was the half satisfied almost
   accidentally, and successes the half nothing could move.
-- Community contribution gates are single-sourced in `store.py`
-  (`CONTRIBUTION_MIN_CONFIDENCE` / `CONTRIBUTION_MIN_SUCCESSES` /
-  `CONTRIBUTION_EXCLUDED_TAGS`), and eligibility is split in two:
-  `is_contribution_candidate` holds the PERMANENT disqualifiers (kind is
-  CONSTRAINT, or provenance is a seed/community/history feed), while the two
-  numeric thresholds are the only part a fact can grow out of. The split exists
-  so a caller reporting *why* a fact is not contributable can name only the gate
-  that binds — `subcommands._describe_contribution_gap`. The status banner used
-  to print a fixed "need 0.8 confidence + 3 successes" at facts already sitting
-  at 1.00, which is this repo's own rule about never blaming a cap for an
-  absence it did not cause, broken in the one line a user reads most. It also
-  filtered `near` differently from `find_contributable`, so it could advertise
-  facts that were never contributable at all.
+- **`neo contribute` and the community feed were removed in 0.61.0.**
+  Contribute exported facts at ≥ 0.8 confidence with ≥ 3 successes for a PR to
+  `community_facts.json`, which the community ingester fetched into every
+  install. No fact on a live install ever reached that bar (see the
+  linked-original and credited-save entries above), and the 141 community facts that were injected into prompts
+  were used 0 times, so the share half never shared and the read half never
+  helped. The bare word `contribute` stays in `cli._COMMAND_WORDS` so it is
+  refused rather than becoming a paid one-word prompt.
 - Learning-loop benchmark (`memory/evaluation.py`, `benchmarks/learning_loop_v1.json`,
   `neo memory evaluate-learning`). **`accepted` is a correctness verdict and nothing
   else — never gate it on wall-clock time.** Everything it enforces is reproducible on

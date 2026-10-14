@@ -30,11 +30,9 @@ from neo.math_utils import batched_cosine, cosine_similarity
 from neo.memory.bm25 import BM25, tokenize
 from neo.memory.query_routing import QueryShape, decompose as _decompose_query
 from neo.memory.claude_memory import ClaudeMemoryIngester
-from neo.memory.community import CommunityFeedIngester
 from neo.memory.constraints import ConstraintIngester
 from neo.memory.context import ContextAssembler
 from neo.memory.metrics import record as metrics_record, time_block
-from neo.memory.seed import SeedIngester
 from neo.languages import language_for_path
 from neo.memory.models import (
     ContextResult,
@@ -59,16 +57,6 @@ logger = logging.getLogger(__name__)
 EMBEDDING_CACHE_MAX_SIZE = 500
 MAX_TEXT_LENGTH = 32000
 SUPERSESSION_THRESHOLD = 0.85  # Cosine similarity threshold for supersession
-
-# Community contribution gates. Single-sourced because the status banner has to
-# report which of them is short, and a banner that quotes its own copy of the
-# numbers will eventually quote the wrong ones.
-CONTRIBUTION_MIN_CONFIDENCE = 0.8
-CONTRIBUTION_MIN_SUCCESSES = 3
-# Provenance that permanently disqualifies a fact from being contributed.
-CONTRIBUTION_EXCLUDED_TAGS = frozenset(
-    {"seed", "community", "constraint", "history", "git-commit"}
-)
 
 # How strong each outcome is as evidence, for deciding which one an episode
 # reports as its final_outcome when a single invocation produced several.
@@ -123,7 +111,7 @@ PROTECTION_CEILING_MAX = 0.9         # Protection alone never certifies a fact
 # Deliberately smaller than the +0.2 a linked suggestion earns: that one fact is
 # being re-verified, not newly established, and the mint cap
 # (`min(0.75, ...)`) means this is the only way a repeatedly-proven pattern ever
-# reaches the contribution bar.
+# climbs past it.
 REACCEPTANCE_BOOST = 0.05
 
 # Independent outcome limits (second layer — outcomes.py caps at 5/session)
@@ -169,6 +157,10 @@ RECALL_LIFTED_TAG = "recall-lifted"
 #: ``invalidation_reason`` on a fact ``retire_legacy_suggestion_facts`` retired,
 #: so the tombstone says why it died.
 LEGACY_SUGGESTION_REASON = "legacy_unverified_suggestion"
+# Facts the removed seed and community-feed ingesters minted. Both carried
+# "auto-ingested"; nothing else mints that tag with either of these.
+RETIRED_FEED_TAGS = frozenset({"seed", "community"})
+RETIRED_FEED_REASON = "retired_feed_fact"
 PROBATION_AGE_DAYS = 3
 PROBATION_PROMOTE_ACCESS = 2  # accesses needed to promote out of probation
 GLOBAL_PROMOTION_MIN_PROJECTS = 2
@@ -561,8 +553,6 @@ class FactStore:
         # package change marked that change ingested and the real store never
         # received it. A read-only store shows what is persisted, nothing more.
         if not self.read_only:
-            self._ingest_seed_facts()
-            self._ingest_community_feed()
             self._ingest_constraints()
             self._ingest_claude_memory()
             self._ingest_git_history()
@@ -579,6 +569,7 @@ class FactStore:
             # Defer each step's save and flush once at the end — a cold start on
             # a multi-MB fact file otherwise pays 4 full merge-on-save rewrites.
             changed = self.retire_legacy_suggestion_facts(save=False)
+            changed += self.retire_feed_facts(save=False)
             # Before the prune: a lesson recall kept handing Claude must not
             # die on the probation clock.
             changed += self.lift_probation_by_recall(save=False)
@@ -2769,7 +2760,7 @@ class FactStore:
         # out at exactly 2, the value promotion writes, because the credit
         # that would carry one past 2 never survived the process. That is why
         # no fact in 6,613 ever reached the `success_count >= 3` contribution
-        # bar and `neo contribute` was unreachable.
+        # bar and the (since removed) `neo contribute` was unreachable.
         if linked_count or touched_fact_ids:
             self.save()
             logger.info(
@@ -2788,6 +2779,7 @@ class FactStore:
             # and flush once here. (REVIEW->PATTERN synthesis used to lead this
             # chain; it was removed — see the note on PROTECTED_TAGS.)
             changed = self.retire_legacy_suggestion_facts(save=False)
+            changed += self.retire_feed_facts(save=False)
             # Before the prune: a lesson recall kept handing Claude must not
             # die on the probation clock.
             changed += self.lift_probation_by_recall(save=False)
@@ -2947,42 +2939,6 @@ class FactStore:
     def entries(self) -> list[Fact]:
         """Backward-compatible access to all facts."""
         return self._facts
-
-    @staticmethod
-    def is_contribution_candidate(fact: Fact) -> bool:
-        """Whether a fact could ever be contributed, ignoring the quality gates.
-
-        Kind and provenance are permanent disqualifiers: a constraint is
-        project-specific and a seed/community fact came FROM the feed. The
-        confidence/success thresholds are the only part a fact can grow out
-        of, so they are asked separately — callers reporting *why* a fact is
-        not contributable must not name a gate that no amount of learning
-        would clear.
-        """
-        if not fact.is_valid:
-            return False
-        if fact.kind == FactKind.CONSTRAINT:
-            return False
-        if CONTRIBUTION_EXCLUDED_TAGS & set(fact.tags):
-            return False
-        return True
-
-    def find_contributable(
-        self,
-        min_confidence: float = CONTRIBUTION_MIN_CONFIDENCE,
-        min_successes: int = CONTRIBUTION_MIN_SUCCESSES,
-    ) -> list[Fact]:
-        """Find high-quality facts worth contributing to the community feed.
-
-        Criteria: high confidence, real success validation, not already
-        from seed/community feeds, not constraints (project-specific).
-        """
-        return [
-            f for f in self._facts
-            if self.is_contribution_candidate(f)
-            and f.metadata.confidence >= min_confidence
-            and f.metadata.success_count >= min_successes
-        ]
 
     # ------------------------------------------------------------------ #
     # Scope capacity enforcement
@@ -3333,6 +3289,40 @@ class FactStore:
             retired += 1
         if retired:
             logger.info("retired %d legacy unverified suggestion fact(s)", retired)
+            if save:
+                self.save()
+        return retired
+
+    def retire_feed_facts(self, save: bool = True) -> int:
+        """Invalidate facts the removed seed and community-feed ingesters minted.
+
+        They were generic patterns bundled with the package or fetched from a
+        GitHub-hosted feed. Measured on a live install, seed facts were used
+        in 3-6.6% of the prompts they reached and community facts in 0%, and
+        since 0.60.0 `carries_lesson` kept both out of every prompt. They are
+        in `PROTECTED_TAGS`, so no janitor would ever remove them: without
+        this they would sit in the GLOBAL scope's 200-fact cap for good.
+
+        Idempotent, like `retire_legacy_suggestion_facts`, and for the same
+        reason stamps access so the tombstone outlives this cold start's
+        purge. A peer on an older release may write one back valid; the next
+        cold start or outcome pass here retires it again, and `NO_LESSON_TAGS`
+        keeps it out of prompts and `neo recall` meanwhile. The
+        `neo:seed_facts` / `community_feed` keys in the shared checksums file
+        are left in place on purpose: deleting them would make every older
+        peer re-ingest its whole feed.
+        """
+        retired = 0
+        for fact in self._facts:
+            if not (fact.is_valid and "auto-ingested" in fact.tags
+                    and RETIRED_FEED_TAGS & set(fact.tags)):
+                continue
+            fact.invalidation_reason = RETIRED_FEED_REASON
+            fact.metadata.last_accessed = time.time()
+            self._invalidate(fact)
+            retired += 1
+        if retired:
+            logger.info("retired %d seed/community feed fact(s)", retired)
             if save:
                 self.save()
         return retired
@@ -3946,7 +3936,7 @@ class FactStore:
     def _strip_ingester_tombstones(superseded_facts: list) -> None:
         """Drop embeddings from facts an ingester just superseded.
 
-        Ingesters (seed/community/constraints/claude-memory) live in their own
+        Ingesters (constraints/claude-memory) live in their own
         classes and invalidate curated facts directly, off the ``_invalidate``
         choke point — so they don't strip. Nulling here, before the consuming
         method's ``save()``, avoids writing the embedding out only for the
@@ -4004,68 +3994,6 @@ class FactStore:
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""
         return cosine_similarity(a, b)
-
-    # ------------------------------------------------------------------ #
-    # Seed fact ingestion
-    # ------------------------------------------------------------------ #
-
-    def _ingest_seed_facts(self) -> None:
-        """Load curated facts bundled with the neo package.
-
-        Seed facts ship with every release and provide community-curated
-        patterns (security, performance, reliability). Re-ingested only
-        when the seed file changes (i.e., after a package update).
-        """
-        ingester = SeedIngester(
-            org_id=self.org_id,
-            project_id=self.project_id,
-        )
-        new_facts, superseded_facts = ingester.ingest(self._facts)
-
-        if new_facts or superseded_facts:
-            for fact in new_facts:
-                if fact.embedding is None:
-                    embed_text = f"{fact.subject} {fact.body}"
-                    fact.embedding = self._embed_text(embed_text)
-
-            self._strip_ingester_tombstones(superseded_facts)
-            self._facts.extend(new_facts)
-            self.save()
-            ingester.save_checksums()
-            logger.info(
-                f"Seed facts: {len(new_facts)} new, {len(superseded_facts)} superseded"
-            )
-
-    def _ingest_community_feed(self) -> None:
-        """Fetch and ingest community-curated patterns from remote feed.
-
-        Checks once per day, caches locally, falls back to cache on
-        network failure. Patterns are contributed via PR and ship
-        between releases.
-        """
-        try:
-            ingester = CommunityFeedIngester(
-                org_id=self.org_id,
-                project_id=self.project_id,
-            )
-            new_facts, superseded_facts = ingester.ingest(self._facts)
-
-            if new_facts or superseded_facts:
-                for fact in new_facts:
-                    if fact.embedding is None:
-                        embed_text = f"{fact.subject} {fact.body}"
-                        fact.embedding = self._embed_text(embed_text)
-
-                self._strip_ingester_tombstones(superseded_facts)
-                self._facts.extend(new_facts)
-                self.save()
-                logger.info(
-                    f"Community feed: {len(new_facts)} new, "
-                    f"{len(superseded_facts)} superseded"
-                )
-        except Exception as e:
-            # Network failures should never block neo startup
-            logger.debug(f"Community feed ingestion failed: {e}")
 
     # ------------------------------------------------------------------ #
     # Constraint ingestion
