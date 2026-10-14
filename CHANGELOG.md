@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.61.0] - 2026-10-14
+
+### Added
+
+- **Recall understands short follow-ups.** "yes" or "fix those next" names nothing, so recall used to find nothing for it. For a prompt of 12 words or fewer it now also matches against the end of Claude's last reply. Lessons your prompt matches on its own still come first, so the reply can add lessons but never push one out. Replayed on 80 recent prompts, short follow-ups got a lesson 33 times of 64, up from 18, for about 44 ms more per prompt. Claude Code's own error lines ("API Error: …") are never taken for the reply (#309).
+
+### Removed
+
+- **The seed and community feeds, and `neo contribute`.** Since 0.60.0 their facts reached no prompt, and before that they were used 0–7% of the time. `neo contribute` exported to a feed nothing else read, and no fact ever reached its bar. Existing seed and community facts are retired the next time each store starts, freeing their global memory slots. Typing `neo contribute` now gets a "this looks like a command" refusal and starts no reasoning run. Expect the memory percentage and stage in `neo --version` to drop, because about 30 global facts no longer count (#308).
+
 ## [0.60.1] - 2026-10-14
 
 ### Fixed
