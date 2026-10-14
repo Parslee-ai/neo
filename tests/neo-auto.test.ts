@@ -18,7 +18,7 @@ const FIX = {
 };
 const PROSE = { ...FIX, code_suggestions: [{ file_path: "a.py", description: "consider" }] };
 
-type Call = { argv: string[]; stdin: string };
+type Call = { argv: string[]; stdin: string; env: Record<string, string> };
 type Row = { type: string; text: string };
 function host(
   on: On,
@@ -54,7 +54,7 @@ function host(
   on("classic.Stop", () => ({}));
   on("session.end", (_$, e) => ({ sessionId: e.sessionId }));
   on("process.run", async (_$, e) => {
-    const call = { argv: [...e.argv], stdin: e.init?.stdin ?? "" };
+    const call = { argv: [...e.argv], stdin: e.init?.stdin ?? "", env: { ...(e.init?.env ?? {}) } };
     if (call.argv[1] !== "hook") calls.push(call);
     const { exitCode = 0, stdout = "" } = await answer(call);
     return {
@@ -92,6 +92,8 @@ test("a typed prompt gets matching memory; a machine-injected one does not", asy
   expect(typed.additionalContext?.[0]).toContain("Neo: lesson");
   expect(calls[0]!.argv).toEqual(["neo", "recall", "--cwd", "/work", "--json", "--recent-beats", ""]);
   expect(calls[0]!.stdin).toBe("fix the hook");
+  // In the environment, not argv: an older CLI exits 2 on an unknown flag.
+  expect(calls[0]!.env).toEqual({ NEO_RECALL_TRANSCRIPT: "/t" });
   const system = await $.classic.UserPromptSubmit({
     ...BASE, prompt: "<task-notification>", source: "system",
   });

@@ -398,6 +398,16 @@ def test_embed_query_answers_from_the_server(server, sock):
     assert vector.tolist() == expected(["q"])[0]
 
 
+def test_embed_queries_answers_several_texts_in_one_request(server, sock):
+    """A short follow-up needs two vectors; recall pays one round trip."""
+    vectors = es.embed_queries(["q", "reply\n\nq"], MODEL, 2.0, path=sock)
+    assert [v.tolist() for v in vectors] == expected(["q", "reply\n\nq"])
+
+
+def test_embed_queries_with_nothing_to_embed_is_none(server, sock):
+    assert es.embed_queries([], MODEL, 2.0, path=sock) is None
+
+
 def test_embed_query_never_waits_past_its_deadline(sock):
     """`neo recall` runs on every prompt: a query queued behind the observer's
     own 32k-char texts must give up, not wait the normal 90 s."""

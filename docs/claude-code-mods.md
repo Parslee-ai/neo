@@ -107,6 +107,19 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
   it writes nothing, and it leaves out what Claude already has (rule files,
   its own memory files, git history) along with generic seed and community
   patterns. It runs only for prompts a person typed, not machine-injected ones.
+- **Follow-ups.** "fix those next" or "yes" names nothing; what it means is in
+  Claude's last reply. The mod passes the session transcript to recall
+  (`NEO_RECALL_TRANSCRIPT`, an environment variable because an older CLI exits
+  2 on an unknown flag and the mod then stops asking). For a prompt of at
+  most 12 words, the lessons the prompt matches alone take the slots first,
+  and the reply's last 600 characters plus the prompt fill the rest, both
+  embedded in one request; the reply is the last main-thread assistant text,
+  skipping Claude Code's own error and limit lines. Notes stay matched on the
+  prompt alone. Replayed on 80 recent typed prompts across projects, short
+  follow-ups got lessons 33 times of 64, up from 17; a prompt that says
+  enough is unchanged. That counts deliveries, not usefulness: a few
+  additions were weak, and one release lesson matched many "do it"-style
+  replies about merging.
 - **Notes.** CLAUDE.md is loaded; the notes it says to read are not. Recall
   offers the passage that matches the prompt from any markdown file or
   directory the project's rule file names in backticks (here

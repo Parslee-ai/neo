@@ -6,6 +6,7 @@ returns lessons the model does not already have in context.
 """
 
 import io
+import json
 from pathlib import Path
 
 import numpy as np
@@ -25,8 +26,9 @@ def _unit(i: int) -> np.ndarray:
 
 
 def _embed(table):
-    """Maps known prompts to fixed vectors; everything else to axis 7."""
-    return lambda text: table.get(text, _unit(7))
+    """Maps known texts to fixed vectors; everything else to axis 7. Batched,
+    like the resident embedder."""
+    return lambda texts: [table.get(text, _unit(7)) for text in texts]
 
 
 def _seed(root: Path, *facts: Fact) -> Path:
@@ -238,7 +240,7 @@ def test_the_json_form_reports_the_beat(tmp_path, monkeypatch, capsys):
     import json as _json
 
     monkeypatch.setattr(recall_mod, "recall",
-                        lambda p, c, recent_beats=None: {"text": "Neo: x", "beat_id": "b1"})
+                        lambda p, c, recent_beats=None, context="": {"text": "Neo: x", "beat_id": "b1"})
     assert run_recall(["--json", "--recent-beats", "a,b"], stdin=io.StringIO("q")) == 0
     assert _json.loads(capsys.readouterr().out) == {"text": "Neo: x", "beat_id": "b1"}
 
@@ -264,3 +266,182 @@ def test_a_matching_note_passage_is_offered_with_its_path(tmp_path):
     assert "- docs/observer.md [note]: - The drain mark gates re-parsing" in result["text"]
     assert result["fact_ids"] == []
     assert recall("q", str(tmp_path), embed=_embed({"q": _unit(5)}))["text"] == ""
+
+
+def _transcript(path: Path, *records) -> str:
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return str(path)
+
+
+def _reply(text, *, sidechain=False):
+    return {"type": "assistant", "isSidechain": sidechain,
+            "message": {"content": [{"type": "text", "text": text}]}}
+
+
+def test_a_short_follow_up_is_read_with_the_reply_it_answers(tmp_path):
+    """"fix it" names nothing; the reply it answers does."""
+    _seed(tmp_path, _fact("Sequence dependent pull request merges",
+                          tags=["transcript-derived"]))
+    reply = "Merge #303 first, then rebase #304 onto it."
+    embed = _embed({f"{reply}\n\nfix it": _unit(0)})
+
+    assert recall("fix it", str(tmp_path), embed=embed)["text"] == ""
+    text = recall("fix it", str(tmp_path), embed=embed, context=reply)["text"]
+    assert "Sequence dependent pull request merges" in text
+
+
+def test_a_prompt_that_says_enough_ignores_the_reply(tmp_path):
+    _seed(tmp_path, _fact("Sequence dependent pull request merges",
+                          tags=["transcript-derived"]))
+    prompt = " ".join(["word"] * (recall_mod.FOLLOW_UP_MAX_WORDS + 1))
+    reply = "Merge #303 first."
+    seen = []
+
+    def embed(texts):
+        seen.extend(texts)
+        return [_unit(7) for _ in texts]
+
+    recall(prompt, str(tmp_path), embed=embed, context=reply)
+    assert seen == [prompt]
+
+
+def test_only_the_tail_of_a_long_reply_is_used(tmp_path):
+    seen = []
+
+    def embed(texts):
+        seen.extend(texts)
+        return [_unit(7) for _ in texts]
+
+    reply = "x" * 5000 + "Should I merge it?"
+    recall("yes", str(tmp_path), embed=embed, context=reply)
+    assert seen[1].endswith("Should I merge it?\n\nyes")
+    assert len(seen[1]) == recall_mod.CONTEXT_TAIL_CHARS + len("\n\nyes")
+
+
+def test_notes_are_matched_on_the_prompt_alone(tmp_path, monkeypatch):
+    queries = []
+    monkeypatch.setattr(recall_mod, "_note_hits",
+                        lambda root, query: queries.append(query) or [])
+    embed = _embed({"yes": _unit(1), "Merge it?\n\nyes": _unit(2)})
+    recall("yes", str(tmp_path), embed=embed, context="Merge it?")
+    assert np.array_equal(queries[0], _unit(1))
+
+
+def test_last_reply_is_the_last_main_thread_assistant_text(tmp_path):
+    from neo.recall import last_reply
+    path = _transcript(
+        tmp_path / "t.jsonl",
+        _reply("an older reply"),
+        _reply("the reply being answered"),
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}},
+        _reply("a subagent's words", sidechain=True),
+        {"type": "user", "message": {"content": "fix it"}},
+    )
+    assert last_reply(path) == "the reply being answered"
+
+
+def test_last_reply_never_fails(tmp_path):
+    from neo.recall import last_reply
+    assert last_reply("") == ""
+    assert last_reply(str(tmp_path / "missing.jsonl")) == ""
+    garbage = tmp_path / "g.jsonl"
+    garbage.write_bytes(b"\xff\xfe not json\n{\"type\": \"assistant\"}\n")
+    assert last_reply(str(garbage)) == ""
+
+
+def test_the_command_reads_the_transcript_from_the_environment(tmp_path, monkeypatch):
+    """A variable, not a flag: an older CLI exits 2 on an unknown flag, and the
+    mod reads exit 2 as "no recall here" for the rest of the session."""
+    path = _transcript(tmp_path / "t.jsonl", _reply("Merge it?"))
+    seen = {}
+    monkeypatch.setenv("NEO_RECALL_TRANSCRIPT", path)
+    monkeypatch.setattr(recall_mod, "recall",
+                        lambda p, c, recent_beats=None, context="": seen.update(context=context)
+                        or {"text": "", "beat_id": "", "fact_ids": []})
+    assert run_recall(["--json"], stdin=io.StringIO("yes")) == 0
+    assert seen["context"] == "Merge it?"
+
+
+def test_context_never_displaces_a_lesson_the_prompt_matched_alone(tmp_path):
+    """Scoring each lesson by its better match is not enough: three lessons the
+    reply raised would outrank the prompt's own and push it out of the slots.
+    Measured: 3 of 57 real follow-ups lost a lesson that way."""
+    _seed(tmp_path,
+          _fact("Verify service shutdown", axis=0, tags=["transcript-derived"]),
+          *[_fact(f"Reply lesson {i}", axis=1, tags=["transcript-derived"])
+            for i in range(3)])
+    reply = "I'll stop the server when you're done."
+    near = _unit(0) * 0.5 + _unit(7) * np.sqrt(0.75)  # cosine 0.5 to axis 0
+    embed = _embed({"kill the server": near, f"{reply}\n\nkill the server": _unit(1)})
+
+    text = recall("kill the server", str(tmp_path), embed=embed, context=reply)["text"]
+
+    assert "Verify service shutdown" in text
+    assert text.count("Reply lesson") == recall_mod.MAX_FACTS - 1
+
+
+def test_a_twelve_word_prompt_is_still_a_follow_up(tmp_path):
+    seen = []
+
+    def embed(texts):
+        seen.extend(texts)
+        return [_unit(7) for _ in texts]
+
+    prompt = " ".join(["word"] * recall_mod.FOLLOW_UP_MAX_WORDS)
+    recall(prompt, str(tmp_path), embed=embed, context="Merge it?")
+    assert len(seen) == 2
+
+
+def test_a_short_answer_from_the_embedder_is_silence(tmp_path):
+    _seed(tmp_path, _fact("lesson", tags=["transcript-derived"]))
+    out = recall("yes", str(tmp_path), embed=lambda texts: [_unit(0)], context="Merge it?")
+    assert out["text"] == ""
+
+
+def test_claude_codes_own_error_lines_are_not_the_reply(tmp_path):
+    """Recorded as assistant messages from model "<synthetic>"; a "continue"
+    after one answers the reply before it, not the network error."""
+    from neo.recall import last_reply
+    error = {"type": "assistant", "message": {
+        "model": "<synthetic>",
+        "content": [{"type": "text", "text": "API Error: Can't reach the API server"}]}}
+    path = _transcript(tmp_path / "t.jsonl", _reply("Should I merge it?"), error)
+    assert last_reply(path) == "Should I merge it?"
+
+
+def test_a_reply_with_a_line_separator_is_still_found(tmp_path):
+    """Claude Code writes U+2028 unescaped; `str.splitlines` cut the record."""
+    from neo.recall import last_reply
+    path = tmp_path / "t.jsonl"
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in (
+        _reply("an older reply"), _reply("first\u2028second"))) + "\n", encoding="utf-8")
+    assert last_reply(str(path)) == "first\u2028second"
+
+
+def test_a_reply_beyond_the_tail_window_is_not_read(tmp_path, monkeypatch):
+    from neo.recall import last_reply
+    monkeypatch.setattr(recall_mod, "TRANSCRIPT_TAIL_BYTES", 4096)
+    filler = {"type": "user", "message": {"content": "x" * 8192}}
+    path = _transcript(tmp_path / "t.jsonl", _reply("too far back"), filler)
+    assert last_reply(path) == ""
+
+
+def test_a_malformed_record_is_skipped_not_fatal(tmp_path):
+    from neo.recall import last_reply
+    path = _transcript(tmp_path / "t.jsonl", _reply("the reply"),
+                       {"type": "assistant", "message": "not an object"},
+                       {"type": "assistant", "message": {"content": [{"type": "text", "text": 7}]}})
+    assert last_reply(path) == "the reply"
+
+
+def test_a_long_prompt_never_reads_the_transcript(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEO_RECALL_TRANSCRIPT", str(tmp_path / "t.jsonl"))
+    monkeypatch.setattr(recall_mod, "last_reply",
+                        lambda path: (_ for _ in ()).throw(AssertionError("read")))
+    seen = {}
+    monkeypatch.setattr(recall_mod, "recall",
+                        lambda p, c, recent_beats=None, context="": seen.update(context=context)
+                        or {"text": "", "beat_id": "", "fact_ids": []})
+    prompt = " ".join(["word"] * (recall_mod.FOLLOW_UP_MAX_WORDS + 1))
+    assert run_recall(["--json"], stdin=io.StringIO(prompt)) == 0
+    assert seen["context"] == ""
