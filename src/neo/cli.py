@@ -132,17 +132,6 @@ def parse_args():
     )
     global_parser.add_argument('--fast', action='store_true', help='Force the fast single-call path (skip multi-agent deliberation)')
 
-    # Detect if 'contribute' subcommand is being used
-    if len(sys.argv) > 1 and sys.argv[1] == 'contribute':
-        p = argparse.ArgumentParser(
-            prog="neo contribute",
-            description="Export high-quality patterns for community contribution",
-            parents=[global_parser]
-        )
-        args = p.parse_args(sys.argv[2:])
-        args.command = 'contribute'
-        return args
-
     # Detect if 'update' subcommand is being used
     if len(sys.argv) > 1 and sys.argv[1] == 'update':
         p = argparse.ArgumentParser(
@@ -463,7 +452,6 @@ def parse_args():
   neo car status          report detected CAR runtime surfaces
   neo serve               host Neo as an Agent2Agent v1.0 endpoint (needs [car])
   neo prompt <action>     analyze | enhance | patterns | suggest | history | stats
-  neo contribute          export high-confidence patterns for the community
   neo update              update the installed neo package
 """,
     )
@@ -1014,9 +1002,12 @@ _COMMAND_WORDS = {
     "upgrade": "neo update",
     "init": "neo --help",
     "stats": "neo memory learning-stats",
+    # Removed in 0.61.0 with the community feed it wrote to. Still refused, so
+    # an old habit does not start a paid reasoning run on the word.
+    "contribute": "neo --help",
 }
 _SUBCOMMANDS = (
-    "contribute", "update", "serve", "car", "construct", "memory",
+    "update", "serve", "car", "construct", "memory",
     "prompt", "hook", "workspace", "lattice",
 )
 
@@ -1239,12 +1230,6 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(1)
-
-    # Handle contribute subcommand
-    if hasattr(args, 'command') and args.command == 'contribute':
-        from neo.subcommands import handle_contribute
-        handle_contribute(args)
-        sys.exit(0)
 
     # Handle update subcommand
     if hasattr(args, 'command') and args.command == 'update':

@@ -28,6 +28,8 @@ from neo.cli import bare_command_hint
         ("Memory", "neo memory"),
         ("Lattice", "neo lattice"),
         ("hook", "neo hook"),
+        # A removed command stays refused rather than becoming a paid prompt.
+        ("contribute", "neo --help"),
     ],
 )
 def test_command_words_and_near_misses_are_refused(prompt, hint):

@@ -76,8 +76,8 @@
 - Legacy per-suggestion facts are invalidated on cold start; do NOT reclassify
   them to a decaying kind instead.
 - Re-accepted durable patterns are reinforced in place; `durable` is terminal;
-  the protection boost is capped by evidence. Contribution gates are
-  single-sourced in `store.py`.
+  the protection boost is capped by evidence. The seed/community feeds and
+  `neo contribute` are removed; `retire_feed_facts` retires their facts.
 - Learning benchmark: `accepted` is correctness only — never gate it, or any
   test, on wall-clock time; pin budgets, never mock the clock.
 
