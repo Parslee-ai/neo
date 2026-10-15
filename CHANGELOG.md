@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.61.2] - 2026-10-15
+
+### Changed
+
+- **About 5 seconds faster on most requests.** Before choosing between a single pass and the multi-agent panel, Neo asked CAR which models it could route to, a round trip of about 5 seconds, on every request. The answer only matters when the prompt is new to Neo's memory or you pass `--deep`. Everywhere else the choice is a single pass regardless, and that covered 525 of 544 recorded requests. Neo now asks only when the answer can change the choice; the choices themselves are unchanged (#313).
+
 ## [0.61.1] - 2026-10-15
 
 ### Fixed
