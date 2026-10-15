@@ -145,7 +145,8 @@
   lessons the session already has are skipped via `NEO_RECALL_SEEN`;
   note passages come from the observer-built `neo.notes` index, never from
   facts); `learn`-mode review at Stop,
-  diagnosis of failing checks, plan check at ExitPlanMode. Cost is bounded by
+  diagnosis of failing checks, plan check at ExitPlanMode — all three `--fast`
+  (the panel outruns the 90 s deadline). Cost is bounded by
   dedup, not a toggle; never re-review when `stop_hook_active`. Code calling `$`
   must live in `register.ts` (the validator rejects `$` across imports); work
   outliving a hook starts from `$.clock.after`.

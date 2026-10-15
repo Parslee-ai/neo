@@ -101,6 +101,11 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
 | A test, build or lint command fails | diagnoses the failure, in the background | one | context at the next main-thread hook |
 | A plan leaves plan mode | checks the plan | one, up to 90 s | context as the work starts |
 
+Each of these runs is a single pass (`--fast`). A prompt new to Neo's memory
+would otherwise convene the multi-agent panel, which took 126 s on a two-line
+repository, so every first review in a new repository ran out the 90 s and
+delivered nothing. `/neo` asked directly still gets the panel when it helps.
+
 - **Recall** makes no model call and never loads the embedding model: it asks
   the observer's resident embedder once, with a 1 s deadline, and says nothing
   if it does not answer. It reads fact files without constructing a store, so
