@@ -81,7 +81,12 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   share one length (`DIFF_SUMMARY_FULL_LEN`) and ties break on path, so no
   later file can displace one and the kept set is unchanged (pinned by a
   randomized comparison against ranking everything). Worktree dirty-file
-  queries run in parallel (12.4 s → 7.5 s; each stats the whole tree). The
+  queries ask only about outstanding suggested paths (a pathspec), in
+  parallel: a whole-tree `git diff` per checkout cost 12.4 s serially at 101
+  worktrees, the pathspec form 0.36 s in parallel for 6 paths at 110, and none
+  at all with nothing outstanding. Literal pathspecs, chunked, with git's
+  global pathspec env vars removed (they make git refuse the literal flag). That
+  answer only resolves suggested paths, so never widen it back to the tree. The
   early stop needs large diffs, so `MAX_INDEPENDENT_DIFFS` (50) also bounds the
   diffs taken per session: a codemod touching thousands of files lightly would
   otherwise fork one `git log -p` per file. Never reintroduce a

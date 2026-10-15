@@ -44,6 +44,12 @@ MAX_INDEPENDENT_DIFFS = 50
 # `git diff` processes run at once when listing dirty files across linked
 # worktrees.
 LINKED_WORKTREE_WORKERS = 8
+# Suggested paths per `git diff` pathspec, so the command line stays well under
+# Windows' ~32K-character limit however many suggestions are outstanding.
+PATHSPEC_CHUNK = 200
+# Each makes git refuse `--literal-pathspecs` ("incompatible with all other
+# global pathspec settings"), which would silently empty the answer.
+_GLOBAL_PATHSPEC_ENV = ("GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
 
 # `_get_file_diff_since` caps its summary here, so every capped summary has
 # the same, largest possible length (`DIFF_SUMMARY_FULL_LEN`).
@@ -917,11 +923,17 @@ class OutcomeTracker:
         # request hot path, growing linearly.
         self._checkout_roots = self._list_checkout_roots()
         working_tree = self._get_working_tree_changes()
-        # Dirty files in the repository's OTHER checkouts (linked worktrees),
-        # path -> the checkout holding it. Like everything gathered "elsewhere"
-        # below, this only resolves paths Neo suggested; it never feeds
-        # INDEPENDENT detection — see `_get_changed_elsewhere_since`.
-        linked_dirty = self._get_linked_worktree_changes()
+        # Suggested paths dirty in the repository's OTHER checkouts (linked
+        # worktrees), path -> the checkout holding it. Like everything gathered
+        # "elsewhere" below, this only resolves paths Neo suggested; it never
+        # feeds INDEPENDENT detection — see `_get_changed_elsewhere_since`.
+        linked_dirty = self._get_linked_worktree_changes({
+            normalize_suggestion_path(
+                sugg.get("file_path", ""), prev.codebase_root or self.codebase_root
+            )
+            for prev in sessions if prev.project_id == self.project_id
+            for sugg in prev.suggestions
+        })
         # Where each dirty path lives, own checkout first: what
         # `_applied_on_revision` reads instead of re-asking git per checkout.
         dirty_roots = dict(linked_dirty)
@@ -1563,19 +1575,47 @@ class OutcomeTracker:
                 continue
         return events
 
-    def _get_working_tree_changes(self, root: Optional[str] = None) -> set[str]:
+    def _get_working_tree_changes(
+        self, root: Optional[str] = None, paths: Optional[list[str]] = None,
+    ) -> set[str]:
         """Files dirty in a working tree (``codebase_root`` by default) right now.
 
         Split out because it does not depend on a session timestamp: callers
-        iterating many sessions compute it once and pass it in.
+        iterating many sessions compute it once and pass it in. ``paths``
+        limits the answer to those repository-relative paths, taken literally,
+        which spares git refreshing the whole index, and leaves out paths
+        DELETED there: a pathspec naming a renamed file's old name reports it
+        deleted (the whole-tree form shows only the new name), and a deleted
+        path neither counts as evidence (`_modified_since`) nor lives in that
+        checkout, so it must not become a `dirty_roots` entry that hands
+        `_applied_on_revision` the wrong base.
         """
         root = root or self.codebase_root
         if not root:
             return set()
+        if not paths:
+            return self._git_dirty(root, ["git", "diff", "--name-only", "HEAD"])
+        # Literal, so `src/[id].tsx` is a file, not a glob.
+        env = {k: v for k, v in os.environ.items() if k not in _GLOBAL_PATHSPEC_ENV}
+        dirty: set[str] = set()
+        for start in range(0, len(paths), PATHSPEC_CHUNK):
+            dirty |= self._git_dirty(
+                root,
+                ["git", "--literal-pathspecs", "diff", "--name-only",
+                 "--diff-filter=d", "HEAD", "--",
+                 *paths[start:start + PATHSPEC_CHUNK]],
+                env=env,
+            )
+        return dirty
+
+    @staticmethod
+    def _git_dirty(root: str, argv: list[str], env: Optional[dict] = None) -> set[str]:
+        """The paths a `git diff --name-only` prints; empty on any failure."""
         try:
             result = subprocess.run(
-                ["git", "diff", "--name-only", "HEAD"],
+                argv,
                 cwd=root,
+                env=env,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=10,
@@ -1628,23 +1668,35 @@ class OutcomeTracker:
             roots.append(str(path))
         return roots
 
-    def _get_linked_worktree_changes(self) -> dict[str, str]:
-        """Files dirty in this repository's OTHER checkouts, path -> checkout.
+    def _get_linked_worktree_changes(self, suggested: set[str]) -> dict[str, str]:
+        """Which of ``suggested`` are dirty in this repository's OTHER
+        checkouts, path -> checkout.
 
-        The first checkout listed wins a path dirty in several. Queried in
-        parallel: agents leave a worktree each, and one `git diff` per checkout
-        in turn took 12.4 s at 101 worktrees of a 21k-file repository (7.5 s
-        in parallel; each diff stats the whole tree, so more workers gain
-        nothing).
+        Only suggested paths are asked about, because that is all this answer
+        resolves (never INDEPENDENT detection). A whole-tree `git diff` per
+        checkout took 12.4 s serially at 101 worktrees of a 21k-file
+        repository (7.5 s in parallel; each one refreshes the whole index).
+        Limited to 6 suggested paths, 110 checkouts took 2.05 s serially and
+        0.36 s in parallel, and nothing at all when no suggestion is
+        outstanding. Left out: paths that cannot be repository-relative
+        (absolute, or climbing out with `..`), which could never match git's
+        output and would fail the whole query, and `.` or a directory, which
+        would widen it back to the whole tree. The first checkout listed wins
+        a path dirty in several.
         """
         roots = (self._checkout_roots or [])[1:]
-        if not roots:
+        wanted = sorted(
+            p for p in suggested
+            if p and p != "." and not p.endswith(("/", "\\"))
+            and not Path(p).is_absolute() and ".." not in Path(p).parts
+        )
+        if not roots or not wanted:
             return {}
         with ThreadPoolExecutor(max_workers=min(LINKED_WORKTREE_WORKERS, len(roots))) as pool:
-            dirty = list(pool.map(self._get_working_tree_changes, roots))
+            dirty = list(pool.map(lambda root: self._get_working_tree_changes(root, wanted), roots))
         changed: dict[str, str] = {}
-        for root, paths in zip(roots, dirty):
-            for path in paths:
+        for root, found in zip(roots, dirty):
+            for path in found:
                 changed.setdefault(path, root)
         return changed
 
