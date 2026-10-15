@@ -816,6 +816,104 @@ class TestModifiedOutcome:
         independent = [o for o in outcomes if o.outcome_type == OutcomeType.INDEPENDENT]
         assert len(independent) == 0  # bar.py skipped due to empty diff
 
+    @staticmethod
+    def _independent_outcomes(tracker, changed, sizes):
+        """Run detection with a diff of ``sizes[path]`` characters per path,
+        returning (kept paths, paths diffed). A size at or past the cap gets a
+        capped summary, as `_get_file_diff_since` builds one."""
+        from neo.memory.outcomes import DIFF_SUMMARY_CHARS, DIFF_TRUNCATION_MARKER
+
+        diffed = []
+
+        def fake_diff(path, ts, **_):
+            diffed.append(path)
+            size = sizes.get(path, 0)
+            if size > DIFF_SUMMARY_CHARS:
+                return "+" * DIFF_SUMMARY_CHARS + DIFF_TRUNCATION_MARKER
+            return "+" * size
+
+        tracker.save_session([FakeSuggestion(file_path="src/foo.py")], "fix")
+        with patch.object(tracker, "_get_changed_files_since", return_value=set(changed)), \
+             patch.object(tracker, "_get_file_diff_since", side_effect=fake_diff):
+            outcomes, _ = tracker.detect_outcomes()
+        kept = [o.file_path for o in outcomes if o.outcome_type == OutcomeType.INDEPENDENT]
+        return kept, [p for p in diffed if p != "src/foo.py"]
+
+    def test_independent_ranking_stops_once_the_kept_set_is_decided(self, tracker):
+        """Diffing every changed file to keep five cost 5,795 `git` diffs (363 s)
+        on one request in a busy repository. Once MAX_INDEPENDENT_OUTCOMES capped
+        summaries are in hand in path order, no later path can displace one."""
+        from neo.memory.outcomes import MAX_INDEPENDENT_OUTCOMES
+
+        changed = [f"src/file{i:02d}.py" for i in range(40)]
+        capped = {"src/file03.py", "src/file07.py", "src/file11.py",
+                  "src/file19.py", "src/file23.py", "src/file31.py"}
+        sizes = {p: (5000 if p in capped else 50) for p in changed}
+
+        kept, diffed = self._independent_outcomes(tracker, changed, sizes)
+
+        assert sorted(kept) == sorted(capped)[:MAX_INDEPENDENT_OUTCOMES]
+        assert diffed == changed[:changed.index("src/file23.py") + 1]
+
+    def test_independent_diffs_are_bounded_when_none_is_large(self, tracker):
+        """The early stop needs large diffs; a codemod touching thousands of
+        files lightly must still cost a bounded number of `git` diffs."""
+        from neo.memory.outcomes import MAX_INDEPENDENT_DIFFS, MAX_INDEPENDENT_OUTCOMES
+
+        changed = [f"src/file{i:04d}.py" for i in range(MAX_INDEPENDENT_DIFFS * 4)]
+        kept, diffed = self._independent_outcomes(tracker, changed, {p: 40 for p in changed})
+
+        assert diffed == changed[:MAX_INDEPENDENT_DIFFS]
+        assert len(kept) == MAX_INDEPENDENT_OUTCOMES
+
+    def test_a_real_oversized_diff_has_the_capped_length(self, tmp_path):
+        """The early stop counts summaries of exactly DIFF_SUMMARY_FULL_LEN, so
+        that length must be what `_get_file_diff_since` really produces."""
+        import subprocess
+
+        from neo.memory.outcomes import DIFF_SUMMARY_FULL_LEN
+
+        def git(*args):
+            subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+        git("init", "-q")
+        git("config", "user.email", "t@t.t")
+        git("config", "user.name", "T")
+        (tmp_path / "big.py").write_text("x = 0\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        (tmp_path / "big.py").write_text("".join(f"value_{i} = {i}\n" for i in range(2000)))
+        tracker = OutcomeTracker(codebase_root=str(tmp_path), project_id="testproj1234")
+
+        assert len(tracker._get_file_diff_since("big.py", time.time() - 60)) == DIFF_SUMMARY_FULL_LEN
+
+    def test_independent_ranking_matches_diffing_everything(self, tmp_sessions_dir, tmp_path):
+        """The early stop keeps exactly what ranking every diff would keep."""
+        import random
+
+        from neo.memory.outcomes import (
+            DIFF_SUMMARY_CHARS, DIFF_TRUNCATION_MARKER, MAX_INDEPENDENT_OUTCOMES,
+        )
+
+        rng = random.Random(1234)
+        for trial in range(60):
+            with patch("neo.memory.outcomes.SESSIONS_DIR", tmp_sessions_dir / str(trial)):
+                (tmp_sessions_dir / str(trial)).mkdir()
+                tracker = OutcomeTracker(codebase_root=str(tmp_path), project_id="testproj1234")
+                changed = [f"src/m{rng.randrange(1000):03d}.py" for _ in range(rng.randrange(1, 30))]
+                sizes = {p: rng.choice([0, 10, 900, 1999, 2000, 2001, 9000]) for p in changed}
+
+                kept, _ = self._independent_outcomes(tracker, changed, sizes)
+
+            def summary_len(size):
+                return DIFF_SUMMARY_CHARS + len(DIFF_TRUNCATION_MARKER) if size > DIFF_SUMMARY_CHARS else size
+
+            reference = sorted(
+                (p for p in set(changed) if sizes[p] > 0),
+                key=lambda p: (-summary_len(sizes[p]), p),
+            )[:MAX_INDEPENDENT_OUTCOMES]
+            assert sorted(kept) == sorted(reference), (trial, sizes)
+
 
 class TestCrossWorktreeAttribution:
     """A suggestion must be resolved against the root it was RECORDED under.

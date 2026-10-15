@@ -230,3 +230,14 @@ def test_auto_runs_record_kind_and_outcome():
     })
     assert life["kind"] == "review" and life["status"] == "prose"
     assert "BODY_MUST_NOT_PERSIST" not in json.dumps(life)
+
+
+def test_a_failed_auto_run_records_why_and_how_long():
+    life = hook.build_lifecycle_record({
+        "event": "auto_finished", "kind": "review", "status": "failed",
+        "reason": "timed out", "elapsed_ms": 90012.6, "session_id": "s",
+    })
+    assert life["reason"] == "timed out" and life["elapsed_ms"] == 90012
+    for bad in ("90", -1, True, None):
+        life = hook.build_lifecycle_record({"event": "auto_finished", "elapsed_ms": bad})
+        assert "elapsed_ms" not in life

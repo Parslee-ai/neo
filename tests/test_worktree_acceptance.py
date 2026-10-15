@@ -394,3 +394,27 @@ def test_dirty_first_application_then_commit_collapses_to_one_base(repo, request
         for o, x in (("a", a[0]), ("b", b[0]))
     })
     assert bases["a"] == bases["b"]
+
+
+def test_dirty_files_across_many_worktrees_keep_the_first_listed_checkout(
+    repo, tmp_path, request,
+):
+    """Worktrees are queried in parallel (one `git diff` each in turn cost 12.4 s
+    at 101 worktrees); the first checkout `git worktree list` names still wins
+    a path dirty in several, whichever query finishes first."""
+    trees = [_worktree(repo, tmp_path / f"wt{i}", f"agent-{i}") for i in range(12)]
+    for tree in trees[3:]:
+        _apply(tree)
+    _write(trees[5] / "src" / "bar.py", "def g():\n    return 5\n")
+
+    tracker = _suggest(repo, request)
+    tracker._checkout_roots = tracker._list_checkout_roots()
+    listed = tracker._checkout_roots[1:]
+
+    changed = tracker._get_linked_worktree_changes()
+
+    dirty = {str(tree) for tree in trees[3:]}
+    assert changed == {
+        "src/foo.py": next(r for r in listed if r in dirty),
+        "src/bar.py": next(r for r in listed if r.endswith("wt5")),
+    }

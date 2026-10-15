@@ -199,6 +199,13 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
     top, per call. `--index` and `architecture_metrics.compute` (which runs on
     the outcome-detection path of every real invocation) go through the same
     cache, so `--index` warms the walk as well as the catalog.
+  - `architecture_metrics.compute` also keeps a per-file memo of its parse
+    results (`.neo/arch_cache.json`), validated per file by size, mtime and
+    ctime and dropped whole on an `ANALYZER_VERSION` bump or any malformed
+    entry. A learn-mode run snapshots twice, and parsing every file each time
+    cost 61 s of a 111 s request in a 21k-file repository; warm it is 0.5 s.
+    Bump `ANALYZER_VERSION` whenever an analyzer or threshold changes what it
+    returns for an unchanged file.
   - Degradations are loud and none is fatal: a corrupt, truncated, malformed or
     foreign-signature cache is discarded with a warning and the walk runs in
     full; an unwritable `.neo/` costs a warning and nothing else. A malformed

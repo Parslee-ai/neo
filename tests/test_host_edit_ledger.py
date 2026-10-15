@@ -225,3 +225,26 @@ def test_the_ledger_is_read_once_per_call_not_once_per_session(repo, monkeypatch
     )
     tracker.detect_outcomes()
     assert len(calls) == 1, f"ledger read {len(calls)}x for 4 sessions"
+
+
+def test_locating_by_string_prefix_agrees_with_relative_to():
+    """`relative_to` cost 11 s scanning 5,511 ledger edits against 102
+    checkouts; the string match that replaced it must give the same answer,
+    including for a sibling whose name merely starts with a root's."""
+    from neo.memory.outcomes import _relative_to_first
+
+    def reference(path, roots):
+        for root, own in roots:
+            try:
+                return str(path.relative_to(root)), own
+            except ValueError:
+                continue
+        return None
+
+    roots = [(Path("/w/app"), True), (Path("/w/app/.claude/worktrees/a1"), False),
+             (Path("/w/other"), False), (Path("/"), False)]
+    paths = ["/w/app/src/x.py", "/w/app", "/w/app2/x.py", "/w/ap", "/w/other/y.ts",
+             "/w/app/.claude/worktrees/a1/z.py", "/elsewhere/q.py", "/w/otherwise/q"]
+    for raw in paths:
+        for ordered in (roots[:-1], roots[1:-1], list(reversed(roots[:-1])), roots[-1:]):
+            assert _relative_to_first(Path(raw), ordered) == reference(Path(raw), ordered), (raw, ordered)
