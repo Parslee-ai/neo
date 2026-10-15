@@ -411,10 +411,98 @@ def test_dirty_files_across_many_worktrees_keep_the_first_listed_checkout(
     tracker._checkout_roots = tracker._list_checkout_roots()
     listed = tracker._checkout_roots[1:]
 
-    changed = tracker._get_linked_worktree_changes()
+    changed = tracker._get_linked_worktree_changes({"src/foo.py", "src/bar.py"})
 
     dirty = {str(tree) for tree in trees[3:]}
     assert changed == {
         "src/foo.py": next(r for r in listed if r in dirty),
         "src/bar.py": next(r for r in listed if r.endswith("wt5")),
     }
+
+
+def test_only_suggested_paths_are_asked_about_in_other_checkouts(repo, tmp_path, request):
+    """A whole-tree `git diff` per checkout took 12.4 s at 101 worktrees; the
+    answer only ever resolves suggested paths, so only those are asked about.
+    A path that cannot be repository-relative must not sink the query."""
+    tree = _worktree(repo, tmp_path / "wt", "agent-1")
+    _apply(tree)
+    _write(tree / "src" / "bar.py", "def g():\n    return 9\n")
+
+    tracker = _suggest(repo, request)
+    tracker._checkout_roots = tracker._list_checkout_roots()
+
+    assert tracker._get_linked_worktree_changes({"src/foo.py"}) == {"src/foo.py": str(tree)}
+    assert tracker._get_linked_worktree_changes(
+        {"src/foo.py", "/elsewhere/x.py", "../outside.py", ""}
+    ) == {"src/foo.py": str(tree)}
+
+
+def test_a_global_pathspec_setting_does_not_silence_other_checkouts(
+    repo, tmp_path, request, monkeypatch,
+):
+    """git refuses `--literal-pathspecs` alongside GIT_GLOB/NOGLOB/ICASE_PATHSPECS,
+    which would empty the answer without a word."""
+    tree = _worktree(repo, tmp_path / "wt", "agent-1")
+    _apply(tree)
+    tracker = _suggest(repo, request)
+    tracker._checkout_roots = tracker._list_checkout_roots()
+    for name in ("GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
+        monkeypatch.setenv(name, "1")
+    assert tracker._get_linked_worktree_changes({"src/foo.py"}) == {"src/foo.py": str(tree)}
+
+
+def test_many_suggested_paths_are_asked_in_chunks(repo, tmp_path, request, monkeypatch):
+    from neo.memory import outcomes
+
+    tree = _worktree(repo, tmp_path / "wt", "agent-1")
+    _apply(tree)
+    tracker = _suggest(repo, request)
+    tracker._checkout_roots = tracker._list_checkout_roots()
+    monkeypatch.setattr(outcomes, "PATHSPEC_CHUNK", 3)
+    calls = []
+    real = outcomes.OutcomeTracker._git_dirty
+    monkeypatch.setattr(outcomes.OutcomeTracker, "_git_dirty",
+                        staticmethod(lambda root, argv, env=None: calls.append(argv) or real(root, argv, env)))
+
+    suggested = {f"src/m{i}.py" for i in range(7)} | {"src/foo.py"}
+    assert tracker._get_linked_worktree_changes(suggested) == {"src/foo.py": str(tree)}
+    assert [len(argv) - argv.index("--") - 1 for argv in calls] == [3, 3, 2]
+
+
+def test_a_directory_suggestion_does_not_widen_the_query(repo, tmp_path, request, monkeypatch):
+    _apply(_worktree(repo, tmp_path / "wt", "agent-1"))
+    tracker = _suggest(repo, request)
+    tracker._checkout_roots = tracker._list_checkout_roots()
+    asked = []
+    monkeypatch.setattr(tracker, "_get_working_tree_changes",
+                        lambda root=None, paths=None: asked.append(paths) or set())
+    tracker._get_linked_worktree_changes({".", "src/", "src/foo.py"})
+    assert asked == [["src/foo.py"]]
+
+
+def test_no_outstanding_suggestion_asks_no_other_checkout(repo, tmp_path, request, monkeypatch):
+    _apply(_worktree(repo, tmp_path / "wt", "agent-1"))
+    tracker = _suggest(repo, request)
+    tracker._checkout_roots = tracker._list_checkout_roots()
+    asked = []
+    monkeypatch.setattr(tracker, "_get_working_tree_changes",
+                        lambda root=None, paths=None: asked.append(root) or set())
+
+    assert tracker._get_linked_worktree_changes(set()) == {}
+    assert tracker._get_linked_worktree_changes({"/abs/only.py"}) == {}
+    assert asked == []
+
+
+def test_a_suggested_file_renamed_away_in_another_checkout_does_not_live_there(
+    repo, tmp_path, request,
+):
+    """Asked about by its old name, a renamed file reads as deleted; it must not
+    become that checkout's dirty file, or `_applied_on_revision` takes that
+    checkout's HEAD as the base of an acceptance it never held."""
+    tree = _worktree(repo, tmp_path / "wt", "agent-1")
+    _git(tree, "mv", "src/foo.py", "src/renamed.py")
+    (tree / "src" / "bar.py").unlink()
+    tracker = _suggest(repo, request)
+    tracker._checkout_roots = tracker._list_checkout_roots()
+
+    assert tracker._get_linked_worktree_changes({"src/foo.py", "src/bar.py"}) == {}
