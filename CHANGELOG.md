@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.61.1] - 2026-10-15
+
+### Fixed
+
+- **Automatic reviews in large repositories finish instead of timing out.** The Claude Code mod gives each end-of-turn review 90 seconds, and in a repository with 21k files and 102 agent worktrees, 85 of 93 reviews ran out of time before Neo asked the model anything. While running, each one held the turn open. Most of the time went into checking whether earlier suggestions had been applied: Neo diffed all 5,795 files changed since then to keep five, and re-parsed every source file twice for architecture metrics. Neo now stops diffing once the five are known (at most 50 diffs per check), caches the per-file parse results in `.neo/arch_cache.json`, and matches recorded edits to worktrees by path prefix. The same review now takes 37–55 seconds instead of about 480 (#311).
+- **Recall no longer repeats a lesson Claude already has.** Every matching prompt re-sent the same lessons, and one reached a single session 43 times. The mod now tells recall which lessons this session already received, and recall leaves them out. It never swaps in a weaker lesson to fill the gap, so which lessons graduate from probation is unchanged. The list resets when the conversation is compacted or a new session starts (#311).
+
+### Changed
+
+- **The mod's log says why an automatic run failed and how long it took.** `auto_finished` in `~/.neo/sessions/host_events.jsonl` now includes `elapsed_ms` and, when the run failed, a `reason` (`timed out`, `exit N`, `neo error`, `unreadable output` or `failed early`). Before, a timeout could not be told apart from a crash (#311).
+
 ## [0.61.0] - 2026-10-14
 
 ### Added
