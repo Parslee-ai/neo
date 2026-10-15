@@ -873,8 +873,11 @@ async function autoNeo(
       );
     });
     redraw($);
+    // `--fast`: a prompt new to Neo's memory would otherwise convene the
+    // multi-agent panel, which took 126 s on a two-line repository, so every
+    // first review there ran out the deadline and delivered nothing.
     const run = await $.process.run(
-      [binary, "--stdin-json", "--json", "--mode", "learn"],
+      [binary, "--stdin-json", "--json", "--mode", "learn", "--fast"],
       {
         cwd,
         stdin: JSON.stringify(

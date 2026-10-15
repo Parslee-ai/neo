@@ -130,7 +130,7 @@ test("what recall delivered is recorded by id, so the lesson can leave probation
 test("each automatic run is logged with what became of it", async ($, on) => {
   const hooks: Call[] = [];
   let answer: object = FIX;
-  host(on, (c) => {
+  const calls = host(on, (c) => {
     if (c.argv[1] === "hook") hooks.push(c);
     if (c.argv[0] === "git") return { stdout: "diff --git " + c.argv.at(-1) };
     return c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(answer) } : {};
@@ -143,6 +143,8 @@ test("each automatic run is logged with what became of it", async ($, on) => {
   const [started, finished] = runs();
   expect(started).toMatchObject({ event: "auto_started", kind: "review", session_id: "session1", cwd: "/work" });
   expect(finished).toMatchObject({ event: "auto_finished", kind: "review", status: "change", invocation_id: started.invocation_id });
+  // A single pass: the panel cannot finish inside the deadline.
+  expect(neoRuns(calls).at(-1)!.argv).toEqual(["neo", "--stdin-json", "--json", "--mode", "learn", "--fast"]);
   answer = PROSE;
   await $.classic.PostToolUse(edit("/work/b.py"));
   await $.classic.Stop(stop());
