@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.61.5] - 2026-10-15
+
+### Fixed
+
+- **Automatic reviews in a new repository finish instead of timing out.** When Neo had no memory of a repository, the Claude Code mod's end-of-turn review convened the multi-agent panel, which took 126 seconds on a two-line repository. The mod gives each automatic run 90 seconds, so every first review there ran out of time and returned nothing. The mod's automatic runs (end-of-turn review, diagnosis of a failing check, plan check) now always take a single pass; the same review takes 24 seconds. `/neo` asked directly can still use the panel. Restart Claude Code to pick it up (#319).
+
 ## [0.61.4] - 2026-10-15
 
 ### Fixed
