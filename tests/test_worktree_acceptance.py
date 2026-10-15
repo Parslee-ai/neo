@@ -506,3 +506,180 @@ def test_a_suggested_file_renamed_away_in_another_checkout_does_not_live_there(
     tracker._checkout_roots = tracker._list_checkout_roots()
 
     assert tracker._get_linked_worktree_changes({"src/foo.py", "src/bar.py"}) == {}
+
+
+NON_ASCII = "src/café.py"
+NON_ASCII_DIFF = f"--- a/{NON_ASCII}\n+++ b/{NON_ASCII}\n@@\n-    return 1\n+    return 2\n"
+
+
+@pytest.mark.parametrize("where", ["here", "linked worktree"])
+@pytest.mark.parametrize("committed", [False, True])
+def test_a_non_ascii_path_is_matched_as_written(repo, tmp_path, request, where, committed):
+    """git C-quotes a non-ASCII path by default (`"src/caf\\303\\251.py"`),
+    so an edit to it matched no suggestion and was never seen."""
+    _write(repo / NON_ASCII, "def f():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add café")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+    suggestion = _Suggestion(file_path=NON_ASCII, diff=NON_ASCII_DIFF)
+    _save(tracker, [suggestion], "make f return 2")
+    checkout = repo if where == "here" else _worktree(repo, tmp_path / "agent-wt", "agent")
+
+    _write(checkout / NON_ASCII, "def f():\n    return 2\n")
+    if committed:
+        _git(checkout, "commit", "-qam", "apply")
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    assert [o.file_path for o in _accepted(outcomes)] == [NON_ASCII], outcomes
+
+
+def test_commit_history_lists_non_ascii_paths_as_written(repo, request):
+    _write(repo / NON_ASCII, "x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add café")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+
+    assert NON_ASCII in tracker._get_commits_since(None, 10)[0]["files"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids `\"` in file names")
+def test_working_tree_paths_survive_quotes_and_edge_spaces(repo):
+    """Unquoted line output still escapes `"` and a strip eats edge spaces;
+    only NUL-separated output names these files as they are."""
+    names = ['src/q"x.py', "src/ lead.py"]
+    for name in names:
+        _write(repo / name, "x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "odd names")
+    for name in names:
+        _write(repo / name, "x = 2\n")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id="odd-names")
+
+    assert set(names) <= tracker._get_working_tree_changes(), names
+    assert tracker._get_working_tree_changes(paths=names) == set(names)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids these characters in file names")
+def test_committed_paths_survive_quotes_tabs_and_newlines(repo, request):
+    """`git log` line output C-quotes these, and a tab in a path could pass for
+    the `hash\\ttime\\tsubject` header; `-z` hands back each name as it is."""
+    names = ['src/q"x.py', "src/tab\tx.py", "src/nl\nx.py", "src/ lead.py", NON_ASCII]
+    for name in names:
+        _write(repo / name, "x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "odd\tsubject")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+
+    newest = tracker._get_commits_since(None, 10)[0]
+    assert set(names) <= set(newest["files"]), newest
+    assert newest["message"] == "odd\tsubject"
+    assert len(tracker._get_commits_since(None, 10)) == int(_git(repo, "rev-list", "--count", "HEAD"))
+    assert set(names) <= tracker._get_changed_files_since(0, working_tree=set())
+    assert set(names) <= tracker._get_changed_elsewhere_since(0)
+
+
+def _commit_spelled(repo, path, text):
+    """Commit ``path`` byte-for-byte and check it out. Through stdin, not argv
+    or the filesystem: macOS's `core.precomposeUnicode` folds those to NFC, and
+    a tree entry stored NFD (committed on Linux) must stay NFD here too."""
+    sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, input=text,
+                         check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "update-index", "--add", "--index-info"], cwd=repo, check=True,
+                   input=f"100644 {sha}\t{path}\n", text=True, encoding="utf-8")
+    _git(repo, "commit", "-qm", "add café")
+    _git(repo, "reset", "-q", "--hard")
+    on_disk = next(p for p in os.listdir(repo / "src") if p.startswith("caf"))
+    return repo / "src" / on_disk
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("where", ["here", "linked worktree"])
+@pytest.mark.parametrize("stored, suggested", [("NFD", "NFC"), ("NFC", "NFD")])
+def test_a_suggestion_matches_its_file_in_either_unicode_form(
+    repo, tmp_path, request, stored, suggested, where, committed,
+):
+    """`é` is one code point (NFC) or `e` + a combining accent (NFD). A model
+    may write either, whichever form git holds the name in."""
+    import unicodedata
+
+    held = unicodedata.normalize(stored, NON_ASCII)
+    said = unicodedata.normalize(suggested, NON_ASCII)
+    _commit_spelled(repo, held, "def f():\n    return 1\n")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+    diff = f"--- a/{said}\n+++ b/{said}\n@@\n-    return 1\n+    return 2\n"
+    _save(tracker, [_Suggestion(file_path=said, diff=diff)], "make f return 2")
+    checkout = repo if where == "here" else _worktree(repo, tmp_path / "agent-wt", "agent")
+    target = next(p for p in os.listdir(checkout / "src") if p.startswith("caf"))
+    base = _git(checkout, "rev-parse", "HEAD")
+
+    _write(checkout / "src" / target, "def f():\n    return 2\n")
+    if committed:
+        _git(checkout, "commit", "-qam", "apply")
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    accepted = _accepted(outcomes)
+    assert [o.file_path for o in accepted] == [held], outcomes
+    assert accepted[0].applied_on_revision == base
+
+
+@pytest.mark.parametrize("stored, spoken", [("NFD", "NFC"), ("NFC", "NFD")])
+def test_a_host_edit_in_the_other_unicode_form_takes_gits_spelling(
+    repo, request, stored, spoken,
+):
+    """The host ledger and the model spell the name one way, git the other.
+    git must only be asked about its own spelling, and the file is ours on
+    every later round, never INDEPENDENT."""
+    import json
+    import unicodedata
+
+    from neo.hook import HOOK_LEDGER
+
+    held = unicodedata.normalize(stored, NON_ASCII)
+    said = unicodedata.normalize(spoken, NON_ASCII)
+    path = _commit_spelled(repo, held, "def f():\n    return 1\n")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+    diff = f"--- a/{said}\n+++ b/{said}\n@@\n-    return 1\n+    return 2\n"
+    # A second, untouched suggestion keeps the session retained for round two.
+    _save(tracker, [_Suggestion(file_path=said, diff=diff), _Suggestion("src/bar.py")],
+          "make f return 2")
+
+    _write(path, "def f():\n    return 2\n")
+    HOOK_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with HOOK_LEDGER.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": _clock.tick(), "tool": "Edit",
+                             "file_path": str(repo / said)}) + "\n")
+
+    first, _ = tracker.detect_outcomes()
+    second, _ = tracker.detect_outcomes()
+
+    assert [(o.outcome_type, o.file_path) for o in first] == [(OutcomeType.ACCEPTED, held)]
+    assert "return 2" in first[0].diff_summary
+    assert not [o for o in second if unicodedata.normalize("NFC", o.file_path)
+                == unicodedata.normalize("NFC", NON_ASCII)], second
+
+
+def test_commit_headers_are_not_mistaken_for_paths(repo, request):
+    """A path may start with the header mark; empty and merge commits list no
+    files, and the commit after either still parses."""
+    _write(repo / "\x01a.py", "x = 1\n")
+    _write(repo / "\x01b.py", "x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "marks")
+    _git(repo, "commit", "-q", "--allow-empty", "--allow-empty-message", "-m", "")
+    _git(repo, "checkout", "-q", "-b", "side")
+    _write(repo / "src" / "bar.py", "def g():\n    return 2\n")
+    _git(repo, "commit", "-qam", "side work")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+
+    commits = tracker._get_commits_since(None, 10)
+    by_message = {c["message"]: c for c in commits}
+
+    assert len(commits) == int(_git(repo, "rev-list", "--count", "HEAD"))
+    assert by_message["merge side"]["files"] == []
+    assert by_message[""]["files"] == []
+    assert by_message["side work"]["files"] == ["src/bar.py"]
+    assert {"\x01a.py", "\x01b.py"} <= set(by_message["marks"]["files"])

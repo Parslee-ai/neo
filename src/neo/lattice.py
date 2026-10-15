@@ -185,14 +185,16 @@ def repository_languages(root: str) -> list[str]:
 
     try:
         out = subprocess.run(
-            ["git", "-C", root, "ls-files"],
-            capture_output=True, text=True, timeout=10, check=True,
+            # NUL-separated: a quoted `"café.py"` ends in `.py"` and has no language.
+            ["git", "-C", root, "ls-files", "-z"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     counts: Counter[str] = Counter()
-    for line in out.splitlines():
-        lang = language_for_path(line)
+    for path in out.split("\0"):
+        lang = language_for_path(path)
         if lang:
             counts[normalize_language_name(lang)] += 1
     return [

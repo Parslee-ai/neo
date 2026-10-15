@@ -210,6 +210,13 @@ class TestIdentity:
         assert "python" in tags and "rust" not in tags
         assert set(lattice.BASE_CAPABILITIES) <= set(tags)
 
+    def test_non_ascii_file_names_count_toward_their_language(self, tmp_path):
+        root = _git_init(tmp_path / "r")
+        for n in range(lattice.MIN_LANGUAGE_FILES):
+            (tmp_path / "r" / f"café{n}.py").write_text("x = 1\n")
+        subprocess.run(["git", "-C", root, "add", "."], check=True)
+        assert "python" in lattice.capabilities_for(root)
+
     def test_a_non_repo_gets_base_tags_only(self, tmp_path):
         assert lattice.capabilities_for(str(tmp_path)) == list(lattice.BASE_CAPABILITIES)
 
