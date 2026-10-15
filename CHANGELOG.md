@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.61.4] - 2026-10-15
+
+### Fixed
+
+- **Neo now notices when you apply a suggestion to a file with an unusual name.** Git escapes some file names in its output: names with accents or other non-ASCII letters, quotes, backslashes, tabs or newlines. Neo compared those escaped names with the paths it had suggested, so a suggestion applied to `src/café.py` was never seen as applied, and such files were also left out of context gathering and language detection. Neo now reads git's file lists unescaped (`-z`). It also matches a name written with composed accents against the same name written with decomposed ones (macOS and Linux tools can produce either), and asks git about a file using the spelling git itself reports (#317).
+
 ## [0.61.3] - 2026-10-15
 
 ### Changed
