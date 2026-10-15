@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.61.3] - 2026-10-15
+
+### Changed
+
+- **Learning checks no longer scan every agent worktree.** To tell whether a suggestion was applied in another worktree, Neo listed every uncommitted file in every worktree of the repository. With 101 agent worktrees in a 21k-file repository, that took 7–12 seconds per request. It now asks each worktree only about the files Neo suggested that are still waiting on you, and skips the check when there are none. The worktree check takes about 0.4 seconds and an automatic review about 22–25 seconds there. A file renamed or deleted in another worktree no longer counts as living there (#315).
+
 ## [0.61.2] - 2026-10-15
 
 ### Changed
