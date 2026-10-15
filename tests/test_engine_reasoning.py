@@ -56,6 +56,54 @@ def test_config_fast_beats_car(monkeypatch):
     assert d.mode is ReasoningMode.FAST
 
 
+def test_the_car_probe_runs_only_when_its_answer_can_change_the_mode(monkeypatch):
+    """`route_model` cost ~5 s per request, and 525 of 544 recorded decisions
+    were "familiar", where the mode is FAST whatever it reports."""
+    from neo.config import NeoConfig
+
+    familiar = MemorySignal(5, 0.9)
+    novel = MemorySignal(0, 0.0)
+    for mode, signal, probed in (
+        ("auto", familiar, False), ("auto", novel, True),
+        ("fast", novel, False), ("deep", familiar, True),
+    ):
+        cfg = NeoConfig()
+        cfg.reasoning_mode = mode
+        e = _engine(FakeLM(lambda m: "{}"), config=cfg)
+        calls = []
+        monkeypatch.setattr(e, "_car_route_capability",
+                            lambda p: calls.append(p) or (True, 3, lambda a, b: "{}"))
+        monkeypatch.setattr(e, "_compute_memory_signal", lambda c, s=signal: s)
+        d, route = e._decide_reasoning_mode({"prompt": "x"}, "medium", _NI())
+        assert bool(calls) is probed, mode
+        if probed:
+            assert d.mode is ReasoningMode.MULTI_AGENT and route is not None
+        else:
+            assert d.mode is ReasoningMode.FAST and route is None
+
+
+def test_skipping_the_probe_never_changes_a_decision():
+    """Wherever the probe is skipped, `decide_mode` decides identically with
+    any capability it could have reported."""
+    from neo.reasoning_mode import decide_mode, needs_panel_capability
+
+    signals = [MemorySignal(n, c) for n in (0, 1, 3, 8)
+               for c in (0.0, 0.4, 0.5, 0.6, 0.8, 0.85, 1.0)]
+    for signal in signals:
+        for difficulty in ("easy", "medium", "hard"):
+            for explicit in (None, "fast", "single", "deep", "multi-agent", "bogus",
+                             "FAST", " deep ", "auto"):
+                if needs_panel_capability(signal, difficulty=difficulty, explicit=explicit):
+                    continue
+                skipped = decide_mode(signal, difficulty=difficulty, explicit=explicit)
+                for car, count, floor in ((True, 1, 1), (True, 5, 1), (False, 3, 1), (True, 1, 2), (True, 0, 1)):
+                    probed = decide_mode(signal, difficulty=difficulty, explicit=explicit,
+                                         car_available=car, capable_model_count=count,
+                                         min_models=floor)
+                    assert (probed.mode, probed.reason, probed.effort) == \
+                        (skipped.mode, skipped.reason, skipped.effort), (signal, difficulty, explicit)
+
+
 _PLAN = json.dumps({"approach": "a", "steps": [
     {"description": "x", "rationale": "r", "risk": "low"}]})
 _CODE = json.dumps({"code": "def f(): return 1", "explanation": "e",

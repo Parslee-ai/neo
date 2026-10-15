@@ -2266,8 +2266,9 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
 
     def _car_route_capability(self, prompt: str):
         """(car_available, capable_model_count, route_fn|None). Multi-agent needs
-        CAR reachable AND a diverse pool; ``route_model`` (decision-only) reports
-        the pool via its ``candidates`` ranking."""
+        CAR reachable AND at least one capable model; ``route_model``
+        (decision-only) reports the pool via its ``candidates`` ranking. Called
+        only when `needs_panel_capability` says the answer can matter."""
         scope = getattr(self, "scoped_consumer", None)
         if scope is not None:
             scope.authorize()
@@ -2313,7 +2314,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         cannot be shown without making the calls that `--dry-run` exists to
         avoid.
         """
-        from neo.reasoning_mode import decide_mode
+        from neo.reasoning_mode import decide_mode, needs_panel_capability
 
         if self.dry_run:
             from neo.reasoning_mode import ModeDecision, ReasoningMode
@@ -2347,7 +2348,12 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         signal = self._compute_memory_signal(context)
         explicit = (getattr(self.config, "reasoning_mode", "auto") if self.config else "auto") or "auto"
         explicit = None if explicit.lower() == "auto" else explicit.lower()
-        car_available, model_count, route_fn = self._car_route_capability(context.get("prompt", ""))
+        # The probe is a CAR `route_model` round trip (~5 s measured); only a
+        # novel prompt or an explicit deep request can use what it reports.
+        if needs_panel_capability(signal, difficulty=difficulty, explicit=explicit):
+            car_available, model_count, route_fn = self._car_route_capability(context.get("prompt", ""))
+        else:
+            car_available, model_count, route_fn = False, 0, None
         decision = decide_mode(
             signal, difficulty=difficulty,
             car_available=car_available, capable_model_count=model_count, explicit=explicit,

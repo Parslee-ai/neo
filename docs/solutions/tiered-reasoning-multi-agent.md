@@ -16,7 +16,7 @@
 | A/B quality harness | `tools/ab_reasoning.py` | (see A/B result below) |
 
 The gate stays **auto** by default; multi-agent fires only on novelty **and**
-CAR-reachable **and** ≥2 distinct capable models — otherwise the fast single
+CAR-reachable **and** ≥1 capable model (`DEFAULT_MIN_MODELS`) — otherwise the fast single
 call runs (a failed panel also falls back). Output `metadata` always carries
 `reasoning_mode` + `reasoning_reason`, and panel runs add `provenance` +
 `panel` (models_used, consensus, rounds).
@@ -302,7 +302,9 @@ engineered by the caller; CAR provides the primitive built for it.
   reports its work.
 
 **The primitives** (both on `CarRuntime.route_model`, which is *decision-only —
-no inference*, so it's cheap to ask up front):
+no inference*, but not cheap: the capability probe measured ~5 s per request on
+a live install, so the engine asks only when `needs_panel_capability` says the
+answer can change the mode — a novel prompt or an explicit `--deep`):
 
 - `exclude_models` — IntentHint field, documented as *"any capable model that is
   NOT this one — for adversarial-reviewer separation (car#358)."* Purpose-built.
