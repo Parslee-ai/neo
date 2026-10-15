@@ -91,6 +91,25 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   diffs taken per session: a codemod touching thousands of files lightly would
   otherwise fork one `git log -p` per file. Never reintroduce a
   per-changed-file git call without both.
+- **Paths from git are read with `-z`; names are compared NFC, queried in
+  git's spelling.** Line output C-quotes any path holding non-ASCII, `"`, `\`
+  or a tab (`café.py` prints as `"caf\303\251.py"`; `core.quotePath=false`
+  only fixes the non-ASCII part), and porcelain status also quotes spaces, so
+  an edit to such a file matched no suggestion. Every git read that lists paths
+  (`diff --name-only`, `log --name-only`, `status`, `ls-files`) uses `-z` and
+  never strips; `_get_commits_since` marks headers with `\x01` and accepts one
+  only if it matches `_COMMIT_HEADER`, because a path may start with `\x01`.
+  `é` is one code point (NFC) or two (NFD); a model may write either and git
+  reports whatever the tree holds. macOS's `core.precomposeUnicode` does NOT
+  fold `git log`/`git diff` output (an NFD name committed on Linux stays NFD)
+  but DOES fold argv, so a pathspec could never reach an NFD tree entry there.
+  Hence: `_spelled_as` resolves suggested AND host-ledger paths to the spelling
+  git printed (NFC key, smallest on a collision); file pathspecs go through
+  `_GIT_NAMING` (`core.precomposeUnicode=false`) so that spelling reaches git
+  unchanged; `known_ours` and host observations compare NFC keys. **Footgun**:
+  with precompose off, a spelling git did not print misses an NFC index on
+  macOS (the file reads as untracked and `--no-index` diffs the whole file), so
+  never hand a pathspec a path that has not been through `_spelled_as`.
 - **Recall hands a session each lesson once** (`NEO_RECALL_SEEN`, see
   `docs/claude-code-mods.md`). Lift is unchanged (it counts distinct sessions),
   but a `recall-lifted` fact's latest delivery is now its FIRST in a session,

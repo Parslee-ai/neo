@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -50,11 +51,16 @@ PATHSPEC_CHUNK = 200
 # Each makes git refuse `--literal-pathspecs` ("incompatible with all other
 # global pathspec settings"), which would silently empty the answer.
 _GLOBAL_PATHSPEC_ENV = ("GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
-# Every git command whose output lists paths. By default git C-quotes a
-# non-ASCII path (`café.py` prints as `"caf\303\251.py"`), which then
-# matches no suggested path, so an edit to it was never seen. A path holding
-# `"`, `\\`, a tab or a newline stays quoted; only `-z` would cover those.
-_GIT_PATHS = ("git", "-c", "core.quotePath=false")
+# Starts each commit header in `git log -z` output (`_get_commits_since`).
+# A path may begin with it too, so a header is only a token that also matches
+# `_COMMIT_HEADER`.
+_COMMIT_MARK = "\x01"
+# git for any query that names a file. macOS git folds argv to NFC
+# (`core.precomposeUnicode`), so a pathspec could never reach a name the tree
+# holds in NFD; off, the spelling `_spelled_as` found reaches git unchanged.
+# A no-op on other systems.
+_GIT_NAMING = ("git", "-c", "core.precomposeUnicode=false")
+_COMMIT_HEADER = re.compile(r"\x01([0-9a-f]{40,64})\t(\d+)\t([^\n]*)(?:\n|$)")
 
 # `_get_file_diff_since` caps its summary here, so every capped summary has
 # the same, largest possible length (`DIFF_SUMMARY_FULL_LEN`).
@@ -383,6 +389,36 @@ def normalize_suggestion_path(path: str, codebase_root: Optional[str]) -> str:
                 return stripped
 
     return path
+
+
+def _spelled_as(path: str, reported: set[str]) -> str:
+    """``path`` as git spelled it in ``reported``, else as written.
+
+    `é` is one code point (NFC) or `e` plus a combining accent (NFD). A model
+    may write either, and git reports whatever bytes the tree or the disk
+    holds; macOS's ``core.precomposeUnicode`` folds only what git reads from
+    disk, so an NFD name committed elsewhere stays NFD in `git log` there too.
+    Compared as written, the suggestion matched nothing. Every later query
+    uses the returned spelling, so the per-file git calls name the real file.
+    """
+    if path in reported or path.isascii():
+        return path
+    key = _nfc(path)
+    # The smallest, so two files differing only in form (possible on Linux)
+    # resolve the same way every run.
+    return min((other for other in reported if _nfc(other) == key), default=path)
+
+
+def _nfc(path: str) -> str:
+    """``path``'s NFC form: the key two spellings of one name share."""
+    return path if path.isascii() else unicodedata.normalize("NFC", path)
+
+
+def _unicode_spellings(path: str) -> set[str]:
+    """``path`` as written and in both normal forms, for a literal pathspec."""
+    if path.isascii():
+        return {path}
+    return {path, unicodedata.normalize("NFC", path), unicodedata.normalize("NFD", path)}
 
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
@@ -932,12 +968,15 @@ class OutcomeTracker:
         # worktrees), path -> the checkout holding it. Like everything gathered
         # "elsewhere" below, this only resolves paths Neo suggested; it never
         # feeds INDEPENDENT detection — see `_get_changed_elsewhere_since`.
+        # Every Unicode spelling: the pathspec is literal, and git may hold
+        # the name in the other normal form (`_spelled_as`).
         linked_dirty = self._get_linked_worktree_changes({
-            normalize_suggestion_path(
-                sugg.get("file_path", ""), prev.codebase_root or self.codebase_root
-            )
+            spelling
             for prev in sessions if prev.project_id == self.project_id
             for sugg in prev.suggestions
+            for spelling in _unicode_spellings(normalize_suggestion_path(
+                sugg.get("file_path", ""), prev.codebase_root or self.codebase_root
+            ))
         })
         # Where each dirty path lives, own checkout first: what
         # `_applied_on_revision` reads instead of re-asking git per checkout.
@@ -971,18 +1010,6 @@ class OutcomeTracker:
             changed_files = self._get_changed_files_since(
                 since, working_tree=working_tree
             )
-            # Union in the host's own record of what it edited. Strictly ADDS
-            # evidence: git already reports anything committed or dirty, and the
-            # ledger additionally covers an edit that was applied and then left
-            # alone with no later Neo run in that repository — the case
-            # `_get_changed_files_since` structurally cannot see, and the one
-            # that ages a real acceptance out at PENDING_SESSION_TTL_SECONDS.
-            # `>=` not `>`: `since` is a session's own timestamp, and an edit
-            # applied in the same clock second as the suggestion is an
-            # acceptance, not a pre-existing change.
-            changed_files |= {
-                path for ts, path, own in host_edits if own and ts >= since
-            }
             elsewhere = self._get_changed_elsewhere_since(since)
             # A linked worktree's dirty file counts only if it was written
             # after the suggestion. Agents keep work in progress uncommitted,
@@ -993,9 +1020,24 @@ class OutcomeTracker:
                 path for path, root in linked_dirty.items()
                 if _modified_since(Path(root) / path, prev.timestamp)
             }
-            elsewhere |= {
-                path for ts, path, own in host_edits if not own and ts >= since
-            }
+            # Union in the host's own record of what it edited. Strictly ADDS
+            # evidence: git already reports anything committed or dirty, and the
+            # ledger additionally covers an edit that was applied and then left
+            # alone with no later Neo run in that repository — the case
+            # `_get_changed_files_since` structurally cannot see, and the one
+            # that ages a real acceptance out at PENDING_SESSION_TTL_SECONDS.
+            # `>=` not `>`: `since` is a session's own timestamp, and an edit
+            # applied in the same clock second as the suggestion is an
+            # acceptance, not a pre-existing change.
+            #
+            # The ledger holds the host's spelling, which may be the other
+            # Unicode form of a name git reports; git must only ever be asked
+            # about a spelling it printed (`_GIT_NAMING`), so each ledger path
+            # takes git's spelling where git reported the file.
+            reported = changed_files | elsewhere
+            for ts, path, own in host_edits:
+                if ts >= since:
+                    (changed_files if own else elsewhere).add(_spelled_as(path, reported))
 
             # Retain a REDUCED record holding only what is still outstanding.
             # Keeping the whole session would re-emit an outcome for every
@@ -1030,7 +1072,7 @@ class OutcomeTracker:
             for outcome in matched:
                 outcome.host_observations = [
                     observation for ts, path, observation in self._host_observations
-                    if path == outcome.file_path and ts >= since
+                    if _nfc(path) == _nfc(outcome.file_path) and ts >= since
                 ][-12:]
             all_outcomes.extend(matched)
 
@@ -1270,6 +1312,7 @@ class OutcomeTracker:
             )
             if self._is_non_git_trackable(file_path, normalized):
                 continue
+            normalized = _spelled_as(normalized, changed_files)
             # Same predicate _match_to_suggestions uses, so "resolved" here and
             # "matched" there cannot drift apart.
             if normalized in changed_files or file_path in changed_files:
@@ -1599,14 +1642,14 @@ class OutcomeTracker:
         if not root:
             return set()
         if not paths:
-            return self._git_dirty(root, [*_GIT_PATHS, "diff", "-z", "--name-only", "HEAD"])
+            return self._git_dirty(root, ["git", "diff", "-z", "--name-only", "HEAD"])
         # Literal, so `src/[id].tsx` is a file, not a glob.
         env = {k: v for k, v in os.environ.items() if k not in _GLOBAL_PATHSPEC_ENV}
         dirty: set[str] = set()
         for start in range(0, len(paths), PATHSPEC_CHUNK):
             dirty |= self._git_dirty(
                 root,
-                [*_GIT_PATHS, "--literal-pathspecs", "diff", "-z", "--name-only",
+                [*_GIT_NAMING, "--literal-pathspecs", "diff", "-z", "--name-only",
                  "--diff-filter=d", "HEAD", "--",
                  *paths[start:start + PATHSPEC_CHUNK]],
                 env=env,
@@ -1617,8 +1660,10 @@ class OutcomeTracker:
     def _git_dirty(root: str, argv: list[str], env: Optional[dict] = None) -> set[str]:
         """The paths a `git diff -z --name-only` prints; empty on any failure.
 
-        NUL-separated and never stripped: even unquoted, git still escapes a
-        `"`, `\\` or tab in a line-mode path, and a strip eats edge spaces.
+        NUL-separated (`-z`) and never stripped. Line output C-quotes any path
+        holding non-ASCII, `"`, `\\` or a tab (`café.py` prints as
+        `"caf\\303\\251.py"`), which then matches no suggested path, and a strip
+        eats edge spaces. Every git query here that lists paths uses `-z`.
         """
         try:
             result = subprocess.run(
@@ -1726,7 +1771,7 @@ class OutcomeTracker:
         ).isoformat()
         try:
             result = subprocess.run(
-                [*_GIT_PATHS, "log", "--branches", "--since", since_iso,
+                ["git", "log", "-z", "--branches", "--since", since_iso,
                  "--name-only", "--pretty=format:"],
                 cwd=self.codebase_root,
                 capture_output=True,
@@ -1738,7 +1783,7 @@ class OutcomeTracker:
             return set()
         if result.returncode != 0:
             return set()
-        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        return {path for path in result.stdout.split("\0") if path}
 
     def _classify_applied(self, sugg: dict, diff: str) -> OutcomeType:
         """ACCEPTED, MODIFIED or UNVERIFIED: does ``diff`` carry ``sugg``?"""
@@ -1798,7 +1843,7 @@ class OutcomeTracker:
 
         def git(root: str, *args: str) -> Optional[str]:
             result = subprocess.run(
-                ["git", *args], cwd=root, capture_output=True,
+                [*_GIT_NAMING, *args], cwd=root, capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=10,
             )
             return result.stdout.strip() if result.returncode == 0 else None
@@ -1857,7 +1902,7 @@ class OutcomeTracker:
 
             # Get committed changes since timestamp
             result = subprocess.run(
-                [*_GIT_PATHS, "log", "--since", since_iso, "--name-only", "--pretty=format:"],
+                ["git", "log", "-z", "--since", since_iso, "--name-only", "--pretty=format:"],
                 cwd=self.codebase_root,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -1865,11 +1910,7 @@ class OutcomeTracker:
             )
             committed = set()
             if result.returncode == 0:
-                committed = {
-                    line.strip()
-                    for line in result.stdout.strip().split("\n")
-                    if line.strip()
-                }
+                committed = {path for path in result.stdout.split("\0") if path}
 
             working = (
                 working_tree if working_tree is not None
@@ -1913,9 +1954,9 @@ class OutcomeTracker:
             # recorded sessions on a live install). project_id already spans
             # worktrees and clones, so the session is found; only the path root
             # was wrong. Falls back to the current root for older records.
-            normalized = normalize_suggestion_path(
+            normalized = _spelled_as(normalize_suggestion_path(
                 file_path, session.codebase_root or self.codebase_root
-            )
+            ), matchable)
             suggested_files.add(normalized)
 
             if normalized in matchable or file_path in matchable:
@@ -1967,10 +2008,12 @@ class OutcomeTracker:
         # longer in `session.suggestions` (dropped on retention so they cannot
         # re-match), so without this an ACCEPTED suggestion reappears here as
         # INDEPENDENT — a record asserting neo never suggested a file it did.
-        known_ours = set(suggested_files)
+        # NFC keys: a resolved path keeps the model's spelling, while
+        # `changed_files` holds git's, which may be the other Unicode form.
+        known_ours = {_nfc(path) for path in suggested_files}
         for path in session.resolved_paths:
-            known_ours.add(path)
-            known_ours.add(self._normalize_path(path))
+            known_ours.add(_nfc(path))
+            known_ours.add(_nfc(self._normalize_path(path)))
 
         # Walked in path order so the walk can stop once the kept set is
         # decided. Summaries are capped at DIFF_SUMMARY_FULL_LEN, so once
@@ -1983,7 +2026,7 @@ class OutcomeTracker:
         diffs_taken = 0
         for changed in sorted(changed_files):
             normalized = self._normalize_path(changed)
-            if normalized not in known_ours and changed not in known_ours:
+            if _nfc(normalized) not in known_ours and _nfc(changed) not in known_ours:
                 if self._is_code_file(changed):
                     if diffs_taken == MAX_INDEPENDENT_DIFFS:
                         break
@@ -2017,7 +2060,7 @@ class OutcomeTracker:
         """
         try:
             result = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", "--", file_path],
+                [*_GIT_NAMING, "ls-files", "--error-unmatch", "--", file_path],
                 cwd=root or self.codebase_root,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -2054,7 +2097,7 @@ class OutcomeTracker:
             refs = ["--branches", "HEAD"] if everywhere else []
             roots = (self._checkout_roots or [self.codebase_root]) if everywhere else [self.codebase_root]
             result = subprocess.run(
-                ["git", "log", *refs, "--since", since_iso, "-p", "--", file_path],
+                [*_GIT_NAMING, "log", *refs, "--since", since_iso, "-p", "--", file_path],
                 cwd=self.codebase_root,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -2073,7 +2116,7 @@ class OutcomeTracker:
                 if working_diff_found and root != self.codebase_root:
                     break
                 result2 = subprocess.run(
-                    ["git", "diff", "HEAD", "--", file_path],
+                    [*_GIT_NAMING, "diff", "HEAD", "--", file_path],
                     cwd=root,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
@@ -2263,10 +2306,12 @@ class OutcomeTracker:
 
         try:
             # Build git log command
+            # `-z`: each commit is `\x01hash\ttime\tsubject\n` + NUL-separated
+            # paths, so a path holding a tab or newline cannot pass for a header.
             cmd = [
-                *_GIT_PATHS, "log",
+                "git", "log", "-z",
                 f"-{max_commits}",
-                "--pretty=format:%H\t%at\t%s",  # hash, timestamp, subject
+                f"--pretty=format:{_COMMIT_MARK}%H\t%at\t%s",
                 "--name-only",
             ]
             if since_hash:
@@ -2282,26 +2327,21 @@ class OutcomeTracker:
             if result.returncode != 0 or not result.stdout.strip():
                 return []
 
-            # Parse: each commit block is header line + file lines + blank line
             commits = []
             current = None
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                if "\t" in line and len(line.split("\t")) >= 3:
-                    # This is a header line: hash\ttimestamp\tsubject
-                    parts = line.split("\t", 2)
+            for token in result.stdout.split("\0"):
+                header = _COMMIT_HEADER.match(token)
+                if header:
                     current = {
-                        "hash": parts[0],
-                        "timestamp": float(parts[1]),
-                        "message": parts[2],
+                        "hash": header[1],
+                        "timestamp": float(header[2]),
+                        "message": header[3],
                         "files": [],
                     }
                     commits.append(current)
-                elif current is not None:
-                    # This is a file path
-                    current["files"].append(line)
+                    token = token[header.end():]
+                if token and current is not None:
+                    current["files"].append(token)
 
             return commits
 

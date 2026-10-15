@@ -344,7 +344,7 @@ def get_git_recent_files(root: str, diff_since: Optional[str] = None) -> set[str
         """Run one git query. None means it failed; "" means it said nothing."""
         try:
             result = subprocess.run(
-                ['git', '-c', 'core.quotePath=false', *args],
+                ['git', *args],
                 cwd=root,
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
@@ -372,9 +372,9 @@ def get_git_recent_files(root: str, diff_since: Optional[str] = None) -> set[str
     if _git(['rev-parse', '--git-dir']) is None:
         return recent
 
-    # `-z` here and `core.quotePath=false` in `_git` keep paths as written:
-    # by default git quotes `café.py` as `"caf\303\251.py"`, and porcelain
-    # status also quotes `a b.py`, so neither matched a file on disk.
+    # Every query below uses `-z`: line output quotes `café.py` as
+    # `"caf\303\251.py"` (porcelain status also quotes `a b.py`), and neither
+    # quoted form names a file on disk.
     status = _git(['status', '--porcelain', '-z'])
     if status is not None:
         entries = iter(status.split('\0'))
@@ -389,9 +389,9 @@ def get_git_recent_files(root: str, diff_since: Optional[str] = None) -> set[str
         if changed is not None:
             recent.update(path for path in changed.split('\0') if path)
     else:
-        log = _git(['log', '-n', '50', '--name-only', '--pretty=format:'])
+        log = _git(['log', '-z', '-n', '50', '--name-only', '--pretty=format:'])
         if log is not None:
-            recent.update(line for line in log.splitlines() if line.strip())
+            recent.update(path for path in log.split('\0') if path)
 
     return recent
 

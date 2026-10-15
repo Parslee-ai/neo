@@ -516,15 +516,20 @@ class TestPathNormalization:
         assert result == "/completely/different/path.py"
 
 
+def _git_log_z(*commits):
+    """`git log -z --name-only` output for ``(hash, time, subject, files)``
+    in the `_get_commits_since` format."""
+    return "".join(
+        f"\x01{sha}\t{ts}\t{subject}" + ("\n" + "\0".join(files) if files else "") + "\0\0"
+        for sha, ts, subject, files in commits
+    )
+
+
 class TestIngestGitHistory:
     def test_ingests_commits(self, tracker):
-        git_log_output = (
-            "abc123def456\t1773000000\tfeat: add user validation\n"
-            "src/auth.py\n"
-            "src/models.py\n"
-            "\n"
-            "def789abc012\t1772900000\tfix: handle null email in signup\n"
-            "src/auth.py\n"
+        git_log_output = _git_log_z(
+            ("a" * 40, 1773000000, "feat: add user validation", ["src/auth.py", "src/models.py"]),
+            ("b" * 40, 1772900000, "fix: handle null email in signup", ["src/auth.py"]),
         )
         diff_output = "+def validate_email(email):\n+    if not email:\n+        raise ValueError"
 
@@ -545,12 +550,9 @@ class TestIngestGitHistory:
         assert "validate_email" in records[0]["body"]
 
     def test_skips_merge_commits(self, tracker):
-        git_log_output = (
-            "abc123\t1773000000\tMerge pull request #42 from feature\n"
-            "src/foo.py\n"
-            "\n"
-            "def456\t1772900000\tfix: real bug fix\n"
-            "src/bar.py\n"
+        git_log_output = _git_log_z(
+            ("a" * 40, 1773000000, "Merge pull request #42 from feature", ["src/foo.py"]),
+            ("b" * 40, 1772900000, "fix: real bug fix", ["src/bar.py"]),
         )
 
         def mock_run(cmd, **kwargs):
@@ -568,7 +570,7 @@ class TestIngestGitHistory:
         assert "real bug fix" in records[0]["subject"]
 
     def test_skips_short_messages(self, tracker):
-        git_log_output = "abc123\t1773000000\twip\nsrc/foo.py\n"
+        git_log_output = _git_log_z(("a" * 40, 1773000000, "wip", ["src/foo.py"]))
 
         def mock_run(cmd, **kwargs):
             result = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
@@ -584,7 +586,9 @@ class TestIngestGitHistory:
         assert len(records) == 0
 
     def test_watermark_prevents_reingestion(self, tracker):
-        git_log_output = "abc123\t1773000000\tfeat: add something useful here\nsrc/foo.py\n"
+        git_log_output = _git_log_z(
+            ("a" * 40, 1773000000, "feat: add something useful here", ["src/foo.py"]),
+        )
 
         call_count = 0
 

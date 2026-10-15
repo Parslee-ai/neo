@@ -68,6 +68,8 @@
   `consume_sessions_keeping_pending()`; never reintroduce `_clear_session_log`.
 - Outcome detection runs on every learn request: INDEPENDENT ranking stops at
   the fifth capped diff; never add an unbounded per-file git call there.
+- Read paths from git with `-z`; compare names by NFC key; give a pathspec only
+  a spelling git printed (`_spelled_as`, `_GIT_NAMING`).
 - UNVERIFIED and ADDRESSED mutate nothing. New `OutcomeType` → update both
   `outcomes.py` and `store.detect_implicit_feedback`. ADDRESSED (changed at the
   lines Neo flagged) is a location heuristic: never let it feed promotion,
