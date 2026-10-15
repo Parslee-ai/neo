@@ -24,7 +24,10 @@ from typing import Optional
 
 from neo.reasoning_effort import MemorySignal, effort_from_memory
 
-__all__ = ["ReasoningMode", "ModeDecision", "decide_mode", "DEFAULT_MIN_MODELS"]
+__all__ = [
+    "ReasoningMode", "ModeDecision", "decide_mode", "needs_panel_capability",
+    "DEFAULT_MIN_MODELS",
+]
 
 #: Effort levels that mean "novel / low-confidence" — the deliberation-worthy end
 #: of ``effort_from_memory``. (``low``/``medium`` mean memory has this covered.)
@@ -58,6 +61,27 @@ class ModeDecision:
         return f"ModeDecision(mode={self.mode.value!r}, reason={self.reason!r})"
 
 
+_DEEP_OVERRIDES = frozenset({"deep", "deliberate", "multi", "multi_agent", "multi-agent"})
+
+
+def needs_panel_capability(
+    signal: MemorySignal, *, difficulty: str = "medium", explicit: Optional[str] = None,
+) -> bool:
+    """Whether `decide_mode` could reach a branch that reads `car_available` /
+    `capable_model_count`: an explicit deep request, or an auto decision on a
+    novel prompt. Every other branch (explicit fast, familiar) decides the same
+    without them, so a caller can skip the CAR `route_model` probe that
+    measures them. It cost ~5 s per request on a live install where 525 of 544
+    recorded decisions were "familiar".
+    """
+    override = (explicit or "").strip().lower()
+    if override in ("fast", "single"):
+        return False
+    if override in _DEEP_OVERRIDES:
+        return True
+    return effort_from_memory(signal, difficulty=difficulty) in _DELIBERATE_EFFORTS
+
+
 def decide_mode(
     signal: MemorySignal,
     *,
@@ -88,7 +112,7 @@ def decide_mode(
     if override in ("fast", "single"):
         return ModeDecision(ReasoningMode.FAST, "explicit --fast", effort)
 
-    if override in ("deep", "deliberate", "multi", "multi_agent", "multi-agent"):
+    if override in _DEEP_OVERRIDES:
         if can_deliberate:
             return ModeDecision(
                 ReasoningMode.MULTI_AGENT,
