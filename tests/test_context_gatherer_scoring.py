@@ -605,6 +605,60 @@ class TestGitFailureIsNotSilence:
         from neo.context_gatherer import get_git_recent_files
         assert "a.py" in get_git_recent_files(str(self._repo(tmp_path)))
 
+    def test_paths_are_reported_as_written(self, tmp_path):
+        """Porcelain status quotes `a b.py` and C-quotes `café.py`; neither
+        quoted form names a file, so their recency was lost. A rename reports
+        its new name, never `old -> new`."""
+        import subprocess
+        from neo.context_gatherer import get_git_recent_files
+        repo = self._repo(tmp_path)
+        for name in ("a b.py", "café.py"):
+            (repo / name).write_text("y = 1\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t.t", "-c", "user.name=T",
+                        "commit", "-qm", "init"], cwd=repo, check=True)
+        (repo / "a b.py").write_text("y = 2\n")
+        (repo / "new é.py").write_text("z = 1\n")
+        subprocess.run(["git", "mv", "café.py", "thé.py"], cwd=repo, check=True)
+
+        recent = get_git_recent_files(str(repo))
+
+        assert {"a b.py", "new é.py", "thé.py"} <= recent, recent
+        assert not any('"' in p or "->" in p for p in recent), recent
+
+    def test_a_working_tree_rename_skips_its_source(self, tmp_path):
+        """An intent-to-add rename is ` R new\\0old\\0`: the R sits in the
+        second column, and the source must not be read as a status line."""
+        import subprocess
+        from neo.context_gatherer import get_git_recent_files
+        repo = self._repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src" / "old.py").write_text("".join(f"v{i} = {i}\\n" for i in range(40)))
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t.t", "-c", "user.name=T",
+                        "commit", "-qm", "init"], cwd=repo, check=True)
+        (repo / "src" / "old.py").rename(repo / "src" / "nëw.py")
+        subprocess.run(["git", "add", "-N", "src/nëw.py"], cwd=repo, check=True)
+        status = subprocess.run(["git", "status", "--porcelain", "-z"], cwd=repo,
+                                capture_output=True, text=True, check=True).stdout
+        assert status.startswith(" R "), status
+
+        recent = get_git_recent_files(str(repo))
+
+        assert "src/nëw.py" in recent and "/old.py" not in recent, recent
+
+    def test_diff_since_reports_paths_as_written(self, tmp_path):
+        import subprocess
+        from neo.context_gatherer import get_git_recent_files
+        repo = self._repo(tmp_path)
+        commit = ["git", "-c", "user.email=t@t.t", "-c", "user.name=T", "commit", "-qm"]
+        subprocess.run([*commit, "init"], cwd=repo, check=True)
+        (repo / "café.py").write_text("y = 1\\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run([*commit, "café"], cwd=repo, check=True)
+
+        assert "café.py" in get_git_recent_files(str(repo), diff_since="HEAD~1")
+
     def test_corrupt_index_is_reported_not_swallowed(self, tmp_path, capsys):
         from neo.context_gatherer import get_git_recent_files
 

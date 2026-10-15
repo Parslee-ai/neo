@@ -344,10 +344,10 @@ def get_git_recent_files(root: str, diff_since: Optional[str] = None) -> set[str
         """Run one git query. None means it failed; "" means it said nothing."""
         try:
             result = subprocess.run(
-                ['git', *args],
+                ['git', '-c', 'core.quotePath=false', *args],
                 cwd=root,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=GIT_QUERY_TIMEOUT_SECONDS,
             )
         except FileNotFoundError:
@@ -372,16 +372,22 @@ def get_git_recent_files(root: str, diff_since: Optional[str] = None) -> set[str
     if _git(['rev-parse', '--git-dir']) is None:
         return recent
 
-    status = _git(['status', '--porcelain'])
+    # `-z` here and `core.quotePath=false` in `_git` keep paths as written:
+    # by default git quotes `café.py` as `"caf\303\251.py"`, and porcelain
+    # status also quotes `a b.py`, so neither matched a file on disk.
+    status = _git(['status', '--porcelain', '-z'])
     if status is not None:
-        for line in status.splitlines():
-            if len(line) > 3:
-                recent.add(line[3:].strip())
+        entries = iter(status.split('\0'))
+        for entry in entries:
+            if len(entry) > 3:
+                recent.add(entry[3:])
+                if {'R', 'C'} & set(entry[:2]):
+                    next(entries, None)  # the rename's or copy's source
 
     if diff_since:
-        changed = _git(['diff', '--name-only', diff_since])
+        changed = _git(['diff', '-z', '--name-only', diff_since])
         if changed is not None:
-            recent.update(changed.splitlines())
+            recent.update(path for path in changed.split('\0') if path)
     else:
         log = _git(['log', '-n', '50', '--name-only', '--pretty=format:'])
         if log is not None:

@@ -50,6 +50,11 @@ PATHSPEC_CHUNK = 200
 # Each makes git refuse `--literal-pathspecs` ("incompatible with all other
 # global pathspec settings"), which would silently empty the answer.
 _GLOBAL_PATHSPEC_ENV = ("GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
+# Every git command whose output lists paths. By default git C-quotes a
+# non-ASCII path (`café.py` prints as `"caf\303\251.py"`), which then
+# matches no suggested path, so an edit to it was never seen. A path holding
+# `"`, `\\`, a tab or a newline stays quoted; only `-z` would cover those.
+_GIT_PATHS = ("git", "-c", "core.quotePath=false")
 
 # `_get_file_diff_since` caps its summary here, so every capped summary has
 # the same, largest possible length (`DIFF_SUMMARY_FULL_LEN`).
@@ -1594,14 +1599,14 @@ class OutcomeTracker:
         if not root:
             return set()
         if not paths:
-            return self._git_dirty(root, ["git", "diff", "--name-only", "HEAD"])
+            return self._git_dirty(root, [*_GIT_PATHS, "diff", "-z", "--name-only", "HEAD"])
         # Literal, so `src/[id].tsx` is a file, not a glob.
         env = {k: v for k, v in os.environ.items() if k not in _GLOBAL_PATHSPEC_ENV}
         dirty: set[str] = set()
         for start in range(0, len(paths), PATHSPEC_CHUNK):
             dirty |= self._git_dirty(
                 root,
-                ["git", "--literal-pathspecs", "diff", "--name-only",
+                [*_GIT_PATHS, "--literal-pathspecs", "diff", "-z", "--name-only",
                  "--diff-filter=d", "HEAD", "--",
                  *paths[start:start + PATHSPEC_CHUNK]],
                 env=env,
@@ -1610,7 +1615,11 @@ class OutcomeTracker:
 
     @staticmethod
     def _git_dirty(root: str, argv: list[str], env: Optional[dict] = None) -> set[str]:
-        """The paths a `git diff --name-only` prints; empty on any failure."""
+        """The paths a `git diff -z --name-only` prints; empty on any failure.
+
+        NUL-separated and never stripped: even unquoted, git still escapes a
+        `"`, `\\` or tab in a line-mode path, and a strip eats edge spaces.
+        """
         try:
             result = subprocess.run(
                 argv,
@@ -1622,7 +1631,7 @@ class OutcomeTracker:
             )
             if result.returncode != 0:
                 return set()
-            return {line.strip() for line in result.stdout.strip().split("\n") if line.strip()}
+            return {path for path in result.stdout.split("\0") if path}
         except (subprocess.SubprocessError, FileNotFoundError, OSError, UnicodeDecodeError) as e:
             logger.debug(f"Git working-tree query failed (non-fatal): {e}")
             return set()
@@ -1717,7 +1726,7 @@ class OutcomeTracker:
         ).isoformat()
         try:
             result = subprocess.run(
-                ["git", "log", "--branches", "--since", since_iso,
+                [*_GIT_PATHS, "log", "--branches", "--since", since_iso,
                  "--name-only", "--pretty=format:"],
                 cwd=self.codebase_root,
                 capture_output=True,
@@ -1848,7 +1857,7 @@ class OutcomeTracker:
 
             # Get committed changes since timestamp
             result = subprocess.run(
-                ["git", "log", "--since", since_iso, "--name-only", "--pretty=format:"],
+                [*_GIT_PATHS, "log", "--since", since_iso, "--name-only", "--pretty=format:"],
                 cwd=self.codebase_root,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -2255,7 +2264,7 @@ class OutcomeTracker:
         try:
             # Build git log command
             cmd = [
-                "git", "log",
+                *_GIT_PATHS, "log",
                 f"-{max_commits}",
                 "--pretty=format:%H\t%at\t%s",  # hash, timestamp, subject
                 "--name-only",

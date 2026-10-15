@@ -506,3 +506,55 @@ def test_a_suggested_file_renamed_away_in_another_checkout_does_not_live_there(
     tracker._checkout_roots = tracker._list_checkout_roots()
 
     assert tracker._get_linked_worktree_changes({"src/foo.py", "src/bar.py"}) == {}
+
+
+NON_ASCII = "src/café.py"
+NON_ASCII_DIFF = f"--- a/{NON_ASCII}\n+++ b/{NON_ASCII}\n@@\n-    return 1\n+    return 2\n"
+
+
+@pytest.mark.parametrize("where", ["here", "linked worktree"])
+@pytest.mark.parametrize("committed", [False, True])
+def test_a_non_ascii_path_is_matched_as_written(repo, tmp_path, request, where, committed):
+    """git C-quotes a non-ASCII path by default (`"src/caf\\303\\251.py"`),
+    so an edit to it matched no suggestion and was never seen."""
+    _write(repo / NON_ASCII, "def f():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add café")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+    suggestion = _Suggestion(file_path=NON_ASCII, diff=NON_ASCII_DIFF)
+    _save(tracker, [suggestion], "make f return 2")
+    checkout = repo if where == "here" else _worktree(repo, tmp_path / "agent-wt", "agent")
+
+    _write(checkout / NON_ASCII, "def f():\n    return 2\n")
+    if committed:
+        _git(checkout, "commit", "-qam", "apply")
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    assert [o.file_path for o in _accepted(outcomes)] == [NON_ASCII], outcomes
+
+
+def test_commit_history_lists_non_ascii_paths_as_written(repo, request):
+    _write(repo / NON_ASCII, "x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add café")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"wt-{request.node.name}")
+
+    assert NON_ASCII in tracker._get_commits_since(None, 10)[0]["files"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids `\"` in file names")
+def test_working_tree_paths_survive_quotes_and_edge_spaces(repo):
+    """Unquoted line output still escapes `"` and a strip eats edge spaces;
+    only NUL-separated output names these files as they are."""
+    names = ['src/q"x.py', "src/ lead.py"]
+    for name in names:
+        _write(repo / name, "x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "odd names")
+    for name in names:
+        _write(repo / name, "x = 2\n")
+    tracker = OutcomeTracker(codebase_root=str(repo), project_id="odd-names")
+
+    assert set(names) <= tracker._get_working_tree_changes(), names
+    assert tracker._get_working_tree_changes(paths=names) == set(names)
