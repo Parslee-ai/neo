@@ -785,6 +785,11 @@ let activityTicker: Timer | undefined;
 let finding:
   | { kind: AutoKind; result: Document; expanded: boolean; prompts: number }
   | undefined;
+/** Lessons recall handed Claude this session, by id: they stay in its context,
+ * so recall is told to skip them (`NEO_RECALL_SEEN`) until a compaction drops
+ * them. Re-sent on every matching prompt, one lesson reached a session 43
+ * times. */
+const recalledIds = new Set<string>();
 /** What recall gave this prompt, shown until the next one. */
 let recalled: { text: string; expanded: boolean } | undefined;
 let pendingNotice = "";
@@ -848,11 +853,15 @@ async function autoNeo(
   const id = crypto.randomUUID();
   // What became of each run, so "does Neo help?" is answerable from the
   // ledger: failed, nothing, prose (findings without a diff: a review then
-  // stays silent) or change.
+  // stays silent) or change. A failure also says why, and every run how long
+  // it took: 85 of 93 reviews once failed, all at the deadline, and the ledger
+  // could not tell that from a crash.
   let status = "failed";
+  let reason = "";
+  const started = await $.clock.now();
   await record($, "event", { event: "auto_started", kind, session_id: session, invocation_id: id, cwd });
   try {
-    activities.set(id, { kind, subject, started: await $.clock.now() });
+    activities.set(id, { kind, subject, started });
     nowMs = await $.clock.now();
     activityTicker ??= $.clock.every(1000, () => {
       void $.clock.now().then(
@@ -881,13 +890,28 @@ async function autoNeo(
         timeoutMs: AUTO_DEADLINE,
       },
     );
-    if (run.exitCode !== 0) return undefined;
-    const result = JSON.parse(run.stdout) as Document;
-    if (!result || result.error) return undefined;
+    if (run.exitCode !== 0) {
+      reason = `exit ${run.exitCode}`;
+      return undefined;
+    }
+    let result: Document;
+    try {
+      result = JSON.parse(run.stdout) as Document;
+    } catch {
+      reason = "unreadable output";
+      return undefined;
+    }
+    if (!result || result.error) {
+      reason = "neo error";
+      return undefined;
+    }
     spokenBeats = rememberBeat(spokenBeats, text(object(result.orchestrator).beat_id));
     status = hasVerifiableSuggestion(result) ? "change" : hasFindings(result) ? "prose" : "nothing";
     return result;
   } catch {
+    // `$.process.run` rejects both when the command cannot start and when it
+    // is still running at the deadline; only the time taken tells them apart.
+    reason = (await $.clock.now()) - started >= AUTO_DEADLINE ? "timed out" : "failed early";
     return undefined; // Neo joining in must never break the session.
   } finally {
     activities.delete(id);
@@ -896,7 +920,11 @@ async function autoNeo(
       activityTicker = undefined;
     }
     redraw($);
-    await record($, "event", { event: "auto_finished", kind, session_id: session, invocation_id: id, cwd, status });
+    await record($, "event", {
+      event: "auto_finished", kind, session_id: session, invocation_id: id, cwd, status,
+      ...(reason ? { reason } : {}),
+      elapsed_ms: Math.round((await $.clock.now()) - started),
+    });
   }
 }
 
@@ -908,14 +936,21 @@ async function autoRecall(
 ): Promise<{ text: string; beat: string; ids: string[] }> {
   const none = { text: "", beat: "", ids: [] };
   if (recallMissing) return none;
+  // A session reset while recall runs makes its answer another session's.
+  const owner = autoGeneration;
   try {
     // The transcript lets recall read a short follow-up ("fix it") with the
     // reply it answers. An environment variable, not a flag: an older CLI
     // ignores it, where an unknown flag exits 2 and switches recall off below.
     const run = await $.process.run(
       [binary, "recall", "--cwd", cwd, "--json", "--recent-beats", spokenBeats.join(",")],
-      { stdin: prompt, timeoutMs: RECALL_TIMEOUT, env: { NEO_RECALL_TRANSCRIPT: transcript } },
+      {
+        stdin: prompt,
+        timeoutMs: RECALL_TIMEOUT,
+        env: { NEO_RECALL_TRANSCRIPT: transcript, NEO_RECALL_SEEN: [...recalledIds].join(",") },
+      },
     );
+    if (owner !== autoGeneration) return none;
     // An older CLI without `recall` answers with an argparse error (exit 2).
     if (run.exitCode === 2) recallMissing = true;
     if (run.exitCode !== 0 || !run.stdout.trim()) return none;
@@ -1055,6 +1090,7 @@ function resetAuto() {
   activityTicker = undefined;
   finding = undefined;
   recalled = undefined;
+  recalledIds.clear();
   pendingNotice = "";
   subagents.clear();
 }
@@ -1078,6 +1114,8 @@ function registerAuto(on: On) {
         // What Claude was handed, by id: a lesson delivered across sessions
         // leaves probation (`FactStore.lift_probation_by_recall`). Recorded
         // from a timer so the prompt does not wait on a process start.
+        // Marked seen here, where it is handed over, never before.
+        for (const i of ids) recalledIds.add(i);
         if (ids.length) {
           const delivered = { event: "recall_delivered", session_id: e.session_id, cwd: e.cwd, fact_ids: ids };
           $.clock.after(0, () => void record($, "event", delivered));
@@ -1660,6 +1698,17 @@ export const register: Register = (on, options) => {
         recent_invocation_id: lastInvocation,
       });
     return afterTool($, e, await next(e));
+  }).catch(async ($, e, next) => next(e));
+  // A compacted conversation no longer holds the lessons recall handed it, so
+  // they may be handed again. A subagent's own compaction and a skipped one
+  // drop nothing. A `precompute` installs nothing yet, but whether installing
+  // it later dispatches again is not documented, so it clears too: the cost is
+  // a lesson handed twice, where the other way it could be withheld after the
+  // context lost it.
+  on("session.compact", async ($, e, next) => {
+    const result = await next(e);
+    if (!e.agentId && !result.skip) recalledIds.clear();
+    return result;
   }).catch(async ($, e, next) => next(e));
   on("session.end", async ($, e, next) => {
     generation++;

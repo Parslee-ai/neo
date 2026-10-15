@@ -1,6 +1,6 @@
 import type { On } from "claude-code";
 import { expect, mock, test } from "claude-code/testing";
-import { isCheckCommand } from "../hooks/auto.js";
+import { AUTO_DEADLINE, isCheckCommand } from "../hooks/auto.js";
 
 /** Neo joining in on its own: memory on each typed prompt, a review of a
  * turn's edits before it ends, a diagnosis of a failing check, a look at a
@@ -93,7 +93,7 @@ test("a typed prompt gets matching memory; a machine-injected one does not", asy
   expect(calls[0]!.argv).toEqual(["neo", "recall", "--cwd", "/work", "--json", "--recent-beats", ""]);
   expect(calls[0]!.stdin).toBe("fix the hook");
   // In the environment, not argv: an older CLI exits 2 on an unknown flag.
-  expect(calls[0]!.env).toEqual({ NEO_RECALL_TRANSCRIPT: "/t" });
+  expect(calls[0]!.env).toEqual({ NEO_RECALL_TRANSCRIPT: "/t", NEO_RECALL_SEEN: "" });
   const system = await $.classic.UserPromptSubmit({
     ...BASE, prompt: "<task-notification>", source: "system",
   });
@@ -147,6 +147,81 @@ test("each automatic run is logged with what became of it", async ($, on) => {
   await $.classic.PostToolUse(edit("/work/b.py"));
   await $.classic.Stop(stop());
   expect(runs().at(-1)).toMatchObject({ kind: "review", status: "prose" });
+});
+
+test("a failed run says why, and every run how long it took", async ($, on) => {
+  const hooks: Call[] = [];
+  let mode = "";
+  const calls = host(on, async (c) => {
+    if (c.argv[1] === "hook") hooks.push(c);
+    if (c.argv[0] === "git") return { stdout: "diff --git " + c.argv.at(-1) };
+    if (c.argv[1] !== "--stdin-json") return {};
+    if (mode === "exit") return { exitCode: 1 };
+    if (mode === "garbled") return { stdout: "Traceback" };
+    if (mode === "error") return { stdout: JSON.stringify({ error: "EngineBusy" }) };
+    if (mode === "timeout") await calls.clock.advance(AUTO_DEADLINE);
+    if (mode === "timeout" || mode === "unstartable") throw new Error("process.run rejected");
+    return { stdout: JSON.stringify(FIX) };
+  });
+  await $.session.start(SESSION);
+  const finished = () =>
+    hooks.map((c) => JSON.parse(c.stdin)).filter((p) => p.event === "auto_finished");
+  const reasons: Record<string, string> = {
+    exit: "exit 1", garbled: "unreadable output", error: "neo error",
+    unstartable: "failed early", timeout: "timed out",
+  };
+  for (const [m, reason] of Object.entries(reasons)) {
+    mode = m;
+    await $.classic.PostToolUse(edit(`/work/${m}.py`));
+    await $.classic.Stop(stop());
+    expect(finished().at(-1)).toMatchObject({ status: "failed", reason });
+  }
+  expect(finished().at(-1)!.elapsed_ms).toBeGreaterThanOrEqual(AUTO_DEADLINE);
+  mode = "";
+  await $.classic.PostToolUse(edit("/work/ok.py"));
+  await $.classic.Stop(stop());
+  expect(finished().at(-1)).toMatchObject({ status: "change" });
+  expect(finished().at(-1)).not.toHaveProperty("reason");
+  expect(typeof finished().at(-1)!.elapsed_ms).toBe("number");
+});
+
+test("recall skips what this session was already handed, until a compaction", async ($, on) => {
+  let reply: object = { text: "Neo:\n- lesson", beat_id: "", fact_ids: ["f1", "f2"] };
+  const calls = host(on, (c) => (c.argv[1] === "recall" ? { stdout: JSON.stringify(reply) } : {}));
+  const summary = [{ role: "user" as const, text: "summary", toolUses: [] }];
+  on("session.compact", (_$, e) => (e.trigger === "plugin" && e.instructions === "skip" ? { skip: "no" } : { messages: summary }));
+  const compact = (extra: object) =>
+    $.session.compact({ trigger: "plugin", messages: summary, ...extra } as never).catch(() => {});
+  const seen = () => calls.filter((c) => c.argv[1] === "recall").map((c) => c.env.NEO_RECALL_SEEN);
+  const ask = (prompt: string) => $.classic.UserPromptSubmit({ ...BASE, prompt, source: "user" });
+  await $.session.start(SESSION);
+  await ask("fix the hook");
+  reply = { text: "Neo:\n- other", beat_id: "", fact_ids: ["f3"] };
+  await ask("and the other hook");
+  await ask("again");
+  expect(seen()).toEqual(["", "f1,f2", "f1,f2,f3"]);
+  // A subagent's own compaction and a skipped one keep them.
+  await compact({ agentId: "sub1" });
+  await compact({ instructions: "skip" });
+  await ask("once more");
+  expect(seen().at(-1)).toBe("f1,f2,f3");
+  await compact({ trigger: "precompute" });
+  await ask("after a precompute");
+  expect(seen().at(-1)).toBe("");
+  reply = { text: "Neo:\n- lesson", beat_id: "", fact_ids: ["f1"] };
+  await ask("fill it again");
+  await compact({});
+  await ask("after compacting");
+  expect(seen().at(-1)).toBe("");
+  // Recall that found nothing marks nothing seen.
+  reply = { text: "", beat_id: "", fact_ids: ["f9"] };
+  await ask("nothing relevant");
+  await ask("still nothing");
+  expect(seen().at(-1)).toBe("f1");
+  // A new session starts with nothing handed.
+  await $.session.start(SESSION);
+  await ask("fresh");
+  expect(seen().at(-1)).toBe("");
 });
 
 test("an older CLI without recall is asked once, then left alone", async ($, on) => {

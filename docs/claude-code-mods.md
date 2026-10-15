@@ -140,9 +140,17 @@ Neo also takes part without being asked, at four moments (`hooks/auto.ts`):
 - **Every automatic run is logged** in `~/.neo/sessions/host_events.jsonl`
   as `auto_started` / `auto_finished` with its `kind` and what became of it
   (`failed`, `nothing`, `prose`, `change`; a review reaches Claude only on
-  `change`), and every recall that reached Claude as `recall_delivered` with
-  the lesson ids. Ids and outcomes only, never prompts, diffs or answers. A
-  lesson recalled in two sessions leaves probation.
+  `change`), plus `elapsed_ms` and, for a failure, a `reason` (`exit N`,
+  `unreadable output`, `neo error`, `timed out`, `failed early`). Every recall
+  that reached Claude is logged as `recall_delivered` with the lesson ids. Ids,
+  outcomes and timings only, never prompts, diffs or answers. A lesson
+  recalled in two sessions leaves probation.
+- **Recall hands a session each lesson once.** The mod keeps the ids it
+  delivered and passes them as `NEO_RECALL_SEEN`; recall ranks as before and
+  drops those, never backfilling with a weaker lesson, so dedup changes how
+  often a lesson is sent, not which ones are (and so not probation lift); a compaction of the main conversation (not a
+  skipped one or a subagent's) and a new session clear the list.
+  Before this, one lesson reached a single session 43 times.
 - **Subagents** contribute edits to the review but never trigger a diagnosis
   or consume findings meant for the main thread. A diagnosis that finishes
   after its session ended (`/clear`, resume) is dropped.

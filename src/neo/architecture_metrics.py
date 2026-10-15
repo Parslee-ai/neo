@@ -17,8 +17,12 @@ Metrics and language coverage:
   maps would need ongoing maintenance for a metric that's already
   noise-banded.
 
-All computation must be cheap (sub-second on neo-sized repos) and
-failure-tolerant — a metrics error must never break the main path.
+All computation must be cheap and failure-tolerant — a metrics error must
+never break the main path. "Cheap" holds through a per-file memo in the
+repository's own `.neo/` (`MEMO_FILENAME`): a learn-mode run snapshots twice,
+and parsing every source file each time cost 61 s of a 111 s request in a
+21k-file repository (1.7 s on neo itself), so only files whose stat changed
+are parsed again.
 
 This is the native, self-contained version of sentrux's session-delta
 idea: same shape, narrower set, no external dependency.
@@ -27,7 +31,11 @@ idea: same shape, narrower set, no external dependency.
 from __future__ import annotations
 
 import ast
+import json
 import logging
+import os
+import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Optional
@@ -50,6 +58,16 @@ _GOD_FILE_FUNC_THRESHOLD = 30
 
 # Depth-delta jitter: small day-to-day noise shouldn't read as regression.
 _DEPTH_NOISE_BAND = 1
+
+#: Per-file results, beside the walk cache in the repository's own `.neo/`
+#: (which the walker never descends into).
+MEMO_FILENAME = "arch_cache.json"
+#: Bumped whenever a per-file analyzer or a threshold above changes what it
+#: returns for the same file: a stored result is then wrong in a way no stat
+#: can detect, so the whole memo is dropped. The interpreter and parser
+#: versions join it in `_memo_signature`, because the memo lives in the
+#: repository and a PyPI install and a dev checkout share it.
+ANALYZER_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +194,32 @@ def compute(root: Optional[Path | str]) -> ArchSnapshot:
     max_depth = 0
     module_imports: dict[str, set[str]] = {}
     python_count = 0
-    ts_parser = _lazy_ts_parser()
+    ts_parser: Optional[TreeSitterParser] = None
+    ts_parser_built = False
+    memo = _load_memo(root_path)
+    fresh: dict[str, list] = {}
 
     for path in source_files:
-        if path.suffix == ".py":
+        key, stamp = _memo_key(path, root_path)
+        stored = memo.get(key)
+        if stamp is not None and stored is not None and stored[0] == stamp:
+            result = _result_from_memo(stored[1])
+        elif path.suffix == ".py":
             result = _analyze_python_file(path, root_path)
-            if result is not None:
-                python_count += 1
         else:
+            if not ts_parser_built:
+                ts_parser, ts_parser_built = _lazy_ts_parser(), True
             result = _analyze_tree_sitter_file(path, root_path, ts_parser)
+        # A file that yielded nothing is not memoized: the cause may be the
+        # environment (no parser, an unreadable file, a parse exception), not
+        # the file, and freezing it would misreport the file until it changed.
+        # Measured: 3 of 15,183 files in a large repository.
+        if stamp is not None and result is not None:
+            fresh[key] = [stamp, _result_to_memo(result)]
         if result is None:
             continue
+        if path.suffix == ".py":
+            python_count += 1
         is_god, depth, module_name, imports = result
         if is_god:
             god_count += 1
@@ -195,6 +228,8 @@ def compute(root: Optional[Path | str]) -> ArchSnapshot:
         module_imports[module_name] = imports
 
     cycle_count = _count_cycles(module_imports)
+    if fresh != memo:
+        _save_memo(root_path, fresh)
 
     return ArchSnapshot(
         cycle_count=cycle_count,
@@ -203,6 +238,119 @@ def compute(root: Optional[Path | str]) -> ArchSnapshot:
         files_scanned=len(source_files),
         python_files_scanned=python_count,
     )
+
+
+# ---------------------------------------------------------------------------
+# Internals: per-file memo
+# ---------------------------------------------------------------------------
+
+def _memo_path(root: Path) -> Path:
+    return root / ".neo" / MEMO_FILENAME
+
+
+def _memo_signature() -> str:
+    """What a stored result depends on besides the file itself."""
+    from importlib import metadata
+
+    from neo import __version__
+
+    # Neo's own version too: the analyzers read queries and language maps from
+    # other modules that can change without anyone bumping ANALYZER_VERSION.
+    parts = [str(ANALYZER_VERSION), __version__, "py%d.%d" % sys.version_info[:2]]
+    for package in ("tree-sitter", "tree-sitter-language-pack"):
+        try:
+            parts.append(f"{package}={metadata.version(package)}")
+        except metadata.PackageNotFoundError:
+            parts.append(f"{package}=none")
+    return " ".join(parts)
+
+
+def _memo_key(path: Path, root: Path) -> tuple[str, Optional[list[int]]]:
+    """(path relative to `root`, its stat stamp), the stamp None when unstattable.
+
+    Size, mtime and ctime, so an edit that restores the old mtime still reads
+    as changed.
+    """
+    try:
+        key = str(path.relative_to(root))
+    except ValueError:
+        key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return key, None
+    return key, [st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def _result_to_memo(result: Optional[tuple[bool, int, str, set[str]]]) -> Optional[list]:
+    if result is None:
+        return None
+    is_god, depth, module_name, imports = result
+    return [is_god, depth, module_name, sorted(imports)]
+
+
+def _result_from_memo(stored: Optional[list]) -> Optional[tuple[bool, int, str, set[str]]]:
+    if stored is None:
+        return None
+    is_god, depth, module_name, imports = stored
+    return bool(is_god), int(depth), str(module_name), set(imports)
+
+
+def _load_memo(root: Path) -> dict[str, list]:
+    """The stored per-file results, or `{}` when absent, stale or damaged.
+
+    Any entry that is not well formed discards the whole memo: it costs one
+    full parse, where trusting half a memo would misreport the repository.
+    """
+    try:
+        raw = json.loads(_memo_path(root).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("signature") != _memo_signature():
+        return {}
+    files = raw.get("files")
+    if not isinstance(files, dict):
+        return {}
+    try:
+        for stamp, stored in files.values():
+            if len(stamp) != 3 or not all(isinstance(n, int) for n in stamp):
+                return {}
+            if stored is None:
+                return {}
+            _result_from_memo(stored)
+    except (TypeError, ValueError):
+        return {}
+    return files
+
+
+def _save_memo(root: Path, files: dict[str, list]) -> None:
+    """Write the memo atomically (temp file plus `os.replace`); never raises.
+
+    Two processes racing here can write results from different moments, and the
+    last writer wins. That is safe because each entry carries the stamp taken
+    BEFORE its file was parsed: a result older than the file holds an older
+    stamp, so the next run parses that file again.
+    """
+    path = _memo_path(root)
+    tmp_name = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=MEMO_FILENAME + ".", suffix=".tmp"
+        )
+        with os.fdopen(handle, "w") as out:
+            json.dump({"signature": _memo_signature(), "files": files}, out)
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, path)
+        tmp_name = None
+    except (OSError, TypeError, ValueError) as exc:
+        logger.debug("architecture_metrics: memo not written under %s: %s", root, exc)
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def _lazy_ts_parser() -> Optional[TreeSitterParser]:

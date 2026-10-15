@@ -240,7 +240,7 @@ def test_the_json_form_reports_the_beat(tmp_path, monkeypatch, capsys):
     import json as _json
 
     monkeypatch.setattr(recall_mod, "recall",
-                        lambda p, c, recent_beats=None, context="": {"text": "Neo: x", "beat_id": "b1"})
+                        lambda p, c, recent_beats=None, context="", **_: {"text": "Neo: x", "beat_id": "b1"})
     assert run_recall(["--json", "--recent-beats", "a,b"], stdin=io.StringIO("q")) == 0
     assert _json.loads(capsys.readouterr().out) == {"text": "Neo: x", "beat_id": "b1"}
 
@@ -251,6 +251,35 @@ def test_delivered_fact_ids_are_returned(tmp_path):
     result = recall("q", str(tmp_path), embed=_embed({"q": _unit(0)}))
     assert result["fact_ids"] == [lesson.id]
     assert recall("q", str(tmp_path), embed=_embed({"q": _unit(3)}))["fact_ids"] == []
+
+
+def test_a_lesson_this_session_already_has_is_not_sent_again(tmp_path):
+    """Re-sent on every matching prompt, one lesson reached a single session 43
+    times. What the session was handed stays in its context (rule 3)."""
+    lessons = [_fact(f"lesson {i}", axis=0, tags=["transcript-derived"]) for i in range(5)]
+    _seed(tmp_path, *lessons)
+    embed = _embed({"q": _unit(0)})
+
+    first = recall("q", str(tmp_path), embed=embed)["fact_ids"]
+    again = recall("q", str(tmp_path), embed=embed, seen=frozenset(first))
+    partly = recall("q", str(tmp_path), embed=embed, seen=frozenset(first[:1]))["fact_ids"]
+
+    assert len(first) == recall_mod.MAX_FACTS
+    assert again == {"text": "", "beat_id": "", "fact_ids": []}
+    # No backfill: a freed slot never goes to a weaker lesson, which would earn
+    # deliveries (and probation lift) it never earned before.
+    assert partly == first[1:]
+
+
+def test_the_command_reads_what_the_session_has_from_the_environment(tmp_path, monkeypatch):
+    """A variable, not a flag, for the same reason as the transcript."""
+    got = {}
+    monkeypatch.setenv("NEO_RECALL_SEEN", "a,,b")
+    monkeypatch.setattr(recall_mod, "recall",
+                        lambda p, c, recent_beats=None, context="", seen=frozenset():
+                        got.update(seen=seen) or {"text": "", "beat_id": "", "fact_ids": []})
+    assert run_recall(["--json"], stdin=io.StringIO("q")) == 0
+    assert got["seen"] == frozenset({"a", "b"})
 
 
 def test_a_matching_note_passage_is_offered_with_its_path(tmp_path):
@@ -356,7 +385,7 @@ def test_the_command_reads_the_transcript_from_the_environment(tmp_path, monkeyp
     seen = {}
     monkeypatch.setenv("NEO_RECALL_TRANSCRIPT", path)
     monkeypatch.setattr(recall_mod, "recall",
-                        lambda p, c, recent_beats=None, context="": seen.update(context=context)
+                        lambda p, c, recent_beats=None, context="", **_: seen.update(context=context)
                         or {"text": "", "beat_id": "", "fact_ids": []})
     assert run_recall(["--json"], stdin=io.StringIO("yes")) == 0
     assert seen["context"] == "Merge it?"
@@ -440,7 +469,7 @@ def test_a_long_prompt_never_reads_the_transcript(tmp_path, monkeypatch):
                         lambda path: (_ for _ in ()).throw(AssertionError("read")))
     seen = {}
     monkeypatch.setattr(recall_mod, "recall",
-                        lambda p, c, recent_beats=None, context="": seen.update(context=context)
+                        lambda p, c, recent_beats=None, context="", **_: seen.update(context=context)
                         or {"text": "", "beat_id": "", "fact_ids": []})
     prompt = " ".join(["word"] * (recall_mod.FOLLOW_UP_MAX_WORDS + 1))
     assert run_recall(["--json"], stdin=io.StringIO(prompt)) == 0

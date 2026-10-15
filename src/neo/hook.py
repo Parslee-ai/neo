@@ -34,6 +34,7 @@ for the weaker case of a decision that is never written to disk.
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -241,10 +242,14 @@ def build_lifecycle_record(payload: dict) -> Optional[dict]:
         return None
     record = {"ts": time.time(), "source": "claude-mod"}
     for key in ("event", "session_id", "turn_id", "agent_id", "invocation_id",
-                "cwd", "status", "kind"):
+                "cwd", "status", "kind", "reason"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             record[key] = value[:4096]
+    elapsed = payload.get("elapsed_ms")
+    if (isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
+            and math.isfinite(elapsed) and elapsed >= 0):
+        record["elapsed_ms"] = int(elapsed)
     # Which lessons recall handed Claude: ids only, never their text.
     if record["event"] == "recall_delivered":
         ids = payload.get("fact_ids")

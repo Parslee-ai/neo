@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,22 @@ SESSIONS_DIR = Path.home() / ".neo" / "sessions"
 # caps the total across sessions. Together: 5/session * ~10 sessions before
 # cap kicks in, then oldest are invalidated.
 MAX_INDEPENDENT_OUTCOMES = 5
+# Diffs taken per session to find them. The early stop below only fires on
+# large diffs; a codemod touching thousands of files lightly would otherwise
+# still cost one `git log -p` per file. Below this many candidates the kept set
+# is exactly what ranking every diff would keep; above it, it is the best of
+# the first MAX_INDEPENDENT_DIFFS in path order.
+MAX_INDEPENDENT_DIFFS = 50
+
+# `git diff` processes run at once when listing dirty files across linked
+# worktrees.
+LINKED_WORKTREE_WORKERS = 8
+
+# `_get_file_diff_since` caps its summary here, so every capped summary has
+# the same, largest possible length (`DIFF_SUMMARY_FULL_LEN`).
+DIFF_SUMMARY_CHARS = 2000
+DIFF_TRUNCATION_MARKER = "\n... (truncated)"
+DIFF_SUMMARY_FULL_LEN = DIFF_SUMMARY_CHARS + len(DIFF_TRUNCATION_MARKER)
 CODE_OVERLAP_ACCEPTED_THRESHOLD = 0.8
 
 # The code a suggested diff targets, kept per suggestion so a later run can
@@ -287,11 +304,23 @@ def _locate(edited: Path, roots: list[tuple[Path, bool]]) -> Optional[tuple[str,
 
 
 def _relative_to_first(path: Path, roots: list[tuple[Path, bool]]) -> Optional[tuple[str, bool]]:
+    """`str(path.relative_to(root))` for the first root holding `path`.
+
+    Compared as strings: both are already-normalized `Path`s, so a prefix match
+    on a separator boundary is the same test, and `relative_to` itself cost
+    11 s scanning a 5,511-edit ledger against 102 checkouts (it builds a chain
+    of parent paths per attempt, and nearly every attempt misses).
+    """
+    text = str(path)
+    folded = os.path.normcase(text)
     for root, own in roots:
-        try:
-            return str(path.relative_to(root)), own
-        except ValueError:
-            continue
+        prefix = os.path.normcase(str(root))
+        if folded == prefix:
+            return ".", own
+        if not prefix.endswith(os.sep):
+            prefix += os.sep
+        if folded.startswith(prefix):
+            return text[len(prefix):], own
     return None
 
 
@@ -1602,11 +1631,20 @@ class OutcomeTracker:
     def _get_linked_worktree_changes(self) -> dict[str, str]:
         """Files dirty in this repository's OTHER checkouts, path -> checkout.
 
-        The first checkout listed wins a path dirty in several.
+        The first checkout listed wins a path dirty in several. Queried in
+        parallel: agents leave a worktree each, and one `git diff` per checkout
+        in turn took 12.4 s at 101 worktrees of a 21k-file repository (7.5 s
+        in parallel; each diff stats the whole tree, so more workers gain
+        nothing).
         """
+        roots = (self._checkout_roots or [])[1:]
+        if not roots:
+            return {}
+        with ThreadPoolExecutor(max_workers=min(LINKED_WORKTREE_WORKERS, len(roots))) as pool:
+            dirty = list(pool.map(self._get_working_tree_changes, roots))
         changed: dict[str, str] = {}
-        for root in (self._checkout_roots or [])[1:]:
-            for path in self._get_working_tree_changes(root):
+        for root, paths in zip(roots, dirty):
+            for path in paths:
                 changed.setdefault(path, root)
         return changed
 
@@ -1873,11 +1911,22 @@ class OutcomeTracker:
             known_ours.add(path)
             known_ours.add(self._normalize_path(path))
 
+        # Walked in path order so the walk can stop once the kept set is
+        # decided. Summaries are capped at DIFF_SUMMARY_FULL_LEN, so once
+        # MAX_INDEPENDENT_OUTCOMES capped ones are in hand, every later path can
+        # at best tie them on length and then loses on path. Diffing every
+        # changed file instead cost 5,795 `git` diffs (363 s) on one request in
+        # a busy repository, all to keep five.
         independent_candidates: list[Outcome] = []
-        for changed in changed_files:
+        full = 0
+        diffs_taken = 0
+        for changed in sorted(changed_files):
             normalized = self._normalize_path(changed)
             if normalized not in known_ours and changed not in known_ours:
                 if self._is_code_file(changed):
+                    if diffs_taken == MAX_INDEPENDENT_DIFFS:
+                        break
+                    diffs_taken += 1
                     diff = self._get_file_diff_since(changed, session.timestamp)
                     if not diff:
                         continue  # No diff content = no learning signal
@@ -1886,6 +1935,10 @@ class OutcomeTracker:
                         file_path=changed,
                         diff_summary=diff,
                     ))
+                    if len(diff) >= DIFF_SUMMARY_FULL_LEN:
+                        full += 1
+                        if full == MAX_INDEPENDENT_OUTCOMES:
+                            break
 
         # Keep only the most informative independent changes (deterministic: size desc, path asc)
         independent_candidates.sort(key=lambda o: (-len(o.diff_summary), o.file_path))
@@ -1930,8 +1983,6 @@ class OutcomeTracker:
         """
         if not self.codebase_root:
             return ""
-
-        MAX_DIFF_CHARS = 2000
 
         try:
             since_iso = datetime.datetime.fromtimestamp(
@@ -2009,8 +2060,8 @@ class OutcomeTracker:
                 or (line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
             ]
             summary = "\n".join(summary_lines)
-            if len(summary) > MAX_DIFF_CHARS:
-                summary = summary[:MAX_DIFF_CHARS] + "\n... (truncated)"
+            if len(summary) > DIFF_SUMMARY_CHARS:
+                summary = summary[:DIFF_SUMMARY_CHARS] + DIFF_TRUNCATION_MARKER
 
             return summary
 

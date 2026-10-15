@@ -66,6 +66,8 @@
 - Pending sessions are RETAINED per suggested path, not cleared; the session log
   is merge-on-write under `scope_file_lock`. `replay_linked_feedback` must use
   `consume_sessions_keeping_pending()`; never reintroduce `_clear_session_log`.
+- Outcome detection runs on every learn request: INDEPENDENT ranking stops at
+  the fifth capped diff; never add an unbounded per-file git call there.
 - UNVERIFIED and ADDRESSED mutate nothing. New `OutcomeType` → update both
   `outcomes.py` and `store.detect_implicit_feedback`. ADDRESSED (changed at the
   lines Neo flagged) is a location heuristic: never let it feed promotion,
@@ -138,6 +140,7 @@
   `neo recall` per typed prompt (no model call/load, 1 s embed deadline, writes
   nothing, never constructs a `FactStore`; a short follow-up is also matched
   with Claude's last reply, read from `NEO_RECALL_TRANSCRIPT` — never a flag;
+  lessons the session already has are skipped via `NEO_RECALL_SEEN`;
   note passages come from the observer-built `neo.notes` index, never from
   facts); `learn`-mode review at Stop,
   diagnosis of failing checks, plan check at ExitPlanMode. Cost is bounded by

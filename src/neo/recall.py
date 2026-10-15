@@ -19,7 +19,12 @@ model as additional context, so three rules decide its shape:
    facts, which a store's cold start would retire or prune, are skipped here
    because nothing here runs that cold start. Measured on this repo's store,
    19 of 203 valid facts survive, and they are the lessons mined from real
-   sessions.
+   sessions. Lessons this session was already handed are skipped too: the host
+   names them in `NEO_RECALL_SEEN` (comma-separated ids), so a session working
+   one topic gets each lesson once. They are dropped after ranking, never
+   replaced by the next-best lesson, so dedup changes how often a lesson is
+   sent, not which lessons are. Re-sent on every matching prompt, one lesson
+   reached a single session 43 times.
 4. **Notes the rule file points to are offered too** (`neo.notes`): the host
    loads CLAUDE.md, never the notes it says to read. Their passages come from
    a sidecar index the observer embeds, scored with the prompt's vector.
@@ -243,12 +248,14 @@ def _note_hits(root: str, query) -> list[tuple[str, str]]:
 def recall(prompt: str, cwd: str,
            embed: Optional[Callable[[list], Optional[list]]] = None,
            recent_beats: Optional[set] = None,
-           context: str = "") -> dict:
+           context: str = "",
+           seen: frozenset = frozenset()) -> dict:
     """`{"text", "beat_id", "fact_ids"}`: relevant learned lessons, opened by
     Neo's beat for the situation when one fits. Empty text when nothing is
     relevant. `fact_ids` lets the host record what it delivered; recall itself
     still writes nothing (`FactStore.lift_probation_by_recall` reads that
-    record). `context` is the reply the prompt answers (rule 5)."""
+    record). `context` is the reply the prompt answers (rule 5); `seen` holds
+    the ids this session was already handed (rule 3)."""
     import numpy as np
 
     from neo.math_utils import batched_cosine
@@ -296,6 +303,10 @@ def recall(prompt: str, cwd: str,
         if len(queries) > 1:
             taken = {fact.id for _, fact in scored_hits}
             scored_hits += hits(queries[1], taken)[:MAX_FACTS - len(scored_hits)]
+        # Ranked first, then what the session already has is dropped, with no
+        # backfill: a slot freed this way going to the next-best lesson would
+        # hand weaker matches the deliveries that lift probation (rule 3).
+        scored_hits = [(score, fact) for score, fact in scored_hits if fact.id not in seen]
     note_hits = _note_hits(root, query)
     if not scored_hits and not note_hits:
         return silent
@@ -317,9 +328,10 @@ def recall(prompt: str, cwd: str,
 
 def run_recall(argv: list[str], stdin=None) -> int:
     """`neo recall [--cwd DIR] [--recent-beats IDS] [--json]`, prompt on stdin.
-    The host's transcript comes in `NEO_RECALL_TRANSCRIPT`, not a flag: an
-    older CLI ignores an unknown variable, but exits 2 on an unknown flag, and
-    the mod reads exit 2 as "this CLI has no recall" and stops asking.
+    The host's transcript comes in `NEO_RECALL_TRANSCRIPT` and the ids it was
+    already handed in `NEO_RECALL_SEEN`, not flags: an older CLI ignores an
+    unknown variable, but exits 2 on an unknown flag, and the mod reads exit 2
+    as "this CLI has no recall" and stops asking.
     Always exits 0."""
     try:
         logging.disable(logging.WARNING)
@@ -333,7 +345,8 @@ def run_recall(argv: list[str], stdin=None) -> int:
         recent = {b for b in args.recent_beats.split(",") if b}
         context = (last_reply(os.environ.get("NEO_RECALL_TRANSCRIPT", ""))
                    if len(prompt.split()) <= FOLLOW_UP_MAX_WORDS else "")
-        result = recall(prompt, args.cwd, recent_beats=recent, context=context)
+        seen = frozenset(i for i in os.environ.get("NEO_RECALL_SEEN", "").split(",") if i)
+        result = recall(prompt, args.cwd, recent_beats=recent, context=context, seen=seen)
         if args.json:
             print(json.dumps(result))
         elif result["text"]:

@@ -72,6 +72,25 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   creates a REVIEW. INDEPENDENT writes a REVIEW at confidence 0.2. **Footgun**:
   if you add a new `OutcomeType`, update both `outcomes.py` and
   `store.detect_implicit_feedback`.
+- **Outcome detection is on the request hot path; keep it bounded.** In a busy
+  agent-driven repository (21k files, 102 linked worktrees) one learn run spent
+  363 s diffing all 5,795 files changed since a retained session to keep the
+  top `MAX_INDEPENDENT_OUTCOMES`, and the Claude Code mod killed 85 of 93 Stop
+  reviews at its 90 s deadline. INDEPENDENT ranking now walks changed files in
+  path order and stops at the fifth length-capped summary: capped summaries
+  share one length (`DIFF_SUMMARY_FULL_LEN`) and ties break on path, so no
+  later file can displace one and the kept set is unchanged (pinned by a
+  randomized comparison against ranking everything). Worktree dirty-file
+  queries run in parallel (12.4 s → 7.5 s; each stats the whole tree). The
+  early stop needs large diffs, so `MAX_INDEPENDENT_DIFFS` (50) also bounds the
+  diffs taken per session: a codemod touching thousands of files lightly would
+  otherwise fork one `git log -p` per file. Never reintroduce a
+  per-changed-file git call without both.
+- **Recall hands a session each lesson once** (`NEO_RECALL_SEEN`, see
+  `docs/claude-code-mods.md`). Lift is unchanged (it counts distinct sessions),
+  but a `recall-lifted` fact's latest delivery is now its FIRST in a session,
+  so only a session resumed across `STALE_MIN_AGE_DAYS` could see a lesson it
+  still holds pruned. Accepted; note passages carry no id and are not deduped.
 - **ADDRESSED: the file changed at the lines Neo flagged, not as Neo
   proposed.** A git match whose diff overlap is ≤ 0.3 used to be MODIFIED,
   which marks the candidate `contradicted`, demotes a linked or derived fact by

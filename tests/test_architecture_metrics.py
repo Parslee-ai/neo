@@ -356,3 +356,117 @@ class TestMultiLanguageGodFiles:
     def test_long_php_file_is_god(self, tmp_path: Path):
         _write(tmp_path, "a.php", "<?php\n" + "$x = 1;\n" * 1000)
         assert compute(tmp_path).god_file_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-file memo
+# ---------------------------------------------------------------------------
+
+class TestMemo:
+    """A learn-mode run snapshots twice; parsing every file each time cost 61 s
+    of a 111 s request in a 21k-file repository. Only changed files re-parse."""
+
+    @staticmethod
+    def _counting(monkeypatch):
+        import neo.architecture_metrics as am
+
+        parsed: list[str] = []
+        for name in ("_analyze_python_file", "_analyze_tree_sitter_file"):
+            real = getattr(am, name)
+
+            def counted(path, *args, _real=real):
+                parsed.append(path.name)
+                return _real(path, *args)
+
+            monkeypatch.setattr(am, name, counted)
+        return parsed
+
+    @staticmethod
+    def _repo(root: Path) -> None:
+        _write(root, "a.py", "import b\n")
+        _write(root, "b.py", "import a\n")
+        _write(root, "big.py", "x = 1\n" * 900)
+        _write(root, "web/app.ts", "function f() { return 1; }\n")
+
+    def test_a_second_snapshot_parses_nothing_and_agrees(self, tmp_path, monkeypatch):
+        self._repo(tmp_path)
+        parsed = self._counting(monkeypatch)
+        first = compute(tmp_path)
+        assert sorted(parsed) == ["a.py", "app.ts", "b.py", "big.py"]
+        parsed.clear()
+        assert compute(tmp_path) == first
+        assert parsed == []
+        assert first.cycle_count == 1 and first.god_file_count == 1
+
+    def test_only_a_changed_file_is_parsed_again(self, tmp_path, monkeypatch):
+        self._repo(tmp_path)
+        compute(tmp_path)
+        parsed = self._counting(monkeypatch)
+        _write(tmp_path, "b.py", "x = 2\n")  # breaks the cycle, new size
+        snap = compute(tmp_path)
+        assert parsed == ["b.py"]
+        assert snap.cycle_count == 0
+
+    def test_a_deleted_file_leaves_the_snapshot_and_the_memo(self, tmp_path):
+        import json
+
+        from neo.architecture_metrics import MEMO_FILENAME
+
+        self._repo(tmp_path)
+        compute(tmp_path)
+        (tmp_path / "big.py").unlink()
+        assert compute(tmp_path).god_file_count == 0
+        files = json.loads((tmp_path / ".neo" / MEMO_FILENAME).read_text())["files"]
+        assert "big.py" not in files
+
+    def test_a_damaged_or_stale_memo_costs_one_full_parse(self, tmp_path, monkeypatch):
+        import json
+
+        from neo.architecture_metrics import MEMO_FILENAME
+
+        self._repo(tmp_path)
+        expected = compute(tmp_path)
+        memo = tmp_path / ".neo" / MEMO_FILENAME
+        good = json.loads(memo.read_text())
+        parsed = self._counting(monkeypatch)
+        for damaged in (
+            "not json",
+            json.dumps({**good, "signature": "another interpreter"}),
+            json.dumps({**good, "files": {"a.py": [[1, 2, 3], None]}}),
+            json.dumps({**good, "files": {"a.py": [[1, 2], None]}}),
+            json.dumps({**good, "files": {"a.py": [[1, 2, 3], [True, 0]]}}),
+        ):
+            memo.write_text(damaged)
+            parsed.clear()
+            assert compute(tmp_path) == expected
+            assert len(parsed) == 4
+
+    def test_an_unwritable_memo_still_measures(self, tmp_path):
+        self._repo(tmp_path)
+        (tmp_path / ".neo").write_text("a file where the directory should be")
+        snap = compute(tmp_path)
+        assert snap.cycle_count == 1 and snap.files_scanned == 4
+
+    def test_a_file_that_yielded_nothing_is_parsed_again(self, tmp_path, monkeypatch):
+        """No parser (a broken install) is the environment, not the file: once
+        it is fixed, the file must be measured, not remembered as empty."""
+        import neo.architecture_metrics as am
+
+        _write(tmp_path, "web/app.ts", "x\n" * 900)
+        real = am._lazy_ts_parser
+        monkeypatch.setattr(am, "_lazy_ts_parser", lambda: None)
+        assert compute(tmp_path).god_file_count == 0
+        monkeypatch.setattr(am, "_lazy_ts_parser", real)
+        assert compute(tmp_path).god_file_count == 1
+
+    def test_another_interpreter_does_not_reuse_the_memo(self, tmp_path, monkeypatch):
+        """The memo lives in the repository, shared by a PyPI install and a dev
+        checkout; their parsers can disagree about the same file."""
+        import neo.architecture_metrics as am
+
+        self._repo(tmp_path)
+        compute(tmp_path)
+        parsed = self._counting(monkeypatch)
+        monkeypatch.setattr(am, "_memo_signature", lambda: "py9.9")
+        compute(tmp_path)
+        assert len(parsed) == 4
