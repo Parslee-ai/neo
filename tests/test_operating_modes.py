@@ -122,6 +122,30 @@ def test_learn_without_a_suggestion_is_not_left_pending(tmp_path):
     assert episode.final_outcome == "suggested_nothing_no_learning"
 
 
+class _NothingToExecute(_Executor):
+    def execute(self, suggestions, policy):
+        self.calls += 1
+        return []
+
+
+def test_agent_without_a_suggestion_is_not_left_pending(tmp_path):
+    engine = _engine(tmp_path, executor=_NothingToExecute(), memory=True)
+    engine.lm = _NoChangeLM()
+
+    output = engine.process(NeoInput(
+        prompt="act",
+        operating_mode=OperatingMode.AGENT,
+        authority=AuthorityPolicy(
+            workspace_root=str(tmp_path),
+            allowed_write_paths=["src/**"],
+        ),
+    ))
+
+    episode = engine.episode_store.load(output.metadata["learning_episode_id"])
+    assert episode.applied_actions == []
+    assert episode.final_outcome == "agent_suggested_nothing_no_learning"
+
+
 def test_learn_with_a_suggestion_waits_for_downstream_outcome(tmp_path):
     engine = _engine(tmp_path, memory=True)
 
