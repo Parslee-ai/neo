@@ -2428,6 +2428,132 @@ class TestOutcomeLinkage:
         review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
         assert len(review_facts) == 0
 
+    def test_replay_records_unlinked_outcome_before_consuming_its_session(self, store):
+        """Replay consumes every processed session, linked or not, so an
+        unlinked acceptance must reach its episode candidate first — otherwise
+        the session is dropped and the episode stays pending forever."""
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        episode = LearningEpisode(episode_id="ep-replay", project_id=store.project_id,
+                                  repository_revision="rev-ep-replay")
+        episode.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id="candidate-replay",
+            suggestion_id="suggestion-replay",
+            subject="pattern: validate input [src/api.py]",
+            body="Suggestion: validate input before processing",
+            kind="pattern",
+        ))
+        LearningEpisodeStore(store.project_id).save(episode)
+        outcome = Outcome(
+            outcome_type=OutcomeType.ACCEPTED,
+            file_path="src/api.py",
+            suggestion_id="suggestion-replay",
+            learning_episode_id="ep-replay",
+            candidate_id="candidate-replay",
+            candidate_subject="pattern: validate input [src/api.py]",
+            candidate_body="Suggestion: validate input before processing",
+            candidate_kind="pattern",
+        )
+
+        with (
+            patch.object(store._outcome_tracker, "collect_outcomes",
+                         return_value=([outcome], {})),
+            patch.object(store._outcome_tracker,
+                         "consume_sessions_keeping_pending") as consume,
+        ):
+            stats = store.replay_linked_feedback()
+
+        consume.assert_called_once()
+        assert stats["skipped_unlinked"] == 0
+        assert stats["recorded_unlinked"] == 1
+        persisted = LearningEpisodeStore(store.project_id).load("ep-replay")
+        assert persisted.final_outcome == "accepted"
+        assert persisted.memory_candidates[0].status == "supported_once"
+
+    def _replay_episode(self, store, episode_id):
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+
+        episode = LearningEpisode(episode_id=episode_id, project_id=store.project_id,
+                                  repository_revision=f"rev-{episode_id}")
+        episode.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id=f"{episode_id}-cand",
+            suggestion_id=f"{episode_id}-sug",
+            subject="pattern: validate input [src/api.py]",
+            body="Suggestion: validate input before processing",
+            kind="pattern",
+        ))
+        LearningEpisodeStore(store.project_id).save(episode)
+
+    def _replay(self, store, outcomes, **kwargs):
+        with (
+            patch.object(store._outcome_tracker, "collect_outcomes",
+                         return_value=(outcomes, {})),
+            patch.object(store._outcome_tracker,
+                         "consume_sessions_keeping_pending") as consume,
+        ):
+            return store.replay_linked_feedback(**kwargs), consume
+
+    def test_replay_records_unlinked_modification_as_contradiction(self, store):
+        from neo.memory.episodes import LearningEpisodeStore
+
+        self._replay_episode(store, "ep-mod")
+        stats, consume = self._replay(store, [Outcome(
+            outcome_type=OutcomeType.MODIFIED,
+            file_path="src/api.py",
+            suggestion_id="ep-mod-sug",
+            learning_episode_id="ep-mod",
+            candidate_id="ep-mod-cand",
+        )])
+
+        consume.assert_called_once()
+        assert stats["recorded_unlinked"] == 1
+        persisted = LearningEpisodeStore(store.project_id).load("ep-mod")
+        assert persisted.final_outcome == "modified"
+        assert persisted.memory_candidates[0].status == "contradicted"
+
+    def test_replay_leaves_unrecordable_unlinked_outcomes_unconsumed(self, store):
+        """A candidate-less acceptance is the live path's REVIEW fallback, and an
+        outcome with no episode has nowhere to go: replay records neither, so
+        it must not consume their sessions on their account."""
+        from neo.memory.episodes import LearningEpisodeStore
+
+        self._replay_episode(store, "ep-bare")
+        stats, consume = self._replay(store, [
+            Outcome(outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
+                    suggestion_id="ep-bare-sug", learning_episode_id="ep-bare"),
+            Outcome(outcome_type=OutcomeType.MODIFIED, file_path="src/other.py",
+                    candidate_id="orphan-cand"),
+        ])
+
+        consume.assert_not_called()
+        assert stats["recorded_unlinked"] == 0
+        assert stats["skipped_unlinked"] == 2
+        persisted = LearningEpisodeStore(store.project_id).load("ep-bare")
+        assert persisted.final_outcome == "pending"
+
+    def test_replay_dry_run_previews_unlinked_records_without_writing(self, store):
+        from neo.memory.episodes import LearningEpisodeStore
+
+        self._replay_episode(store, "ep-dry")
+        stats, consume = self._replay(store, [Outcome(
+            outcome_type=OutcomeType.ACCEPTED, file_path="src/api.py",
+            suggestion_id="ep-dry-sug", learning_episode_id="ep-dry",
+            candidate_id="ep-dry-cand",
+        )], dry_run=True)
+
+        consume.assert_not_called()
+        assert stats["recorded_unlinked"] == 1
+        persisted = LearningEpisodeStore(store.project_id).load("ep-dry")
+        assert persisted.memory_candidates[0].status == "observed_unverified"
+
     def test_replay_linked_feedback_dry_run_does_not_mutate_or_clear(self, store):
         """Dry-run reports linked outcomes without changing memory."""
 

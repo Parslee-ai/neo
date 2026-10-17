@@ -2475,6 +2475,78 @@ class FactStore:
             logger.warning("Cross-project reconcile failed: %s", exc)
             return 0
 
+    @staticmethod
+    def _unlinked_outcome_is_recordable(outcome) -> bool:
+        """Whether `_apply_unlinked_candidate_outcome` would record this outcome.
+
+        An ACCEPTED without a candidate is the live path's REVIEW fallback,
+        never an episode record, so it is not recordable here either.
+        """
+        if not outcome.learning_episode_id:
+            return False
+        if outcome.outcome_type == OutcomeType.ACCEPTED:
+            return bool(outcome.candidate_id)
+        return outcome.outcome_type in (
+            OutcomeType.MODIFIED, OutcomeType.REGRESSION,
+            OutcomeType.UNVERIFIED, OutcomeType.ADDRESSED,
+        )
+
+    def _apply_unlinked_candidate_outcome(self, outcome) -> bool:
+        """Record an outcome that has no linked fact against its episode candidate.
+
+        Shared by the live path and `replay_linked_feedback`: both consume the
+        session that produced this outcome, so skipping it here loses the
+        acceptance or contradiction for good. Returns whether it was recorded.
+        """
+        if not self._unlinked_outcome_is_recordable(outcome):
+            return False
+        if outcome.outcome_type == OutcomeType.ACCEPTED:
+            # First acceptance supports the episode candidate but does
+            # not create a Fact. Only a second independent accepted
+            # episode can promote an ordinary pattern.
+            self._record_attributed_episode_outcome(outcome)
+            promoted = self._promote_repeatedly_supported_candidate(outcome)
+            if promoted is not None:
+                self._record_attributed_episode_outcome(
+                    outcome,
+                    fact_id=promoted.id,
+                    operation="promote_repeated_episode_candidate",
+                    after_state=self._fact_learning_state(promoted),
+                    append_verification=False,
+                )
+                # Global promotion can only succeed once this project has
+                # itself project-promoted the pattern (its contribution to
+                # cross-project evidence). Gating the all-projects scan on
+                # that rare event keeps it off the per-request path — it no
+                # longer runs on every acceptance, only when THIS project's
+                # verified evidence newly clears the project bar.
+                self._promote_cross_project_candidate(outcome)
+        elif outcome.outcome_type in (OutcomeType.MODIFIED, OutcomeType.REGRESSION):
+            self._record_attributed_episode_outcome(outcome)
+            contradicted_fact, before_state = self._apply_candidate_contradiction(outcome)
+            if contradicted_fact is not None:
+                operation = (
+                    "rollback_contradicted_fact"
+                    if not contradicted_fact.is_valid
+                    else "demote_contradicted_fact"
+                )
+                self._record_attributed_episode_outcome(
+                    outcome,
+                    fact_id=contradicted_fact.id,
+                    operation=operation,
+                    append_verification=False,
+                    before_state=before_state,
+                    after_state=self._fact_learning_state(contradicted_fact),
+                )
+        elif outcome.outcome_type in (OutcomeType.UNVERIFIED, OutcomeType.ADDRESSED):
+            # Absence of verification is not success. Preserve the
+            # evidence in the episode but never mutate FactStore.
+            # ADDRESSED likewise: the flagged code was rewritten, but not
+            # as Neo proposed, so no fact earns credit from it; recording
+            # it is what keeps the finding from reading as contradicted.
+            self._record_attributed_episode_outcome(outcome)
+        return True
+
     def detect_implicit_feedback(self, current_request: dict, request_history: list) -> None:
         """Detect outcomes from previous session and update/create facts.
 
@@ -2609,26 +2681,7 @@ class FactStore:
                     continue
 
                 if outcome.candidate_id:
-                    # First acceptance supports the episode candidate but does
-                    # not create a Fact. Only a second independent accepted
-                    # episode can promote an ordinary pattern.
-                    self._record_attributed_episode_outcome(outcome)
-                    promoted = self._promote_repeatedly_supported_candidate(outcome)
-                    if promoted is not None:
-                        self._record_attributed_episode_outcome(
-                            outcome,
-                            fact_id=promoted.id,
-                            operation="promote_repeated_episode_candidate",
-                            after_state=self._fact_learning_state(promoted),
-                            append_verification=False,
-                        )
-                        # Global promotion can only succeed once this project has
-                        # itself project-promoted the pattern (its contribution to
-                        # cross-project evidence). Gating the all-projects scan on
-                        # that rare event keeps it off the per-request path — it no
-                        # longer runs on every acceptance, only when THIS project's
-                        # verified evidence newly clears the project bar.
-                        self._promote_cross_project_candidate(outcome)
+                    self._apply_unlinked_candidate_outcome(outcome)
                     continue
 
                 # Fallback: no linked fact, create REVIEW as before
@@ -2685,29 +2738,9 @@ class FactStore:
                         after_state=self._fact_learning_state(original_fact),
                     )
                 else:
-                    self._record_attributed_episode_outcome(outcome)
-                    contradicted_fact, before_state = self._apply_candidate_contradiction(outcome)
-                    if contradicted_fact is not None:
-                        operation = (
-                            "rollback_contradicted_fact"
-                            if not contradicted_fact.is_valid
-                            else "demote_contradicted_fact"
-                        )
-                        self._record_attributed_episode_outcome(
-                            outcome,
-                            fact_id=contradicted_fact.id,
-                            operation=operation,
-                            append_verification=False,
-                            before_state=before_state,
-                            after_state=self._fact_learning_state(contradicted_fact),
-                        )
+                    self._apply_unlinked_candidate_outcome(outcome)
             elif outcome.outcome_type in (OutcomeType.UNVERIFIED, OutcomeType.ADDRESSED):
-                # Absence of verification is not success. Preserve the
-                # evidence in the episode but never mutate FactStore.
-                # ADDRESSED likewise: the flagged code was rewritten, but not
-                # as Neo proposed, so no fact earns credit from it; recording
-                # it is what keeps the finding from reading as contradicted.
-                self._record_attributed_episode_outcome(outcome)
+                self._apply_unlinked_candidate_outcome(outcome)
                 continue
             elif outcome.outcome_type == OutcomeType.INDEPENDENT:
                 subject = f"outcome:independent {outcome.file_path}"
@@ -2824,6 +2857,14 @@ class FactStore:
         ``suggestion_fact_ids`` and deliberately skips architecture deltas,
         independent-change review creation, synthesis, and pruning. That keeps
         replay fast and safe enough for a user-facing maintenance command.
+
+        Outcomes with no linked fact still reach their episode candidate via
+        `_apply_unlinked_candidate_outcome`, because the consume at the end
+        drops their sessions; the REVIEW facts the live path would also write
+        for them are not created. Replay collects outside the session lock, so
+        a live request racing it can record the same outcome twice: candidate
+        evidence is keyed by episode and stays idempotent, but an
+        already-durable pattern takes `REACCEPTANCE_BOOST` once per record.
         """
         try:
             outcomes, suggestion_fact_ids = self._outcome_tracker.collect_outcomes(
@@ -2863,6 +2904,7 @@ class FactStore:
             "unverified": 0,
             "recorded_without_update": 0,
             "skipped_unlinked": 0,
+            "recorded_unlinked": 0,
             "skipped_independent": 0,
             "dry_run": dry_run,
         }
@@ -2874,7 +2916,16 @@ class FactStore:
 
             original_fact = _lookup_fact(outcome.file_path)
             if original_fact is None:
-                stats["skipped_unlinked"] += 1
+                # No fact to update, but the consume below drops this outcome's
+                # session, so its candidate evidence is recorded now or never.
+                # The live path's REVIEW facts are not written here (see the
+                # docstring); that loss predates this branch.
+                if not self._unlinked_outcome_is_recordable(outcome):
+                    stats["skipped_unlinked"] += 1
+                    continue
+                stats["recorded_unlinked"] += 1
+                if not dry_run:
+                    self._apply_unlinked_candidate_outcome(outcome)
                 continue
 
             if outcome.outcome_type == OutcomeType.ACCEPTED:
@@ -2902,7 +2953,11 @@ class FactStore:
                     update_effectiveness(original_fact, outcome="worse")
                     original_fact.metadata.last_accessed = time.time()
 
-        if not dry_run and (stats["linked_updates"] or stats["recorded_without_update"]):
+        if not dry_run and (
+            stats["linked_updates"]
+            or stats["recorded_without_update"]
+            or stats["recorded_unlinked"]
+        ):
             if stats["linked_updates"]:
                 self.save()
             # Retention-aware: deleting the whole log here would destroy every
