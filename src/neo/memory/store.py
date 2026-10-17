@@ -2482,8 +2482,6 @@ class FactStore:
         An ACCEPTED without a candidate is the live path's REVIEW fallback,
         never an episode record, so it is not recordable here either.
         """
-        if not outcome.learning_episode_id:
-            return False
         if outcome.outcome_type == OutcomeType.ACCEPTED:
             return bool(outcome.candidate_id)
         return outcome.outcome_type in (
@@ -2920,7 +2918,13 @@ class FactStore:
                 # session, so its candidate evidence is recorded now or never.
                 # The live path's REVIEW facts are not written here (see the
                 # docstring); that loss predates this branch.
-                if not self._unlinked_outcome_is_recordable(outcome):
+                # Without an episode there is nothing to record against. Checked
+                # here, not in the shared predicate: on the live path promotion
+                # still runs for such an outcome (it scans other episodes).
+                if not (
+                    outcome.learning_episode_id
+                    and self._unlinked_outcome_is_recordable(outcome)
+                ):
                     stats["skipped_unlinked"] += 1
                     continue
                 stats["recorded_unlinked"] += 1
