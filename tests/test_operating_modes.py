@@ -96,6 +96,66 @@ def test_advise_records_episode_but_never_creates_learning_candidate(tmp_path):
     assert episode.memory_candidates == []
 
 
+class _NoChangeLM(_ModeLM):
+    def generate(self, messages, **kwargs):
+        self.calls += 1
+        return """<<<NEO:SCHEMA=v3:KIND=plan>>>
+[{"id":"ps_1","description":"explain it","rationale":"requested","dependencies":[],"schema_version":"3"}]
+<<<END:plan>>>
+<<<NEO:SCHEMA=v3:KIND=simulation>>>
+[{"n":1,"input_data":"x","expected_output":"y","reasoning_steps":["**NO_MODIFY**"],"issues_found":[],"schema_version":"3"}]
+<<<END:simulation>>>
+<<<NEO:SCHEMA=v3:KIND=code>>>
+[]
+<<<END:code>>>"""
+
+
+def test_learn_without_a_suggestion_is_not_left_pending(tmp_path):
+    engine = _engine(tmp_path, memory=True)
+    engine.lm = _NoChangeLM()
+
+    output = engine.process(NeoInput(prompt="explain the module"))
+
+    episode = engine.episode_store.load(output.metadata["learning_episode_id"])
+    assert episode.operating_mode == "learn"
+    assert episode.suggestions == []
+    assert episode.final_outcome == "suggested_nothing_no_learning"
+
+
+class _NothingToExecute(_Executor):
+    def execute(self, suggestions, policy):
+        self.calls += 1
+        return []
+
+
+def test_agent_without_a_suggestion_is_not_left_pending(tmp_path):
+    engine = _engine(tmp_path, executor=_NothingToExecute(), memory=True)
+    engine.lm = _NoChangeLM()
+
+    output = engine.process(NeoInput(
+        prompt="act",
+        operating_mode=OperatingMode.AGENT,
+        authority=AuthorityPolicy(
+            workspace_root=str(tmp_path),
+            allowed_write_paths=["src/**"],
+        ),
+    ))
+
+    episode = engine.episode_store.load(output.metadata["learning_episode_id"])
+    assert episode.applied_actions == []
+    assert episode.final_outcome == "agent_suggested_nothing_no_learning"
+
+
+def test_learn_with_a_suggestion_waits_for_downstream_outcome(tmp_path):
+    engine = _engine(tmp_path, memory=True)
+
+    output = engine.process(NeoInput(prompt="change it"))
+
+    episode = engine.episode_store.load(output.metadata["learning_episode_id"])
+    assert episode.suggestions
+    assert episode.final_outcome == "suggested_pending_downstream_outcome"
+
+
 def test_verify_mode_uses_caller_change_and_never_calls_lm(tmp_path):
     engine = _engine(tmp_path)
     engine._run_static_checks = lambda suggestions, constraints=None: [StaticCheckResult(

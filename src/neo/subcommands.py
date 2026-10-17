@@ -1445,6 +1445,7 @@ def handle_memory(args):
         "unverified": 0,
         "skipped_independent": 0,
         "skipped_unlinked": 0,
+        "recorded_unlinked": 0,
         "errors": 0,
     }
 
@@ -1464,7 +1465,7 @@ def handle_memory(args):
         if updates:
             totals["updated_projects"] += 1
         for key in ("linked_updates", "accepted", "modified", "addressed", "unverified",
-                    "skipped_independent", "skipped_unlinked"):
+                    "skipped_independent", "skipped_unlinked", "recorded_unlinked"):
             totals[key] += int(stats.get(key, 0))
         label = pid or getattr(store, "project_id", "")
         if updates or getattr(args, "verbose", False):
@@ -1478,7 +1479,8 @@ def handle_memory(args):
     mode = "dry run" if getattr(args, "dry_run", False) else "replay"
     print(
         f"[Neo] feedback {mode}: {totals['linked_updates']} linked update(s) "
-        f"across {totals['updated_projects']}/{totals['projects']} project(s)"
+        f"across {totals['updated_projects']}/{totals['projects']} project(s); "
+        f"{totals['recorded_unlinked']} unlinked outcome(s) {'to record' if getattr(args, 'dry_run', False) else 'recorded'} on their episodes"
     )
     if totals["errors"]:
         print(f"[Neo] {totals['errors']} project(s) failed", file=sys.stderr)

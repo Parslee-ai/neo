@@ -1834,8 +1834,17 @@ class NeoEngine:
             OperatingMode.ADVISE: "advised_no_learning",
             OperatingMode.PATCH: "patch_proposed_no_learning",
             OperatingMode.VERIFY: "verification_complete",
-            OperatingMode.LEARN: "suggested_pending_downstream_outcome",
-            OperatingMode.AGENT: "agent_actions_pending_downstream_outcome",
+            # A run that proposed no change has nothing a later diff can
+            # accept or contradict; labelling it pending leaves it waiting
+            # forever and inflates the pending count learning-stats reports.
+            OperatingMode.LEARN: (
+                "suggested_pending_downstream_outcome" if episode.suggestions
+                else "suggested_nothing_no_learning"
+            ),
+            OperatingMode.AGENT: (
+                "agent_actions_pending_downstream_outcome" if episode.suggestions
+                else "agent_suggested_nothing_no_learning"
+            ),
         }[mode]
         metadata["learning_episode_id"] = episode.episode_id
         metadata["learning_task_id"] = episode.task_id

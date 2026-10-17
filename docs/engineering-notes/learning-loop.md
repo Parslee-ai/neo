@@ -33,7 +33,13 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   **`replay_linked_feedback` must use `consume_sessions_keeping_pending()`**,
   never a wholesale delete — it is the documented repair command for a broken
   memory loop, so nuking the log there destroyed every pending suggestion the
-  moment you ran it. `_clear_session_log` is deleted; do not reintroduce it. This used
+  moment you ran it. Because that consume drops every processed session,
+  replay also routes outcomes with NO linked fact through
+  `_apply_unlinked_candidate_outcome` (shared with the live path) — it used to
+  only count them `skipped_unlinked`, so an unlinked acceptance consumed by a
+  replay never reached its episode candidate. A learn run with no suggestions is
+  labelled `suggested_nothing_no_learning`, not pending: nothing can resolve it.
+  `_clear_session_log` is deleted; do not reintroduce it. This used
   to clear the WHOLE log whenever any session existed — so any neo invocation
   between "neo suggests X" and "user applies X" silently destroyed the pending
   suggestion. The multi-session read in `collect_outcomes` exists to prevent
