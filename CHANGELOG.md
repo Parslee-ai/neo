@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.61.6] - 2026-10-17
+
+### Fixed
+
+- **`learning-stats` no longer counts runs that suggested nothing as waiting on you.** A learn-mode run that proposed no change was recorded as pending a downstream outcome, which nothing can ever resolve. On a live install, 92 of 148 recent "pending" episodes had no suggestions at all, mostly end-of-turn reviews that found nothing to fix. They are now recorded as `suggested_nothing_no_learning` (`agent_suggested_nothing_no_learning` in agent mode), so the pending count shows only suggestions you can still accept or reject. Episodes recorded before this release keep their old label and age out of `--since` windows (#321).
+- **`neo memory replay-feedback` no longer drops acceptances.** The repair command consumed every processed session but only updated suggestions linked to an existing fact, so an acceptance or correction of any other suggestion was discarded without reaching its episode. It now records those the same way a normal request does. The summary reports how many it recorded, and `--dry-run` previews that count (#321).
+
 ## [0.61.5] - 2026-10-15
 
 ### Fixed
