@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.62.0] - 2026-10-18
+
+### Changed
+
+- **Neo's line above the prompt now says what he found, in his own voice.** The Claude Code mod's band showed the summary written for Claude, so a real finding (trailing spaces slipping past a SQL Server CHECK constraint) reached you as "2 files. 2 change(s). 0.96. I've seen this shape before. Let me use what I remember." The band now shows Neo's new `headline`: the finding in one short line, with no file paths, counts or scores. The model writes it in the same call that does the reasoning (no extra request), speaking as Neo at his current memory stage, for example "Binary collation. Still lets trailing spaces through." A line that is too long, has markdown, or slips in a path, count or score is dropped, and Neo builds one from the proposed change instead. A low-confidence or unbacked finding still says so. Claude still reads the full summary. `--json` output gains `orchestrator.headline` (#324).
+- **Neo's beats are short and in the past tense,** since they are spoken after the run: "Seen this shape before.", "Looked under the failure." (#324).
+- **Remembered notes are named by what they say.** The band's lessons row named a note by its file path; it now uses the note's first sentence, and the path moves into the expanded view (#324).
+- **Lessons Neo promotes get readable titles.** A promoted lesson was titled with the start of the prompt that produced it, which for every automatic review was the mod's own wording ("bugfix: Review the changes the coding agent just made for…"). It is now titled with what the lesson says. How lessons are matched for promotion is unchanged (#324).
+- Development: ruff is pinned to 0.17.0 (#301).
+
 ## [0.61.6] - 2026-10-17
 
 ### Fixed
