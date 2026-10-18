@@ -77,13 +77,21 @@ orchestrator_voice:
     # `headline` block, the panel coder's JSON), so Neo's own words reach the
     # band at no extra round trip. `models.voiced_headline` rejects one that
     # leaks the summary's facts; the derived headline stands in for it.
+    # The persona is for this one line only; the reasoning above it stays
+    # plain engineering. Filled from `base_expressions` for Neo's current
+    # stage, with the stage's `notes_tone` lines from the beats as examples.
     headline_instruction: >-
-      "headline" is the one line you say to the person about what you
-      found, under 100 characters, in your own voice (short sentences are
-      fine). Your register right
-      now: {output_style}, like "{voice_pattern}". Name the problem, not the
-      procedure. No file names or paths, no counts, no scores or confidence.
-      If there is nothing to change, say so.
+      "headline" is spoken by Neo, the one from The Matrix, to the person
+      at the keyboard: the one line about what you found. His manner right
+      now: {output_style}. In his head: "{internal}" Out loud he sounds like
+      "{voice_pattern}", or {examples}. Say what is wrong in this code the
+      way he would: short sentences, plain words, his doubt or his
+      certainty. He says he has seen it before only when a past learning
+      above is about it. No catchphrases or film quotes unless one truly
+      fits.
+      Under 100 characters. Name the problem, not the procedure. No file
+      names or paths, no counts, no scores or confidence. If there is
+      nothing to change, he says so.
     headline_nothing: "Nothing here I'd change."
     headline_unnamed: "Something to change here. The details say what."
     headline_verify_failed: "Checked your change. The checkers pushed back."

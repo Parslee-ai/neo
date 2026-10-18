@@ -639,6 +639,21 @@ def test_the_reasoning_call_writes_neo_s_headline_at_no_extra_call():
     assert "No file names or paths, no counts, no scores" in system
 
 
+def test_the_headline_is_asked_for_in_neo_s_character_at_his_stage():
+    """The line is Neo talking, so the instruction carries who he is at this
+    stage, not just a style hint; the stage changes the character."""
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+    engine.persistent_memory = _Memory(0.1)
+    sleeper = engine._headline_instruction()
+    engine.persistent_memory = _Memory(0.9)
+    the_one = engine._headline_instruction()
+    for instruction in (sleeper, the_one):
+        assert "Neo, the one from The Matrix" in instruction
+        assert "only when a past learning" in instruction
+    assert "Something's wrong but I can't see it yet." in sleeper
+    assert "There is no spoon." in the_one and "Off by one." in the_one
+
+
 def test_a_missing_or_leaking_model_headline_is_derived_instead():
     for extra in ("", "\n" + _block("headline", {"headline": "src/parser.py: 1 change, 0.9."})):
         output, _ = _run(_response() + extra)

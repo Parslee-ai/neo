@@ -432,12 +432,19 @@ class NeoEngine:
         cannot be built: like `_voice`, a slip here costs the line (the
         headline is then derived), never the reasoning call it rides on."""
         try:
+            stage = self._stage_now()
             expressions = self.beat_deck.get("base_expressions", {}) or {}
-            register = expressions.get(self._stage_now()) or expressions.get(3) or {}
+            register = expressions.get(stage) or expressions.get(3) or {}
+            examples = [line for line in dict.fromkeys(
+                str(((beat.get("expressions") or {}).get(stage) or {}).get("notes_tone", ""))
+                for beat in self.beat_deck.get("beats", []) or []
+            ) if line][:4]
             return self._voice(
                 "headline_instruction",
-                output_style=register.get("output_style", ""),
+                output_style=str(register.get("output_style", "")).lower().rstrip("."),
+                internal=register.get("internal", ""),
                 voice_pattern=register.get("voice_pattern", ""),
+                examples=", ".join(f'"{line}"' for line in examples),
             )
         except Exception as exc:
             logger.debug("headline instruction unavailable: %s", exc)

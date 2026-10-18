@@ -74,8 +74,16 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   fast path asks for a fourth `headline` block and the panel's coder adds a
   `headline` field to its JSON — the coder's FINAL (post-repair) answer, and
   only when the engine accepts the panel, so a rejected draft never speaks.
-  The instruction is `headline_instruction` in the deck, filled with the
-  stage's `base_expressions` register. `models.voiced_headline` rejects a
+  The instruction is `headline_instruction` in the deck and it carries the
+  CHARACTER, not a style hint: the combined call's system prompt is format
+  only (the "You are Neo from The Matrix" prompt belongs to the unused
+  `_generate_plan`), and a register-only instruction produced a polite
+  reviewer ("…what should happen when there is no word?"). It is filled from
+  the stage's `base_expressions` (`internal`, `voice_pattern`,
+  `output_style`) plus the beats' `notes_tone` lines for that stage, and it
+  covers that one line only, so the reasoning stays plain. It forbids
+  claiming recognition unless a past learning is about the problem: the
+  stage-2 register alone produced "Same trap." on a first sighting. `models.voiced_headline` rejects a
   line over `SPOKEN_LIMIT`, with markup, or leaking a score, a count of the
   run's artifacts or a path; then the derived headline stands. It does NOT
   demand one sentence: Neo talks in short ones, and that rule threw away a
