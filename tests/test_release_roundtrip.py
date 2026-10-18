@@ -210,10 +210,22 @@ class TestLanguageRoundTrip:
         Low confidence is a legitimate answer and is NOT gated here — a
         correct refusal must not block a release. Its absence means the
         serialization contract broke.
+
+        A null score is the contract for an answer that proposed no change
+        (#199): these prompts ask for an explanation, so the model may well
+        answer without a patch, and gating on a number then fails releases at
+        random. Null is accepted only with that basis and no suggestions.
         """
         payload = roundtrip_results[language]
 
-        assert isinstance(payload.get("confidence"), (int, float)), payload.keys()
+        assert "confidence" in payload, payload.keys()
+        if payload["confidence"] is None:
+            assert payload.get("confidence_basis") == "analysis_only", (
+                payload.get("confidence_basis")
+            )
+            assert payload.get("code_suggestions") == [], payload.get("code_suggestions")
+        else:
+            assert isinstance(payload["confidence"], (int, float)), payload["confidence"]
 
     def test_the_orchestrator_envelope_is_present(self, language, roundtrip_results):
         """Both host adapters read this envelope; a release must not ship
