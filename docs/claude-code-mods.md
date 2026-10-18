@@ -36,7 +36,10 @@ Neo lives in the conversation, not in a panel you have to open:
 - **The band above the prompt** shows what he is doing while he works
   (`reading this turn's changes · 0:12`), what he remembered for the prompt you
   just typed (`lessons` expands them), and his latest finding in his own words
-  (`d` details, with the proposed diffs; `x` dismiss). When he has nothing to
+  (`d` details, with the proposed diffs; `x` dismiss). That line is his
+  `headline`: the finding, led by an earned beat or his stage's lead, with no
+  paths, counts or scores (`2 files. 2 change(s). 0.96.` once stood where the
+  finding should have been). The summary with those facts goes to Claude. When he has nothing to
   say it shows one dim line, `Neo: listening`, so a quiet Neo is not mistaken
   for a missing one.
 - **A line in the conversation** (`$.ui.log`, drawn dim) marks each time he
@@ -128,7 +131,8 @@ delivered nothing. `/neo` asked directly still gets the panel when it helps.
 - **Notes.** CLAUDE.md is loaded; the notes it says to read are not. Recall
   offers the passage that matches the prompt from any markdown file or
   directory the project's rule file names in backticks (here
-  `docs/engineering-notes/`), as `- <path> [note]: …`. The observer embeds
+  `docs/engineering-notes/`), as `- <first sentence> [note, <path>]: …`, so
+  the band names a note by what it says, not by its file. The observer embeds
   them into `~/.neo/notes/<project_id>.json` on each sweep (unchanged files
   cost a hash); recall only reads that index, and leaves out a note edited
   since it was embedded. Measured on this repo's last 36 typed prompts: recall

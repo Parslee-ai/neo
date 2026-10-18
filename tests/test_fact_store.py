@@ -1086,6 +1086,33 @@ class TestOutcomeLinkage:
         assert set(promoted[0].supporting_episode_ids) == {"ep-one", "ep-two"}
         assert "durable" in promoted[0].tags
         assert "probation" not in promoted[0].tags
+        # Minted under what the lesson says, not its correlation key (the
+        # prompt prefix, which for an automatic review is the mod's wording).
+        assert promoted[0].subject == "Validate input before processing"
+        assert promoted[0].canonical_signature == store._episode_signature(
+            "pattern: validate input [src/api.py]"
+        )
+
+    def test_a_lesson_twin_of_another_promoted_lesson_keeps_its_key(self, store):
+        """One description on two files gives two lessons the same title and
+        body. Titling the second like the first would hand `add_fact` the first
+        back, and freezing the second signature onto it orphans the first."""
+        from neo.memory.models import FactKind, FactScope
+
+        body = "Reasoning: x\nSuggestion: validate input before processing"
+        first = store.add_fact(
+            subject="Validate input before processing", body=body,
+            kind=FactKind.PATTERN, scope=FactScope.PROJECT,
+        )
+        first.canonical_signature = "sig-first"
+        subject = "pattern: validate input [src/b.py] [fp:abc]"
+        assert store._title_for_mint(
+            subject, body, FactScope.PROJECT, "sig-second"
+        ) == "pattern: validate input [src/b.py]"
+        # The lesson that owns the twin keeps its title.
+        assert store._title_for_mint(
+            subject, body, FactScope.PROJECT, "sig-first"
+        ) == "Validate input before processing"
 
     def _accept_episode(self, store, ep_id, subject, body, kind="pattern",
                         revision=None, applied_on_revision=None, carrier_revision=""):

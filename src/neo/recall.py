@@ -61,6 +61,9 @@ MAX_FACTS = 3
 NOTE_MIN_SIMILARITY = 0.52
 MAX_NOTES = 2
 MAX_BODY_CHARS = 400
+# A note has no subject of its own, so its first sentence names it in the
+# band; the path stays in the bracket, for Claude and the expanded view.
+NOTE_TITLE_CHARS = 60
 # The whole embedding exchange: tens of ms on an idle server, for one text or
 # the two a follow-up sends; past this the observer is busy with its own
 # sweep and we stay silent.
@@ -260,6 +263,7 @@ def recall(prompt: str, cwd: str,
 
     from neo.math_utils import batched_cosine
     from neo.memory.models import carries_lesson
+    from neo.models import spoken_line
     from neo.memory.store import MAX_TEXT_LENGTH, STALE_MAX_CONFIDENCE
     from neo.text_budget import truncate_marked
 
@@ -318,7 +322,9 @@ def recall(prompt: str, cwd: str,
         lines.append(f"- {fact.subject} [{fact.kind.value}, {fact.scope.value}]: {body}")
     for path, passage in note_hits:
         body = " ".join(truncate_marked(passage, MAX_BODY_CHARS).split())
-        lines.append(f"- {path} [note]: {body}")
+        # The band names a lesson by what precedes its first " [".
+        title = spoken_line(passage, NOTE_TITLE_CHARS).replace(" [", " (")
+        lines.append(f"- {title} [note, {path}]: {body}")
     return {
         "text": "\n".join(lines),
         "beat_id": beat.get("beat_id", "") if beat else "",

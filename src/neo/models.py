@@ -378,6 +378,80 @@ class StaticCheckResult:
     status: str = ""
 
 
+SPOKEN_LIMIT = 120
+# Leading heading marks, bullets, list numbers ("1.", "2)") and severity
+# tags ("[P2]"): a numbered description otherwise ends its first sentence at
+# "1." and the headline reads "There. 1."
+_SPOKEN_TAG = re.compile(r"^(?:#+\s+|[-*]\s+|\d+[.)]\s+|\[[A-Z]?\d\]\s*)+")
+_SPOKEN_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+# Not inside a URL: "https://host/a/x.py" stays whole rather than "https:x.py".
+_SPOKEN_PATH = re.compile(
+    r"(?<![\w.:/\\])(?![\w.~-]*://)(?:[\w.~:-]*[/\\])+([\w-]+\.[A-Za-z0-9]{1,8})\b"
+)
+_SPOKEN_SENTENCE_END = re.compile(
+    r"(?<=[.!?])(?<!\be\.g\.)(?<!\bi\.e\.)(?<!\bvs\.)(?<!\betc\.)"
+    r"(?<!\bMr\.)(?<!\bDr\.)(?<!\b\d\.)\s+(?=[A-Z0-9(\"'])"
+)
+
+
+def spoken_line(text: str, limit: int = SPOKEN_LIMIT) -> str:
+    """The first sentence of model prose, fit to be said to a person in one
+    line: severity tags, bullets and markdown dropped, a path reduced to its
+    file name, cut at a word with an ellipsis. "" for empty text.
+
+    For UI lines only (the headline, a lesson's title). A prompt-side cut
+    goes through `neo.text_budget`, which marks what it dropped."""
+    line = " ".join((text or "").split())
+    line = _SPOKEN_LINK.sub(r"\1", line)
+    line = _SPOKEN_TAG.sub("", line).replace("**", "").replace("`", "")
+    line = _SPOKEN_PATH.sub(r"\1", line)
+    line = _SPOKEN_SENTENCE_END.split(line, 1)[0].strip()
+    line = line[:1].upper() + line[1:]
+    if len(line) > limit:
+        line = line[:limit - 1].rsplit(" ", 1)[0].rstrip(",;:-") + "…"
+    return line
+
+
+# What a model-written headline may not carry: the summary's facts. A score
+# ("0.96", "96%", "confidence"), a count of the run's own artifacts ("2
+# files", "3 change(s)"), or a path, which `spoken_line` would only shorten.
+# A version ("Python 3.10") is not a score; "0.96" and ".96" are.
+_HEADLINE_LEAK = re.compile(
+    r"(?<![\w.])[01]?\.\d+\b|\d+(?:\.\d+)?\s*%|\bpercent\b|\bconfidence\b|\b\d+/100\b"
+    r"|\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"(?:files?|changes?|change\(s\)|suggestions?|steps?|checks?|checkers?|diffs?)\b"
+    r"|[\w.~-]+[/\\][\w.~-]*\.[A-Za-z0-9]{1,8}\b|(?:[\w.~-]*[/\\]){2,}"
+    r"|\b[\w-]+\.(?:py|pyi|ts|tsx|js|jsx|mjs|sql|go|rs|java|kt|rb|php|cs|cpp|cc|c|h|hpp"
+    r"|swift|sh|md|json|ya?ml|toml|ini|cfg|html|css)\b",
+    re.IGNORECASE,
+)
+
+
+_HEADLINE_MARKUP = re.compile(r"\*\*|`|\]\(|^(?:#+|[-*]|\d+[.)])\s")
+
+
+def voiced_headline(text: str) -> str:
+    """A model-written headline if it is fit for the band, else "".
+
+    The model writes it in the same call as the finding, so it costs no
+    round trip; it is still model prose, so it must fit where a derived one
+    does (within `SPOKEN_LIMIT`, no markup) and must not restate the summary's
+    paths, counts or scores. Several short sentences are fine: that is how
+    Neo talks ("There. Line 47. That's the problem."), and a live run's
+    "Empty input raises IndexError. Is that intended, or should it return an
+    empty string?" was lost to a one-sentence rule. A rejected one leaves the
+    caller to derive the headline instead."""
+    raw = " ".join((text or "").split())
+    if (
+        not raw
+        or len(raw) > SPOKEN_LIMIT
+        or _HEADLINE_LEAK.search(raw)
+        or _HEADLINE_MARKUP.search(raw)
+    ):
+        return ""
+    return raw[:1].upper() + raw[1:]
+
+
 @dataclass
 class OrchestratorMessage:
     """What a host should say about this run, derived from what Neo did.
@@ -393,6 +467,11 @@ class OrchestratorMessage:
 
     personality: str = ""
     """An in-voice line, present only when a beat is tied to a real finding."""
+
+    headline: str = ""
+    """The finding itself in Neo's voice, one short sentence with no paths,
+    counts or scores, for a host with one line to show. `summary` stays the
+    full statement; a host that has room for it relays that instead."""
 
     beat_id: str = ""
     """Which beat spoke `personality` ("" when silent), so a host with session

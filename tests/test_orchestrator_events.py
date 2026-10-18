@@ -538,6 +538,151 @@ def test_every_stage_still_states_the_facts():
         assert "src/parser.py" in summary, level
 
 
+def test_the_headline_is_the_finding_without_paths_counts_or_scores():
+    """The one line a person reads in the band says what Neo found, in his
+    voice. "src/parser.py. 1 change(s). 0.88." is the summary's job."""
+    from neo.models import CodeSuggestion
+
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+    engine.persistent_memory = _Memory(0.9)
+    engine.context = NeoInput(prompt="review this")
+    engine.last_reasoning_mode = "fast"
+    engine._selected_beat, engine._beat_selected = None, True  # no beat
+    message = engine._build_orchestrator_message(
+        plan=[], simulation_traces=[],
+        code_suggestions=[CodeSuggestion(
+            file_path="/w/api/x.sql", unified_diff="-a\n+b\n", confidence=0.96,
+            description=(
+                "[P2] padded values pass the CHECK in /w/api/x.sql. "
+                "This diff targets the new migration."
+            ),
+        )],
+        static_checks=[], next_questions=[], confidence=0.96, early_exit=False,
+    )
+    assert message.headline == "Padded values pass the CHECK in x.sql."
+    assert "0.96" in message.summary  # the facts stay in the summary
+
+
+def test_a_spoken_line_fits_its_limit_ellipsis_included():
+    from neo.models import spoken_line
+
+    assert spoken_line("X" * 121, 120) == "X" * 119 + "…"
+    assert spoken_line("Alpha beta gamma", 11) == "Alpha…"
+    assert spoken_line("ABC", 3) == "ABC"
+
+
+def test_a_spoken_line_keeps_the_sentence_not_its_markup():
+    from neo.models import spoken_line
+
+    assert spoken_line("1. change the guard. 2. Test.") == "Change the guard."
+    assert spoken_line("See [the notes](x.md) for why. More.") == "See the notes for why."
+    assert spoken_line("## Loop Pending sessions stay. More.") == "Loop Pending sessions stay."
+    assert spoken_line(r"Fix C:\work\parser.py now.") == "Fix parser.py now."
+    url = "Fetch https://github.com/a/b/x.py now."
+    assert spoken_line(url) == url
+
+
+def _headline_for(code_suggestions, plan=(), static_checks=(), mode="fast"):
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+    engine.persistent_memory = _Memory(0.9)
+    engine.context = NeoInput(prompt="review this")
+    engine.last_reasoning_mode = mode
+    engine._selected_beat, engine._beat_selected = None, True  # no beat
+    return engine._build_orchestrator_message(
+        plan=list(plan), simulation_traces=[], code_suggestions=list(code_suggestions),
+        static_checks=list(static_checks), next_questions=[], confidence=0.96,
+        early_exit=False,
+    ).headline
+
+
+def test_a_finding_with_no_usable_words_still_gets_a_headline():
+    """An empty headline sends a host back to the summary, counts and all."""
+    from neo.models import CodeSuggestion
+
+    headline = _headline_for([CodeSuggestion(
+        file_path="a.py", unified_diff="-a\n+b\n", description="[P2]", confidence=0.96,
+    )])
+    assert headline == "Something to change here. The details say what."
+
+
+def test_a_verify_headline_carries_no_count():
+    from neo.models import CodeSuggestion, StaticCheckResult
+
+    failed = [StaticCheckResult(tool_name=f"t{i}", diagnostics=[], summary="bad",
+                                status="failed") for i in range(2)]
+    headline = _headline_for(
+        [CodeSuggestion(file_path="a.py", unified_diff="-a\n+b\n", description="x",
+                        confidence=0.0)],
+        static_checks=failed, mode="verification_only",
+    )
+    assert headline == "Checked your change. The checkers pushed back."
+
+
+class _PromptCapturingLM(FakeLM):
+    def generate(self, messages, **kwargs):
+        self.messages = messages
+        return self._response
+
+
+def test_the_reasoning_call_writes_neo_s_headline_at_no_extra_call():
+    """The headline is a fourth block of the one fast-path call, asked for in
+    Neo's register, and it is what the person reads."""
+    response = _response() + "\n" + _block(
+        "headline", {"headline": "Empty input walks straight into the deref."}
+    )
+    lm = _PromptCapturingLM(response)
+    engine = NeoEngine(lm_adapter=lm, enable_persistent_memory=False)
+    output = engine.process(NeoInput(prompt="fix the crash in the parser"))
+    assert output.orchestrator.headline == "Empty input walks straight into the deref."
+    system = lm.messages[0]["content"]
+    assert "KIND=headline" in system
+    assert "No file names or paths, no counts, no scores" in system
+
+
+def test_a_missing_or_leaking_model_headline_is_derived_instead():
+    for extra in ("", "\n" + _block("headline", {"headline": "src/parser.py: 1 change, 0.9."})):
+        output, _ = _run(_response() + extra)
+        assert output.orchestrator.headline.endswith("Guard the deref."), extra
+
+
+def test_a_model_headline_may_be_clipped_sentences_but_not_the_summary():
+    from neo.models import voiced_headline
+
+    assert voiced_headline("There. Line 47. That's the problem.") == (
+        "There. Line 47. That's the problem."
+    )
+    assert voiced_headline("Breaks on Python 3.10.") == "Breaks on Python 3.10."
+    for leak in ("Confidence 0.96.", "2 files need a guard.", "Fix src/a/parser.py.",
+                 "Off-by-one in parser.py.", "Two files need a guard.",
+                 "Ninety-six percent sure.", "**Guard** it.", "- guard it", "x" * 121):
+        assert voiced_headline(leak) == "", leak
+
+
+def test_only_the_accepted_panel_answer_speaks():
+    from neo.multi_agent import MultiAgentReasoner
+
+    reasoner = MultiAgentReasoner(lambda role: None, headline_instruction="Say it.")
+    result = reasoner._assemble(
+        {"steps": [{"description": "guard"}]},
+        {"code": "x = 1", "explanation": "e", "file_path": "a.py",
+         "headline": "The guard was missing."},
+        {"verdict": "ok", "severity": "none", "issues": []}, 1.0, 0, 3,
+    )
+    assert result.headline == "The guard was missing."
+    listed = reasoner._assemble(
+        {"steps": []}, {"code": "x", "headline": ["Empty input raises."]},
+        {"verdict": "ok"}, 1.0, 0, 3,
+    )
+    assert listed.headline == ""
+
+
+def test_a_shaky_headline_says_so_and_an_earned_beat_leads_it():
+    message = _summary_at(0.5, confidence=0.4)
+    assert message.personality
+    assert message.headline.startswith(message.personality)
+    assert message.headline.endswith("Guard. Check me on this.")
+
+
 def test_the_panel_opener_differs_from_the_solo_one():
     for level in _LEVELS:
         solo = _summary_at(level, mode="fast").summary
@@ -642,7 +787,7 @@ def test_beat_requiring_a_finding_fires_once_there_is_one():
     engine.context = NeoInput(prompt="optimize the search algorithm")
     engine._findings = ["prior knowledge: hash lookups beat scans here"]
     assert engine._orchestrator_beat(confidence=0.9) == (
-        "The obvious answer is probably the wrong one here."
+        "The obvious answer is probably wrong here."
     )
 
 

@@ -254,6 +254,14 @@ CODE_SUGGESTION_SCHEMA = {
 }
 
 
+# Neo's one-line headline, written in the same call as the finding.
+HEADLINE_SCHEMA = {
+    "type": "object",
+    "required": ["headline"],
+    "properties": {"headline": {"type": "string"}},
+}
+
+
 # Multi-phase schema for combined output
 MULTI_PHASE_SCHEMA = {
     "type": "object",

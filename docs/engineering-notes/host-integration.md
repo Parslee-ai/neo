@@ -57,6 +57,33 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   same facts read `Don't know this code. … , maybe. Confidence 0.88.` at stage 1
   and `src/parser.py. 1 change(s). 0.88.` at stage 5. A single fixed register
   throws away a signal the system already computes.
+  **`headline` is for people, `summary` for models** (2026-10-18). The mod's
+  band showed the summary, and a sharp review finding (trailing spaces passing
+  a SQL Server CHECK) reached the person as `2 files. 2 change(s). 0.96. I've
+  seen this shape before. Let me use what I remember.` — counts, a bare score
+  and a canned line, nothing found. `_headline` is the first sentence of the
+  first change's description (else the first plan step) through
+  `models.spoken_line` (no severity tags, markdown or directories), led by the
+  earned beat or the stage's `headline_lead`, with a stage-neutral tail when
+  the confidence is low or no diff backs it. Beat lines are spoken AFTER the
+  run in front of that finding, so they are short and never promise work to
+  come.
+  **The model writes the headline in the call it already makes** (same day).
+  "LM-voiced summaries were rejected" (below) was about a SEPARATE call per
+  run; the review, diagnosis and plan-check runs already make one, so the
+  fast path asks for a fourth `headline` block and the panel's coder adds a
+  `headline` field to its JSON — the coder's FINAL (post-repair) answer, and
+  only when the engine accepts the panel, so a rejected draft never speaks.
+  The instruction is `headline_instruction` in the deck, filled with the
+  stage's `base_expressions` register. `models.voiced_headline` rejects a
+  line over `SPOKEN_LIMIT`, with markup, or leaking a score, a count of the
+  run's artifacts or a path; then the derived headline stands. It does NOT
+  demand one sentence: Neo talks in short ones, and that rule threw away a
+  live run's "Empty input raises IndexError. Is that intended, or should it
+  return an empty string?" A cheaper second model was rejected: another round trip and
+  failure mode inside the hooks' 90 s deadline, with less context than the
+  call that found the problem. `neo recall` makes no model call and stays
+  templated.
   `test_engine_holds_no_prose_of_its_own` pins the no-literals rule — a string
   in `engine.py` is a personality change hidden in a code diff. `_voice`
   degrades to `""` on a missing key/bad placeholder (a YAML slip must not kill a

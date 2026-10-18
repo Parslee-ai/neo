@@ -19,7 +19,8 @@ from neo.schemas import (
     PLAN_STEP_SCHEMA,
     SIMULATION_TRACE_SCHEMA,
     CODE_SUGGESTION_SCHEMA,
-    MULTI_PHASE_SCHEMA
+    MULTI_PHASE_SCHEMA,
+    HEADLINE_SCHEMA
 )
 
 logger = logging.getLogger(__name__)
@@ -496,3 +497,8 @@ def parse_multi_phase(response: str) -> ParseResult:
     """Parse combined multi-phase output."""
     result = parse_structured_response(response, "multi_phase", MULTI_PHASE_SCHEMA)
     return result
+
+
+def parse_headline(response: str) -> ParseResult:
+    """Parse Neo's headline block from LM response."""
+    return parse_structured_response(response, "headline", HEADLINE_SCHEMA)
