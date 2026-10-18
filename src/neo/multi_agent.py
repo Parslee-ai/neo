@@ -42,6 +42,8 @@ class DeliberationResult:
     provenance: str = "multi-agent"
     models_used: dict[str, str] = field(default_factory=dict)
     meta: dict = field(default_factory=dict)
+    # Neo's one line about the accepted answer, as its coder wrote it.
+    headline: str = ""
 
     def as_engine_tuple(self):
         """(plan, simulation_traces, code_suggestions) — matches ``_process_combined``."""
@@ -93,11 +95,16 @@ class MultiAgentReasoner:
         max_repair_rounds: int = 1,
         max_tokens: int = 8000,  # reasoning models (gpt-5*) spend output on hidden
                                  # reasoning; give the visible answer real headroom
+        headline_instruction: str = "",
     ):
         self._role_adapter = role_adapter
         self.k_plans = max(1, k_plans)
         self.max_repair_rounds = max(0, max_repair_rounds)
         self.max_tokens = max_tokens
+        # The coder writes Neo's headline with the code it is accepted for, so
+        # the line describes the final answer, not a rejected draft.
+        self._headline_field = ', "headline": str' if headline_instruction else ""
+        self._headline_instruction = f" {headline_instruction}" if headline_instruction else ""
         self._models_used: dict[str, str] = {}
 
     # -- LLM plumbing ------------------------------------------------------
@@ -159,7 +166,7 @@ class MultiAgentReasoner:
         system = (
             "You are a senior engineer. Implement the given PLAN. Respond ONLY with JSON: "
             '{"code": str, "explanation": str, "edge_cases": [str], "confidence": 0.0-1.0, '
-            '"file_path": str}'
+            f'"file_path": str{self._headline_field}}}' + self._headline_instruction
         )
         user = f"{self._task_block(prompt, context)}\n\nPLAN:\n{json.dumps(plan)}"
         return _extract_json(self._call("coder", system, user, temperature=0.3)) or {}
@@ -188,7 +195,7 @@ class MultiAgentReasoner:
             "You are a senior engineer fixing your code given a reviewer's issues. "
             "Respond ONLY with JSON: "
             '{"code": str, "explanation": str, "edge_cases": [str], "confidence": 0.0-1.0, '
-            '"file_path": str}'
+            f'"file_path": str{self._headline_field}}}' + self._headline_instruction
         )
         user = (
             f"Task:\n{prompt}\n\nYour previous solution:\n{code.get('code','')}\n\n"
@@ -286,6 +293,7 @@ class MultiAgentReasoner:
             consensus=consensus,
             rounds=rounds,
             models_used=dict(self._models_used),
+            headline=code["headline"] if isinstance(code.get("headline"), str) else "",
             meta={
                 "n_plans": n_plans,
                 "critic_verdict": critique.get("verdict"),

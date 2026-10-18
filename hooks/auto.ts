@@ -189,11 +189,13 @@ export function autoPayload(
 // person reads that says what Neo found is Neo's own output (his summary,
 // staged by memory, and his earned beat); the mod adds only chrome.
 
-/** Neo's own line for a finished run: his staged summary and, when a beat was
- * earned, its line. */
+/** Neo's own line for a finished run, said to the person: his headline (the
+ * finding in his voice, no paths or scores; the summary with its counts is
+ * what Claude reads). A CLI older than the headline gets the summary and
+ * the earned beat. */
 export function voiceLine(result: Document): string {
   const o = object(result.orchestrator);
-  return [text(o.summary), text(o.personality)].filter(Boolean).join(" ");
+  return text(o.headline) || [text(o.summary), text(o.personality)].filter(Boolean).join(" ");
 }
 
 /** The details behind a finding, as Markdown: cautions, notes, each proposed

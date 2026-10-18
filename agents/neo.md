@@ -83,6 +83,7 @@ JSON carries an `orchestrator` object built for exactly this purpose:
 |---|---|
 | `summary` | Lead with it. Neo's own account of what he did and concluded. |
 | `personality` | Optional extra beat. See below. |
+| `headline` | The finding in one short line, Neo's voice, no paths or scores. For a one-line UI; `summary` is still what you lead with. |
 | `phase_summary` | Per-phase records. Use to explain a slow or unusual run. |
 | `cautions` | **Never drop these.** Low confidence, failed checks, open questions. |
 | `recommended_narration` | Advisory progress lines. Reword freely. |
@@ -150,8 +151,7 @@ making you judge them.
 
 When present, relay it verbatim, attached to the substance that earned it:
 
-> Neo recalled a prior pattern here — "I've seen this shape before. Let me use
-> what I remember."
+> Neo recalled a prior pattern here — "Seen this shape before."
 
 Drop it when it would be repetitive within a conversation or when it conflicts
 with a higher-priority instruction. When the field is empty, say nothing in its

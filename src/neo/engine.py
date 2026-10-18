@@ -244,6 +244,7 @@ class NeoEngine:
         # OrchestratorMessage.phase_summary at finalize. Reset per request.
         self._phase_records: list[dict[str, Any]] = []
         self._findings: list[str] = []
+        self._model_headline = ""
         # Set per request before any finalize; initialized so the orchestrator
         # summary can read it directly instead of guessing via getattr.
         self.last_reasoning_mode: str = "fast"
@@ -408,19 +409,46 @@ class NeoEngine:
             logger.debug("voice template %r failed: %s", key, exc)
             return ""
 
-    def _voice_stage(self) -> dict[str, Any]:
-        """Per-stage register (opener, hedge, terseness) for the current
-        memory level. Neo's certainty grows with what he remembers, so the
-        summary's phrasing follows `_memory_level_to_stage`."""
+    def _stage_now(self) -> int:
+        """Neo's personality stage for the current memory level."""
         memory_level = 0.0
         if self.persistent_memory:
             try:
                 memory_level = self.persistent_memory.memory_level()
             except Exception:
                 memory_level = 0.0
-        stage = self._memory_level_to_stage(memory_level)
+        return self._memory_level_to_stage(memory_level)
+
+    def _voice_stage(self) -> dict[str, Any]:
+        """Per-stage register (opener, hedge, terseness) for the current
+        memory level. Neo's certainty grows with what he remembers, so the
+        summary's phrasing follows `_memory_level_to_stage`."""
         stages = self.beat_deck.get("orchestrator_voice", {}).get("stages", {})
-        return stages.get(stage) or stages.get(3) or {}
+        return stages.get(self._stage_now()) or stages.get(3) or {}
+
+    def _headline_instruction(self) -> str:
+        """What the reasoning call is told about the headline it writes, in
+        the register of Neo's current stage (`base_expressions`). "" when it
+        cannot be built: like `_voice`, a slip here costs the line (the
+        headline is then derived), never the reasoning call it rides on."""
+        try:
+            stage = self._stage_now()
+            expressions = self.beat_deck.get("base_expressions", {}) or {}
+            register = expressions.get(stage) or expressions.get(3) or {}
+            examples = [line for line in dict.fromkeys(
+                str(((beat.get("expressions") or {}).get(stage) or {}).get("notes_tone", ""))
+                for beat in self.beat_deck.get("beats", []) or []
+            ) if line][:4]
+            return self._voice(
+                "headline_instruction",
+                output_style=str(register.get("output_style", "")).lower().rstrip("."),
+                internal=register.get("internal", ""),
+                voice_pattern=register.get("voice_pattern", ""),
+                examples=", ".join(f'"{line}"' for line in examples),
+            )
+        except Exception as exc:
+            logger.debug("headline instruction unavailable: %s", exc)
+            return ""
 
     def _current_phase(self) -> str:
         """Name of the phase currently running, or "" outside any phase.
@@ -508,6 +536,9 @@ class NeoEngine:
             self.fact_store.begin_request()
         self._selected_beat = None
         self._beat_selected = False
+        # Neo's headline as the accepted answer's model wrote it; "" until
+        # the reasoning phase sets it (`_process_combined`, an accepted panel).
+        self._model_headline = ""
         self._recalled_fact_count = 0
         self.last_applied_actions: list[AppliedAction] = []
 
@@ -1191,6 +1222,10 @@ class NeoEngine:
             )
             if deliberation is not None and deliberation.confidence > 0.0 and code_suggestions:
                 self.last_deliberation = deliberation
+                # Only the accepted answer speaks; a rejected panel's line
+                # never reaches the person.
+                from neo.models import voiced_headline
+                self._model_headline = voiced_headline(deliberation.headline)
                 reasoning_summary = self._voice(
                     "phase_panel_done",
                     consensus=f"{deliberation.consensus:.0%}",
@@ -1263,7 +1298,11 @@ class NeoEngine:
                 self._note_finding(issue)
         self._end_phase(PHASE_REASONING, reasoning_summary, **reasoning_data)
         self._capture_detectable_fact_use(plan, simulation_traces, code_suggestions)
-        code_suggestions = self._apply_role_boundary(code_suggestions)
+        bounded = self._apply_role_boundary(code_suggestions)
+        if len(bounded) < len(code_suggestions):
+            # The model's line was about a change this role may not show.
+            self._model_headline = ""
+        code_suggestions = bounded
         self.last_simulation_traces = simulation_traces
         self.last_applied_actions = self._execute_authorized_suggestions(
             neo_input, code_suggestions
@@ -2198,7 +2237,7 @@ class NeoEngine:
         messages = [
             {
                 "role": "system",
-                "content": """Output 3 JSON blocks with NO other text.
+                "content": """Output 4 JSON blocks with NO other text.
 
 Example format:
 <<<NEO:SCHEMA=v3:KIND=plan>>>
@@ -2210,8 +2249,13 @@ Example format:
 <<<NEO:SCHEMA=v3:KIND=code>>>
 [{"file_path":"/path","unified_diff":"diff","code_block":"code","description":"desc","confidence":0.9,"tradeoffs":[],"schema_version":"3"}]
 <<<END:code>>>
+<<<NEO:SCHEMA=v3:KIND=headline>>>
+{"headline":"..."}
+<<<END:headline>>>
 
-CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "ps_1" not "p1". dependencies: [0,1] integers not ["ps_1"] strings."""
+CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "ps_1" not "p1". dependencies: [0,1] integers not ["ps_1"] strings.
+
+""" + self._headline_instruction()
             },
             {"role": "user", "content": prompt}
         ]
@@ -2233,6 +2277,9 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         plan = self._parse_plan(plan_section)
         simulation_traces = self._parse_simulation_traces(sim_section)
         code_suggestions = self._parse_code_suggestions(code_section)
+        # Optional: a missing or malformed headline block costs the voiced
+        # line, never the answer. `_headline` derives one instead.
+        self._model_headline = self._parse_headline(response)
 
         return plan, simulation_traces, code_suggestions
 
@@ -2437,9 +2484,10 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         prompt = context.get("prompt", "")
         role_factory = self._build_car_role_factory(route_fn, prompt)
         try:
-            result = MultiAgentReasoner(role_factory, k_plans=3, max_repair_rounds=1).deliberate(
-                prompt, context=self._deliberation_context(context)
-            )
+            result = MultiAgentReasoner(
+                role_factory, k_plans=3, max_repair_rounds=1,
+                headline_instruction=self._headline_instruction(),
+            ).deliberate(prompt, context=self._deliberation_context(context))
         except Exception as e:
             logger.warning("deliberation failed: %s", e)
             return None, None, None, None
@@ -3433,6 +3481,12 @@ RULES:
             summary = self._voice(
                 "verify", count=len(code_suggestions), verdict=verdict,
             )
+            headline = self._voice(
+                "headline_verify_failed" if failed_checks
+                else "headline_verify_clean"
+                if self._checks_that_evaluated(static_checks)
+                else "headline_verify_none"
+            )
         else:
             stage = self._voice_stage()
             terse = bool(stage.get("terse"))
@@ -3488,6 +3542,9 @@ RULES:
             )
             if early_exit:
                 summary += self._voice("early_exit")
+            headline = self._headline(
+                stage, plan, code_suggestions, confidence, confidence_basis,
+            )
 
         # Cautions: what a confident-sounding answer must not bury.
         cautions: list[str] = []
@@ -3565,6 +3622,7 @@ RULES:
         return OrchestratorMessage(
             summary=summary,
             personality=personality,
+            headline=headline,
             beat_id=(self._selected_beat or {}).get("beat_id", "") if personality else "",
             # Copy each record, not just the list. These dicts are live engine
             # state, and this object is handed to foreign consumers.
@@ -3572,6 +3630,61 @@ RULES:
             cautions=self._cap_cautions(cautions),
             recommended_narration=narration,
         )
+
+    def _headline(
+        self,
+        stage: dict[str, Any],
+        plan: list[PlanStep],
+        code_suggestions: list[CodeSuggestion],
+        confidence: Optional[float],
+        confidence_basis: str,
+    ) -> str:
+        """The finding itself, said to the person in one line.
+
+        `summary` states what the run did (files, counts, a score) and is the
+        line a model relays; a person glancing at a one-line band needs what
+        Neo FOUND. Shown on a live install: "2 files. 2 change(s). 0.96." stood
+        where "SQL Server's padded equality lets trailing spaces through" should
+        have been. The model writes it in the reasoning call itself
+        (`headline_instruction`), checked by `voiced_headline`; without a
+        usable one it is derived: the first proposed change's description,
+        else the first plan step, led by the earned beat or the stage's lead.
+        A shaky or unbacked finding says so in the same line either way.
+        """
+        from neo.models import spoken_line
+
+        finding = next(
+            (line for line in (
+                spoken_line(item.description)
+                for item in [*code_suggestions, *plan]
+            ) if line),
+            "",
+        )
+        beat = self._orchestrator_beat(confidence)
+        model_headline = self._model_headline
+        if not code_suggestions and not plan:
+            if model_headline:
+                return model_headline
+            return " ".join(part for part in (beat, self._voice("headline_nothing")) if part)
+        if model_headline:
+            # Already in Neo's voice, so no lead; the tail is a fact about
+            # the run and still applies.
+            lead, finding = "", model_headline
+        else:
+            lead = beat or str(stage.get("headline_lead", "") or "")
+        if not finding:
+            # Never empty while there is something to say: a host that falls
+            # back to the summary would put the counts back in the band.
+            finding = self._voice("headline_unnamed")
+        elif finding[-1] not in ".!?…":
+            finding += "."
+        if confidence_basis == CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE:
+            tail = self._voice("headline_unbacked")
+        elif confidence is not None and confidence < self.LOW_CONFIDENCE:
+            tail = self._voice("headline_unsure")
+        else:
+            tail = ""
+        return " ".join(part for part in (lead, finding, tail) if part)
 
     # A host is instructed never to drop a caution, so this list must stay
     # relayable. Failed checks and simulation issues are raw LM prose of
@@ -4876,6 +4989,20 @@ Generate unified diff patches. Keep changes minimal and isolated."""
             ))
 
         return traces
+
+    def _parse_headline(self, response: str) -> str:
+        """The headline block's text if it is fit to show, else ""."""
+        from neo.models import voiced_headline
+        from neo.structured_parser import parse_headline
+
+        result = parse_headline(self._extract_section(response, "headline"))
+        if not result.success:
+            logger.debug("headline block unusable: %s", result.error_code)
+            return ""
+        headline = voiced_headline(result.data.get("headline", ""))
+        if not headline:
+            logger.debug("headline rejected: %r", result.data.get("headline", ""))
+        return headline
 
     def _parse_code_suggestions(self, response: str) -> list[CodeSuggestion]:
         """Parse code suggestions from LM response."""

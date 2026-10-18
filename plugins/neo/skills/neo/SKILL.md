@@ -58,6 +58,7 @@ purpose:
 |---|---|
 | `summary` | Lead with it. Neo's own account of what he did and concluded. |
 | `personality` | Optional in-voice beat. Relay verbatim when present. |
+| `headline` | The finding in one short line, Neo's voice, no paths or scores. For a one-line UI; `summary` is still what you lead with. |
 | `phase_summary` | Per-phase records. Use to explain a slow or unusual run. |
 | `cautions` | **Never drop these.** Low confidence, failed checks, open questions. |
 | `recommended_narration` | Advisory progress lines. Reword freely. |

@@ -433,3 +433,16 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   Changes to layer ordering, the 2/3 constraint cap, or the inline `(changed from: X)`
   annotation should preserve the validated 95.8% decision-accuracy contract (GPT-5.2 on
   the v1.0 development split). See `docs/solutions/token-budget-enforcement.md`.
+
+- **A promoted fact's subject is a title, not its key** (2026-10-18). Both
+  mints store `_lesson_title` (the first sentence of the body's `Suggestion:`
+  line) because the candidate subject starts with the prompt's first 50
+  characters, which for every automatic review is the mod's own wording
+  ("bugfix: Review the changes the coding agent just made for"). Safe only
+  because nothing re-derives a signature from a fact's subject: correlation
+  recomputes from `candidate.subject` and facts resolve through the frozen
+  `canonical_signature`. Keep it that way. The body has no path and a run's
+  suggestions share its Reasoning and Pitfalls, so `_title_for_mint` falls
+  back to the key when the title would make the lesson an exact twin of one
+  promoted under another signature; otherwise `add_fact` returns that fact and
+  the mint freezes the wrong signature onto it.

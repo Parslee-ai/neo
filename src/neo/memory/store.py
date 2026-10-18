@@ -1552,6 +1552,56 @@ class FactStore:
         clean = FactStore._FINGERPRINT_RE.sub("", subject or "")
         return clean, fingerprint
 
+    def _title_for_mint(
+        self, candidate_subject: str, body: str, scope: FactScope, signature: str,
+        shape_subject=lambda text: text, shape_body=lambda text: text,
+    ) -> str:
+        """`_lesson_title`, unless it would make this lesson an exact twin
+        (`_canonical_signature`: subject + body) of a fact promoted under a
+        DIFFERENT signature. The body carries no path and its Reasoning and
+        Pitfalls are shared by a run's suggestions, so one description on two
+        files would hand `add_fact` the first lesson back, and freezing the
+        second signature onto it would orphan the first from reinforcement and
+        rollback. Such a lesson keeps its correlation key as its subject, as
+        every lesson did before titles. The `shape_*` callables are how the
+        caller transforms each field before storing it (the global mint
+        generalizes, strips brackets and caps)."""
+        from neo.memory.generalize import generalize
+
+        title = self._lesson_title(candidate_subject, body)
+        stored = generalize(f"{shape_subject(title)} {shape_body(body)}")
+        for fact in self._facts:
+            if (
+                fact.is_valid
+                and fact.scope == scope
+                and fact.kind == FactKind.PATTERN
+                and fact.canonical_signature
+                and fact.canonical_signature != signature
+                and generalize(f"{fact.subject} {fact.body}") == stored
+            ):
+                return self._split_fingerprint(candidate_subject)[0].strip()
+        return title
+
+    @staticmethod
+    def _lesson_title(candidate_subject: str, body: str) -> str:
+        """The subject a promoted fact is minted with: what the lesson says.
+
+        A candidate's subject is its correlation key (task type, the prompt's
+        first 50 characters, path, fingerprint), and for every automatic
+        review that prompt is the mod's own wording, so a lesson minted from it
+        reads "bugfix: Review the changes the coding agent just made for".
+        The fact stores its signature frozen at mint and nothing re-derives
+        one from a fact's subject, so the title is free to be the change's own
+        description. Falls back to the key without its fingerprint."""
+        from neo.models import spoken_line
+
+        for line in (body or "").splitlines():
+            if line.startswith("Suggestion: "):
+                title = spoken_line(line[len("Suggestion: "):])
+                if title:
+                    return title
+        return FactStore._split_fingerprint(candidate_subject)[0].strip()
+
     @staticmethod
     def _episode_signature(subject: str) -> str:
         """PROJECT-tier correlation identity for episode-derived candidates and
@@ -2071,10 +2121,13 @@ class FactStore:
                 return existing_fact
 
             fact = self.add_fact(
-                # Strip the [fp:<hash>] correlation qualifier from the stored
-                # subject — it's a key ingredient, not user-facing text. The
-                # fingerprint survives in the frozen canonical_signature below.
-                subject=self._split_fingerprint(outcome.candidate_subject)[0].strip(),
+                # The stored subject is what the lesson says, not its
+                # correlation key (`_lesson_title`); the key survives in the
+                # frozen canonical_signature below.
+                subject=self._title_for_mint(
+                    outcome.candidate_subject, outcome.candidate_body,
+                    FactScope.PROJECT, target_signature,
+                ),
                 # The fingerprint gate verified the two episodes share a code
                 # SHAPE; the body stored here is ONE triggering episode's prose.
                 # It is representative of the co-verified shape, not a co-verified
@@ -2229,11 +2282,19 @@ class FactStore:
 
         # Global memory receives only deterministic generalized text, with
         # path-like bracket qualifiers removed and credential redaction.
-        subject = re.sub(r"\[[^\]]+\]", "", generalize(subject_src))
-        body = re.sub(r"\[[^\]]+\]", "", generalize(body_src))
+        def stored(text: str, cap: int) -> str:
+            return redact_sensitive_text(
+                re.sub(r"\[[^\]]+\]", "", generalize(text))
+            ).strip()[:cap]
+
+        title = self._title_for_mint(
+            subject_src, body_src, FactScope.GLOBAL, target_signature,
+            shape_subject=lambda text: stored(text, 300),
+            shape_body=lambda text: stored(text, 1000),
+        )
         fact = self.add_fact(
-            subject=redact_sensitive_text(subject).strip()[:300],
-            body=redact_sensitive_text(body).strip()[:1000],
+            subject=stored(title, 300),
+            body=stored(body_src, 1000),
             kind=FactKind.PATTERN,
             scope=FactScope.GLOBAL,
             confidence=min(0.8, 0.5 + 0.05 * len(project_ids)),

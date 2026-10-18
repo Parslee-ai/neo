@@ -29,30 +29,35 @@ orchestrator_voice:
       hedge: ", maybe"
       confidence_lead: "Confidence"
       terse: false
+      headline_lead: "Could be wrong, but:"
     2:  # Glitch — sensing a pattern, still unsure
       opener_solo: "Something here feels familiar."
       opener_panel: "Wanted other eyes on this."
       hedge: ", I think"
       confidence_lead: "Confidence"
       terse: false
+      headline_lead: "Something's off."
     3:  # Unplugged — direct, sees it
       opener_solo: "I read it."
       opener_panel: "I didn't work this alone."
       hedge: ""
       confidence_lead: "Confidence"
       terse: false
+      headline_lead: "There."
     4:  # Training — knows the shape, sees the break coming
       opener_solo: "I know this shape."
       opener_panel: "Ran it past the others anyway."
       hedge: ""
       confidence_lead: "Confidence"
       terse: false
+      headline_lead: "See it."
     5:  # The One — certain, minimal
       opener_solo: ""
       opener_panel: "Not alone."
       hedge: ""
       confidence_lead: ""
       terse: true
+      headline_lead: ""
 
   # Fact templates. `terse` stages drop the connective prose and keep the nouns.
   lines:
@@ -62,6 +67,40 @@ orchestrator_voice:
     action_plan_terse: "{steps}-step path. No code"
     action_none: "I don't have a path for this yet"
     action_none_terse: "Nothing yet"
+
+    # The headline: the finding itself, one sentence spoken to the person,
+    # for a host with one line to show (the Claude Code mod's band). Led by
+    # the earned beat, else the stage's `headline_lead`. No paths, counts or
+    # scores: those stay in `summary` and the details. A headline without a
+    # finding says one of these instead.
+    # Asked of the model in the reasoning call itself (the fast path's
+    # `headline` block, the panel coder's JSON), so Neo's own words reach the
+    # band at no extra round trip. `models.voiced_headline` rejects one that
+    # leaks the summary's facts; the derived headline stands in for it.
+    # The persona is for this one line only; the reasoning above it stays
+    # plain engineering. Filled from `base_expressions` for Neo's current
+    # stage, with the stage's `notes_tone` lines from the beats as examples.
+    headline_instruction: >-
+      "headline" is spoken by Neo, the one from The Matrix, to the person
+      at the keyboard: the one line about what you found. His manner right
+      now: {output_style}. In his head: "{internal}" Out loud he sounds like
+      "{voice_pattern}", or {examples}. Say what is wrong in this code the
+      way he would: short sentences, plain words, his doubt or his
+      certainty. He says he has seen it before only when a past learning
+      above is about it. No catchphrases or film quotes unless one truly
+      fits.
+      Under 100 characters. Name the problem, not the procedure. No file
+      names or paths, no counts, no scores or confidence. If there is
+      nothing to change, he says so.
+    headline_nothing: "Nothing here I'd change."
+    headline_unnamed: "Something to change here. The details say what."
+    headline_verify_failed: "Checked your change. The checkers pushed back."
+    headline_verify_clean: "Checked your change. Nothing pushed back."
+    headline_verify_none: "Checked your change. No checkers could run."
+    # Stage-neutral, like the cautions: a shaky or unbacked finding says so
+    # in the one line a person reads.
+    headline_unsure: "Check me on this."
+    headline_unbacked: "No diff to back it."
     target_one: " in {path}"
     target_many: " across {count} file(s)"
     early_exit: " Stopped early — I was sure and the checkers were clean."
@@ -159,6 +198,9 @@ base_expressions:
 #                     one per memory stage: the situation carries the meaning,
 #                     and five near-identical variants would be upkeep with no
 #                     reader-visible payoff.
+#                     It is spoken AFTER the run, in front of the finding (the
+#                     headline below), so it is short and never promises work
+#                     still to come ("Let me look…" read as stale narration).
 #
 # No cooldown/max_uses field in the deck. Each `neo` invocation is a fresh
 # process that selects at most one beat, so an in-process cooldown would be a
@@ -176,7 +218,7 @@ beats:
     # a cascade the run has not established. Gated on a finding AND worded to
     # what one traceback actually supports.
     requires_finding: true
-    orchestrator_line: "There's a failure here. I'm looking for what's underneath it."
+    orchestrator_line: "Looked under the failure."
     trigger_contexts:
       - "error_trace_present"
       - "multiple_failures"
@@ -202,7 +244,7 @@ beats:
     surface: "orchestrator"
     importance: "medium"
     requires_finding: false
-    orchestrator_line: "I have no memory of this codebase. Treat what follows as a first read."
+    orchestrator_line: "First read of this code."
     trigger_contexts:
       - "first_time_codebase"
       - "unfamiliar_domain"
@@ -231,7 +273,7 @@ beats:
     # establish that anything previously worked. Worded to the ask, not to an
     # assumed history.
     requires_finding: false
-    orchestrator_line: "You're chasing a break. Let's find where it actually starts."
+    orchestrator_line: "You're chasing a break."
     trigger_contexts:
       - "bugfix"
       - "error_trace"
@@ -258,7 +300,7 @@ beats:
     importance: "medium"
     # Fires on the word "refactor" alone, which says nothing about coupling.
     requires_finding: false
-    orchestrator_line: "Refactors live or die on the seams. Let me look there first."
+    orchestrator_line: "Refactors break at the seams."
     trigger_contexts:
       - "refactor"
       - "architecture"
@@ -284,7 +326,7 @@ beats:
     surface: "orchestrator"
     importance: "high"
     requires_finding: true
-    orchestrator_line: "The obvious answer is probably the wrong one here."
+    orchestrator_line: "The obvious answer is probably wrong here."
     trigger_contexts:
       - "algorithm"
       - "optimization"
@@ -313,7 +355,7 @@ beats:
     # about failure — so the line claims recognition, not knowledge of the
     # break. "I know where it breaks" was earned by remembering a style rule.
     requires_finding: true
-    orchestrator_line: "I've seen this shape before. Let me use what I remember."
+    orchestrator_line: "Seen this shape before."
     trigger_contexts:
       - "high_confidence"
       - "familiar_pattern"
