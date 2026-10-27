@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.62.1] - 2026-10-27
+
+### Fixed
+
+- **Plumbing records no longer become lessons as if you had asked them.** Claude Code writes some records with the user role that you never typed: messages from other sessions, hook feedback, skill bodies and continuation summaries after a compaction. The observer opened a new episode on each of them, so lessons were mined from them as if you had asked, and those records matched each other across sessions. They now join the episode already in progress, as tool results do, and a session that starts with a continuation summary waits for your first real message (#328).
+
 ## [0.62.0] - 2026-10-18
 
 ### Changed
