@@ -10,8 +10,8 @@ This is the schema-correct Stage A: Claude Code transcripts interleave
 ~10 record ``type`` values across multiple ``sessionId``s, and ~94% of
 ``user``-role records are ``tool_result`` envelopes rather than human
 messages. We therefore parse defensively — filtering to ``user``/
-``assistant`` records, skipping sidechains and meta records, and
-distinguishing genuine human text from tool output by content-block
+``assistant`` records, skipping sidechains, never letting a meta record
+(``isMeta``/``isCompactSummary``) open an episode, and distinguishing genuine human text from tool output by content-block
 structure. Only ``user``/``assistant`` records (which always carry
 ``uuid``/``sessionId``/``timestamp``) anchor episodes, so every episode
 has a stable watermark key.
@@ -184,11 +184,12 @@ def iter_records(path: Path) -> Iterator[dict]:
 def build_episodes(path: Path) -> list[Episode]:
     """Parse one transcript file into episodes (schema-correct Stage A).
 
-    Records are filtered to ``user``/``assistant``, sidechains and meta
-    records dropped, and partitioned by ``sessionId``. Within a session a
-    new episode opens on each genuine human message and absorbs the
-    following assistant text, tool uses, and tool errors until the next
-    human message.
+    Records are filtered to ``user``/``assistant``, sidechains dropped, and
+    partitioned by ``sessionId``. Within a session a new episode opens on
+    each genuine human message and absorbs the following assistant text,
+    tool uses, and tool errors until the next human message. A meta record
+    never opens one: it folds into the episode it lands in, like a
+    tool_result.
     """
     # Group records by session, preserving file order. Invariant relied upon:
     # human-message anchors are monotonic in file order; only intra-episode
@@ -216,7 +217,11 @@ def build_episodes(path: Path) -> list[Episode]:
             content = msg.get("content")
             uuid = r["uuid"]
             if r["type"] == "user":
-                human = _human_text(content)
+                # Meta records (cross-session messages, hook feedback, skill
+                # bodies) and continuation summaries wear the user role in
+                # plain prose, so `_is_synthetic` cannot see them.
+                plumbing = r.get("isMeta") or r.get("isCompactSummary")
+                human = "" if plumbing else _human_text(content)
                 if human:
                     if cur:
                         episodes.append(cur)

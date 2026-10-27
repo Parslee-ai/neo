@@ -142,6 +142,41 @@ def test_synthetic_command_and_control_strings_are_not_human(tmp_path):
     assert eps[0].ask == "a genuine human request"
 
 
+def test_meta_and_compact_summary_records_are_not_human(tmp_path):
+    """Plain-prose plumbing is flagged on the record, not in its text."""
+    fp = tmp_path / "s.jsonl"
+    _write(fp, [
+        _user("u1", "s1", text="a genuine human request"),
+        _assistant("a1", "s1", text="working"),
+        _user("m1", "s1", text="Another Claude session sent a message: hi", isMeta=True),
+        _user("m2", "s1", blocks=[{"type": "text", "text": "Stop hook feedback: Neo reviewed"}],
+              isMeta=True),
+        _user("m3", "s1", text="This session is being continued from a previous conversation",
+              isCompactSummary=True),
+        _assistant("a2", "s1", text="still working"),
+    ])
+    eps = build_episodes(fp)
+    assert len(eps) == 1
+    assert eps[0].ask == "a genuine human request"
+    assert eps[0].assistant_text == ["working", "still working"]
+    assert eps[0].last_uuid == "a2"
+
+
+def test_session_opening_on_a_compact_summary_waits_for_a_human_ask(tmp_path):
+    """Work answering only a summary has no ask, like any orphan assistant work."""
+    fp = tmp_path / "s.jsonl"
+    _write(fp, [
+        _user("m1", "s1", text="This session is being continued from a previous conversation",
+              isCompactSummary=True),
+        _assistant("a0", "s1", text="resuming the summarized task"),
+        _user("u1", "s1", text="a genuine human request"),
+        _assistant("a1", "s1", text="done"),
+    ])
+    eps = build_episodes(fp)
+    assert [ep.ask for ep in eps] == ["a genuine human request"]
+    assert eps[0].assistant_text == ["done"]
+
+
 def test_sessions_are_partitioned(tmp_path):
     fp = tmp_path / "s.jsonl"
     _write(fp, [
