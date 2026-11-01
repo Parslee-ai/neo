@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.62.5] - 2026-11-01
+
+### Changed
+
+- **Neo can now learn from fixes Claude writes its own way.** A lesson used to become durable memory only after Claude applied Neo's suggested change nearly word for word, which it almost never does: on a live install review findings were fixed differently every time (13 changed another way, 0 applied as written), so promotions stayed at one. Now, when Claude fixes the exact lines Neo flagged its own way and the static checks pass on that fix, it counts as evidence that the lesson was right (#336).
+  - **The bar for durable memory is unchanged:** two such pieces of evidence on two different revisions of the repository, so one session still can't promote its own lesson.
+  - **"Pass" means:** the edited file still parses and gains no new error. Warnings don't count against it, and code in other files isn't checked.
+  - **A fix that can't be checked, or fails the checks, counts for nothing,** as before. It never raises a lesson's confidence directly.
+  - **`neo memory learning-stats` shows how many fixes were verified this way.**
+  - **The check runs at most twice per request and within the `--fast` time budget,** so Claude Code's automatic reviews stay inside their deadline.
+
 ## [0.62.4] - 2026-11-01
 
 ### Fixed
