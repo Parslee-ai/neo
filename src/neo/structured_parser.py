@@ -8,7 +8,7 @@ import json
 import logging
 import re
 from typing import Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from jsonschema import validate, ValidationError
 
@@ -34,6 +34,10 @@ class ParseResult:
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     raw_block: Optional[str] = None
+    # What a lenient parse set aside or cut to accept the rest, one dict per
+    # event: {"item": 1-based index, "kind": "dropped" | "trimmed",
+    # "detail": text}. Empty when the block parsed as written.
+    notes: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ParseErrorCode:
@@ -334,7 +338,9 @@ def _normalize_empty_strings_recursive(data: Any, schema: dict) -> Any:
         return _normalize_empty_strings(data, schema)
 
 
-def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
+def _truncate_oversized_fields(
+    data: Any, schema: dict, cuts: Optional[list] = None, path: str = "",
+) -> Any:
     """
     Recursively truncate string fields that exceed maxLength constraints.
 
@@ -347,6 +353,11 @@ def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
 
     Returns:
         Modified data with truncated strings
+
+    ``cuts``, when given, also trims a list longer than its ``maxItems`` to its
+    head, and records ``(path, kept, total, unit)`` for every cut made, list
+    or string, so the caller can report it. Without it a long list is left to
+    fail validation; string cuts are then marked only by their ``...``.
     """
     if isinstance(data, dict):
         # Process dict values according to schema properties
@@ -355,7 +366,9 @@ def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
             for key, value in data.items():
                 if key in schema["properties"]:
                     field_schema = schema["properties"][key]
-                    result[key] = _truncate_oversized_fields(value, field_schema)
+                    result[key] = _truncate_oversized_fields(
+                        value, field_schema, cuts, f"{path}.{key}" if path else key
+                    )
                 else:
                     result[key] = value
             return result
@@ -363,9 +376,16 @@ def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
 
     elif isinstance(data, list):
         # Process list items according to schema items
+        limit = schema.get("maxItems")
+        if cuts is not None and limit is not None and len(data) > limit:
+            cuts.append((path, limit, len(data), "items"))
+            data = data[:limit]
         if "items" in schema:
             item_schema = schema["items"]
-            return [_truncate_oversized_fields(item, item_schema) for item in data]
+            return [
+                _truncate_oversized_fields(item, item_schema, cuts, f"{path}[{index}]")
+                for index, item in enumerate(data)
+            ]
         return data
 
     elif isinstance(data, str):
@@ -375,6 +395,8 @@ def _truncate_oversized_fields(data: Any, schema: dict) -> Any:
             if len(data) > max_len:
                 # Truncate to maxLength - 3 and append '...' (total length = maxLength)
                 # Example: maxLength=500 -> truncate to 497 chars + '...' = 500 chars
+                if cuts is not None:
+                    cuts.append((path, max_len, len(data), "chars"))
                 return data[:max_len - 3] + "..."
         return data
 
@@ -482,9 +504,68 @@ def parse_plan_steps(response: str) -> ParseResult:
 
 
 def parse_simulation_traces(response: str) -> ParseResult:
-    """Parse simulation traces from LM response."""
-    result = parse_structured_response(response, "simulation", {"type": "array", "items": SIMULATION_TRACE_SCHEMA})
-    return result
+    """Parse simulation traces from LM response, judging each trace alone.
+
+    Traces support an answer; they are not the answer. Validated as one array,
+    a single malformed trace (an omitted empty `issues_found`, eleven issues
+    where ten are allowed) discarded the plan and the code with it: on a live
+    install that was 9 of 13 engine errors, and it failed a release gate. Now
+    a trace that fails its schema is dropped and an over-long list in one is
+    cut to its limit, each recorded in ``notes`` for the caller to report.
+    A block that cannot be read at all, or in which EVERY trace fails, still
+    fails as before: there is then nothing left to stand on.
+    """
+    extracted = extract_block(response, "simulation")
+    if not extracted.success:
+        return extracted
+    loaded = tolerant_json_load(extracted.data)
+    if not loaded.success:
+        loaded.raw_block = extracted.raw_block
+        return loaded
+    if not isinstance(loaded.data, list):
+        result = validate_schema(loaded.data, {"type": "array", "items": SIMULATION_TRACE_SCHEMA})
+        result.raw_block = extracted.raw_block
+        return result
+
+    kept: list[dict[str, Any]] = []
+    notes: list[dict[str, Any]] = []
+    first_failure: Optional[ParseResult] = None
+    for index, item in enumerate(loaded.data, start=1):
+        cuts: list[tuple[str, int, int, str]] = []
+        if isinstance(item, dict) and "schema_version" not in item:
+            # It has one allowed value and says nothing about the trace, and
+            # the block's sentinel already declares the version. Dropping
+            # the trace for it threw away real evidence (its issues).
+            item = {**item, "schema_version": SCHEMA_VERSION}
+            notes.append({"item": index, "kind": "filled",
+                          "detail": "schema_version missing; the block declares it"})
+        item = _normalize_empty_strings_recursive(item, SIMULATION_TRACE_SCHEMA)
+        item = _truncate_oversized_fields(item, SIMULATION_TRACE_SCHEMA, cuts)
+        checked = validate_schema(item, SIMULATION_TRACE_SCHEMA)
+        if not checked.success:
+            first_failure = first_failure or checked
+            note = {"item": index, "kind": "dropped",
+                    "detail": f"[{checked.error_code}] {checked.error_message}"}
+            # What the dropped trace had found, when it said so legibly: a
+            # trace dropped for an unrelated field may be the one that found
+            # the bug, and its warnings must not vanish with it.
+            issues = item.get("issues_found") if isinstance(item, dict) else None
+            if isinstance(issues, list) and all(isinstance(i, str) for i in issues):
+                note["issues"] = issues
+            notes.append(note)
+            continue
+        notes.extend(
+            {"item": index, "kind": "trimmed", "unit": unit,
+             "detail": f"{path} cut to {limit} of {total} {unit}"}
+            for path, limit, total, unit in cuts
+        )
+        kept.append(item)
+
+    if first_failure is not None and not kept:
+        first_failure.raw_block = extracted.raw_block
+        first_failure.notes = notes
+        return first_failure
+    return ParseResult(success=True, data=kept, raw_block=extracted.raw_block, notes=notes)
 
 
 def parse_code_suggestions(response: str) -> ParseResult:

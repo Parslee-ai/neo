@@ -123,6 +123,11 @@ orchestrator_voice:
     caution_low_confidence: "I'm at {confidence} on this. Don't take it on trust — check it."
     caution_check_failed: "{tool} isn't happy: {summary}"
     caution_sim_issues: "I ran this through and hit {count} problem(s) with my own approach."
+    caution_sim_dropped: "{count} of my own simulation run(s) came back malformed. I set them aside."
+    caution_sim_dropped_flagged: >-
+      {count} of my own simulation run(s) came back malformed. I set them
+      aside, but they'd flagged {issues} problem(s). Treat those as open.
+    caution_sim_trimmed: "I listed more than I keep in {count} place(s). The rest got cut."
     caution_unverified_skipped: "No change was proposed, so the checkers had nothing to verify."
     caution_unverified_no_tools: "No checkers on this machine. This code is unverified."
     caution_no_verifiable_change: >-

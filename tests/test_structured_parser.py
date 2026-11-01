@@ -543,3 +543,85 @@ class TestRepairKeepsStringContents:
         r = tolerant_json_load('{"a": \u201cb"')
         assert not r.success
         assert "char" in r.error_message
+
+
+# ---------------------------------------------------------------------------
+# One malformed trace must not discard the rest. Validated as one array, a
+# single trace with an omitted empty `issues_found` (a v0.62.2 release-gate
+# failure) or eleven issues where ten are allowed threw away the plan and the
+# code with it: 9 of 13 engine errors on a live install.
+# ---------------------------------------------------------------------------
+
+def _trace(n, **overrides):
+    trace = {"n": n, "input_data": "in", "expected_output": "out",
+             "reasoning_steps": ["step"], "issues_found": [], "schema_version": "3"}
+    trace.update(overrides)
+    return {k: v for k, v in trace.items() if v is not None}
+
+
+def _sim_block(traces):
+    import json
+    return f"<<<NEO:SCHEMA=v3:KIND=simulation>>>\n{json.dumps(traces)}\n<<<END:simulation>>>"
+
+
+def test_a_trace_missing_a_field_is_dropped_and_the_rest_kept():
+    result = parse_simulation_traces(_sim_block([_trace(1), _trace(2, issues_found=None)]))
+
+    assert result.success
+    assert [t["n"] for t in result.data] == [1]
+    assert [(n["item"], n["kind"]) for n in result.notes] == [(2, "dropped")]
+    assert "issues_found" in result.notes[0]["detail"]
+
+
+def test_an_over_long_issue_list_is_cut_to_its_limit_and_noted():
+    issues = [f"issue {i}" for i in range(14)]
+
+    result = parse_simulation_traces(_sim_block([_trace(1, issues_found=issues)]))
+
+    assert result.success
+    assert result.data[0]["issues_found"] == issues[:10]
+    assert result.notes == [{"item": 1, "kind": "trimmed", "unit": "items",
+                             "detail": "issues_found cut to 10 of 14 items"}]
+
+
+def test_a_block_where_every_trace_fails_still_fails():
+    result = parse_simulation_traces(_sim_block([_trace(1, reasoning_steps=None),
+                                                 _trace(2, issues_found=None)]))
+
+    assert not result.success
+    assert result.error_code == "missing_required_field"
+    assert [n["kind"] for n in result.notes] == ["dropped", "dropped"]
+
+
+def test_an_empty_block_is_still_a_clean_parse():
+    result = parse_simulation_traces(_sim_block([]))
+
+    assert result.success and result.data == [] and result.notes == []
+
+
+def test_list_trimming_is_opt_in_so_other_blocks_still_fail_loudly():
+    from neo.structured_parser import _truncate_oversized_fields
+
+    schema = {"type": "array", "maxItems": 2, "items": {"type": "string"}}
+    assert _truncate_oversized_fields(["a", "b", "c"], schema) == ["a", "b", "c"]
+    cuts = []
+    assert _truncate_oversized_fields(["a", "b", "c"], schema, cuts) == ["a", "b"]
+    assert cuts == [("", 2, 3, "items")]
+
+
+def test_a_missing_schema_version_is_filled_not_dropped():
+    """One allowed value, no information: the trace and its issues stay."""
+    result = parse_simulation_traces(_sim_block([_trace(1, schema_version=None,
+                                                        issues_found=["off by one"])]))
+
+    assert result.success
+    assert result.data[0]["issues_found"] == ["off by one"]
+    assert [n["kind"] for n in result.notes] == ["filled"]
+
+
+def test_a_cut_string_is_recorded_on_the_trace_path():
+    result = parse_simulation_traces(_sim_block([_trace(1, input_data="x" * 1200)]))
+
+    assert result.success
+    assert result.notes == [{"item": 1, "kind": "trimmed", "unit": "chars",
+                             "detail": "input_data cut to 1000 of 1200 chars"}]
