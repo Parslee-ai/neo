@@ -327,10 +327,32 @@ def suggestion_is_scoreable(suggestion: "CodeSuggestion") -> bool:
     """
     if suggestion_is_review_marker(suggestion):
         return False
-    return bool(
-        (suggestion.unified_diff or "").strip()
-        or (suggestion.code_block or "").strip()
+    return diff_changes_lines(suggestion.unified_diff) or bool(
+        (suggestion.code_block or "").strip()
     )
+
+
+def diff_changes_lines(unified_diff: Optional[str]) -> bool:
+    """Does a unified diff add or remove a line?
+
+    Headers alone (`--- a\n+++ b\n`) change nothing, and they scored like a
+    patch. Compared as a tuple: `line[:1] in "+-"` is true for an EMPTY line,
+    so a blank line or a paragraph of prose passed for a change. The one
+    predicate for "carries a change"; the static checks use it too.
+    """
+    # `---`/`+++` are headers only before a section's first hunk: inside one,
+    # `+++i;` (C, JS) and `-- comment` (SQL, Lua) are changed lines.
+    in_hunk = False
+    for line in (unified_diff or "").splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+        elif not in_hunk and line.startswith(("--- ", "+++ ", "diff ")):
+            continue
+        elif line.startswith("diff "):
+            in_hunk = False
+        elif line[:1] in ("+", "-") and (in_hunk or not line.startswith(("+++", "---"))):
+            return True
+    return False
 
 
 # Why a run's `confidence` is — or is not — a number on the 0..1 scale.
@@ -376,6 +398,10 @@ class StaticCheckResult:
     summary: str
     kind: str = ""
     status: str = ""
+    # The suggested file this result is about ("" for a result about none,
+    # e.g. constraint checks). Coverage is counted per CHANGE: a clean check
+    # on one file must not read as the whole answer verified.
+    file_path: str = ""
 
 
 SPOKEN_LIMIT = 120

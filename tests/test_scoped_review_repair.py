@@ -25,7 +25,7 @@ def test_scoped_review_checks_patch_and_only_processes_advice(tmp_path):
         _check_constraints_static=lambda suggestions, constraints: None,
     )
     checked = []
-    def checks(suggestions):
+    def checks(suggestions, **_kwargs):
         checked.extend(suggestions)
         return [SimpleNamespace(tool_name='fixture-check', status='passed', summary='checked')]
     with patch('neo.static_analysis.run_static_checks', side_effect=checks), \
@@ -46,7 +46,7 @@ def test_revocation_during_deterministic_review_blocks_advisory_disclosure(tmp_p
         _extract_input_constraints=lambda request: [],
         _check_constraints_static=lambda suggestions, constraints: None,
     )
-    def checks(suggestions):
+    def checks(suggestions, **_kwargs):
         binding.runtime.refused = True
         return []
     with patch('neo.static_analysis.run_static_checks', side_effect=checks), \
