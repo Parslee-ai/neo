@@ -895,6 +895,48 @@ class TestOutcomeLinkage:
         review_facts = [f for f in store._facts if f.kind == FactKind.REVIEW]
         assert len(review_facts) == 0
 
+    def test_a_fact_reapplied_from_a_subdirectory_session_is_reinforced(self, store, tmp_path):
+        """(Linus c) Neo asked from `src/` links the suggestion as the model
+        wrote it (`foo.py`); git reports `src/foo.py`. The link must survive to
+        the reinforcement, round-tripped through a real tracker and git."""
+        import os
+        import subprocess
+        import time
+
+        from neo.memory.outcomes import OutcomeTracker
+
+        original = store.add_fact(subject="bugfix: fix validation",
+                                  body="Suggestion: add input validation",
+                                  kind=FactKind.PATTERN, confidence=0.7)
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "foo.py").write_text("def f():\n    return 1\n")
+        old = f"@{int(time.time() - 600)} +0000"
+        env = {**os.environ, "GIT_AUTHOR_DATE": old, "GIT_COMMITTER_DATE": old}
+        for args in (["init", "-q", "-b", "main", "."], ["config", "user.email", "t@t.t"],
+                     ["config", "user.name", "T"], ["add", "-A"], ["commit", "-qm", "init"]):
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
+        store._outcome_tracker = OutcomeTracker(codebase_root=str(repo / "src"),
+                                                project_id=store.project_id)
+
+        class _Suggestion:
+            file_path = "foo.py"
+            suggestion_id = "s-1"
+            description = "return 2"
+            confidence = 0.7
+            unified_diff = "--- a/foo.py\n+++ b/foo.py\n@@\n-    return 1\n+    return 2\n"
+            code_block = ""
+
+        store._outcome_tracker.save_session([_Suggestion()], "fix", {"foo.py": original.id})
+        (repo / "src" / "foo.py").write_text("def f():\n    return 2\n")
+        subprocess.run(["git", "commit", "-qam", "apply"], cwd=repo, check=True,
+                       capture_output=True)
+
+        store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        assert original.metadata.success_count == 1
+        assert original.metadata.confidence == pytest.approx(0.9)
+
     def test_accepted_outcome_without_linkage_creates_review(self, store):
         """When no fact ID is linked, fall back to creating a REVIEW fact."""
 
@@ -1001,6 +1043,69 @@ class TestOutcomeLinkage:
 
         # No new facts created
         assert len(store._facts) == initial_count
+
+    def test_an_expired_suggestion_closes_its_episode_on_disk(self, store, tmp_path):
+        """A suggestion nothing happened to for the whole TTL used to vanish
+        from the session log with its episode and candidate still reading
+        pending forever. It now closes as UNVERIFIED, which mutates no fact."""
+        import json
+        import os
+        import subprocess
+        import time
+
+        from neo.memory.episodes import (
+            LearningEpisode,
+            LearningEpisodeStore,
+            MemoryCandidateEvidence,
+        )
+        from neo.memory.outcomes import OutcomeTracker
+
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "api.py").write_text("x = 1\n")
+        # Committed before the record is aged to, or the init commit itself
+        # reads as a change made after the suggestion.
+        stamp = f"@{int(time.time() - OutcomeTracker.PENDING_SESSION_TTL_SECONDS - 600)} +0000"
+        env = {**os.environ, "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+        for args in (["init", "-q", "-b", "main", "."], ["config", "user.email", "t@t.t"],
+                     ["config", "user.name", "T"], ["add", "-A"], ["commit", "-qm", "init"]):
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
+        store._outcome_tracker = OutcomeTracker(codebase_root=str(repo),
+                                                project_id=store.project_id)
+        episode = LearningEpisode(episode_id="ep-expired", project_id=store.project_id,
+                                  final_outcome="suggested_pending_downstream_outcome")
+        episode.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id="candidate-expired", suggestion_id="suggestion-expired",
+            subject="pattern: validate input [src/api.py]", body="validate", kind="pattern",
+        ))
+        LearningEpisodeStore(store.project_id).save(episode)
+
+        class _Suggestion:
+            file_path = "src/api.py"
+            suggestion_id = "suggestion-expired"
+            description = "validate input"
+            confidence = 0.6
+            unified_diff = "--- a/src/api.py\n+++ b/src/api.py\n@@\n-x = 1\n+x = 2\n"
+            code_block = ""
+
+        store._outcome_tracker.save_session(
+            [_Suggestion()], "validate", {}, learning_episode_id="ep-expired",
+            candidates_by_suggestion={"suggestion-expired": {
+                "candidate_id": "candidate-expired",
+                "subject": "pattern: validate input [src/api.py]", "body": "validate",
+            }},
+        )
+        log = store._outcome_tracker._session_log_path
+        record = json.loads(log.read_text().strip())
+        record["timestamp"] -= OutcomeTracker.PENDING_SESSION_TTL_SECONDS + 60
+        log.write_text(json.dumps(record) + "\n")
+
+        store.detect_implicit_feedback({"prompt": "next"}, [])
+
+        persisted = LearningEpisodeStore(store.project_id).load("ep-expired")
+        assert persisted.final_outcome == "unverified"
+        assert persisted.memory_candidates[0].status == "unverified"
+        assert not log.exists()
 
     def test_single_accepted_episode_remains_candidate_only(self, store):
         """One verified result is insufficient to create durable knowledge."""

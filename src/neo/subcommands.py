@@ -925,6 +925,9 @@ def _handle_learning_stats(args) -> None:
             print(f"[Neo] {exc}", file=sys.stderr)
             return
         cutoff = (time.time() - window) if window else None
+    from neo.memory.outcomes import OutcomeTracker
+
+    expired_before = time.time() - OutcomeTracker.PENDING_SESSION_TTL_SECONDS
 
     projects = episodes = 0
     outcomes: Counter = Counter()
@@ -965,9 +968,23 @@ def _handle_learning_stats(args) -> None:
                 if cutoff is not None and float(episode.started_at or 0) < cutoff:
                     continue
                 counted_here += 1
-                outcomes[episode.final_outcome or "pending"] += 1
+                # Outcome detection stops waiting at the pending TTL. Episodes
+                # from before it closed what expired still read "pending";
+                # past the TTL nothing can resolve them, so they are reported
+                # as expired rather than inflating the pending count.
+                expired = (
+                    float(episode.started_at or 0) < expired_before
+                    and (episode.final_outcome or "").endswith("pending_downstream_outcome")
+                )
+                outcomes[
+                    "expired_no_outcome_observed" if expired
+                    else episode.final_outcome or "pending"
+                ] += 1
                 for candidate in episode.memory_candidates:
-                    candidates[candidate.status or "observed_unverified"] += 1
+                    status = candidate.status or "observed_unverified"
+                    if expired and status == "observed_unverified":
+                        status = "expired_unobserved"
+                    candidates[status] += 1
                     if candidate.kind != FactKind.PATTERN.value:
                         continue
                     if candidate.status not in {"supported_once", "durable"}:
@@ -1074,6 +1091,7 @@ def _handle_learning_stats(args) -> None:
             "rejected_by_verification": "rejected_by_verification (det. failure)",
             "unverified": "unverified",
             "observed_unverified": "observed_unverified (pending)",
+            "expired_unobserved": "expired (nothing observed within TTL)",
         }
         for status, count in candidates.most_common():
             print(f"    {labels.get(status, status):<42} {count:>5}")
@@ -1236,7 +1254,7 @@ def _classify_suggestion(file_path: str, has_change_text: bool, root: str) -> st
     # ALL-CAPS keeps real extension-less files (Makefile, Dockerfile) out.
     stem = Path(file_path).name
     if (not suffix and stem and stem.replace("_", "").isupper()
-            and not (Path(root) / normalize_suggestion_path(file_path, root)).is_file()):
+            and not _resolves_to_file(file_path, root)):
         return "advisory"
     # Prose suffix that names no existing file. This runs BEFORE the verifiable
     # test on purpose: a bare-slash doc at repo root ("/ARCHITECTURAL_REVIEW.md")
@@ -1264,16 +1282,11 @@ def _classify_suggestion(file_path: str, has_change_text: bool, root: str) -> st
 
 def _resolves_to_file(file_path: str, root: str) -> bool:
     """Does this suggestion path name a file that exists right now?"""
-    from neo.memory.outcomes import normalize_suggestion_path
+    from neo.memory.outcomes import suggested_file
 
     try:
-        normalized = normalize_suggestion_path(file_path, root)
-        path = Path(normalized)
-        if not path.is_absolute():
-            if not root:
-                return False
-            path = Path(root) / normalized
-        return path.is_file()
+        path = suggested_file(file_path, root)
+        return path is not None and path.is_file()
     except (OSError, ValueError):
         return False
 

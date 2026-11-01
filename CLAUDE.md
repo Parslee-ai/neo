@@ -70,6 +70,12 @@
   the fifth capped diff; never add an unbounded per-file git call there.
 - Read paths from git with `-z`; compare names by NFC key; give a pathspec only
   a spelling git printed (`_spelled_as`, `_GIT_NAMING`).
+- A suggested path resolves ONLY through `resolve_suggestion_target`: relative
+  to the top of whichever checkout of the repo holds it (nested/sibling
+  worktree, clone with the same remote, subdirectory root). Resolve at SAVE
+  (`repo_path`/`checkout`; worktrees get deleted); detection reads `repo_path`.
+  A path in no checkout is untrackable: one UNVERIFIED, never pending. The
+  tracker runs at the checkout top; `scope_root` is the asked dir.
 - UNVERIFIED and ADDRESSED mutate nothing. New `OutcomeType` → update both
   `outcomes.py` and `store.detect_implicit_feedback`. ADDRESSED (changed at the
   lines Neo flagged) is a location heuristic: never let it feed promotion,

@@ -116,6 +116,92 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   with precompose off, a spelling git did not print misses an NFC index on
   macOS (the file reads as untracked and `--no-index` diffs the whole file), so
   never hand a pathspec a path that has not been through `_spelled_as`.
+- **A suggested path is resolved once, at save, to where GIT will name it**
+  (`resolve_suggestion_target`, 2026-11-01). Four earlier fixes (`fb30817`,
+  #254, #315, #317) each closed one variant of "the suggestion's path is not
+  the path git prints", every one tested by suggesting `src/foo.py` relative
+  to the main checkout. Claude Code's Stop review does the opposite: the agent
+  works in `.claude/worktrees/agent-*/`, so the suggestion names the ABSOLUTE
+  path in that worktree while Neo runs rooted at the main checkout, and
+  `relative_to(main)` gave `.claude/worktrees/x/src/foo.py`, which git never
+  prints. Measured on a live install (October): of 344 Stop-review diff
+  suggestions only 48 (14%) targeted a file the detector could match; 57 of
+  60 pending worktree suggestions had been committed to main and never
+  matched; 150 named scratchpad files and 42 `~/.claude/plans`/`.claude`
+  files, which git can never see, and sat "pending" for the full TTL; 67 of
+  1,028 episodes were rooted in a subdirectory, where `Foo.cs` never matched
+  git's `backend/Foo.cs`.
+  - **One resolver, every shape.** The checkout holding a file is found the way
+    git discovers it (nearest `.git` entry, `checkout_top`, `stat` only). The
+    result is relative to THAT checkout's top. Same repository = same common
+    git dir (linked worktree) or the same remote-derived `project_id` (clone);
+    a clone without a remote never matches. Forks only for a file in another
+    checkout. `normalize_suggestion_path`, `suggestion_is_verifiable` and
+    `suggested_file` (filesystem location; never join a normalized path to
+    `codebase_root`, it is relative to the checkout) all go through it.
+  - **Spelling, not just location.** Parent directories are canonicalized
+    (a directory symlink `alias -> src`, `/tmp` -> `/private/tmp`) but the
+    last component is kept, because a tracked symlink is its own git entry.
+    On a case-insensitive filesystem `src/Foo.py` opens `src/foo.py` while git
+    prints the stored case; `_stored_spelling` asks git for it at save
+    (`ls-files` with a `:(icase,literal)` pathspec, one fork, never on the
+    detection path; directory listing is reserved to `neo/eligibility.py`). A rejected
+    RELATIVE path is returned absolute so it closes as untrackable instead of
+    reading as a git name.
+  - **At save, not detection.** Agent worktrees are removed once merged, and
+    then the absolute path resolves to nothing. `save_session` records
+    `repo_path` and `checkout`; `_suggestion_target` prefers them. Flagged
+    regions are read from `checkout`.
+  - **The tracker works from the checkout top.** git prints top-relative paths
+    and reads pathspecs relative to its cwd, so a subdirectory root broke both.
+    `scope_root` keeps the asked directory: relative suggestion paths are
+    relative to it (what the model was shown), and the architecture snapshot
+    measures it.
+  - **Untrackable closes once.** A resolved path still absolute (or climbing
+    out with `..`) is in no checkout: `_is_non_git_trackable` → one UNVERIFIED,
+    never retained. A suggestion still unresolved at the TTL also closes as
+    UNVERIFIED, so its episode and candidate stop reading pending forever.
+    UNVERIFIED mutates nothing. `learning-stats` reports older episodes left
+    pending past the TTL as `expired_no_outcome_observed`.
+  - **Legacy records rescan once.** A record saved before `repo_path` had its
+    watermark advanced past the commit that applied it. Its SUGGESTED paths
+    are looked for from the suggestion's own time (`elsewhere` and non-own
+    ledger edits only; widening `changed_files` would re-mint every file in
+    the window as INDEPENDENT), and retention stamps `repo_path` so it happens
+    once. Measured on fms: first run 11.6 s (2.5 s before), then 2.0 s.
+  - **Git's name is the only name downstream.** `repo_path` is authoritative:
+    the raw-path fallbacks (`file_path in changed_files`) are gone, because
+    from a subdirectory root the raw `foo.py` matched an unrelated top-level
+    `foo.py` and dropped the real suggestion. `resolved_paths` records git's
+    name as well, or an accepted file came back INDEPENDENT on the next run.
+    Fact links are keyed by both spellings. `_dedup_outcomes` keys by each
+    outcome's own git name (`Outcome.git_path`), never a map shared across
+    sessions: in a monorepo one session's raw `src/foo.py` is another's
+    `backend/src/foo.py`, and a shared map dropped one acceptance.
+    `_normalize_path` resolves against `scope_root` (raw suggestion paths are
+    relative to it). On the request path (`known_ours`, the store's link
+    keys) it runs with `identify_other_checkouts=False`: git's name for a file
+    in another checkout is already recorded, and identifying that checkout
+    again forked git twice per path on every request. The INDEPENDENT loop compares
+    git-printed paths directly: normalizing them again was ~200x the cost
+    (1.1 s per 5,000 paths) for an identical answer.
+  - **A removed recorded root is not walked through.** A legacy record saved
+    from inside an agent worktree holds relative paths and that worktree as
+    its root; resolving after removal walked into the main checkout and
+    answered `.claude/worktrees/x/src/foo.py`. Its paths stay as written.
+  - **Repository identity ignores ambient git env.** With `GIT_DIR` exported
+    (hooks, pre-commit) every checkout reports the same common dir, so every
+    foreign repository read as ours. `_git_here` strips the repository-
+    selecting variables (`_GIT_REPOSITORY_ENV`); the suite's conftest scrub
+    hid this, so the test sets `GIT_DIR` itself.
+  - **Known limits.** A suggestion naming a file in a DIFFERENT repository
+    closes as UNVERIFIED here; it is not routed to that project. A clone's
+    work counts only once it reaches a local branch of this checkout. A
+    legacy record whose worktree is already gone cannot be resolved.
+  - **What it changed, measured the same day:** on contrails and fms the
+    retained logs (133 suggestions) resolved to 13 MODIFIED and 55 UNVERIFIED,
+    0 ACCEPTED. Attribution was the leak that hid outcomes; it was not what
+    stops promotion. Claude applies review findings its own way.
 - **Recall hands a session each lesson once** (`NEO_RECALL_SEEN`, see
   `docs/claude-code-mods.md`). Lift is unchanged (it counts distinct sessions),
   but a `recall-lifted` fact's latest delivery is now its FIRST in a session,

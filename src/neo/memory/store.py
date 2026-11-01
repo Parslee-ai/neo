@@ -2653,8 +2653,10 @@ class FactStore:
         normalized_fact_ids: dict[str, str] = {}
         for path, fid in suggestion_fact_ids.items():
             normalized_fact_ids[path] = fid
-            normalized = self._outcome_tracker._normalize_path(path)
-            normalized_fact_ids[normalized] = fid
+            # Detection keys links in other checkouts by git's name already;
+            # identifying those checkouts again would fork git per link.
+            normalized_fact_ids[self._outcome_tracker._normalize_path(
+                path, identify_other_checkouts=False)] = fid
 
         def _lookup_fact_id(file_path: str) -> Optional[str]:
             """Look up fact_id with fallback for path normalization mismatches."""
@@ -2938,7 +2940,10 @@ class FactStore:
         normalized_fact_ids: dict[str, str] = {}
         for path, fid in suggestion_fact_ids.items():
             normalized_fact_ids[path] = fid
-            normalized_fact_ids[self._outcome_tracker._normalize_path(path)] = fid
+            # Detection keys links in other checkouts by git's name already;
+            # identifying those checkouts again would fork git per link.
+            normalized_fact_ids[self._outcome_tracker._normalize_path(
+                path, identify_other_checkouts=False)] = fid
 
         def _lookup_fact(file_path: str) -> Optional[Fact]:
             candidates = [
