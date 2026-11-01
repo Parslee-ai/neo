@@ -130,6 +130,10 @@ orchestrator_voice:
     caution_sim_trimmed: "I listed more than I keep in {count} place(s). The rest got cut."
     caution_unverified_skipped: "No change was proposed, so the checkers had nothing to verify."
     caution_unverified_no_tools: "No checkers on this machine. This code is unverified."
+    caution_unverified_unchecked: >-
+      The checkers couldn't give a verdict on {count} changed file(s). This
+      code is unverified.
+    caution_partly_checked: "Only part of this got checked. {count} changed file(s) went unchecked."
     caution_no_verifiable_change: >-
       {count} suggestion(s) named a file but carried no diff and no code.
       Nothing here is verifiable — treat this as no answer, not a safe one.
@@ -153,6 +157,8 @@ orchestrator_voice:
     panel_rejected: "Threw out the panel's answer. Nothing in it held up."
     phase_checks: "Running the checkers over it."
     phase_checks_clean: "All {count} checker(s) clean."
+    phase_checks_partial: "{count} checker(s) reached a verdict. {unchecked} changed file(s) went unchecked."
+    phase_checks_warned: "No errors. {warned} checker(s) raised warnings."
     phase_checks_failed: "{failed} of {count} checker(s) pushed back."
     phase_checks_none: "No checkers here. Nothing verified this."
     phase_checks_inconclusive: "The checkers ran and could evaluate none of it. Treat this as unverified."

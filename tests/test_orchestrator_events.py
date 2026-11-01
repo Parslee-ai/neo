@@ -29,7 +29,20 @@ def _block(kind, payload):
     return f"<<<NEO:SCHEMA=v3:KIND={kind}>>>\n{json.dumps(payload)}\n<<<END:{kind}>>>"
 
 
-def _response(*, issues=None, confidence=0.9, hypotheses=None, diff="--- a\n+++ b\n"):
+@pytest.fixture(autouse=True)
+def _empty_cwd(tmp_path, monkeypatch):
+    """The engine here has no codebase root, so suggestion paths resolve
+    against the cwd. An empty one keeps `src/parser.py` absent whatever
+    repository the suite runs from."""
+    monkeypatch.chdir(tmp_path)
+
+
+# A real change to a file that is not on disk: scoreable, and the checkers
+# report it not checked (they cannot read it) without spawning a tool.
+REAL_DIFF = "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+
+
+def _response(*, issues=None, confidence=0.9, hypotheses=None, diff=REAL_DIFF):
     plan = [{
         "id": "ps_1",
         "description": "Add a guard clause before the deref",
@@ -309,7 +322,7 @@ def test_skipped_static_checks_still_open_the_phase_they_close(monkeypatch):
     for something it never saw open."""
     sink = RecordingSink()
     engine = NeoEngine(
-        lm_adapter=FakeLM(_response()),
+        lm_adapter=FakeLM(_response(diff="")),  # proposes no change to check
         enable_persistent_memory=False,
         event_sink=sink,
     )
@@ -343,7 +356,7 @@ def test_skipped_static_checks_caution_names_the_real_reason(monkeypatch):
     seconds". Users were told their code was unverified because time ran out,
     on runs whose actual state was that no diff had been produced at all.
     """
-    engine = NeoEngine(lm_adapter=FakeLM(_response()), enable_persistent_memory=False)
+    engine = NeoEngine(lm_adapter=FakeLM(_response(diff="")), enable_persistent_memory=False)
     monkeypatch.setattr(engine, "_get_time_budget", lambda difficulty: 0.0)
     output = engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
 
@@ -722,7 +735,7 @@ def test_engine_holds_no_prose_of_its_own():
     # Comments may quote the wording to explain a decision; only executable
     # lines are the concern, since those are what actually reach a user.
     source = "\n".join(
-        line for line in Path("src/neo/engine.py").read_text().splitlines()
+        line for line in (Path(__file__).resolve().parents[1] / "src" / "neo" / "engine.py").read_text().splitlines()
         if not line.lstrip().startswith("#")
     )
     for phrase in ("I'd change", "Reading the code", "Don't take it on trust",
@@ -1076,10 +1089,7 @@ def _three_trace_response(bad_trace):
     """Two clean traces that agree, plus `bad_trace`."""
     import re
 
-    response = _response(
-        confidence=0.97,
-        diff="--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n",
-    )
+    response = _response(confidence=0.97)
     block = re.search(r"KIND=simulation>>>\n(.*)\n<<<END:simulation", response).group(1)
     good = json.loads(block)[0]
     traces = [good, dict(good, n=2), dict(good, n=3, **bad_trace)]
@@ -1153,3 +1163,70 @@ def test_trace_notes_do_not_leak_into_the_next_request():
     assert any("set them aside" in c for c in first.orchestrator.cautions)
     assert not any("set them aside" in c for c in second.orchestrator.cautions)
     assert "simulation_parse_notes" not in second.metadata
+
+
+def test_a_suggestion_with_a_diff_runs_the_checkers(monkeypatch):
+    """`have_changes` read `sug.diff` / `sug.code`, attributes CodeSuggestion
+    never had, so from 2026-08-26 no request ran its checkers and every real
+    diff was told it had nothing to verify."""
+    from neo.models import StaticCheckResult
+
+    ran = []
+    engine = NeoEngine(lm_adapter=FakeLM(_response()), enable_persistent_memory=False)
+    monkeypatch.setattr(
+        engine, "_run_static_checks",
+        lambda suggestions, constraints=None: ran.append(suggestions) or [
+            StaticCheckResult("ruff", [], "ok", status="passed", file_path="src/parser.py")],
+    )
+
+    output = engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
+
+    assert ran, "a diff was proposed and the checkers never ran"
+    assert not any("nothing to verify" in c for c in output.orchestrator.cautions)
+
+
+def test_a_header_only_diff_is_not_a_change_to_check(monkeypatch):
+    ran = []
+    engine = NeoEngine(lm_adapter=FakeLM(_response(diff="--- a\n+++ b\n")),
+                       enable_persistent_memory=False)
+    monkeypatch.setattr(engine, "_run_static_checks",
+                        lambda suggestions, constraints=None: ran.append(suggestions) or [])
+
+    engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
+
+    assert ran == []
+
+
+def _cautions_for(checks):
+    """Cautions for a run whose checks came back as ``checks``."""
+    from neo.models import StaticCheckResult  # noqa: F401  (shape reference)
+
+    engine = NeoEngine(lm_adapter=FakeLM(_response()), enable_persistent_memory=False)
+    engine._run_static_checks = lambda suggestions, constraints=None: checks
+    output = engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
+    return output.orchestrator.cautions
+
+
+def test_no_checkers_on_this_machine_is_said_only_when_true():
+    from neo.models import StaticCheckResult
+
+    missing = [StaticCheckResult("ruff", [], "ruff is unavailable", status="unavailable",
+                                 file_path="src/parser.py")]
+    crashed = [StaticCheckResult("ruff", [], "ruff failed (exit 2); treat this check as NOT run",
+                                 status="unavailable", file_path="src/parser.py")]
+
+    assert any("No checkers on this machine" in c for c in _cautions_for(missing))
+    crashed_cautions = _cautions_for(crashed)
+    assert not any("No checkers on this machine" in c for c in crashed_cautions)
+    assert any("couldn't give a verdict" in c for c in crashed_cautions), crashed_cautions
+
+
+def test_one_clean_file_does_not_vouch_for_another():
+    from neo.models import StaticCheckResult
+
+    checks = [
+        StaticCheckResult("ruff", [], "ok", status="passed", file_path="src/parser.py"),
+        StaticCheckResult("eslint", [], "eslint is unavailable", status="unavailable",
+                          file_path="web/app.ts"),
+    ]
+    assert any("Only part of this got checked" in c for c in _cautions_for(checks))

@@ -1046,7 +1046,11 @@ class NeoEngine:
             for change in neo_input.proposed_changes
         ]
         constraints = self._extract_input_constraints(neo_input)
-        static_checks = self._run_static_checks(suggestions, constraints)
+        from neo.models import suggestion_is_scoreable
+
+        static_checks = self._run_static_checks(
+            [s for s in suggestions if suggestion_is_scoreable(s)], constraints
+        )
         statuses = [self._static_check_status(check) for check in static_checks]
         confidence = (
             0.0 if "failed" in statuses
@@ -1321,15 +1325,24 @@ class NeoEngine:
         # Run the checks whenever there is something to check. Verification is
         # the last thing to drop, not the first: a slow network call is not a
         # reason to stop being able to say whether the patch is sound.
-        have_changes = any(
-            getattr(sug, "diff", None) or getattr(sug, "code", None)
-            for sug in code_suggestions
-        )
+        # `suggestion_is_scoreable` is the one "carries a change" predicate
+        # (the early exit and confidence use it too). This read `sug.diff` /
+        # `sug.code`, attributes CodeSuggestion has never had, so from
+        # 2026-08-26 no request ran its checkers and every answer with a real
+        # diff was told it had nothing to verify.
+        from neo.models import suggestion_is_scoreable
+
+        have_changes = any(suggestion_is_scoreable(sug) for sug in code_suggestions)
         if have_changes:
             self._begin_phase(
                 PHASE_STATIC_CHECKS, self._voice("phase_checks")
             )
-            static_checks = self._run_static_checks(code_suggestions, extracted_constraints)
+            # Only what carries a change: an advisory note with no diff would
+            # report "not run" and drag a run whose changes all passed.
+            static_checks = self._run_static_checks(
+                [sug for sug in code_suggestions if suggestion_is_scoreable(sug)],
+                extracted_constraints,
+            )
             statuses = [self._static_check_status(check) for check in static_checks]
             failed = [
                 check for check, status in zip(static_checks, statuses)
@@ -1354,6 +1367,18 @@ class NeoEngine:
                 )
             elif not evaluated:
                 summary = self._voice("phase_checks_inconclusive")
+            elif self._unchecked_changes(static_checks):
+                summary = self._voice(
+                    "phase_checks_partial", count=len(evaluated),
+                    unchecked=len(self._unchecked_changes(static_checks)),
+                )
+            elif any(self._static_check_status(c) == "warning" for c in evaluated):
+                # A warning is not "clean".
+                summary = self._voice(
+                    "phase_checks_warned",
+                    warned=sum(1 for c in evaluated
+                               if self._static_check_status(c) == "warning"),
+                )
             else:
                 summary = self._voice("phase_checks_clean", count=len(evaluated))
             self._end_phase(
@@ -2787,10 +2812,15 @@ RULES:
         Constraints are passed through explicitly (no instance state) so
         callers can compose the check without ordering-dependent setup.
         """
-        from neo.static_analysis import run_static_checks
+        from neo.static_analysis import (
+            FAST_STATIC_CHECK_PHASE_BUDGET_SECONDS,
+            STATIC_CHECK_PHASE_BUDGET_SECONDS,
+            run_static_checks,
+        )
         from neo.config import NeoConfig
 
         config = NeoConfig.load()
+        fast = getattr(self.config, "reasoning_mode", None) == "fast"
 
         results = run_static_checks(
             suggestions,
@@ -2798,6 +2828,11 @@ RULES:
             enable_pyright=config.enable_pyright,
             enable_mypy=config.enable_mypy,
             enable_eslint=config.enable_eslint,
+            codebase_root=self.codebase_root,
+            phase_budget=(
+                FAST_STATIC_CHECK_PHASE_BUDGET_SECONDS if fast
+                else STATIC_CHECK_PHASE_BUDGET_SECONDS
+            ),
         )
 
         # Phase 5.5: Static constraint verification (no code execution).
@@ -2810,6 +2845,23 @@ RULES:
             results.append(constraint_result)
 
         return results
+
+    @staticmethod
+    def _unchecked_changes(checks: list[StaticCheckResult]) -> list[str]:
+        """The changed files no check reached a verdict on.
+
+        Per change, not per check: a passed ruff run on one file and an
+        unavailable eslint (or a change that did not apply) on another read
+        as "all clean" when counted by checks. Results about no file (a
+        constraint check) are not changes.
+        """
+        reached: dict[str, bool] = {}
+        for check in checks:
+            if not check.file_path:
+                continue
+            verdict = NeoEngine._static_check_status(check) in ("passed", "warning", "failed")
+            reached[check.file_path] = reached.get(check.file_path, False) or verdict
+        return [path for path, ok in reached.items() if not ok]
 
     @staticmethod
     def _checks_that_evaluated(
@@ -3617,9 +3669,27 @@ RULES:
                 record["name"] == PHASE_STATIC_CHECKS and record["status"] == "skipped"
                 for record in self._phase_records
             )
+            # "No checkers on this machine" only when that is the reason:
+            # every result is a checker that is not installed. Checkers that
+            # ran and could not judge (a timeout, a failure, a change that did
+            # not apply) are a different fact with a different remedy.
+            unchecked = self._unchecked_changes(static_checks)
+            tools_missing = bool(static_checks) and all(
+                self._static_check_status(c) == "unavailable"
+                and c.summary.endswith(("is unavailable", "not found"))
+                or "not found - install" in c.summary
+                for c in static_checks
+            )
+            cautions.append(
+                self._voice("caution_unverified_skipped") if skipped or not static_checks
+                else self._voice("caution_unverified_no_tools") if tools_missing
+                else self._voice("caution_unverified_unchecked", count=max(1, len(unchecked)))
+            )
+        elif code_suggestions and self._unchecked_changes(static_checks):
+            # Some of it was checked. One clean check must not read as the
+            # whole answer verified.
             cautions.append(self._voice(
-                "caution_unverified_skipped" if skipped
-                else "caution_unverified_no_tools"
+                "caution_partly_checked", count=len(self._unchecked_changes(static_checks)),
             ))
         for question in next_questions[:3]:
             cautions.append(self._voice("caution_open_question", question=question))

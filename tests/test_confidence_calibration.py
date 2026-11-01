@@ -210,13 +210,18 @@ def _suggestion(path, diff="", code="", confidence=0.9):
     )
 
 
+REAL_HUNK = "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+
+
 def _engine():
     return NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
 
 
 def test_a_real_path_with_no_change_is_not_scoreable():
     assert suggestion_is_scoreable(_suggestion("src/a.py")) is False
-    assert suggestion_is_scoreable(_suggestion("src/a.py", diff="--- a\n+++ b\n"))
+    # Headers alone change nothing; they scored like a patch.
+    assert suggestion_is_scoreable(_suggestion("src/a.py", diff="--- a\n+++ b\n")) is False
+    assert suggestion_is_scoreable(_suggestion("src/a.py", diff=REAL_HUNK))
     assert suggestion_is_scoreable(_suggestion("src/a.py", code="return 1"))
 
 
@@ -241,7 +246,7 @@ def test_an_empty_change_is_dropped_from_the_average_not_averaged_in():
         [],
         [],
         [
-            _suggestion("src/a.py", diff="--- a\n+++ b\n", confidence=0.60),
+            _suggestion("src/a.py", diff=REAL_HUNK, confidence=0.60),
             _suggestion("src/b.py", confidence=0.96),
         ],
         [],

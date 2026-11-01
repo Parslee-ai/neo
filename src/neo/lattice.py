@@ -642,7 +642,7 @@ class Answerer:
                         file_path=str(path), unified_diff=change.unified_diff,
                         description=change.description, confidence=0.0,
                     ))
-                checks = run_static_checks(suggestions)
+                checks = run_static_checks(suggestions, codebase_root=str(root))
                 request = NeoInput(prompt=task.prompt or "Verify the proposed change.",
                                    working_directory=self.root,
                                    operating_mode=OperatingMode.ADVISE)
