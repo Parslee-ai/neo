@@ -267,6 +267,10 @@ class Outcome:
     """A detected outcome from comparing suggestions to actual changes."""
     outcome_type: OutcomeType
     file_path: str
+    # The name git prints for the file, when `file_path` is the suggestion as
+    # written (UNVERIFIED keeps that spelling for its fact link). What
+    # `_dedup_outcomes` keys on; "" means `file_path` already is git's name.
+    git_path: str = ""
     diff_summary: str = ""  # actual git diff content (truncated)
     suggestion_description: str = ""  # empty for independent changes
     suggestion_confidence: float = 0.0
@@ -356,19 +360,199 @@ def _modified_since(path: Path, since_timestamp: float) -> bool:
         return False
 
 
-def normalize_suggestion_path(path: str, codebase_root: Optional[str]) -> str:
-    """Normalize a suggestion's file path to the form outcome matching uses.
+def checkout_top(directory: Path) -> Optional[Path]:
+    """The top of the git checkout holding ``directory``, found the way git
+    discovers it: the nearest ancestor (or itself) with a ``.git`` entry, a
+    directory in a main checkout or clone, a file in a linked worktree or
+    submodule. None outside any checkout.
 
-    Handles three cases:
-    1. True absolute paths under codebase_root -> relative
-    2. Bare leading slash under codebase_root (/src/bar.py) -> src/bar.py
-    3. Everything else unchanged
-
-    Module-level and shared: anything that predicts whether a suggestion can be
-    verified MUST resolve paths the same way attribution does, or it will gate
-    on a different answer than the code it is predicting.
+    Directories that do not exist are walked through, so a path in a
+    not-yet-created directory still finds its checkout. Only `stat` calls: this
+    runs per suggested path on the request path and must never fork.
+    Absolutized first: `Path(".").parents` is empty, so a relative directory
+    would otherwise never reach the checkout above it.
     """
-    if not path:
+    directory = directory.absolute()
+    for candidate in (directory, *directory.parents):
+        try:
+            if (candidate / ".git").exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+# Variables that make git answer for a repository other than the one at its
+# cwd. Hooks and pre-commit export them (they flipped this repo bare once,
+# #179/#180), and with GIT_DIR set every checkout reports the same common dir,
+# so any foreign repository would read as this one.
+_GIT_REPOSITORY_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
+def _git_here(top: Path, *args: str) -> Optional[str]:
+    """``git <args>`` run in ``top`` about ``top``'s own repository; its
+    stripped stdout, or None on any failure."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_REPOSITORY_ENV}
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=top, env=env,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        logger.debug("git %s failed in %s (non-fatal): %s", args[0], top, exc)
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _git_common_dir(top: Path) -> Optional[Path]:
+    """The repository a checkout belongs to: its resolved common git dir,
+    shared by a main checkout and all its linked worktrees. None on failure."""
+    common = _git_here(top, "rev-parse", "--git-common-dir")
+    return _resolved(top / common) if common else None
+
+
+def _same_repository(top: Path, own_top: Path) -> bool:
+    """Is checkout ``top`` the same repository as ``own_top``?
+
+    A linked worktree shares the common git dir. A separate clone does not, but
+    it carries the project's identity (``project_id``: the hash of the
+    normalized remote URL), and its commits reach this checkout through a
+    branch. A clone with no remote falls back to a path hash, which differs per
+    clone, so it is never matched: there is nothing to prove it is the same
+    project. Forks git; called only for a path in ANOTHER checkout.
+    """
+    common = _git_common_dir(top)
+    if common is not None and common == _git_common_dir(own_top):
+        return True
+    from neo.memory.scope import _normalize_remote_url
+
+    remote = _normalize_remote_url(_git_here(top, "remote", "get-url", "origin") or "")
+    if not remote:
+        return False
+    # The same comparison `project_id` makes (hash of the normalized remote).
+    return remote == _normalize_remote_url(
+        _git_here(own_top, "remote", "get-url", "origin") or ""
+    )
+
+
+def resolve_suggestion_target(
+    path: str, codebase_root: Optional[str], *, identify_other_checkouts: bool = True,
+) -> Optional[tuple[str, str]]:
+    """``(checkout, repo_path)`` for the file a suggestion names, or None.
+
+    ``repo_path`` is the path relative to the top of the checkout holding the
+    file, which is the form git prints in every listing outcome detection
+    reads, whatever directory git runs in. ``checkout`` is that top, the
+    directory ``repo_path`` is read from. None when the file is in no checkout
+    of ``codebase_root``'s repository: a scratchpad, ``~/.claude/plans``, a
+    different repository, or a non-git ``codebase_root``. Git can never show
+    what was done to such a file.
+
+    The suggestion may name the file in any checkout of the repository: its own
+    (possibly from a subdirectory ``codebase_root``), a linked worktree nested
+    inside it (``.claude/worktrees/x/``) or beside it, or a separate clone with
+    the same remote. Each used to stay relative to the wrong directory
+    (``.claude/worktrees/x/src/foo.py``, ``backend/...`` vs ``src/...``) and
+    matched nothing git printed, so the suggestion sat pending until it expired.
+
+    A relative path, or a bare leading slash (``/src/foo.py``) whose target is
+    under ``codebase_root``, is relative to ``codebase_root``: the directory the
+    model was shown. Resolved and as-given forms both count (``/tmp`` vs
+    ``/private/tmp``), as in ``_locate``.
+
+    ``identify_other_checkouts=False`` answers None for a file in another
+    checkout instead of forking git to establish it is the same repository:
+    for callers on the request path that already hold git's name for those.
+
+    A file in a linked worktree resolves only while that worktree exists, so a
+    suggestion must be resolved when it is SAVED (``save_session`` records the
+    answer): agent worktrees are routinely removed once their work is merged.
+    """
+    if not path or not codebase_root:
+        return None
+    root = Path(codebase_root)
+    own_top = checkout_top(root)
+    if own_top is None:
+        return None
+    given = Path(path)
+    if not given.is_absolute():
+        target = root / given
+    else:
+        target = given
+        if path.startswith("/") and checkout_top(given.parent) is None:
+            # "/src/foo.py": the model's root-relative spelling, when it names
+            # something under the root rather than a real absolute path.
+            stripped = root / path.lstrip("/")
+            if stripped.exists() or stripped.parent.exists():
+                target = stripped
+    # Parent directories canonicalized first: a directory symlink (`alias ->
+    # src`) or a symlinked prefix (`/tmp` -> `/private/tmp`) is not a path git
+    # prints. The last component stays as written, because a tracked symlink
+    # is its own git entry and resolving it would name its target instead.
+    def forms():
+        parent = _resolved(target.parent)
+        if parent is not None:
+            yield parent / target.name
+        yield target
+        yield _resolved(target)
+
+    for form in forms():
+        if form is None:
+            continue
+        top = checkout_top(form.parent)
+        if top is None:
+            continue
+        try:
+            relative = form.relative_to(top)
+        except ValueError:
+            continue
+        if ".." in relative.parts or str(relative) == ".":
+            continue  # "src/../src/foo.py" still resolves in its resolved form
+        same = top == own_top or _resolved(top) == _resolved(own_top)
+        if not same and not (identify_other_checkouts and _same_repository(top, own_top)):
+            return None
+        return str(top), relative.as_posix()
+    return None
+
+
+def _stored_spelling(top: Path, repo_path: str) -> str:
+    """``repo_path`` in the letter case git stores it under.
+
+    On a case-insensitive filesystem (macOS by default) `src/Foo.py` opens
+    `src/foo.py`, so the resolver accepts the model's spelling, but git prints
+    the name as stored and the two never match. Asked of git with a
+    case-insensitive literal pathspec; kept as written unless exactly one
+    tracked file matches, and only when the written spelling opens a file at
+    all (a new file, or a Linux tree holding `Foo.py` and `foo.py`, stays as
+    written). One fork, at save time only, never on the detection path.
+    """
+    if not (top / repo_path).is_file():
+        return repo_path
+    listed = _git_here(top, *_GIT_NAMING[1:], "ls-files", "-z", "--",
+                       f":(icase,literal){repo_path}")
+    names = [name for name in (listed or "").split("\0") if name]
+    if len(names) == 1 and names[0] != repo_path and names[0].casefold() == repo_path.casefold():
+        return names[0]
+    return repo_path
+
+
+def _unresolved_spelling(path: str, codebase_root: Optional[str]) -> str:
+    """What ``normalize_suggestion_path`` answers when the resolver could not
+    place ``path`` in a checkout of the repository."""
+    if codebase_root and checkout_top(Path(codebase_root)) is not None:
+        # Rejected by the resolver: in no checkout of this repository (a
+        # nested repository with another identity, or `../` out of it). Left
+        # relative it would read as a name git prints and sit pending until
+        # it expired; absolute, it is untrackable and closes once.
+        given = Path(path)
+        if not given.is_absolute():
+            return str((Path(codebase_root) / given).absolute())
         return path
 
     if codebase_root:
@@ -389,6 +573,46 @@ def normalize_suggestion_path(path: str, codebase_root: Optional[str]) -> str:
                 return stripped
 
     return path
+
+
+def normalize_suggestion_path(
+    path: str, codebase_root: Optional[str], *, identify_other_checkouts: bool = True,
+) -> str:
+    """Normalize a suggestion's file path to the form outcome matching uses.
+
+    The ``repo_path`` of ``resolve_suggestion_target`` when the file is in a
+    checkout of the repository; otherwise, for a ``codebase_root`` outside git,
+    the old rules: a true absolute path under it becomes relative, a bare
+    leading slash (``/src/bar.py``) whose target exists is stripped, and
+    anything else is returned unchanged. A path still absolute afterwards is one
+    git can never name (``_is_non_git_trackable``).
+
+    Module-level and shared: anything that predicts whether a suggestion can be
+    verified MUST resolve paths the same way attribution does, or it will gate
+    on a different answer than the code it is predicting.
+    """
+    if not path:
+        return path
+
+    if codebase_root and not Path(codebase_root).is_dir():
+        # A root since removed (an agent's worktree). Resolving would walk
+        # through it into the enclosing checkout and answer
+        # `.claude/worktrees/x/src/foo.py`. Paths under it were relative to
+        # its top, which is what git prints in every checkout.
+        given = Path(path)
+        if not given.is_absolute():
+            return path
+        try:
+            return given.relative_to(codebase_root).as_posix()
+        except ValueError:
+            return path
+
+    target = resolve_suggestion_target(
+        path, codebase_root, identify_other_checkouts=identify_other_checkouts
+    )
+    if target is not None:
+        return target[1]
+    return _unresolved_spelling(path, codebase_root)
 
 
 def _spelled_as(path: str, reported: set[str]) -> str:
@@ -544,6 +768,21 @@ def region_rewritten(region: dict, code_lines: list[str]) -> bool:
             and all(line in present for line in region.get("outer", [])))
 
 
+def suggested_file(path: str, codebase_root: Optional[str]) -> Optional[Path]:
+    """Where on disk the file a suggestion names is, by the same resolution
+    attribution uses; None when it cannot be placed. ``normalize_suggestion_path``
+    is relative to the CHECKOUT holding the file, which is not ``codebase_root``
+    for a file in another checkout or a root below the checkout's top, so
+    joining it to ``codebase_root`` names the wrong file."""
+    target = resolve_suggestion_target(path, codebase_root)
+    if target is not None:
+        return Path(target[0]) / target[1]
+    normalized = Path(normalize_suggestion_path(path, codebase_root))
+    if normalized.is_absolute():
+        return normalized
+    return Path(codebase_root) / normalized if codebase_root else None
+
+
 def suggestion_is_verifiable(
     file_path: str, has_change_text: bool, codebase_root: Optional[str]
 ) -> bool:
@@ -561,27 +800,39 @@ def suggestion_is_verifiable(
     or which points outside the repo ("/review/commit-<sha>.md", "/dev/null").
     Directories are rejected — a diff never names one.
 
-    Resolution goes through ``normalize_suggestion_path`` deliberately: an
+    Resolution goes through ``resolve_suggestion_target``, the resolver
+    ``normalize_suggestion_path`` and attribution use, deliberately: an
     independent reimplementation missed bare-leading-slash paths and so called
-    two genuinely promotable candidates unverifiable.
+    two genuinely promotable candidates unverifiable. A file in no checkout of
+    the repository (a scratchpad, a plan) is not verifiable even though it
+    exists: no git diff will ever name it.
     """
     if not file_path or not has_change_text:
         return False
     try:
-        normalized = normalize_suggestion_path(file_path, codebase_root)
-        path = Path(normalized)
-        if not path.is_absolute():
-            if not codebase_root:
-                return False
-            path = Path(codebase_root) / normalized
+        target = resolve_suggestion_target(file_path, codebase_root)
+        if target is not None:
+            checkout, repo_path = target
+            base = checkout
+            path = Path(checkout) / repo_path
+        elif codebase_root and checkout_top(Path(codebase_root)) is not None:
+            return False
+        else:
+            base = codebase_root
+            normalized = normalize_suggestion_path(file_path, codebase_root)
+            path = Path(normalized)
+            if not path.is_absolute():
+                if not codebase_root:
+                    return False
+                path = Path(codebase_root) / normalized
         if path.is_dir():
             return False
         if path.is_file():
             return True
         # Doesn't exist yet: only a plausible new file inside the repo.
-        if not codebase_root:
+        if not base:
             return False
-        root = Path(codebase_root).resolve()
+        root = Path(base).resolve()
         parent = path.parent.resolve()
         return parent.is_dir() and (parent == root or parent.is_relative_to(root))
     except (OSError, ValueError):
@@ -600,7 +851,17 @@ class OutcomeTracker:
     """
 
     def __init__(self, codebase_root: Optional[str] = None, project_id: str = ""):
-        self.codebase_root = codebase_root
+        # Neo may be asked from a subdirectory of a checkout. Every path git
+        # prints is relative to the checkout's TOP, and every pathspec is read
+        # relative to git's cwd, so outcome detection works from the top:
+        # rooted at the subdirectory, a suggestion read `Foo.cs` while git
+        # printed `backend/Foo.cs`, and nothing ever matched. `scope_root`
+        # keeps the directory Neo was asked about, which is what the model saw
+        # (relative suggestion paths are relative to it) and what the
+        # architecture snapshot measures.
+        self.scope_root = codebase_root
+        top = checkout_top(Path(codebase_root)) if codebase_root else None
+        self.codebase_root = str(top) if top is not None else codebase_root
         self.project_id = project_id
         self._session_path = self._get_session_path()
         self._session_log_path = self._get_session_log_path()
@@ -768,13 +1029,28 @@ class OutcomeTracker:
             suggestion_id = getattr(s, "suggestion_id", "")
             candidate = candidates_by_suggestion.get(suggestion_id, {})
             unified_diff = getattr(s, "unified_diff", "")
+            # Resolved NOW, while the checkout holding the file still exists:
+            # an agent's worktree is usually removed once its work is merged,
+            # and after that its absolute path resolves to nothing. Detection
+            # reads `repo_path` instead of re-resolving `file_path`.
+            target = resolve_suggestion_target(file_path, self.scope_root)
+            if target is not None:
+                checkout = target[0]
+                repo_path = _stored_spelling(Path(checkout), target[1])
+            else:
+                repo_path = _unresolved_spelling(file_path, self.scope_root)
+                checkout = "" if Path(repo_path).is_absolute() else self.codebase_root or ""
             records.append({
                 "suggestion_id": suggestion_id,
                 "file_path": file_path,
+                "repo_path": repo_path,
+                "checkout": checkout,
                 "description": getattr(s, "description", "")[:500],
                 "confidence": getattr(s, "confidence", 0.0),
                 "suggested_diff": unified_diff[:2000],
-                "flagged_regions": self._flagged_regions_present(file_path, unified_diff),
+                "flagged_regions": self._flagged_regions_present(
+                    checkout, repo_path, file_path, unified_diff
+                ),
                 "suggested_code": getattr(s, "code_block", "")[:4000],
                 "candidate_id": candidate.get("candidate_id", ""),
                 "candidate_subject": candidate.get("subject", ""),
@@ -826,11 +1102,11 @@ class OutcomeTracker:
 
     def _snapshot_architecture(self) -> dict:
         """Capture an ArchSnapshot of the codebase. Always best-effort."""
-        if not self.codebase_root:
+        if not self.scope_root:
             return {}
         try:
             from neo.architecture_metrics import compute
-            return compute(self.codebase_root).to_dict()
+            return compute(self.scope_root).to_dict()
         except Exception as exc:
             logger.debug("architecture snapshot failed (non-fatal): %s", exc)
             return {}
@@ -864,7 +1140,7 @@ class OutcomeTracker:
 
         try:
             baseline = ArchSnapshot.from_dict(baseline_dict)
-            current = compute(self.codebase_root) if self.codebase_root else ArchSnapshot()
+            current = compute(self.scope_root) if self.scope_root else ArchSnapshot()
         except Exception as exc:
             logger.debug("arch delta computation failed (non-fatal): %s", exc)
             return None
@@ -875,19 +1151,21 @@ class OutcomeTracker:
 
         return compare(baseline, current)
 
-    def _flagged_regions_present(self, file_path: str, unified_diff: str) -> list[dict]:
+    def _flagged_regions_present(
+        self, checkout: str, repo_path: str, file_path: str, unified_diff: str
+    ) -> list[dict]:
         """The regions ``unified_diff`` targets that the file holds right now.
 
         Recorded at suggestion time because the outcome check asks whether
         they were rewritten later, which only means something for code that
         was there: a hunk written against another version of the file, or
-        invented, is dropped here instead of reading as addressed later.
+        invented, is dropped here instead of reading as addressed later. Read
+        from the checkout holding the file, which for a suggestion about an
+        agent's worktree is not ``codebase_root``.
         """
-        if not unified_diff or not self.codebase_root:
+        if not unified_diff or not checkout:
             return []
-        code = _read_code_lines(
-            self.codebase_root, normalize_suggestion_path(file_path, self.codebase_root)
-        )
+        code = _read_code_lines(checkout, repo_path)
         if code is None:
             return []
         present = set(code)
@@ -974,9 +1252,7 @@ class OutcomeTracker:
             spelling
             for prev in sessions if prev.project_id == self.project_id
             for sugg in prev.suggestions
-            for spelling in _unicode_spellings(normalize_suggestion_path(
-                sugg.get("file_path", ""), prev.codebase_root or self.codebase_root
-            ))
+            for spelling in _unicode_spellings(self._suggestion_target(sugg, prev))
         })
         # Where each dirty path lives, own checkout first: what
         # `_applied_on_revision` reads instead of re-asking git per checkout.
@@ -992,6 +1268,8 @@ class OutcomeTracker:
         # Sessions whose suggestions are still awaiting a user action. Retained
         # rather than cleared — see the note at the clearing step below.
         pending: list[SessionRecord] = []
+        # Suggestions that reached the TTL with nothing observed.
+        expired: list[Outcome] = []
 
         for prev in sessions:
             if prev.project_id != self.project_id:
@@ -1002,6 +1280,16 @@ class OutcomeTracker:
             # (below) resolve their linked fact through this map, and those
             # sessions never reach the git-matching branch.
             merged_fact_ids.update(prev.suggestion_fact_ids)
+            # Links are keyed by the path as the model wrote it; outcomes carry
+            # the name git prints. Key each link by both (same precedence as
+            # the raw keys: the later session wins), so a durable fact
+            # re-applied from a subdirectory or an agent's worktree is found.
+            for sugg in prev.suggestions:
+                raw = sugg.get("file_path", "")
+                if raw in prev.suggestion_fact_ids:
+                    merged_fact_ids[self._suggestion_target(sugg, prev)] = (
+                        prev.suggestion_fact_ids[raw]
+                    )
 
             # Start from how far this record has already been scanned, not from
             # when the suggestion was made. A retained record's anchor never
@@ -1010,7 +1298,22 @@ class OutcomeTracker:
             changed_files = self._get_changed_files_since(
                 since, working_tree=working_tree
             )
-            elsewhere = self._get_changed_elsewhere_since(since)
+            # A record saved before suggestions carried `repo_path` was resolved
+            # wrongly on every earlier run (a suggestion naming a file in an
+            # agent's worktree, or from a subdirectory root, matched nothing),
+            # while its scan watermark kept advancing past the commit that
+            # applied it. Its suggested paths are looked for once more from the
+            # suggestion itself; retention below stamps `repo_path`, so this
+            # happens once per record. Only the evidence that resolves Neo's
+            # OWN suggestions widens; `changed_files`, which INDEPENDENT
+            # detection scans, keeps its watermark, or every file touched in
+            # the window would be re-minted as an independent change.
+            legacy = any(
+                "repo_path" not in sugg for sugg in prev.suggestions
+                if sugg.get("file_path")
+            )
+            resolve_since = prev.timestamp if legacy else since
+            elsewhere = self._get_changed_elsewhere_since(resolve_since)
             # A linked worktree's dirty file counts only if it was written
             # after the suggestion. Agents keep work in progress uncommitted,
             # often in the very file they asked about; read as-is, that
@@ -1038,19 +1341,45 @@ class OutcomeTracker:
             for ts, path, own in host_edits:
                 if ts >= since:
                     (changed_files if own else elsewhere).add(_spelled_as(path, reported))
+                elif ts >= resolve_since:
+                    elsewhere.add(_spelled_as(path, reported))
 
             # Retain a REDUCED record holding only what is still outstanding.
             # Keeping the whole session would re-emit an outcome for every
             # already-resolved suggestion on each later invocation.
             remaining = self._unresolved_suggestions(prev, changed_files | elsewhere)
-            if remaining and not self._session_expired(prev):
+            if remaining and self._session_expired(prev):
+                # Nothing was observed in the whole window. Say so, once:
+                # UNVERIFIED mutates no fact and overrules no verdict, but it
+                # closes the episode and its candidate, which otherwise read
+                # "pending" forever after the record is dropped here.
+                expired.extend(
+                    self._unverified_outcome(prev, sugg, sugg.get("file_path", ""))
+                    for sugg in remaining
+                )
+            elif remaining:
+                # Both spellings: the git name is what INDEPENDENT detection
+                # compares against, and the raw one keeps older readers right.
                 resolved_now = [
-                    s.get("file_path", "") for s in prev.suggestions
+                    name for s in prev.suggestions
                     if s.get("file_path") and s not in remaining
+                    for name in (s["file_path"], self._suggestion_target(s, prev))
                 ]
+                if legacy:
+                    # Once, with the legacy record: its resolved paths are raw
+                    # spellings; add git's names while any worktree they name
+                    # still exists.
+                    resolved_now += [
+                        normalize_suggestion_path(path, prev.codebase_root or self.codebase_root)
+                        for path in prev.resolved_paths if Path(path).is_absolute()
+                    ]
                 pending.append(replace(
                     prev,
-                    suggestions=remaining,
+                    suggestions=[
+                        sugg if "repo_path" in sugg
+                        else {**sugg, "repo_path": self._suggestion_target(sugg, prev)}
+                        for sugg in remaining
+                    ],
                     scanned_through=scan_started,
                     resolved_paths=sorted(set(prev.resolved_paths) | set(resolved_now)),
                 ))
@@ -1079,6 +1408,7 @@ class OutcomeTracker:
         # Also check for non-git outcomes (weak implicit acceptance for paths the
         # git matcher can't see: review docs, /dev/null, docs/).
         all_outcomes.extend(self._detect_non_git_outcomes(sessions))
+        all_outcomes.extend(expired)
 
         # Collapse to one outcome per file path, strongest signal winning, so a
         # path that is BOTH git-changed and non-git-trackable doesn't double-bump
@@ -1251,7 +1581,12 @@ class OutcomeTracker:
         }
         best: dict[str, Outcome] = {}
         for o in outcomes:
-            key = self._normalize_path(o.file_path)
+            # A git-matched outcome carries git's name, an UNVERIFIED one the
+            # raw suggested path plus the git name it resolved to; both key by
+            # the file git names. Per outcome, never a lookup shared across
+            # sessions: one session's raw `src/foo.py` may be another's
+            # `backend/src/foo.py`.
+            key = o.git_path or o.file_path
             cur = best.get(key)
             if cur is None or priority.get(o.outcome_type, 0) > priority.get(cur.outcome_type, 0):
                 best[key] = o
@@ -1277,8 +1612,15 @@ class OutcomeTracker:
         retention rule, so the two cannot disagree about which suggestions are
         still worth waiting on.
         """
+        # Resolution leaves a path absolute, or climbing out with `..`, only
+        # when the file is in no checkout of this repository: a scratchpad, a
+        # plan under ~/.claude, another repository. Git prints neither form, so
+        # such a suggestion used to sit "pending" until it expired, and it was
+        # nearly half of what the Stop review suggested.
+        rel = Path(normalized) if normalized else None
         return (
             file_path in self._NON_TRACKABLE_PATHS
+            or (rel is not None and (rel.is_absolute() or ".." in rel.parts))
             or normalized.startswith("docs/")
             or "/docs/" in normalized
             or self._is_review_only_path(file_path)
@@ -1307,18 +1649,43 @@ class OutcomeTracker:
             file_path = sugg.get("file_path", "")
             if not file_path:
                 continue
-            normalized = normalize_suggestion_path(
-                file_path, session.codebase_root or self.codebase_root
-            )
+            normalized = self._suggestion_target(sugg, session)
             if self._is_non_git_trackable(file_path, normalized):
                 continue
             normalized = _spelled_as(normalized, changed_files)
             # Same predicate _match_to_suggestions uses, so "resolved" here and
             # "matched" there cannot drift apart.
-            if normalized in changed_files or file_path in changed_files:
+            if normalized in changed_files:
                 continue
             remaining.append(sugg)
         return remaining
+
+    def _recorded_top(self, session: SessionRecord) -> str:
+        """The top of the checkout a record was saved in. Old records hold the
+        asked directory, which may be below it; git names are top-relative."""
+        root = session.codebase_root or self.codebase_root or ""
+        top = checkout_top(Path(root)) if root and Path(root).is_dir() else None
+        return str(top) if top is not None else root
+
+    def _suggestion_target(self, sugg: dict, session: SessionRecord) -> str:
+        """The path of the file ``sugg`` names, as git prints it.
+
+        ``repo_path``, resolved when the suggestion was saved, is preferred: the
+        checkout holding the file (often an agent's worktree) may be gone by
+        now. Records written before it existed are resolved now, against the
+        root they were recorded under, which differs from this run's whenever
+        that run happened in another checkout of the repository.
+        """
+        if "repo_path" in sugg:
+            return sugg["repo_path"]
+        path = sugg.get("file_path", "")
+        root = session.codebase_root or self.codebase_root
+        if root and not Path(root).is_dir() and Path(path).is_absolute():
+            try:
+                Path(path).relative_to(root)
+            except ValueError:
+                root = self.codebase_root  # not under the removed root
+        return normalize_suggestion_path(path, root)
 
     @staticmethod
     def _session_key(session: SessionRecord) -> tuple:
@@ -1478,11 +1845,7 @@ class OutcomeTracker:
         for prev in sessions:
             for sugg in prev.suggestions:
                 file_path = sugg.get("file_path", "")
-                # Same reasoning as _match_to_suggestions: resolve against the
-                # root this suggestion was recorded under, not the current run's.
-                normalized = normalize_suggestion_path(
-                    file_path, prev.codebase_root or self.codebase_root
-                )
+                normalized = self._suggestion_target(sugg, prev)
 
                 if not self._is_non_git_trackable(file_path, normalized):
                     continue
@@ -1491,24 +1854,29 @@ class OutcomeTracker:
                 # Use the raw recorded path (falling back to normalized) so
                 # detect_implicit_feedback resolves the linked
                 # suggestion_fact_id, which is keyed by the path as recorded.
-                outcomes.append(Outcome(
-                    outcome_type=OutcomeType.UNVERIFIED,
-                    file_path=file_path or normalized,
-                    diff_summary="",
-                    suggestion_description=sugg.get("description", ""),
-                    suggestion_confidence=sugg.get("confidence", 0.0),
-                    suggestion_id=sugg.get("suggestion_id", ""),
-                    learning_episode_id=prev.learning_episode_id,
-                    repository_revision=prev.repository_revision,
-                    retrieved_fact_ids=list(prev.retrieved_fact_ids),
-                    used_fact_ids=list(prev.used_fact_ids),
-                    candidate_id=sugg.get("candidate_id", ""),
-                    candidate_subject=sugg.get("candidate_subject", ""),
-                    candidate_body=sugg.get("candidate_body", ""),
-                    candidate_kind=sugg.get("candidate_kind", "pattern"),
-                ))
+                outcomes.append(self._unverified_outcome(prev, sugg, file_path or normalized))
 
         return outcomes
+
+    def _unverified_outcome(self, prev: SessionRecord, sugg: dict, file_path: str) -> Outcome:
+        """An UNVERIFIED outcome for ``sugg``: nothing git can confirm."""
+        return Outcome(
+            outcome_type=OutcomeType.UNVERIFIED,
+            file_path=file_path,
+            git_path=self._suggestion_target(sugg, prev),
+            diff_summary="",
+            suggestion_description=sugg.get("description", ""),
+            suggestion_confidence=sugg.get("confidence", 0.0),
+            suggestion_id=sugg.get("suggestion_id", ""),
+            learning_episode_id=prev.learning_episode_id,
+            repository_revision=prev.repository_revision,
+            retrieved_fact_ids=list(prev.retrieved_fact_ids),
+            used_fact_ids=list(prev.used_fact_ids),
+            candidate_id=sugg.get("candidate_id", ""),
+            candidate_subject=sugg.get("candidate_subject", ""),
+            candidate_body=sugg.get("candidate_body", ""),
+            candidate_kind=sugg.get("candidate_kind", "pattern"),
+        )
 
     def _load_host_edit_events(self) -> list[tuple[float, str, bool]]:
         """Edits the HOST recorded, as ``(timestamp, repo-relative path, own)``.
@@ -1944,22 +2312,12 @@ class OutcomeTracker:
             if not file_path:
                 continue
 
-            # Normalize: suggestions may have absolute paths, git diff has relative.
-            # Resolve against the root the suggestion was RECORDED under, not the
-            # current run's. They differ whenever the previous run happened in a
-            # different working tree of the same repo — the common case being a
-            # Claude Code session in `.claude/worktrees/agent-*`, whose absolute
-            # paths never relative_to() the main checkout, so every suggestion
-            # silently failed to match and its learning was orphaned (14 of 65
-            # recorded sessions on a live install). project_id already spans
-            # worktrees and clones, so the session is found; only the path root
-            # was wrong. Falls back to the current root for older records.
-            normalized = _spelled_as(normalize_suggestion_path(
-                file_path, session.codebase_root or self.codebase_root
-            ), matchable)
+            # Suggestions may name absolute paths in any checkout; git prints
+            # paths relative to a checkout's top (`_suggestion_target`).
+            normalized = _spelled_as(self._suggestion_target(sugg, session), matchable)
             suggested_files.add(normalized)
 
-            if normalized in matchable or file_path in matchable:
+            if normalized in matchable:
                 diff = self._get_file_diff_since(
                     normalized, session.timestamp, everywhere=True
                 )
@@ -1970,7 +2328,9 @@ class OutcomeTracker:
                 # acted on (a review fix rewritten Claude's way), not Neo
                 # contradicted.
                 if outcome_type == OutcomeType.MODIFIED and self._flagged_code_rewritten(
-                    sugg, session.codebase_root or self.codebase_root or "", normalized
+                    sugg,
+                    sugg.get("checkout") or self._recorded_top(session),
+                    normalized,
                 ):
                     outcome_type = OutcomeType.ADDRESSED
 
@@ -2013,7 +2373,10 @@ class OutcomeTracker:
         known_ours = {_nfc(path) for path in suggested_files}
         for path in session.resolved_paths:
             known_ours.add(_nfc(path))
-            known_ours.add(_nfc(self._normalize_path(path)))
+            # Git's name is recorded beside each raw path, so a path in
+            # another checkout need not be identified again: that forked git
+            # twice per path on every request.
+            known_ours.add(_nfc(self._normalize_path(path, identify_other_checkouts=False)))
 
         # Walked in path order so the walk can stop once the kept set is
         # decided. Summaries are capped at DIFF_SUMMARY_FULL_LEN, so once
@@ -2025,8 +2388,9 @@ class OutcomeTracker:
         full = 0
         diffs_taken = 0
         for changed in sorted(changed_files):
-            normalized = self._normalize_path(changed)
-            if _nfc(normalized) not in known_ours and _nfc(changed) not in known_ours:
+            # `changed` is git-printed, already the form suggestions resolve
+            # to: normalizing it again cost ~200x on large change sets.
+            if _nfc(changed) not in known_ours:
                 if self._is_code_file(changed):
                     if diffs_taken == MAX_INDEPENDENT_DIFFS:
                         break
@@ -2201,9 +2565,11 @@ class OutcomeTracker:
         overlap = len(code_lines & changed_lines)
         return overlap / min(len(code_lines), len(changed_lines))
 
-    def _normalize_path(self, path: str) -> str:
+    def _normalize_path(self, path: str, *, identify_other_checkouts: bool = True) -> str:
         """Normalize a file path to relative form for comparison."""
-        return normalize_suggestion_path(path, self.codebase_root)
+        return normalize_suggestion_path(
+            path, self.scope_root, identify_other_checkouts=identify_other_checkouts
+        )
 
     @staticmethod
     def _compute_diff_overlap(suggested: str, actual: str) -> float:

@@ -683,3 +683,391 @@ def test_commit_headers_are_not_mistaken_for_paths(repo, request):
     assert by_message[""]["files"] == []
     assert by_message["side work"]["files"] == ["src/bar.py"]
     assert {"\x01a.py", "\x01b.py"} <= set(by_message["marks"]["files"])
+
+
+# ---------------------------------------------------------------------------
+# Suggestions that NAME a file in another checkout.
+#
+# Every test above suggests `src/foo.py` relative to the main checkout and
+# applies it elsewhere. Claude Code's Stop review does the opposite: the agent
+# works in `.claude/worktrees/agent-*/`, so the suggestion names the file by its
+# ABSOLUTE path in that worktree, while Neo runs rooted at the main checkout.
+# Resolved against the main checkout that read `.claude/worktrees/x/src/foo.py`,
+# which git never prints; 57 of 60 such suggestions on a live install were
+# committed to main and never matched. One test per checkout shape seen there.
+# ---------------------------------------------------------------------------
+
+
+def _tracker(root, request):
+    return OutcomeTracker(codebase_root=str(root), project_id=f"wt-{request.node.name}")
+
+
+def _outcomes_for(tracker, path):
+    outcomes, _ = tracker.detect_outcomes()
+    return [(o.outcome_type, o.file_path) for o in outcomes if o.file_path == path]
+
+
+def test_a_suggestion_in_a_removed_nested_worktree_is_accepted_once_merged(repo, request):
+    """The Stop-review shape end to end: the worktree is gone by the time the
+    next Neo run looks, so the path must have been resolved when saved."""
+    wt = _worktree(repo, repo / ".claude" / "worktrees" / "x", "agent")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(wt / "src" / "foo.py"))], "make f return 2")
+    _apply(wt)
+    _git(wt, "commit", "-qam", "apply")
+    _git(repo, "worktree", "remove", str(wt))
+    _git(repo, "merge", "-q", "--ff-only", "agent")
+
+    assert _outcomes_for(tracker, "src/foo.py") == [(OutcomeType.ACCEPTED, "src/foo.py")]
+
+
+def test_a_suggestion_in_a_live_nested_worktree_is_accepted_uncommitted(repo, request):
+    wt = _worktree(repo, repo / ".claude" / "worktrees" / "x", "agent")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(wt / "src" / "foo.py"))], "make f return 2")
+    _apply(wt)
+
+    assert _outcomes_for(tracker, "src/foo.py") == [(OutcomeType.ACCEPTED, "src/foo.py")]
+
+
+def test_a_suggestion_in_a_sibling_worktree_is_accepted_on_its_branch(repo, tmp_path, request):
+    wt = _worktree(repo, tmp_path / "sibling", "agent")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(wt / "src" / "foo.py"))], "make f return 2")
+    _apply(wt)
+    _git(wt, "commit", "-qam", "apply")
+
+    assert _outcomes_for(tracker, "src/foo.py") == [(OutcomeType.ACCEPTED, "src/foo.py")]
+
+
+def test_a_suggestion_in_a_clone_of_the_same_remote_is_accepted_once_fetched(
+    repo, tmp_path, request
+):
+    """A separate clone shares no git dir, only the project's identity (its
+    remote). Its work counts once it reaches a local branch here."""
+    remote = f"https://example.invalid/o/{request.node.name}.git"
+    _git(repo, "remote", "add", "origin", remote)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(repo), str(clone)], check=True,
+                   capture_output=True)
+    _git(clone, "remote", "set-url", "origin", remote)
+    _git(clone, "config", "user.email", "t@t.t")
+    _git(clone, "config", "user.name", "T")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(clone / "src" / "foo.py"))], "make f return 2")
+    _apply(clone)
+    _git(clone, "commit", "-qam", "apply")
+    _git(repo, "fetch", "-q", str(clone), "main:from-clone")
+
+    assert _outcomes_for(tracker, "src/foo.py") == [(OutcomeType.ACCEPTED, "src/foo.py")]
+
+
+def _assert_closed_once(tracker, path):
+    """Unverifiable: one UNVERIFIED, nothing retained, nothing re-emitted."""
+    first, _ = tracker.detect_outcomes()
+    assert [(o.outcome_type, o.file_path) for o in first] == [(OutcomeType.UNVERIFIED, path)]
+    assert tracker._last_pending == []
+    second, _ = tracker.detect_outcomes()
+    assert second == []
+
+
+def test_a_suggestion_in_another_repository_is_closed_not_left_pending(
+    repo, tmp_path, request
+):
+    other = tmp_path / "other"
+    (other / "src").mkdir(parents=True)
+    _write(other / "src" / "foo.py", "def f():\n    return 1\n")
+    _git(other, "init", "-q", "-b", "main", ".")
+    _git(other, "remote", "add", "origin", f"https://example.invalid/other/{request.node.name}.git")
+    tracker = _tracker(repo, request)
+    path = str(other / "src" / "foo.py")
+    _save(tracker, [_Suggestion(file_path=path)], "make f return 2")
+
+    _assert_closed_once(tracker, path)
+
+
+def test_a_scratchpad_suggestion_is_closed_and_never_verifiable(repo, tmp_path, request):
+    scratch = tmp_path / "scratchpad"
+    scratch.mkdir()
+    _write(scratch / "probe.sh", "echo 1\n")
+    path = str(scratch / "probe.sh")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=path)], "fix the probe")
+
+    assert not outcomes_mod.suggestion_is_verifiable(path, True, str(repo))
+    _assert_closed_once(tracker, path)
+
+
+def test_a_session_rooted_in_a_subdirectory_matches_git_paths(repo, request):
+    """Asked from `src/`, the model names `foo.py` (relative to what it was
+    shown) or the absolute path; git prints `src/foo.py` either way."""
+    tracker = _tracker(repo / "src", request)
+    _save(tracker, [_Suggestion(file_path="foo.py")], "make f return 2")
+    _apply(repo)
+    _git(repo, "commit", "-qam", "apply")
+
+    assert _outcomes_for(tracker, "src/foo.py") == [(OutcomeType.ACCEPTED, "src/foo.py")]
+    assert outcomes_mod.normalize_suggestion_path(str(repo / "src" / "foo.py"),
+                                                  str(repo / "src")) == "src/foo.py"
+
+
+def test_the_resolver_names_each_shape_the_way_git_prints_it(repo, tmp_path):
+    nested = _worktree(repo, repo / ".claude" / "worktrees" / "x", "nested")
+    sibling = _worktree(repo, tmp_path / "sibling", "sibling")
+    resolve = outcomes_mod.resolve_suggestion_target
+
+    assert resolve(str(nested / "src" / "foo.py"), str(repo)) == (str(nested), "src/foo.py")
+    assert resolve(str(sibling / "src" / "new.py"), str(repo)) == (str(sibling), "src/new.py")
+    assert resolve("src/foo.py", str(repo)) == (str(repo), "src/foo.py")
+    assert resolve("/src/foo.py", str(repo)) == (str(repo), "src/foo.py")
+    assert resolve("src/../src/foo.py", str(repo))[1] == "src/foo.py"
+    assert resolve(str(tmp_path / "elsewhere.py"), str(repo)) is None
+    assert resolve(str(repo), str(repo)) is None
+    assert outcomes_mod.suggestion_is_verifiable(str(nested / "src" / "foo.py"), True, str(repo))
+
+
+def test_the_checkout_holding_the_file_supplies_its_flagged_regions(repo, tmp_path, request):
+    """ADDRESSED compares against the code the review saw, which for a sibling
+    worktree is only in that worktree."""
+    wt = _worktree(repo, tmp_path / "sibling", "agent")
+    _write(wt / "src" / "foo.py", "def f():\n    x = 0\n    return 1\n    # end\n")
+    diff = ("--- a/src/foo.py\n+++ b/src/foo.py\n@@ -1,4 +1,4 @@\n def f():\n"
+            "     x = 0\n-    return 1\n+    return 2\n     # end\n")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(wt / "src" / "foo.py"), diff=diff)], "fix")
+
+    record = tracker._load_unprocessed_sessions()[0].suggestions[0]
+    assert (record["checkout"], record["repo_path"]) == (str(wt), "src/foo.py")
+    assert record["flagged_regions"]
+
+
+def test_a_record_saved_before_repo_path_is_rescanned_once(repo, request):
+    """An old record resolved the worktree path wrongly on every run while its
+    watermark moved past the commit that applied it. It is looked for once more
+    from the suggestion itself, and only for Neo's own suggested paths:
+    unrelated work in that window is not re-minted as INDEPENDENT."""
+    import json
+
+    wt = _worktree(repo, repo / ".claude" / "worktrees" / "x", "agent")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(wt / "src" / "foo.py"))], "make f return 2")
+    _apply(wt)
+    _git(wt, "commit", "-qam", "apply")
+    _git(repo, "merge", "-q", "--ff-only", "agent")
+    _write(repo / "src" / "bar.py", "def g():\n" + "    return 2\n" * 40)
+    _git(repo, "commit", "-qam", "unrelated")
+    log = tracker._session_log_path
+    record = json.loads(log.read_text().strip())
+    for sugg in record["suggestions"]:
+        sugg.pop("repo_path")
+        sugg.pop("checkout")
+    record["scanned_through"] = _clock.tick()
+    log.write_text(json.dumps(record) + "\n")
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    assert [(o.outcome_type, o.file_path) for o in outcomes] == [
+        (OutcomeType.ACCEPTED, "src/foo.py")
+    ]
+
+
+def test_a_suggestion_nothing_happened_to_is_closed_at_expiry(repo, request, monkeypatch):
+    monkeypatch.setattr(OutcomeTracker, "PENDING_SESSION_TTL_SECONDS", 60)
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion()], "make f return 2")
+
+    _assert_closed_once(tracker, "src/foo.py")
+
+
+def test_a_relative_root_still_finds_its_checkout(repo, monkeypatch):
+    monkeypatch.chdir(repo / "src")
+
+    assert outcomes_mod.checkout_top(outcomes_mod.Path(".")) == repo
+    assert OutcomeTracker(codebase_root=".").codebase_root == str(repo)
+
+
+def test_a_relative_path_into_another_repository_is_closed_not_pending(repo, request):
+    """`vendor/lib/x.py` inside a nested repository with its own identity is
+    not a name this repository's git prints, so it must not wait for one."""
+    nested = repo / "vendor" / "lib"
+    nested.mkdir(parents=True)
+    _write(nested / "x.py", "x = 1\n")
+    _git(nested, "init", "-q", "-b", "main", ".")
+    _git(nested, "remote", "add", "origin", f"https://example.invalid/v/{request.node.name}.git")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path="vendor/lib/x.py")], "fix x")
+
+    record = tracker._load_unprocessed_sessions()[0].suggestions[0]
+    assert outcomes_mod.Path(record["repo_path"]).is_absolute()
+    _assert_closed_once(tracker, "vendor/lib/x.py")
+
+
+def test_a_directory_alias_resolves_to_the_path_git_prints(repo):
+    (repo / "alias").symlink_to(repo / "src", target_is_directory=True)
+
+    assert outcomes_mod.resolve_suggestion_target("alias/foo.py", str(repo))[1] == "src/foo.py"
+
+
+def test_a_tracked_symlink_keeps_its_own_name(repo, request):
+    (repo / "link.py").symlink_to(repo / "src" / "foo.py")
+    _git(repo, "add", "link.py")
+    _git(repo, "commit", "-qm", "link")
+
+    assert outcomes_mod.resolve_suggestion_target("link.py", str(repo))[1] == "link.py"
+
+
+def test_a_case_misspelled_suggestion_is_saved_as_git_spells_it(repo, request):
+    if not (repo / "SRC" / "FOO.PY").exists():
+        pytest.skip("case-sensitive filesystem: the misspelling names no file")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(repo / "Src" / "Foo.py"))], "make f return 2")
+    _apply(repo)
+    _git(repo, "commit", "-qam", "apply")
+
+    assert tracker._load_unprocessed_sessions()[0].suggestions[0]["repo_path"] == "src/foo.py"
+    assert _outcomes_for(tracker, "src/foo.py") == [(OutcomeType.ACCEPTED, "src/foo.py")]
+
+
+def test_an_accepted_worktree_suggestion_is_never_reminted_as_independent(repo, request):
+    """(Linus a) The second run after an acceptance whose worktree is gone:
+    `resolved_paths` must hold git's name, or the file comes back INDEPENDENT."""
+    wt = _worktree(repo, repo / ".claude" / "worktrees" / "x", "agent")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(wt / "src" / "foo.py")),
+                    _Suggestion(file_path=str(wt / "src" / "bar.py"))], "two fixes")
+    _apply(wt)
+    _git(wt, "commit", "-qam", "apply")
+    _git(repo, "worktree", "remove", str(wt))
+    _git(repo, "merge", "-q", "--ff-only", "agent")
+    first, _ = tracker.detect_outcomes()
+    assert [(o.outcome_type, o.file_path) for o in first] == [(OutcomeType.ACCEPTED, "src/foo.py")]
+    _write(repo / "src" / "foo.py", "def f():\n" + "    return 9\n" * 40)
+
+    second, _ = tracker.detect_outcomes()
+
+    assert [o for o in second if o.file_path == "src/foo.py"] == []
+
+
+def test_a_legacy_record_from_a_removed_worktree_root_still_resolves(repo, request):
+    """(Linus b) Saved by a run INSIDE the worktree, with a relative path; the
+    worktree is gone when detection reads it. Walking through the removed
+    directory into the main checkout named `.claude/worktrees/x/src/foo.py`."""
+    import json
+
+    wt = _worktree(repo, repo / ".claude" / "worktrees" / "x", "agent")
+    tracker_in_wt = _tracker(wt, request)
+    _save(tracker_in_wt, [_Suggestion()], "make f return 2")
+    record = json.loads(tracker_in_wt._session_log_path.read_text().strip())
+    for sugg in record["suggestions"]:
+        sugg.pop("repo_path")
+        sugg.pop("checkout")
+    record["codebase_root"] = str(wt)
+    _apply(wt)
+    _git(wt, "commit", "-qam", "apply")
+    # --force: the run inside it left its own (untracked) cache there.
+    _git(repo, "worktree", "remove", "--force", str(wt))
+    _git(repo, "merge", "-q", "--ff-only", "agent")
+    tracker = _tracker(repo, request)
+    tracker._session_log_path.write_text(json.dumps(record) + "\n")
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    assert [(o.outcome_type, o.file_path) for o in outcomes] == [
+        (OutcomeType.ACCEPTED, "src/foo.py")
+    ]
+
+
+def test_a_subdirectory_link_is_keyed_by_the_name_git_prints(repo, request):
+    """(Linus c, tracker half) The link is keyed by what the model wrote."""
+    tracker = _tracker(repo / "src", request)
+    with _at_clock():
+        tracker.save_session([_Suggestion(file_path="foo.py")], "fix", {"foo.py": "fact-1"})
+    _apply(repo)
+    _git(repo, "commit", "-qam", "apply")
+
+    outcomes, fact_ids = tracker.detect_outcomes()
+
+    assert [(o.outcome_type, o.file_path) for o in outcomes] == [(OutcomeType.ACCEPTED, "src/foo.py")]
+    assert fact_ids["src/foo.py"] == "fact-1"
+
+
+def test_a_same_named_top_level_file_does_not_resolve_a_subdirectory_suggestion(repo, request):
+    """(Linus d) Scope `src/`, suggestion `foo.py`: an edit to the unrelated
+    top-level `foo.py` is not this suggestion being acted on."""
+    _write(repo / "foo.py", "y = 1\n")
+    _git(repo, "add", "foo.py")
+    _git(repo, "commit", "-qm", "top-level foo")
+    tracker = _tracker(repo / "src", request)
+    _save(tracker, [_Suggestion(file_path="foo.py")], "fix")
+    _write(repo / "foo.py", "y = 2\n")
+    _git(repo, "commit", "-qam", "edit top-level foo")
+
+    outcomes, _ = tracker.detect_outcomes()
+
+    assert [o for o in outcomes if o.outcome_type != OutcomeType.INDEPENDENT] == []
+    assert [s["repo_path"] for p in tracker._last_pending for s in p.suggestions] == ["src/foo.py"]
+
+
+def test_an_ambient_git_dir_does_not_make_a_foreign_repository_ours(repo, tmp_path, monkeypatch):
+    """(Linus e) Hooks export GIT_DIR; every checkout then reports the same
+    common dir unless the resolver strips it."""
+    other = tmp_path / "other"
+    (other / "src").mkdir(parents=True)
+    _write(other / "src" / "x.py", "x = 1\n")
+    _git(other, "init", "-q", "-b", "main", ".")
+    monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+
+    assert outcomes_mod.resolve_suggestion_target(str(other / "src" / "x.py"), str(repo)) is None
+
+
+def test_two_sessions_naming_one_raw_path_keep_both_acceptances(repo, request):
+    """Monorepo: from the top `src/foo.py` is one file; from `backend/` the
+    same spelling is `backend/src/foo.py`. Deduplication must key each outcome
+    by its own git name, or one acceptance silently replaces the other."""
+    (repo / "backend" / "src").mkdir(parents=True)
+    _write(repo / "backend" / "src" / "foo.py", "def f():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "backend")
+    top = _tracker(repo, request)
+    _save(top, [_Suggestion(file_path="src/foo.py")], "fix top")
+    _save(_tracker(repo / "backend", request), [_Suggestion(file_path="src/foo.py")], "fix backend")
+    _apply(repo)
+    _write(repo / "backend" / "src" / "foo.py", "def f():\n    return 2\n")
+    _git(repo, "commit", "-qam", "apply both")
+
+    outcomes, _ = top.detect_outcomes()
+
+    assert sorted((o.outcome_type, o.file_path) for o in outcomes) == [
+        (OutcomeType.ACCEPTED, "backend/src/foo.py"),
+        (OutcomeType.ACCEPTED, "src/foo.py"),
+    ]
+
+
+def test_retained_worktree_resolutions_cost_no_git_fork_per_request(repo, request, monkeypatch):
+    """Resolved worktree paths are kept with their git names; re-resolving the
+    raw absolute ones forked git twice per path on every request."""
+    _write(repo / "other.py", "o = 1\n")
+    _git(repo, "add", "other.py")
+    _git(repo, "commit", "-qm", "other")
+    wt = _worktree(repo, repo / ".claude" / "worktrees" / "x", "agent")
+    _write(wt / "src" / "baz.py", "z = 1\n")
+    tracker = _tracker(repo, request)
+    _save(tracker, [_Suggestion(file_path=str(wt / "src" / name))
+                    for name in ("foo.py", "bar.py", "baz.py")], "three fixes")
+    _apply(wt)
+    _write(wt / "src" / "bar.py", "def g():\n    return 2\n")
+    tracker.detect_outcomes()
+    assert len(tracker._last_pending) == 1  # baz.py still outstanding
+    _write(repo / "other.py", "o = 2\n")  # tracked: the run reaches matching
+    real_run = outcomes_mod.subprocess.run
+    forks = []
+
+    def counting_run(argv, *args, **kwargs):
+        if "--git-common-dir" in argv:
+            forks.append(argv)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(outcomes_mod.subprocess, "run", counting_run)
+    tracker.detect_outcomes()
+
+    assert forks == []

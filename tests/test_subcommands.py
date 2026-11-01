@@ -270,6 +270,38 @@ def test_learning_stats_keeps_the_unscoped_sentinel(capsys):
     assert out["excluded_projects_without_fact_store"] == []
 
 
+def test_learning_stats_reports_pending_past_the_ttl_as_expired(capsys):
+    """Detection stops waiting at the pending TTL, so an episode still labelled
+    pending past it can never resolve. Counting it as pending made 417 dead
+    suggestions read as a busy loop."""
+    import json
+    import time
+    from types import SimpleNamespace
+    from neo.memory.episodes import (
+        LearningEpisode, LearningEpisodeStore, MemoryCandidateEvidence,
+    )
+    from neo.memory.outcomes import OutcomeTracker
+    from neo.subcommands import _handle_learning_stats
+
+    store = LearningEpisodeStore("")  # -> "unscoped", survives the store filter
+    old = time.time() - OutcomeTracker.PENDING_SESSION_TTL_SECONDS - 60
+    for episode_id, started in (("old", old), ("new", time.time())):
+        ep = LearningEpisode(episode_id=episode_id, started_at=started,
+                             final_outcome="suggested_pending_downstream_outcome")
+        ep.memory_candidates.append(MemoryCandidateEvidence(
+            candidate_id=f"c-{episode_id}", suggestion_id="s", subject="x",
+            body="y", kind="pattern"))
+        store.save(ep)
+
+    _handle_learning_stats(SimpleNamespace(json=True, since=None))
+    out = json.loads(capsys.readouterr().out)
+    assert out["final_outcomes"] == {
+        "expired_no_outcome_observed": 1,
+        "suggested_pending_downstream_outcome": 1,
+    }
+    assert out["candidate_status"] == {"expired_unobserved": 1, "observed_unverified": 1}
+
+
 def test_learning_stats_buckets_suggestions_four_ways(tmp_path, monkeypatch):
     """Collapsing these makes the number unactionable: a prompt that legitimately
     had no edit target is a usage property, a real code suggestion we failed to

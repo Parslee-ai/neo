@@ -416,7 +416,9 @@ class TestReviewOnlyOutcomes:
         assert len(outcomes) == 1
         assert outcomes[0].outcome_type == OutcomeType.UNVERIFIED
         assert outcomes[0].file_path == "/REVIEW.md"
-        assert fact_ids == {"/REVIEW.md": "factR"}
+        # Keyed as written and by the name git would print, both to the link.
+        assert fact_ids["/REVIEW.md"] == "factR"
+        assert set(fact_ids.values()) == {"factR"}
 
     def test_git_match_wins_over_non_git_no_double_count(self, tracker):
         """A docs path that is BOTH git-changed and non-git-trackable must
