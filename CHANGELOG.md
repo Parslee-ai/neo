@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.62.2] - 2026-11-01
+
+### Fixed
+
+- **Suggestions about files in an agent's worktree now count when you apply them.** Claude Code's end-of-turn review names a file by its full path inside the agent's worktree (`.claude/worktrees/agent-…/src/foo.py`), while Neo runs from the main checkout. Neo compared that path with the ones git prints (`src/foo.py`), so the two never matched. On a live install, 57 of 60 such suggestions had been committed to main and never registered. The same mismatch hit worktrees beside the main checkout, other clones of the repository, and runs started from a subdirectory. Neo now works out the path git uses when it saves a suggestion, while the worktree still exists, and detection uses that path (#330).
+- **Suggestions git can never see close at once instead of waiting two weeks.** A suggestion naming a scratchpad file, a plan under `~/.claude`, or a file in another repository used to sit "pending" for the full 14 days. It now closes as unverified on the next run. So does a suggestion nothing happened to within those 14 days. Neither changes any fact (#330).
+- **`learning-stats` reports old pending episodes as expired.** Episodes still labelled pending past the 14-day window can no longer resolve. They are now counted as `expired_no_outcome_observed`, and their candidates as expired, so the pending count shows only what can still change (#330).
+
+### Changed
+
+- **Outcome detection is faster after a one-time catch-up.** The first learn run in each project after upgrading re-checks older pending suggestions once, which took 8–13 seconds on large repositories. After that, detection took under half a second where it took 2.5 seconds before (#330).
+
 ## [0.62.1] - 2026-10-27
 
 ### Fixed
