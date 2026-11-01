@@ -4399,6 +4399,22 @@ class TestAddressedOutcomeFeedback:
 
         assert [f for f in store.entries if "episode-derived" in f.tags] == []
 
+    def test_a_deterministic_failure_at_ask_time_still_blocks_a_verified_fix(self, store):
+        """A failed check on Neo's own change at ask time is a contradiction
+        no later evidence erases."""
+        import uuid
+        from neo.memory.episodes import VerificationEvidence
+
+        es = self._episode(store, "vd-0")
+        episode = es.load("vd-0")
+        episode.verification.append(VerificationEvidence(
+            verification_id=uuid.uuid4().hex, kind="lint", status="failed",
+            tool_name="ruff", summary="x"))
+        es.save(episode)
+        self._feed(store, self._verified("vd-0"))
+
+        assert es.load("vd-0").memory_candidates[0].status == "rejected_by_verification"
+
     def test_an_unverified_fix_still_never_promotes(self, store):
         for ep_id in ("vu-0", "vu-1"):
             self._episode(store, ep_id)

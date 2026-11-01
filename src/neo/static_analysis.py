@@ -593,12 +593,13 @@ def run_static_checks(
         "eslint": enable_eslint,
     }
     deadline = time.monotonic() + phase_budget
+    available = detect_available_tools()
     results: list[StaticCheckResult] = []
     for suggestion in suggestions:
         results.extend(_check_one_file(
             suggestion.file_path,
             lambda timeout, s=suggestion: prepare_change(s, codebase_root, timeout=timeout),
-            enable_map, deadline, phase_budget,
+            enable_map, deadline, phase_budget, available,
         ))
     return results
 
@@ -636,11 +637,7 @@ def check_change(
                                   target=target, root=codebase_root)
         why = ""
     return _check_one_file(
-        file_path,
-        lambda timeout: (prepared, why) if prepared is None else (
-            PreparedChange(prepared.file_path, prepared.content, timeout,
-                           original=prepared.original, target=prepared.target,
-                           root=prepared.root), ""),
+        file_path, lambda _timeout: (prepared, why),
         enable_map, time.monotonic() + phase_budget, phase_budget,
     )
 
@@ -651,13 +648,15 @@ def _check_one_file(
     enable_map: dict[str, bool],
     deadline: float,
     phase_budget: float,
+    available_tools: Optional[set[str]] = None,
 ) -> list[StaticCheckResult]:
     """Every enabled checker for ``file_path``'s language on the change
     ``prepare(timeout)`` yields, judged against the original. At least one
     result, always: a change nothing could check is reported, never dropped.
     """
     results: list[StaticCheckResult] = []
-    available_tools = detect_available_tools()
+    if available_tools is None:
+        available_tools = detect_available_tools()
 
     def not_run(tool: str, summary: str, status: str) -> StaticCheckResult:
         return StaticCheckResult(tool_name=tool, diagnostics=[], summary=summary,

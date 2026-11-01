@@ -262,14 +262,27 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   `static_analysis.check_change`, the rules that judge Neo's own changes).
   When at least one checker reaches a verdict and none fails, the outcome is
   `verified_fix`: it supports its candidate exactly like an acceptance
-  (`supported_once`, `supporting_episode_ids`, an `applied_on` base from
-  `_fix_base_revision`: the parent of the first commit since the suggestion
-  that touched the file, or HEAD when uncommitted). The recurrence bar is
-  unchanged: two supporting episodes on distinct base revisions. What does NOT
-  change: no fact earns credit from it, the human edit stays
-  `user_addressed`/`skipped` (the checker's verdict is a separate
-  `fix_static_checks`/`passed` evidence), and an unverified ADDRESSED never
-  supports anything. It runs on the request path under the `--fast` budget.
+  (`supported_once`, `supporting_episode_ids`, an `applied_on` base). The base
+  comes from `_applied_on_revision` itself, with a different "carries" test:
+  the commit whose version of the file has the flagged regions rewritten
+  (`_commit_rewrites_flagged`); uncommitted, HEAD of the checkout holding it
+  dirty; otherwise "" and promotion fails closed. A separate copy that took
+  ANY commit touching the file as the carrier let a peer branch's unrelated
+  edit supply a base from another sitting (reproduced; pinned by a test). The
+  recurrence bar is unchanged: two supporting episodes on distinct base
+  revisions. What does NOT change: no fact earns credit from it, the human
+  edit stays `user_addressed`/`skipped` (the checker's verdict is a separate
+  `fix_static_checks`/`passed` evidence), a deterministic failure at ask time
+  still makes the candidate `rejected_by_verification`, and an unverified
+  ADDRESSED never supports anything.
+  - **The bar, stated plainly:** the edited file still parses and gains no
+    new error (syntax, undefined name, what the project's checkers call an
+    error). Warnings pass; callers in OTHER files are not seen. What is judged
+    is the file's net change since the suggestion, so unrelated new errors on
+    a busy branch fail it (the safe direction).
+  - **Cost:** at most `MAX_FIX_CHECKS_PER_REQUEST` (2) per learn request,
+    sharing one `--fast` budget; past it the ADDRESSED stays unverified that
+    request. `learning-stats` counts episodes verified this way.
 - **"The linked original fact" means the DURABLE fact the suggestion re-applied,
   and the link nearly died in silence.** `suggestion_fact_ids` (file_path →
   fact_id) is the only input to the ACCEPTED reinforcement branch and to
