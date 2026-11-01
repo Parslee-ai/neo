@@ -245,6 +245,9 @@ class NeoEngine:
         self._phase_records: list[dict[str, Any]] = []
         self._findings: list[str] = []
         self._model_headline = ""
+        # Simulation traces set aside or cut while parsing this request
+        # (`structured_parser.parse_simulation_traces` notes). Reset per request.
+        self._trace_notes: list[dict[str, Any]] = []
         # Set per request before any finalize; initialized so the orchestrator
         # summary can read it directly instead of guessing via getattr.
         self.last_reasoning_mode: str = "fast"
@@ -528,6 +531,7 @@ class NeoEngine:
         self.action_log.clear()
         self._phase_records = []
         self._findings = []
+        self._trace_notes = []
         # Per-request memoization starts clean. build_context is called from
         # more than one place in a single request and is expensive; the memo
         # that serves that is reset here so its scope is the request, never the
@@ -1390,7 +1394,11 @@ class NeoEngine:
         scoreable_suggestions = [
             s for s in code_suggestions if suggestion_is_scoreable(s)
         ]
-        if scoreable_suggestions and self._simulation_consensus(simulation_traces):
+        # A trace set aside as malformed, or cut, is an unknown, not a clean
+        # run: the dropped one may have found the bug, and a cut
+        # `reasoning_steps` may have held the MODIFY veto. Either way the run
+        # does not skip verification.
+        if scoreable_suggestions and self._traces_allow_early_exit(simulation_traces):
             max_confidence = max(s.confidence for s in scoreable_suggestions)
             check_statuses = [self._static_check_status(check) for check in static_checks]
             static_ran_clean = bool(check_statuses) and all(
@@ -1560,6 +1568,9 @@ class NeoEngine:
         metadata["operating_mode"] = neo_input.operating_mode.value
         metadata["learning_enabled_for_request"] = learning_allowed
         metadata["repository_actions"] = len(self.last_applied_actions)
+        if self._trace_notes:
+            # The facts behind the dropped/trimmed cautions, for hosts.
+            metadata["simulation_parse_notes"] = list(self._trace_notes)
         metadata["execution_context"] = self._safe_execution_context_dict()
         # Reasoning-tier provenance — always explainable which path ran and why.
         metadata["reasoning_mode"] = getattr(self, "last_reasoning_mode", "fast")
@@ -3246,8 +3257,12 @@ RULES:
         # Average suggestion confidence
         avg_confidence = sum(s.confidence for s in scoreable) / len(scoreable)
 
-        # Penalty for simulation issues (reduced from 0.05 to 0.02)
-        total_issues = sum(len(s.issues_found) for s in simulations)
+        # Penalty for simulation issues (reduced from 0.05 to 0.02). A trace
+        # set aside as malformed counts its issues if it listed them legibly,
+        # else one: dropping it must never raise confidence.
+        total_issues = (
+            sum(len(s.issues_found) for s in simulations) + self._dropped_trace_issues()
+        )
         issue_penalty = min(0.15, total_issues * 0.02)  # Cap reduced from 0.3 to 0.15
 
         # Penalty for static check failures (reduced from 0.02 to 0.01).
@@ -3573,6 +3588,17 @@ RULES:
         issue_count = sum(len(t.issues_found) for t in simulation_traces or [])
         if issue_count:
             cautions.append(self._voice("caution_sim_issues", count=issue_count))
+        dropped = self._dropped_trace_count()
+        trimmed = sum(1 for note in self._trace_notes if note.get("unit") == "items")
+        if dropped:
+            flagged = sum(len(n.get("issues") or []) for n in self._trace_notes
+                          if n["kind"] == "dropped")
+            cautions.append(
+                self._voice("caution_sim_dropped_flagged", count=dropped, issues=flagged)
+                if flagged else self._voice("caution_sim_dropped", count=dropped)
+            )
+        if trimmed:
+            cautions.append(self._voice("caution_sim_trimmed", count=trimmed))
         if code_suggestions and not self._checks_that_evaluated(static_checks):
             # Two different facts with two different remedies: install a
             # linter, versus the model proposed nothing to check. The phase
@@ -4960,6 +4986,32 @@ Generate unified diff patches. Keep changes minimal and isolated."""
 
         return plan_steps
 
+    def _dropped_trace_count(self) -> int:
+        """Simulation traces this request set aside as malformed."""
+        return sum(1 for note in self._trace_notes if note["kind"] == "dropped")
+
+    def _dropped_trace_issues(self) -> int:
+        """Problems the dropped traces had flagged; one per trace that said
+        nothing legible, because its silence is not a clean result."""
+        return sum(
+            max(1, len(note.get("issues") or []))
+            for note in self._trace_notes if note["kind"] == "dropped"
+        )
+
+    def _trace_parse_was_lenient(self) -> bool:
+        """Was any trace dropped, or a list in one cut, to accept the rest?
+        A string cut is not counted: it is marked in place (`...`) and holds
+        no hidden trace or token count."""
+        return any(
+            note["kind"] == "dropped" or note.get("unit") == "items"
+            for note in self._trace_notes
+        )
+
+    def _traces_allow_early_exit(self, traces: list[SimulationTrace]) -> bool:
+        """The traces' half of the early-exit decision: they agree, and none
+        was set aside or cut to get there."""
+        return not self._trace_parse_was_lenient() and self._simulation_consensus(traces)
+
     def _parse_simulation_traces(self, response: str) -> list[SimulationTrace]:
         """Parse simulation traces from LM response."""
         from neo.structured_parser import parse_simulation_traces
@@ -4967,6 +5019,10 @@ Generate unified diff patches. Keep changes minimal and isolated."""
 
         logger = logging.getLogger(__name__)
         result = parse_simulation_traces(response)
+        for note in result.notes:
+            logger.warning(
+                "Simulation %s %s: %s", note["item"], note["kind"], note["detail"]
+            )
 
         if not result.success:
             logger.error(
@@ -4977,6 +5033,11 @@ Generate unified diff patches. Keep changes minimal and isolated."""
             raise ValueError(
                 f"Failed to parse simulation traces: [{result.error_code}] {result.error_message}"
             )
+
+        # A malformed trace was set aside, or an over-long list cut, so the
+        # rest of the answer stands. Kept for the cautions: a cut is reported,
+        # never silent.
+        self._trace_notes.extend(result.notes)
 
         # Convert ParseResult.data to list[SimulationTrace]
         traces = []

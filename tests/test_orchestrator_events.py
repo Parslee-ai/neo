@@ -29,7 +29,7 @@ def _block(kind, payload):
     return f"<<<NEO:SCHEMA=v3:KIND={kind}>>>\n{json.dumps(payload)}\n<<<END:{kind}>>>"
 
 
-def _response(*, issues=None, confidence=0.9, hypotheses=None):
+def _response(*, issues=None, confidence=0.9, hypotheses=None, diff="--- a\n+++ b\n"):
     plan = [{
         "id": "ps_1",
         "description": "Add a guard clause before the deref",
@@ -50,7 +50,7 @@ def _response(*, issues=None, confidence=0.9, hypotheses=None):
     }]
     code = [{
         "file_path": "src/parser.py",
-        "unified_diff": "--- a\n+++ b\n",
+        "unified_diff": diff,
         "description": "guard the deref",
         "confidence": confidence,
         "tradeoffs": [],
@@ -1049,3 +1049,107 @@ def test_untruncated_traceback_carries_no_elision_marker():
         raise ValueError("small")
     except ValueError as exc:
         assert "elided" not in NeoEngine._error_evidence(exc)["traceback"]
+
+
+def test_a_malformed_trace_is_reported_and_the_answer_stands():
+    """The gate failure end to end: the second trace omits `issues_found`.
+    The plan and code survive, and the cautions say a trace was set aside."""
+    import re
+
+    response = _response()
+    block = re.search(r"KIND=simulation>>>\n(.*)\n<<<END:simulation", response).group(1)
+    good = json.loads(block)[0]
+    bad = dict(good, n=2)
+    bad.pop("issues_found")
+    response = response.replace(block, json.dumps([good, bad]))
+
+    output, _ = _run(response)
+
+    assert output.code_suggestions, "the answer was discarded with the trace"
+    assert len(output.simulation_traces) == 1
+    assert any("set them aside" in c for c in output.orchestrator.cautions), (
+        output.orchestrator.cautions
+    )
+
+
+def _three_trace_response(bad_trace):
+    """Two clean traces that agree, plus `bad_trace`."""
+    import re
+
+    response = _response(
+        confidence=0.97,
+        diff="--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n",
+    )
+    block = re.search(r"KIND=simulation>>>\n(.*)\n<<<END:simulation", response).group(1)
+    good = json.loads(block)[0]
+    traces = [good, dict(good, n=2), dict(good, n=3, **bad_trace)]
+    traces = [{k: v for k, v in t.items() if v is not None} for t in traces]
+    return response.replace(block, json.dumps(traces))
+
+
+def _parsed(engine, bad_trace):
+    """Parse a three-trace block through the engine, as a request would."""
+    import re
+
+    block = re.search(r"(<<<NEO:SCHEMA=v3:KIND=simulation>>>.*?<<<END:simulation>>>)",
+                      _three_trace_response(bad_trace), re.S).group(1)
+    engine._trace_notes = []
+    return engine._parse_simulation_traces(block)
+
+
+def test_a_dropped_trace_that_found_a_bug_blocks_the_early_exit():
+    """(Linus #1) The dropped trace flagged a bug and asked to MODIFY the
+    plan; the two that survive agree. Its loss must not let the traces vouch
+    for the run, and its problem still counts against confidence. (Asserted on
+    the gate itself: end to end the early exit is unreachable while
+    `have_changes` reads attributes CodeSuggestion does not have.)"""
+    bad = {"input_data": None, "issues_found": ["off-by-one on empty input"],
+           "reasoning_steps": ["**Plan Modification Needed** MODIFY"]}
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+
+    traces = _parsed(engine, bad)
+
+    assert len(traces) == 2 and NeoEngine._simulation_consensus(traces)
+    assert not engine._traces_allow_early_exit(traces)
+    assert engine._dropped_trace_issues() == 1
+    assert engine._trace_notes[0]["issues"] == ["off-by-one on empty input"]
+
+
+def test_agreeing_traces_with_nothing_dropped_still_allow_the_early_exit():
+    """Control: the gate, not the fixture, is what held above."""
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+
+    assert engine._traces_allow_early_exit(_parsed(engine, {}))
+
+
+def test_a_cut_issue_list_blocks_the_early_exit_but_a_cut_string_does_not():
+    engine = NeoEngine(lm_adapter=FakeLM(""), enable_persistent_memory=False)
+
+    assert not engine._traces_allow_early_exit(
+        _parsed(engine, {"issues_found": [f"i{n}" for n in range(12)]}))
+    # A long string is cut in place and marked; it hides no trace or count.
+    traces = _parsed(engine, {"input_data": "x" * 1200})
+    assert engine._trace_notes and engine._traces_allow_early_exit(traces)
+
+
+def test_a_dropped_trace_is_named_in_the_cautions_with_what_it_found():
+    bad = {"input_data": None, "issues_found": ["off-by-one on empty input"]}
+    output, _ = _run(_three_trace_response(bad))
+
+    assert any("flagged 1 problem" in c for c in output.orchestrator.cautions), (
+        output.orchestrator.cautions
+    )
+    assert output.metadata["simulation_parse_notes"][0]["issues"] == [
+        "off-by-one on empty input"]
+
+
+def test_trace_notes_do_not_leak_into_the_next_request():
+    engine = NeoEngine(lm_adapter=FakeLM(_three_trace_response({"input_data": None})),
+                       enable_persistent_memory=False)
+    first = engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
+    engine.lm = FakeLM(_response())
+    second = engine.process(NeoInput(prompt="fix the parser", task_type=TaskType.BUGFIX))
+
+    assert any("set them aside" in c for c in first.orchestrator.cautions)
+    assert not any("set them aside" in c for c in second.orchestrator.cautions)
+    assert "simulation_parse_notes" not in second.metadata
