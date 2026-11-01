@@ -324,6 +324,15 @@ class TestDiffApplicationIsBounded:
 _RUFF = __import__("shutil").which("ruff") and __import__("shutil").which("patch")
 
 
+def _pin_ruff_rules(root):
+    """Pin the rules, as a project's config would: ruff's DEFAULT rule set
+    differs between versions (0.17 adds import sorting, drops E741), and a
+    verdict test must not depend on which ruff is installed."""
+    config = root / "ruff.toml"
+    if not config.exists():
+        config.write_text('[lint]\nselect = ["E4", "E7", "E9", "F"]\n')
+
+
 @pytest.mark.skipif(not _RUFF, reason="needs ruff and patch")
 class TestTheCheckerJudgesTheChange:
     """Against real ruff and patch: what Linus measured passing that should
@@ -333,6 +342,7 @@ class TestTheCheckerJudgesTheChange:
             "def g():\n    return 1\n")
 
     def _check(self, tmp_path, diff="", code=""):
+        _pin_ruff_rules(tmp_path)
         (tmp_path / "c.py").write_text(self.FILE)
         return run_static_checks(
             [CodeSuggestion(file_path="c.py", unified_diff=diff, code_block=code,
@@ -453,7 +463,8 @@ class TestTheCheckerJudgesTheChange:
         assert self._check(tmp_path, self._change_g("return nowhere")).status == "failed"
 
     def test_the_projects_ruff_config_applies(self, tmp_path):
-        (tmp_path / "ruff.toml").write_text('[lint]\nignore = ["E741"]\n')
+        (tmp_path / "ruff.toml").write_text(
+            '[lint]\nselect = ["E4", "E7", "E9", "F"]\nignore = ["E741"]\n')
         assert self._check(tmp_path, self._change_g("return [l for l in (1,)]")).status == "passed"
 
     def test_a_crashed_tool_is_not_a_clean_one(self, tmp_path, monkeypatch):
@@ -506,6 +517,7 @@ class TestReviewRoundTwo:
     """Neo's second review, each reproduced with real ruff first."""
 
     def _run(self, tmp_path, before, diff, path="c.py"):
+        _pin_ruff_rules(tmp_path)
         (tmp_path / path).write_text(before)
         return run_static_checks(
             [CodeSuggestion(file_path=path, unified_diff=diff, code_block="",
@@ -586,6 +598,7 @@ class TestReviewRoundThree:
     """Linus's third review, reproduced with real ruff and patch."""
 
     def _run(self, tmp_path, before, diff, path="c.py"):
+        _pin_ruff_rules(tmp_path)
         (tmp_path / path).write_text(before)
         return run_static_checks(
             [CodeSuggestion(file_path=path, unified_diff=diff, code_block="",
