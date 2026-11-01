@@ -4350,6 +4350,62 @@ class TestAddressedOutcomeFeedback:
 
         assert [f for f in store.entries if "episode-derived" in f.tags] == []
 
+    def _verified(self, ep_id, base=None):
+        from dataclasses import replace
+        return replace(self._outcome(ep_id, OutcomeType.ADDRESSED), verified_fix=True,
+                       applied_on_revision=base or f"rev-{ep_id}")
+
+    def test_a_verified_fix_supports_its_candidate(self, store):
+        """Decided 2026-11-01: the flagged code fixed Claude's way, with the
+        static checks passing on that fix, is evidence the lesson was right.
+        The human edit is still not a check that passed; the checker's
+        verdict is recorded as its own evidence."""
+        es = self._episode(store, "vf-0")
+        self._feed(store, self._verified("vf-0"))
+
+        episode = es.load("vf-0")
+        candidate = episode.memory_candidates[0]
+        assert candidate.status == "supported_once"
+        assert candidate.supporting_episode_ids == ["vf-0"]
+        assert episode.applied_on("vf-0-sug")[0] == "rev-vf-0"
+        statuses = {v.kind: v.status for v in episode.verification}
+        assert statuses["user_addressed"] == "skipped"
+        assert statuses["fix_static_checks"] == "passed"
+
+    def test_a_verified_fix_earns_no_fact_credit(self, store):
+        cited = store.add_fact(subject="cited lesson", body="b", kind=FactKind.PATTERN,
+                               confidence=0.6)
+        self._episode(store, "vf-1")
+        from dataclasses import replace
+        self._feed(store, replace(self._verified("vf-1"), used_fact_ids=[cited.id],
+                                  retrieved_fact_ids=[cited.id]))
+
+        assert cited.metadata.confidence == pytest.approx(0.6)
+        assert cited.metadata.success_count == 0
+
+    def test_two_verified_fixes_on_distinct_revisions_promote(self, store):
+        for ep_id in ("vp-0", "vp-1"):
+            self._episode(store, ep_id)
+            self._feed(store, self._verified(ep_id))
+
+        assert [f for f in store.entries if "episode-derived" in f.tags]
+
+    def test_two_verified_fixes_on_one_revision_do_not_promote(self, store):
+        """The distinct-revision bar is unchanged: one sitting cannot promote
+        its own lesson."""
+        for ep_id in ("vs-0", "vs-1"):
+            self._episode(store, ep_id)
+            self._feed(store, self._verified(ep_id, base="rev-shared"))
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
+    def test_an_unverified_fix_still_never_promotes(self, store):
+        for ep_id in ("vu-0", "vu-1"):
+            self._episode(store, ep_id)
+            self._feed(store, self._outcome(ep_id, OutcomeType.ADDRESSED))
+
+        assert [f for f in store.entries if "episode-derived" in f.tags] == []
+
     @pytest.mark.parametrize("verdict", [OutcomeType.ACCEPTED, OutcomeType.MODIFIED,
                                          OutcomeType.ADDRESSED])
     def test_unverified_never_walks_a_verdict_back(self, store, verdict):

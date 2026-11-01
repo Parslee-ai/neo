@@ -271,6 +271,12 @@ class Outcome:
     # written (UNVERIFIED keeps that spelling for its fact link). What
     # `_dedup_outcomes` keys on; "" means `file_path` already is git's name.
     git_path: str = ""
+    # ADDRESSED only: the change at the flagged lines was judged by the static
+    # checks (file at the suggestion's revision vs now) and introduced no
+    # problem. A verified fix supports its candidate toward promotion like an
+    # acceptance (decided 2026-11-01); it earns no fact credit and is never
+    # recorded as a `passed` user acceptance.
+    verified_fix: bool = False
     diff_summary: str = ""  # actual git diff content (truncated)
     suggestion_description: str = ""  # empty for independent changes
     suggestion_confidence: float = 0.0
@@ -2340,10 +2346,21 @@ class OutcomeTracker:
                     )
                     if outcome_type == OutcomeType.ACCEPTED else ("", "", "")
                 )
+                verified_fix = False
+                if outcome_type == OutcomeType.ADDRESSED:
+                    verified_fix = self._addressed_fix_passes_checks(normalized, session, sugg)
+                    if verified_fix:
+                        # The promotion gate compares the revision each piece
+                        # of evidence was made on; fails closed on "".
+                        applied_on_revision, carrier_revision, applied_on_parent = (
+                            self._fix_base_revision(normalized, session.timestamp,
+                                                    dirty_roots or {})
+                        )
 
                 outcomes.append(Outcome(
                     outcome_type=outcome_type,
                     file_path=normalized,
+                    verified_fix=verified_fix,
                     diff_summary=diff,
                     suggestion_description=sugg.get("description", ""),
                     suggestion_confidence=sugg.get("confidence", 0.0),
@@ -2413,6 +2430,96 @@ class OutcomeTracker:
         outcomes.extend(independent_candidates[:MAX_INDEPENDENT_OUTCOMES])
 
         return outcomes
+
+    def _addressed_fix_passes_checks(
+        self, file_path: str, session: SessionRecord, sugg: dict,
+    ) -> bool:
+        """Did Claude's own fix at the flagged lines pass the static checks?
+
+        The file at the revision the suggestion was made on is the before;
+        the file as the suggesting checkout holds it now is the after (the
+        same checkout `_flagged_code_rewritten` read). Passes when at least
+        one checker reached a verdict and none failed; warnings (style) do
+        not count against it. Anything that cannot be judged (no recorded
+        revision, a file unreadable, every checker unavailable or out of
+        budget) is not a pass: the ADDRESSED stays neutral.
+        """
+        revision = session.repository_revision
+        root = self.codebase_root
+        if not revision or not root or not file_path:
+            return False
+        try:
+            shown = subprocess.run(
+                [*_GIT_NAMING, "show", f"{revision}:{file_path}"], cwd=root,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+            logger.debug("git show for an addressed fix failed (non-fatal): %s", exc)
+            return False
+        if shown.returncode != 0:
+            return False
+        checkout = sugg.get("checkout") or self._recorded_top(session)
+        target = Path(checkout) / file_path
+        try:
+            after = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        try:
+            from neo.config import NeoConfig
+            from neo.static_analysis import check_change
+
+            config = NeoConfig.load()
+            results = check_change(
+                file_path, shown.stdout, after, codebase_root=root, target=target,
+                enable_ruff=config.enable_ruff, enable_pyright=config.enable_pyright,
+                enable_mypy=config.enable_mypy, enable_eslint=config.enable_eslint,
+            )
+        except Exception as exc:  # the verdict is optional evidence, never fatal
+            logger.debug("static checks on an addressed fix failed (non-fatal): %s", exc)
+            return False
+        statuses = {result.status for result in results}
+        return bool(statuses & {"passed", "warning"}) and "failed" not in statuses
+
+    def _fix_base_revision(
+        self, file_path: str, since_timestamp: float, dirty_roots: dict[str, str],
+    ) -> tuple[str, str, str]:
+        """``(base, carrier, base's parent)`` for a fix made Claude's way.
+
+        `_applied_on_revision` finds the commit that CARRIES Neo's diff, which
+        a fix written differently never does. Here the carrier is the first
+        commit on any local branch since the suggestion that touched the file;
+        uncommitted, the base is HEAD of the checkout holding it. "" when
+        neither is found: promotion fails closed on it.
+        """
+        if not self.codebase_root:
+            return "", "", ""
+        since_iso = datetime.datetime.fromtimestamp(
+            since_timestamp, tz=datetime.timezone.utc
+        ).isoformat()
+
+        def git(root: str, *args: str) -> str:
+            try:
+                result = subprocess.run(
+                    [*_GIT_NAMING, *args], cwd=root, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=10,
+                )
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                return ""
+            return result.stdout.strip() if result.returncode == 0 else ""
+
+        commits = git(self.codebase_root, "log", "--branches", "HEAD", "--since",
+                      since_iso, "--format=%H", "--", file_path).splitlines()
+        if commits:
+            carrier = commits[-1].strip()
+            base = git(self.codebase_root, "rev-parse", "--verify", "-q", f"{carrier}^")
+            parent = git(self.codebase_root, "rev-parse", "--verify", "-q",
+                         f"{base}^") if base else ""
+            return base, carrier, parent
+        root = dirty_roots.get(file_path) or self.codebase_root
+        base = git(root, "rev-parse", "HEAD")
+        parent = git(root, "rev-parse", "--verify", "-q", f"{base}^") if base else ""
+        return base, "", parent
 
     def _is_untracked(self, file_path: str, root: Optional[str] = None) -> bool:
         """Is this path present on disk but unknown to git?

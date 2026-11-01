@@ -254,6 +254,22 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   `addressed` only from `observed_unverified`/`unverified`. The cost of a
   false ADDRESSED is a MODIFIED demotion not applied; it never makes an
   accept.
+  **Verified fixes support promotion (owner's decision, 2026-11-01).** On a
+  live install Claude fixed Neo's findings its own way: 13 MODIFIED, 0
+  ACCEPTED, so promotion could never be reached by review traffic. An
+  ADDRESSED now runs the static checks on Claude's actual fix (the file at the
+  suggestion's `repository_revision` vs the suggesting checkout now, judged by
+  `static_analysis.check_change`, the rules that judge Neo's own changes).
+  When at least one checker reaches a verdict and none fails, the outcome is
+  `verified_fix`: it supports its candidate exactly like an acceptance
+  (`supported_once`, `supporting_episode_ids`, an `applied_on` base from
+  `_fix_base_revision`: the parent of the first commit since the suggestion
+  that touched the file, or HEAD when uncommitted). The recurrence bar is
+  unchanged: two supporting episodes on distinct base revisions. What does NOT
+  change: no fact earns credit from it, the human edit stays
+  `user_addressed`/`skipped` (the checker's verdict is a separate
+  `fix_static_checks`/`passed` evidence), and an unverified ADDRESSED never
+  supports anything. It runs on the request path under the `--fast` budget.
 - **"The linked original fact" means the DURABLE fact the suggestion re-applied,
   and the link nearly died in silence.** `suggestion_fact_ids` (file_path →
   fact_id) is the only input to the ACCEPTED reinforcement branch and to
