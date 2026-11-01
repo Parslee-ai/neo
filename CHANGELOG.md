@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.62.4] - 2026-11-01
+
+### Fixed
+
+- **Neo checks his code again, and says only what he actually checked.** Since 2026-08-26 no request ran ruff, pyright or mypy, because a check of whether a suggestion carries a change read fields suggestions don't have. Every answer said its code was unverified. The checkers are back, and their verdicts are honest first (#334):
+  - A change is applied once, and `patch`'s result is read. A diff that doesn't apply, a header-only or blank diff, or a code block with no diff is reported as not checked, never as passed. A diff that's already in the file (what VERIFY is asked about a change just made) is checked as that change.
+  - Only problems the change introduced count. The checker reads the file before the change too, so an old error elsewhere in the file no longer blocks a lesson from being learned. A syntax error or undefined name the change causes is caught even on a line it didn't touch.
+  - ruff reads your project's own config. Style findings are warnings; only broken code (syntax errors, undefined names) fails a change.
+  - One clean file no longer vouches for another. Cautions now say when only part of an answer was checked, or when the checkers couldn't reach a verdict. "No checkers on this machine" appears only when that's true.
+  - Under `--fast`, which the Claude Code mod uses, the checks get 20 seconds. Anything that doesn't fit is reported as skipped.
+
 ## [0.62.3] - 2026-11-01
 
 ### Fixed
