@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.62.3] - 2026-11-01
+
+### Fixed
+
+- **One malformed simulation run no longer throws away Neo's answer.** Neo checks his plan by simulating it, and he used to validate those simulation runs as one block. If the model left a field out of a single run, or listed more than ten problems in one, the whole answer was discarded with "I broke on this one". On a live install that caused 9 of 13 failed runs, and it tripped the v0.62.2 release gate once. Each simulation run is now checked on its own. A malformed one is set aside, an over-long list is cut to its limit, and a run missing only its version marker is kept. A set-aside run still counts against confidence, its problems are named in a caution ("…they'd flagged 1 problem(s). Treat those as open."), and it stops Neo skipping verification. If every run is malformed, the request still fails. Hosts get the details in `metadata.simulation_parse_notes` (#332).
+
+### Known issue
+
+- **Neo's static checkers have not run since 2026-08-26.** A check of whether a suggestion carries a change reads fields that suggestions don't have, so every answer says its code is unverified. Simply re-enabling them was reviewed and held back: the checker would report a diff that does not apply as passing and lint whole files into promotion vetoes. Those come first, in a separate fix.
+
 ## [0.62.2] - 2026-11-01
 
 ### Fixed
