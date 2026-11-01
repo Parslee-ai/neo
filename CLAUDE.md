@@ -30,11 +30,12 @@
 - Per-scope valid-fact caps (`SCOPE_LIMITS`): global 200, org 100, project 500,
   session 50. Supersession at cosine ≥ 0.85 (`SUPERSESSION_THRESHOLD`);
   pre-write dedup is canonical-signature EQUALITY, not cosine.
-- Promotion to a durable PATTERN needs ≥2 git-verified ACCEPTED episodes sharing
+- Promotion to a durable PATTERN needs ≥2 supporting episodes (git-verified
+  ACCEPTED, or a verified-fix ADDRESSED: `FactStore._supports_promotion`) sharing
   a correlation signature AND spanning ≥2 distinct sittings/base revisions
   (`applied_on_revision`, `FactStore._sitting_bases` union-find). Fails closed on
   a blank revision. **Never reintroduce a session-id fallback.** Any new producer
-  of ACCEPTED outcomes must set `applied_on_revision` or it never promotes.
+  of supporting outcomes must set `applied_on_revision` or it never promotes.
 - Correlation signature = candidate SUBJECT + structural fingerprint
   (`_suggestion_fingerprint`, name-normalized inside the skeleton extractor),
   never the LM body. Frozen into `Fact.canonical_signature` at mint; teardown
@@ -76,10 +77,12 @@
   (`repo_path`/`checkout`; worktrees get deleted); detection reads `repo_path`.
   A path in no checkout is untrackable: one UNVERIFIED, never pending. The
   tracker runs at the checkout top; `scope_root` is the asked dir.
-- UNVERIFIED and ADDRESSED mutate nothing. New `OutcomeType` → update both
+- UNVERIFIED and ADDRESSED mutate no fact. New `OutcomeType` → update both
   `outcomes.py` and `store.detect_implicit_feedback`. ADDRESSED (changed at the
-  lines Neo flagged) is a location heuristic: never let it feed promotion,
-  `user_acceptance`, a `passed` status or credit.
+  lines Neo flagged) is a location heuristic: never let it feed
+  `user_acceptance`, a `passed` status or credit. It supports promotion ONLY
+  when `verified_fix` (static checks pass on the fix, file at the suggestion's
+  revision vs now; the owner's decision, 2026-11-01); unverified never does.
 - Linked facts resolve via `find_durable_fact_for_candidate` against the FROZEN
   `canonical_signature`; never let an empty target match.
 - **Every credit path must reach a `save()`**, with a test that reloads from disk.

@@ -1156,3 +1156,109 @@ class TestFlaggedRegions:
         assert region_present(["a", "b"], ["a", "b", "c"])
         assert not region_present(["a", "c"], ["a", "b", "c"])
         assert not region_present([], ["a"])
+
+
+_RUFF_AND_PATCH = __import__("shutil").which("ruff") and __import__("shutil").which("git")
+
+
+@pytest.mark.skipif(not _RUFF_AND_PATCH, reason="needs ruff and git")
+class TestVerifiedAddressedFix:
+    """Decided 2026-11-01: an ADDRESSED fix whose change passes the static
+    checks counts toward promotion. Real git, real ruff."""
+
+    SOUND = ("        if path.is_symlink() and not path.exists():\n"
+             "            continue\n"
+             "        path = path.resolve(strict=False)\n")
+
+    def _git(self, repo, *args):
+        import subprocess
+        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def _fix(self, tmp_path, fixed_line_block, *, peer_commit=False, commit=True):
+        import subprocess
+
+        repo = tmp_path / "repo"
+        notes = repo / "src" / "neo" / "notes.py"
+        notes.parent.mkdir(parents=True)
+        notes.write_text(_REVIEWED_NOTES)
+        (repo / "ruff.toml").write_text('[lint]\nselect = ["E4", "E7", "E9", "F"]\n')
+        old = "@1700000000 +0000"
+        env = {**__import__("os").environ, "GIT_AUTHOR_DATE": old, "GIT_COMMITTER_DATE": old}
+        for args in (["init", "-q", "-b", "main", "."], ["config", "user.email", "t@t.t"],
+                     ["config", "user.name", "T"], ["add", "-A"], ["commit", "-qm", "init"]):
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                              text=True).stdout.strip()
+        tracker = OutcomeTracker(codebase_root=str(repo), project_id=f"vf-{tmp_path.name}")
+        tracker.save_session(
+            [FakeSuggestion(file_path=str(notes), description="Guard resolve()",
+                            unified_diff=_NEO_FIX)],
+            "review", repository_revision=head,
+        )
+        if peer_commit:
+            # A peer branch edits the same file ELSEWHERE, before the fix
+            # lands: it touches the path but does not carry the fix, and
+            # taking it as the carrier split one sitting into two bases.
+            self._git(repo, "checkout", "-q", "-b", "peer")
+            notes.write_text(_REVIEWED_NOTES.replace("    return found\n",
+                                                     "    return list(found)\n"))
+            self._git(repo, "commit", "-qam", "peer edit elsewhere")
+            self._git(repo, "checkout", "-q", "main")
+            self._git(repo, "commit", "-q", "--allow-empty", "-m", "main moves on")
+        base = self._git(repo, "rev-parse", "HEAD")
+        notes.write_text(_REVIEWED_NOTES.replace("        path = path.resolve()\n",
+                                                 fixed_line_block))
+        if commit:
+            self._git(repo, "commit", "-qam", "fix it my way")
+        outcomes, _ = tracker.detect_outcomes()
+        [outcome] = [o for o in outcomes if o.file_path == "src/neo/notes.py"]
+        outcome.expected_base = base
+        return outcome
+
+    def test_a_sound_fix_the_other_way_is_verified(self, tmp_path):
+        outcome = self._fix(
+            tmp_path,
+            "        if path.is_symlink() and not path.exists():\n"
+            "            continue\n"
+            "        path = path.resolve(strict=False)\n",
+        )
+        assert outcome.outcome_type == OutcomeType.ADDRESSED
+        assert outcome.verified_fix is True
+        # The fix commit's parent: what the distinct-revision gate compares.
+        assert outcome.applied_on_revision == outcome.expected_base
+
+    def test_an_unrelated_commit_to_the_file_does_not_supply_the_base(self, tmp_path):
+        """(Linus) A peer branch's earlier edit elsewhere in the file used to
+        be taken as the carrier, giving a base from another sitting."""
+        outcome = self._fix(tmp_path, self.SOUND, peer_commit=True)
+        assert outcome.verified_fix is True
+        assert outcome.applied_on_revision == outcome.expected_base
+
+    def test_an_uncommitted_fix_is_based_on_head(self, tmp_path):
+        outcome = self._fix(tmp_path, self.SOUND, commit=False)
+        assert outcome.verified_fix is True
+        assert outcome.applied_on_revision == outcome.expected_base
+
+    def test_fix_checks_are_capped_per_request(self, tmp_path, monkeypatch):
+        """Each check can take the --fast budget, on every learn request."""
+        from neo.memory import outcomes as om
+        from neo.static_analysis import check_change as real
+
+        calls = []
+        monkeypatch.setattr("neo.static_analysis.check_change",
+                            lambda *a, **k: calls.append(a) or real(*a, **k))
+        monkeypatch.setattr(om, "MAX_FIX_CHECKS_PER_REQUEST", 0)
+        outcome = self._fix(tmp_path, self.SOUND)
+        assert outcome.outcome_type == OutcomeType.ADDRESSED
+        assert outcome.verified_fix is False and calls == []
+
+    def test_a_fix_that_breaks_the_file_is_not_verified(self, tmp_path):
+        outcome = self._fix(
+            tmp_path,
+            "        if path.is_symlink() and not path.exists():\n"
+            "            continue\n"
+            "        path = resolve_safely(path)\n",
+        )
+        assert outcome.outcome_type == OutcomeType.ADDRESSED
+        assert outcome.verified_fix is False

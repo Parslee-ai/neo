@@ -22,7 +22,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from neo.memory.io_utils import atomic_write_json
 
@@ -45,6 +45,11 @@ MAX_INDEPENDENT_DIFFS = 50
 # `git diff` processes run at once when listing dirty files across linked
 # worktrees.
 LINKED_WORKTREE_WORKERS = 8
+
+# Static checks of Claude's own fix per learn request (verified ADDRESSED).
+# Each can take the --fast budget; they share one deadline. Past it, an
+# ADDRESSED stays unverified for that request.
+MAX_FIX_CHECKS_PER_REQUEST = 2
 # Suggested paths per `git diff` pathspec, so the command line stays well under
 # Windows' ~32K-character limit however many suggestions are outstanding.
 PATHSPEC_CHUNK = 200
@@ -271,6 +276,12 @@ class Outcome:
     # written (UNVERIFIED keeps that spelling for its fact link). What
     # `_dedup_outcomes` keys on; "" means `file_path` already is git's name.
     git_path: str = ""
+    # ADDRESSED only: the change at the flagged lines was judged by the static
+    # checks (file at the suggestion's revision vs now) and introduced no
+    # problem. A verified fix supports its candidate toward promotion like an
+    # acceptance (decided 2026-11-01); it earns no fact credit and is never
+    # recorded as a `passed` user acceptance.
+    verified_fix: bool = False
     diff_summary: str = ""  # actual git diff content (truncated)
     suggestion_description: str = ""  # empty for independent changes
     suggestion_confidence: float = 0.0
@@ -1242,6 +1253,13 @@ class OutcomeTracker:
         # request hot path, growing linearly.
         self._checkout_roots = self._list_checkout_roots()
         working_tree = self._get_working_tree_changes()
+        # Verified-fix checks: at most MAX_FIX_CHECKS_PER_REQUEST, all inside
+        # one --fast budget (`_addressed_fix_passes_checks`).
+        from neo.static_analysis import FAST_STATIC_CHECK_PHASE_BUDGET_SECONDS
+
+        self._fix_checks_left = MAX_FIX_CHECKS_PER_REQUEST
+        self._fix_check_deadline = time.monotonic() + FAST_STATIC_CHECK_PHASE_BUDGET_SECONDS
+        self._fix_config = None
         # Suggested paths dirty in the repository's OTHER checkouts (linked
         # worktrees), path -> the checkout holding it. Like everything gathered
         # "elsewhere" below, this only resolves paths Neo suggested; it never
@@ -2172,7 +2190,7 @@ class OutcomeTracker:
 
     def _applied_on_revision(
         self, file_path: str, since_timestamp: float, dirty_roots: dict[str, str],
-        sugg: dict,
+        sugg: dict, carries: Optional[Callable[[str, str], bool]] = None,
     ) -> tuple[str, str, str]:
         """``(base, carrier, base's parent)``: the revision an applied change
         was made ON TOP OF, the commit that carried it ("" when seen
@@ -2202,6 +2220,12 @@ class OutcomeTracker:
         HEAD at ask time could not be used either: a Lattice node's main
         checkout sits still while peers commit on their own branches, so every
         episode carried one revision and promotion could never fire (#254).
+
+        ``carries(sha, patch)`` replaces the overlap test for evidence that is
+        not Neo's diff: a verified fix written Claude's way carries the change
+        when that commit's version of the file has the flagged code rewritten
+        (`_commit_rewrites_flagged`). The rest is shared on purpose: a second
+        copy of this function took ANY commit touching the file as the carrier.
         """
         if not self.codebase_root:
             return "", "", ""
@@ -2229,7 +2253,11 @@ class OutcomeTracker:
             for sha in reversed((commits or "").splitlines()):
                 patch = git(self.codebase_root, "show", "--format=", sha.strip(),
                             "--", file_path)
-                if patch and self._classify_applied(sugg, patch) == OutcomeType.ACCEPTED:
+                carried = (
+                    carries(sha.strip(), patch) if carries is not None
+                    else self._classify_applied(sugg, patch) == OutcomeType.ACCEPTED
+                ) if patch else False
+                if carried:
                     base = git(self.codebase_root, "rev-parse", "--verify", "-q",
                                f"{sha.strip()}^") or ""
                     return with_parent(base, sha.strip())
@@ -2340,10 +2368,26 @@ class OutcomeTracker:
                     )
                     if outcome_type == OutcomeType.ACCEPTED else ("", "", "")
                 )
+                verified_fix = False
+                if outcome_type == OutcomeType.ADDRESSED:
+                    verified_fix = self._addressed_fix_passes_checks(normalized, session, sugg)
+                    if verified_fix:
+                        # The promotion gate compares the revision each piece
+                        # of evidence was made on: the parent of the commit
+                        # that CARRIES the fix, or HEAD of the checkout holding
+                        # it dirty; "" otherwise, and promotion fails closed.
+                        applied_on_revision, carrier_revision, applied_on_parent = (
+                            self._applied_on_revision(
+                                normalized, session.timestamp, dirty_roots or {}, sugg,
+                                carries=lambda sha, _patch, path=normalized, s=sugg:
+                                    self._commit_rewrites_flagged(path, s, sha),
+                            )
+                        )
 
                 outcomes.append(Outcome(
                     outcome_type=outcome_type,
                     file_path=normalized,
+                    verified_fix=verified_fix,
                     diff_summary=diff,
                     suggestion_description=sugg.get("description", ""),
                     suggestion_confidence=sugg.get("confidence", 0.0),
@@ -2413,6 +2457,99 @@ class OutcomeTracker:
         outcomes.extend(independent_candidates[:MAX_INDEPENDENT_OUTCOMES])
 
         return outcomes
+
+    def _addressed_fix_passes_checks(
+        self, file_path: str, session: SessionRecord, sugg: dict,
+    ) -> bool:
+        """Did Claude's own fix at the flagged lines pass the static checks?
+
+        The file at the revision the suggestion was made on is the before;
+        the file as the suggesting checkout holds it now is the after (the
+        same checkout `_flagged_code_rewritten` read). So what is judged is
+        the file's NET change since the suggestion, which on a busy branch
+        includes more than the fix: an unrelated new error fails it (the safe
+        direction).
+
+        The bar is low on purpose and should be read as such: the edited file
+        still parses and gains no new error (syntax, undefined name, or what
+        the project's checkers call an error). Warnings do not count against
+        it, and callers in OTHER files are not seen. Anything that cannot be
+        judged (no recorded revision, a file unreadable, every checker
+        unavailable, past the per-request cap) is not a pass: the ADDRESSED
+        stays neutral.
+        """
+        revision = session.repository_revision
+        root = self.codebase_root
+        if not revision or not root or not file_path:
+            return False
+        # Bounded per request: outcome detection runs on every learn request
+        # and each check can take the --fast budget. Past the cap or the
+        # shared deadline the ADDRESSED stays unverified THIS request (fail
+        # closed); the suggestion is resolved either way.
+        budget = getattr(self, "_fix_check_deadline", 0.0) - time.monotonic()
+        if getattr(self, "_fix_checks_left", 0) <= 0 or budget <= 0:
+            return False
+        self._fix_checks_left -= 1
+        try:
+            shown = subprocess.run(
+                [*_GIT_NAMING, "show", f"{revision}:{file_path}"], cwd=root,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+            logger.debug("git show for an addressed fix failed (non-fatal): %s", exc)
+            return False
+        if shown.returncode != 0:
+            return False
+        checkout = sugg.get("checkout") or self._recorded_top(session)
+        target = Path(checkout) / file_path
+        try:
+            after = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        try:
+            from neo.static_analysis import check_change
+
+            config = self._fix_check_config()
+            results = check_change(
+                file_path, shown.stdout, after, codebase_root=root, target=target,
+                enable_ruff=config.enable_ruff, enable_pyright=config.enable_pyright,
+                enable_mypy=config.enable_mypy, enable_eslint=config.enable_eslint,
+                phase_budget=budget,
+            )
+        except Exception as exc:  # the verdict is optional evidence, never fatal
+            logger.debug("static checks on an addressed fix failed (non-fatal): %s", exc)
+            return False
+        statuses = {result.status for result in results}
+        return bool(statuses & {"passed", "warning"}) and "failed" not in statuses
+
+    def _fix_check_config(self):
+        """The checker settings, read once per request (each check used to
+        re-read the config file from disk)."""
+        if getattr(self, "_fix_config", None) is None:
+            from neo.config import NeoConfig
+
+            self._fix_config = NeoConfig.load()
+        return self._fix_config
+
+    def _commit_rewrites_flagged(self, file_path: str, sugg: dict, sha: str) -> bool:
+        """Does commit ``sha``'s version of ``file_path`` have every region
+        Neo flagged rewritten, by the same test the checkout was judged by?"""
+        regions = [r for r in sugg.get("flagged_regions") or [] if isinstance(r, dict)]
+        if not regions or not self.codebase_root:
+            return False
+        try:
+            shown = subprocess.run(
+                [*_GIT_NAMING, "show", f"{sha}:{file_path}"], cwd=self.codebase_root,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            return False
+        if shown.returncode != 0:
+            return False
+        code = [line.strip() for line in shown.stdout.splitlines() if line.strip()]
+        return all(region_rewritten(region, code) for region in regions)
 
     def _is_untracked(self, file_path: str, root: Optional[str] = None) -> bool:
         """Is this path present on disk but unknown to git?

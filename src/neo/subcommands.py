@@ -930,6 +930,7 @@ def _handle_learning_stats(args) -> None:
     expired_before = time.time() - OutcomeTracker.PENDING_SESSION_TTL_SECONDS
 
     projects = episodes = 0
+    verified_fixes = 0
     outcomes: Counter = Counter()
     candidates: Counter = Counter()
     mutations: Counter = Counter()
@@ -968,6 +969,10 @@ def _handle_learning_stats(args) -> None:
                 if cutoff is not None and float(episode.started_at or 0) < cutoff:
                     continue
                 counted_here += 1
+                # Evidence through the 2026-11-01 route: Claude fixed the
+                # flagged code its own way and the static checks passed.
+                if any(v.kind == "fix_static_checks" for v in episode.verification):
+                    verified_fixes += 1
                 # Outcome detection stops waiting at the pending TTL. Episodes
                 # from before it closed what expired still read "pending";
                 # past the TTL nothing can resolve them, so they are reported
@@ -1035,6 +1040,7 @@ def _handle_learning_stats(args) -> None:
             "final_outcomes": dict(outcomes),
             "candidate_status": dict(candidates),
             "promotions": promotions,
+            "verified_fixes": verified_fixes,
             "promotions_project": promotions_project,
             "promotions_global": promotions_global,
             "rollbacks": rollbacks,
@@ -1098,6 +1104,7 @@ def _handle_learning_stats(args) -> None:
     print("  learning actions (from the ledger):")
     print(f"    {'promotions':<42} {promotions:>5}"
           f"   (project {promotions_project}, cross-project {promotions_global})")
+    print(f"    {'verified fixes (Claude-written, checks passed)':<42} {verified_fixes:>5}")
     print(f"    {'rollbacks':<42} {rollbacks:>5}")
     print(f"    {'demotions':<42} {demotions:>5}")
     print(f"    {'reinforcements (incl. cited-fact credit)':<42} {reinforcements:>5}")

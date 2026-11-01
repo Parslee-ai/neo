@@ -592,78 +592,134 @@ def run_static_checks(
         "mypy": enable_mypy,
         "eslint": enable_eslint,
     }
-    available_tools = detect_available_tools()
-    results: list[StaticCheckResult] = []
     deadline = time.monotonic() + phase_budget
+    available = detect_available_tools()
+    results: list[StaticCheckResult] = []
+    for suggestion in suggestions:
+        results.extend(_check_one_file(
+            suggestion.file_path,
+            lambda timeout, s=suggestion: prepare_change(s, codebase_root, timeout=timeout),
+            enable_map, deadline, phase_budget, available,
+        ))
+    return results
+
+
+def check_change(
+    file_path: str,
+    before: Optional[str],
+    after: str,
+    codebase_root: Optional[str] = None,
+    target: Optional[Path] = None,
+    enable_ruff: bool = True,
+    enable_pyright: bool = True,
+    enable_mypy: bool = False,
+    enable_eslint: bool = True,
+    phase_budget: float = FAST_STATIC_CHECK_PHASE_BUDGET_SECONDS,
+) -> list[StaticCheckResult]:
+    """Judge a change already made to ``file_path``: ``before`` (None if the
+    file is new) to ``after``, by the same rules as a suggested change.
+
+    Outcome detection uses it to ask whether Claude's own fix at the lines
+    Neo flagged introduced any problem. It runs on the request path, so its
+    budget defaults to the `--fast` one.
+    """
+    enable_map = {
+        "ruff": enable_ruff,
+        "pyright": enable_pyright,
+        "mypy": enable_mypy,
+        "eslint": enable_eslint,
+    }
+    if before is not None and before == after:
+        prepared: Optional[PreparedChange] = None
+        why = "the change changes nothing in the file"
+    else:
+        prepared = PreparedChange(file_path, after, original=before,
+                                  target=target, root=codebase_root)
+        why = ""
+    return _check_one_file(
+        file_path, lambda _timeout: (prepared, why),
+        enable_map, time.monotonic() + phase_budget, phase_budget,
+    )
+
+
+def _check_one_file(
+    file_path: str,
+    prepare: Callable[[float], tuple[Optional[PreparedChange], str]],
+    enable_map: dict[str, bool],
+    deadline: float,
+    phase_budget: float,
+    available_tools: Optional[set[str]] = None,
+) -> list[StaticCheckResult]:
+    """Every enabled checker for ``file_path``'s language on the change
+    ``prepare(timeout)`` yields, judged against the original. At least one
+    result, always: a change nothing could check is reported, never dropped.
+    """
+    results: list[StaticCheckResult] = []
+    if available_tools is None:
+        available_tools = detect_available_tools()
 
     def not_run(tool: str, summary: str, status: str) -> StaticCheckResult:
         return StaticCheckResult(tool_name=tool, diagnostics=[], summary=summary,
                                  kind=_TOOL_KINDS.get(tool, "lint"), status=status,
-                                 file_path=suggestion.file_path)
+                                 file_path=file_path)
 
     def budget_spent(tool: str) -> StaticCheckResult:
         return not_run(tool, f"{tool} not run - the static-check phase budget of "
                              f"{phase_budget:g}s expired", "skipped")
 
-    for suggestion in suggestions:
-        suffix = Path(suggestion.file_path).suffix.lower()
-        claimed = [c for c in _LANGUAGE_CHECKERS if suffix in c.extensions]
-        checkers = [c for c in claimed if enable_map.get(c.tool_name, False)]
-        if not checkers:
+    suffix = Path(file_path).suffix.lower()
+    claimed = [c for c in _LANGUAGE_CHECKERS if suffix in c.extensions]
+    checkers = [c for c in claimed if enable_map.get(c.tool_name, False)]
+    if not checkers:
+        return [not_run(
+            "static-checks",
+            f"{file_path} not checked - "
+            + ("every checker for it is disabled" if claimed
+               else f"no checker for {suffix or 'this file type'}"),
+            "skipped",
+        )]
+    prepared: Optional[PreparedChange] = None
+    why = ""
+    for checker in checkers:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Reported, not dropped. A check that never started is not a
+            # check that passed.
+            results.append(budget_spent(checker.tool_name))
+            continue
+        if checker.tool_name not in available_tools:
+            results.append(not_run(checker.tool_name,
+                                   f"{checker.tool_name} is unavailable", "unavailable"))
+            continue
+        if prepared is None and not why:
+            prepared, why = prepare(min(STATIC_CHECK_TIMEOUT_SECONDS, remaining))
+        if prepared is None:
             results.append(not_run(
-                "static-checks",
-                f"{suggestion.file_path} not checked - "
-                + ("every checker for it is disabled" if claimed
-                   else f"no checker for {suffix or 'this file type'}"),
-                "skipped",
+                checker.tool_name, f"{checker.tool_name} not run - {why}", "skipped",
             ))
             continue
-        prepared: Optional[PreparedChange] = None
-        why = ""
-        for checker in checkers:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                # Reported, not dropped. A check that never started is not a
-                # check that passed.
-                results.append(budget_spent(checker.tool_name))
-                continue
-            if checker.tool_name not in available_tools:
-                results.append(not_run(checker.tool_name,
-                                       f"{checker.tool_name} is unavailable", "unavailable"))
-                continue
-            if prepared is None and not why:
-                prepared, why = prepare_change(
-                    suggestion, codebase_root,
-                    timeout=min(STATIC_CHECK_TIMEOUT_SECONDS, remaining),
-                )
-            if prepared is None:
-                results.append(not_run(
-                    checker.tool_name, f"{checker.tool_name} not run - {why}", "skipped",
-                ))
-                continue
-            prepared.timeout = min(STATIC_CHECK_TIMEOUT_SECONDS, deadline - time.monotonic())
-            if prepared.timeout <= 0:
-                results.append(budget_spent(checker.tool_name))
-                continue
-            result = checker.run(prepared)
-            result.file_path = suggestion.file_path
-            if not result.kind:
-                result.kind = _TOOL_KINDS[checker.tool_name]
-            prepared.timeout = min(STATIC_CHECK_TIMEOUT_SECONDS, deadline - time.monotonic())
-            _judge_against_the_original(result, prepared, checker)
-            if not result.status:
-                severities = {
-                    str(item.get("severity", "")).lower()
-                    for item in result.diagnostics
-                }
-                if "error" in severities:
-                    result.status = "failed"
-                elif result.diagnostics:
-                    result.status = "warning"
-                elif "not found" in result.summary.lower() or "failed:" in result.summary.lower():
-                    result.status = "unavailable"
-                else:
-                    result.status = "passed"
-            results.append(result)
-
+        prepared.timeout = min(STATIC_CHECK_TIMEOUT_SECONDS, deadline - time.monotonic())
+        if prepared.timeout <= 0:
+            results.append(budget_spent(checker.tool_name))
+            continue
+        result = checker.run(prepared)
+        result.file_path = file_path
+        if not result.kind:
+            result.kind = _TOOL_KINDS[checker.tool_name]
+        prepared.timeout = min(STATIC_CHECK_TIMEOUT_SECONDS, deadline - time.monotonic())
+        _judge_against_the_original(result, prepared, checker)
+        if not result.status:
+            severities = {
+                str(item.get("severity", "")).lower()
+                for item in result.diagnostics
+            }
+            if "error" in severities:
+                result.status = "failed"
+            elif result.diagnostics:
+                result.status = "warning"
+            elif "not found" in result.summary.lower() or "failed:" in result.summary.lower():
+                result.status = "unavailable"
+            else:
+                result.status = "passed"
+        results.append(result)
     return results

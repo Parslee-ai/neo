@@ -1409,9 +1409,21 @@ class FactStore:
                 episode.outcome_details.pop("host_observations", None)
                 if outcome.host_observations:
                     episode.outcome_details["host_observations"] = outcome.host_observations
+            if append_verification and getattr(outcome, "verified_fix", False):
+                # The checker's verdict on Claude's fix, as its own evidence.
+                # The human edit itself stays `user_addressed` / `skipped`:
+                # where the file changed is not a check that passed.
+                episode.verification.append(VerificationEvidence(
+                    verification_id=uuid.uuid4().hex,
+                    kind="fix_static_checks",
+                    status="passed",
+                    tool_name="static_analysis",
+                    summary="addressed fix introduced no static-check problem",
+                    repository_revision=outcome.applied_on_revision,
+                ))
             if (
                 append_verification
-                and outcome.outcome_type == OutcomeType.ACCEPTED
+                and self._supports_promotion(outcome)
                 and outcome.suggestion_id
             ):
                 # Fill-once. `replay_linked_feedback` re-collects and records
@@ -1449,10 +1461,10 @@ class FactStore:
             for candidate in episode.memory_candidates:
                 if candidate.candidate_id != outcome.candidate_id:
                     continue
-                if outcome.outcome_type == OutcomeType.ACCEPTED:
-                    # User acceptance is useful evidence, but it must not
-                    # erase a deterministic failure recorded earlier in the
-                    # same episode. Keep the contradiction inspectable and
+                if self._supports_promotion(outcome):
+                    # User acceptance (or a verified fix) is useful evidence,
+                    # but it must not erase a deterministic failure recorded
+                    # earlier in the same episode. Keep the contradiction inspectable and
                     # ineligible for durable promotion.
                     if deterministic_failure:
                         candidate.status = "rejected_by_verification"
@@ -1494,9 +1506,11 @@ class FactStore:
                     outcome.outcome_type == OutcomeType.ADDRESSED
                     and candidate.status in ("observed_unverified", "unverified")
                 ):
-                    # Its own status, never `supporting_episode_ids`: promotion
-                    # counts acceptances of Neo's change, and this was not one.
-                    # It does not overrule a verdict already reached.
+                    # Unverified: its own status, never
+                    # `supporting_episode_ids`. A change at the flagged lines
+                    # is a location, not proof of a fix. (A VERIFIED one is
+                    # handled above, with the acceptances.) It does not
+                    # overrule a verdict already reached.
                     candidate.status = "addressed"
 
             association = outcome.outcome_type.value
@@ -2537,6 +2551,17 @@ class FactStore:
             return 0
 
     @staticmethod
+    def _supports_promotion(outcome) -> bool:
+        """Evidence a lesson was right: Neo's change applied (ACCEPTED), or
+        the flagged code fixed Claude's way with the static checks passing on
+        the fix (a verified ADDRESSED, decided 2026-11-01). Promotion still
+        needs two such episodes on distinct base revisions."""
+        return outcome.outcome_type == OutcomeType.ACCEPTED or (
+            outcome.outcome_type == OutcomeType.ADDRESSED
+            and bool(getattr(outcome, "verified_fix", False))
+        )
+
+    @staticmethod
     def _unlinked_outcome_is_recordable(outcome) -> bool:
         """Whether `_apply_unlinked_candidate_outcome` would record this outcome.
 
@@ -2559,10 +2584,10 @@ class FactStore:
         """
         if not self._unlinked_outcome_is_recordable(outcome):
             return False
-        if outcome.outcome_type == OutcomeType.ACCEPTED:
-            # First acceptance supports the episode candidate but does
-            # not create a Fact. Only a second independent accepted
-            # episode can promote an ordinary pattern.
+        if self._supports_promotion(outcome):
+            # First acceptance (or verified fix) supports the episode
+            # candidate but does not create a Fact. Only a second
+            # independent supporting episode can promote an ordinary pattern.
             self._record_attributed_episode_outcome(outcome)
             promoted = self._promote_repeatedly_supported_candidate(outcome)
             if promoted is not None:
@@ -2600,8 +2625,8 @@ class FactStore:
         elif outcome.outcome_type in (OutcomeType.UNVERIFIED, OutcomeType.ADDRESSED):
             # Absence of verification is not success. Preserve the
             # evidence in the episode but never mutate FactStore.
-            # ADDRESSED likewise: the flagged code was rewritten, but not
-            # as Neo proposed, so no fact earns credit from it; recording
+            # An unverified ADDRESSED likewise: the flagged code was
+            # rewritten, but nothing showed the rewrite is sound; recording
             # it is what keeps the finding from reading as contradicted.
             self._record_attributed_episode_outcome(outcome)
         return True
@@ -3011,8 +3036,12 @@ class FactStore:
             elif outcome.outcome_type in (OutcomeType.UNVERIFIED, OutcomeType.ADDRESSED):
                 stats[outcome.outcome_type.value] += 1
                 # Missing evidence is not a successful outcome. Replays must
-                # preserve the same invariant as the live feedback path.
+                # preserve the same invariant as the live feedback path: no
+                # fact moves. A verified fix still supports its candidate, as
+                # it does live.
                 stats["recorded_without_update"] += 1
+                if not dry_run and self._supports_promotion(outcome):
+                    self._apply_unlinked_candidate_outcome(outcome)
             elif outcome.outcome_type in (OutcomeType.MODIFIED, OutcomeType.REGRESSION):
                 stats["modified"] += 1
                 stats["linked_updates"] += 1
