@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Automatic Stop reviews now stay inside the session Git worktree. Outside agent notes, ignored scratch files, nested checkouts and symlink escapes no longer trigger whole-file review. Tracked docs and new extensionless scripts remain reviewable. `NEO_AUTO_REVIEW=0` disables only automatic Stop review (#338).
+
 ## [0.62.5] - 2026-11-01
 
 ### Changed

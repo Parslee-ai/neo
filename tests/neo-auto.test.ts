@@ -18,12 +18,13 @@ const FIX = {
 };
 const PROSE = { ...FIX, code_suggestions: [{ file_path: "a.py", description: "consider" }] };
 
-type Call = { argv: string[]; stdin: string; env: Record<string, string> };
+type Call = { argv: string[]; stdin: string; env: Record<string, string>; cwd?: string };
 type Row = { type: string; text: string };
 function host(
   on: On,
   answer: (call: Call) => { exitCode?: number; stdout?: string } | Promise<{ exitCode?: number; stdout?: string }> = () => ({}),
   refuseRows = false,
+  options: { env?: Record<string, string>; untracked?: string[]; realGit?: boolean } = {},
 ) {
   const calls: Call[] = [];
   const appended: Row[] = [];
@@ -45,7 +46,7 @@ function host(
   on("session.cwd", () => ({ value: "/work" }));
   on("session.start", (_$, e) => ({ cwd: e.cwd }));
   on("command.register", (_$, e) => ({ value: { command: e.name } }));
-  on("env.get", () => ({ value: undefined }));
+  mock.env(on, options.env ?? {});
   on("ui.status", () => ({ value: undefined }));
   // The engine's own answers beneath the mod: nothing added.
   on("classic.UserPromptSubmit", () => ({}));
@@ -54,9 +55,20 @@ function host(
   on("classic.Stop", () => ({}));
   on("session.end", (_$, e) => ({ sessionId: e.sessionId }));
   on("process.run", async (_$, e) => {
-    const call = { argv: [...e.argv], stdin: e.init?.stdin ?? "", env: { ...(e.init?.env ?? {}) } };
+    const call = { argv: [...e.argv], stdin: e.init?.stdin ?? "", env: { ...(e.init?.env ?? {}) }, cwd: e.init?.cwd };
     if (call.argv[1] !== "hook") calls.push(call);
-    const { exitCode = 0, stdout = "" } = await answer(call);
+    let metadata: { exitCode?: number; stdout?: string } | undefined;
+    if (call.argv[0] === "git" && !options.realGit) {
+      if (call.argv[1] === "rev-parse") metadata = { stdout: call.argv.includes("--quiet") ? "abc\n" : "/work\n" };
+      if (call.argv[1] === "ls-files" && (call.argv.includes("--stage") || call.argv.includes("--others"))) {
+        const path = call.argv.at(-1)!.replace(/^:\(literal\)/, "").replace(/^\/work\//, "");
+        const untracked = options.untracked?.includes(path);
+        metadata = call.argv.includes("--stage")
+          ? { stdout: untracked ? "" : `100644 ${"0".repeat(40)} 0\t${path}\0` }
+          : { stdout: untracked ? path + "\0" : "" };
+      }
+    }
+    const { exitCode = 0, stdout = "" } = metadata ?? await answer(call);
     return {
       value: { exitCode, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false },
     };
@@ -255,7 +267,7 @@ test("a turn that edited files is reviewed in learn mode and continues with a co
   const payload = JSON.parse(neoRuns(calls)[0]!.stdin);
   expect(payload.operating_mode).toBe("learn");
   expect(payload.task_type).toBeUndefined();
-  expect(payload.prompt).toContain("/work/a.py");
+  expect(payload.prompt).toContain("a.py");
   expect(payload.prompt).toContain("diff --git a/a.py");
   // The continued turn ends without a second review.
   expect((await $.classic.Stop(stop(true))).block).toBeUndefined();
@@ -432,7 +444,7 @@ test("a brand-new file is reviewed with its content, and again when it changes",
     if (c.argv[2] === "--no-index") return { exitCode: 1, stdout: content };
     if (c.argv[1] === "ls-files") return { exitCode: 1 }; // not tracked
     return {};
-  });
+  }, false, { untracked: ["new.py"] });
   await $.session.start(SESSION);
   await $.classic.PostToolUse(edit("/work/new.py"));
   await $.classic.Stop(stop());
@@ -707,4 +719,117 @@ test("a subagent's spinner keeps its own words", async ($, on) => {
   await $.classic.PostToolUse({ ...edit("/work/a.py"), agent_id: "agent-7" } as any);
   await $.classic.Stop(stop());
   expect(spinner).not.toContain("Neo is");
+});
+
+// Model calls and Stop continuation are tested at the native hook boundary.
+// tests/neo-review-git.integration.ts exercises autoDiffOf against actual Git.
+function scopeGit(call: Call, admitted: string[] = []) {
+  if (call.argv[0] !== "git") return call.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {};
+  if (call.argv[1] === "rev-parse") return { stdout: call.argv.includes("--quiet") ? "abc\n" : "/work\n" };
+  const path = call.argv.at(-1)!.replace(/^:\(literal\)/, "");
+  if (call.argv[1] === "ls-files") return { stdout: admitted.includes(path) && call.argv.includes("--stage") ? `100644 ${"0".repeat(40)} 0\t${path.replace(/^\/work\//, "")}\0` : "" };
+  return { stdout: "diff --git " + path + "\n+changed" };
+}
+
+test("outside notes alone do not diff, call Neo or reopen Stop; mixed edits submit only admitted source", async ($, on) => {
+  const calls = host(on, (c) => scopeGit(c, ["/work/src/foo.ts"]), false, { realGit: true });
+  await $.session.start(SESSION);
+  await $.classic.PostToolUse(edit("/other/RESUME.md"));
+  await $.classic.PostToolUse(edit("/tmp/scratchpad/note.md"));
+  expect((await $.classic.Stop(stop())).block).toBeUndefined();
+  expect(neoRuns(calls).length).toBe(0);
+  expect(calls.some((c) => c.argv[1] === "diff")).toBe(false);
+  await $.classic.PostToolUse(edit("/other/RESUME.md"));
+  await $.classic.PostToolUse(edit("/work/src/foo.ts"));
+  await $.classic.Stop(stop());
+  expect(neoRuns(calls).length).toBe(1);
+  const prompt = JSON.parse(neoRuns(calls)[0]!.stdin).prompt;
+  expect(prompt).toContain("src/foo.ts");
+  expect(prompt).not.toContain("RESUME.md");
+});
+
+test("Git errors cannot authorize whole-file additions", async ($, on) => {
+  const calls = host(on, (c) => c.argv[1] === "ls-files" ? { exitCode: 128, stdout: "untrusted" } : scopeGit(c), false, { realGit: true });
+  await $.session.start(SESSION);
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  expect((await $.classic.Stop(stop())).block).toBeUndefined();
+  expect(neoRuns(calls).length).toBe(0);
+  expect(calls.some((c) => c.argv.includes("--no-index"))).toBe(false);
+});
+
+test("subdirectory Stop payload keeps absolute file identity and session context", async ($, on) => {
+  const calls = host(on, (c) => scopeGit(c, ["/work/src/foo.ts", "/work/run/bin/ship"]), false, { realGit: true });
+  const cwd = "/work/src";
+  await $.session.start({ ...SESSION, cwd });
+  for (const path of ["/work/src/foo.ts", "/work/run/bin/ship"])
+    await $.classic.PostToolUse({ ...edit(path), cwd });
+  await $.classic.Stop({ ...stop(), cwd });
+  const payload = JSON.parse(neoRuns(calls)[0]!.stdin);
+  expect(payload.working_directory).toBe(cwd);
+  expect(payload.safe_read_paths).toEqual([cwd]);
+  expect(payload.prompt).toContain("Files changed:\n/work/run/bin/ship\n/work/src/foo.ts");
+});
+
+test("failed Git discovery stays quiet and retries pending edits after recovery", async ($, on) => {
+  let failed = true;
+  const calls = host(on, (c) => c.argv[1] === "rev-parse" && failed
+    ? { exitCode: 128, stdout: "" }
+    : scopeGit(c, ["/work/a.py"]), false, { realGit: true });
+  await $.session.start(SESSION);
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  expect((await $.classic.Stop(stop())).block).toBeUndefined();
+  expect(neoRuns(calls).length).toBe(0);
+  failed = false;
+  await $.classic.Stop(stop());
+  expect(neoRuns(calls).length).toBe(1);
+});
+
+test("edits arriving during Git discovery are included rather than cleared unseen", async ($, on) => {
+  let arriving: (() => Promise<void>) | undefined;
+  const calls = host(on, async (c) => {
+    if (c.argv[1] === "rev-parse" && arriving) {
+      const send = arriving;
+      arriving = undefined;
+      await send();
+    }
+    return scopeGit(c, ["/work/a.py", "/work/b.py"]);
+  }, false, { realGit: true });
+  await $.session.start(SESSION);
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  arriving = async () => { await $.classic.PostToolUse(edit("/work/b.py")); };
+  await $.classic.Stop(stop());
+  const prompt = JSON.parse(neoRuns(calls)[0]!.stdin).prompt;
+  expect(prompt).toContain("Files changed:\n/work/a.py\n/work/b.py");
+});
+
+test("Stop-only switch keeps recall, plan checks, diagnosis, manual requests and recording", async ($, on) => {
+  const recorded: Call[] = [];
+  const calls = host(on, (c) => {
+    if (c.argv[1] === "hook") recorded.push(c);
+    if (c.argv[1] === "recall") return { stdout: JSON.stringify({ text: "recalled lesson" }) };
+    return c.argv[1] === "--stdin-json" ? { stdout: JSON.stringify(FIX) } : {};
+  }, false, { env: { NEO_AUTO_REVIEW: "0" } });
+  const explicit: Record<string, unknown>[] = [];
+  on("process.spawn", async function* (_$, e) {
+    explicit.push(JSON.parse(e.input!));
+    yield { stream: "stderr", text: '{"type":"completed","message":"Done"}\n' };
+    yield { stream: "stdout", text: JSON.stringify(FIX) };
+    return { value: { code: 0, signal: null } };
+  });
+  await $.session.start(SESSION);
+  const memory = await $.classic.UserPromptSubmit({ ...BASE, prompt: "fix it", source: "user" });
+  expect(memory.additionalContext?.[0]).toContain("recalled lesson");
+  await $.classic.PostToolUse(edit("/work/a.py"));
+  expect((await $.classic.Stop(stop())).block).toBeUndefined();
+  expect(neoRuns(calls).length).toBe(0);
+  expect(recorded.some((c) => c.argv[2] === "record")).toBe(true);
+  await $.classic.PostToolUse({ ...edit(""), tool_name: "ExitPlanMode", tool_input: { plan: "Fix the bounded behavior" } });
+  expect(neoRuns(calls).length).toBe(1);
+  await $.classic.PostToolUseFailure(failure("pytest"));
+  await calls.clock.advance(0);
+  await calls.clock.settle();
+  expect(neoRuns(calls).length).toBe(2);
+  await $.command.run({ command: "neo-ask", args: "review this explicit request" });
+  expect(explicit.length).toBe(1);
+  expect(explicit[0]!.operating_mode).toBe("advise");
 });

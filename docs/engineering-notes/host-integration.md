@@ -288,3 +288,30 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   wording and an explicit "Neo's result is an input, not the deliverable".
   Cursor mid-loop skills use Codex's `--no-scan` / advise `--no-memory` defaults;
   the Cursor agent keeps Claude's looser advise invoke.
+
+## Automatic Stop review admission (#338)
+
+`autoDiffOf` uses literal, NUL-delimited Git inventories before reading a diff.
+Only regular tracked or non-ignored new files are admitted. Git's inventory
+excludes outside paths, traversal through symlink directories and nested
+untracked repositories; the indexed-file case also checks the parent checkout
+because a newly nested repository may contain a file still in the outer index.
+Tracked deletions whose parent no longer exists are confirmed with `ls-files
+--deleted`; their diff reads the session repository's existing blob. An absent
+HEAD is distinguished from a Git failure before using the addition fallback.
+Symlink/gitlink and binary diffs are excluded. Source paths are literal pathspecs
+so brackets and other glob characters cannot widen review scope.
+The review prompt names admitted files absolutely while keeping the session cwd
+and safe read context unchanged; Git-root-relative names would be misattributed
+when Neo runs from a subdirectory.
+
+`NEO_AUTO_REVIEW=0` disables only automatic Stop review and clears its pending
+paths. It does not disable recall, explicit requests, plan checks, diagnosis or
+the edit ledger. HEAD remains the baseline; this change adds no turn snapshots.
+Do not reintroduce blanket Markdown/comment/whitespace or absolute TMPDIR
+filters: contracts, directives, indentation and extensionless scripts can matter.
+
+The Claude mod test sandbox forbids Node imports. Native hook tests pin zero
+model calls/no Stop block and switch isolation; `bun
+tests/neo-review-git.integration.ts` runs the exported implementation against real
+Git checkouts, including nested ownership and removed-parent deletions.

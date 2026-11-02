@@ -155,8 +155,9 @@
   note passages come from the observer-built `neo.notes` index, never from
   facts); `learn`-mode review at Stop,
   diagnosis of failing checks, plan check at ExitPlanMode — all three `--fast`
-  (the panel outruns the 90 s deadline). Cost is bounded by
-  dedup, not a toggle; never re-review when `stop_hook_active`. Code calling `$`
+  (the panel outruns the 90 s deadline). Stop reviews are limited to the
+  session worktree; `NEO_AUTO_REVIEW=0` disables only those reviews. Cost is
+  bounded by dedup; never re-review when `stop_hook_active`. Code calling `$`
   must live in `register.ts` (the validator rejects `$` across imports); work
   outliving a hook starts from `$.clock.after`.
 - Beats stay situational: the mod passes the person's last prompt

@@ -968,34 +968,67 @@ async function autoRecall(
   }
 }
 
-/** What one edited path changed: its diff against HEAD, or, for a file git
- * does not track (new, outside a repository, or a repository with no
- * commits), its whole content as an addition. "" when it matches HEAD. */
-async function autoDiffOf($: EngineInterface, cwd: string, path: string) {
+/** Admit paths through Git's literal, worktree-scoped inventory before diffing.
+ * Git omits ignored new files, nested checkouts and paths through symlinks.
+ * Confirm the nearest directory's checkout too: an outer index may still
+ * track a file underneath a newly created nested repository. */
+export async function autoDiffOf(
+  $: EngineInterface, cwd: string, root: string, path: string, hasHead: boolean,
+): Promise<{ path: string; diff: string } | undefined> {
   try {
-    const tracked = await $.process.run(["git", "diff", "HEAD", "--", path], {
-      cwd,
-      timeoutMs: 10000,
-    });
-    if (tracked.exitCode === 0 && tracked.stdout.trim()) return tracked.stdout;
-    // `--no-index` exits 1 when the files differ, which is the normal case.
-    const added = await $.process.run(
-      ["git", "diff", "--no-index", "--", "/dev/null", path],
+    const literal = ":(literal)" + path;
+    const indexed = await $.process.run(
+      ["git", "ls-files", "--stage", "--full-name", "-z", "--", literal],
       { cwd, timeoutMs: 10000 },
     );
-    if (added.exitCode === 1 && added.stdout.trim()) {
-      // A tracked file that matches HEAD also differs from /dev/null; only an
-      // untracked or out-of-repository file is a real addition.
-      const known = await $.process.run(
-        ["git", "ls-files", "--error-unmatch", "--", path],
+    if (indexed.exitCode !== 0) return;
+    const entries = indexed.stdout.split("\0").filter(Boolean);
+    let relative = "";
+    if (entries.length) {
+      // Only a regular, unconflicted file; never a symlink or gitlink.
+      if (entries.length !== 1 || !/^100(?:644|755) [0-9a-f]+ 0\t/.test(entries[0]!)) return;
+      relative = entries[0]!.slice(entries[0]!.indexOf("\t") + 1);
+    } else {
+      const untracked = await $.process.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "--full-name", "-z", "--", literal],
         { cwd, timeoutMs: 10000 },
       );
-      return known.exitCode === 0 ? "" : added.stdout;
+      if (untracked.exitCode !== 0) return;
+      const names = untracked.stdout.split("\0").filter(Boolean);
+      if (names.length !== 1 || names[0]!.endsWith("/")) return;
+      relative = names[0]!;
     }
+    const parent = relative.includes("/") ? relative.slice(0, relative.lastIndexOf("/")) : ".";
+    const owner = await $.process.run(["git", "rev-parse", "--show-toplevel"], {
+      cwd: root + "/" + parent, timeoutMs: 10000,
+    }).catch(() => undefined);
+    if (owner?.exitCode === 0) {
+      if (owner.stdout.replace(/\r?\n$/, "") !== root) return;
+    } else {
+      // A tracked deletion may also remove its parent directory. Confirm
+      // deletion from Git's index before reading only the existing Git blob.
+      if (!entries.length || !hasHead) return;
+      const deleted = await $.process.run(
+        ["git", "ls-files", "--deleted", "--full-name", "-z", "--", ":(literal)" + relative],
+        { cwd: root, timeoutMs: 10000 },
+      );
+      if (deleted.exitCode !== 0 || deleted.stdout !== relative + "\0") return;
+    }
+    const diff = await $.process.run(
+      entries.length && hasHead
+        ? ["git", "diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", ":(literal)" + relative]
+        : ["git", "diff", "--no-index", "--no-ext-diff", "--no-textconv", "--", "/dev/null", relative],
+      { cwd: root, timeoutMs: 10000 },
+    );
+    const expected = entries.length && hasHead ? 0 : 1;
+    if (diff.exitCode !== expected || !diff.stdout.trim()) return;
+    if (/^(?:new file mode|new mode|old mode) (?:120000|160000)$/m.test(diff.stdout)
+        || /^Binary files .* differ$/m.test(diff.stdout)) return;
+    return { path: relative, diff: diff.stdout };
   } catch {
-    /* no diff for this path */
+    // Missing ownership or a Git failure never authorizes whole-file review.
+    return;
   }
-  return "";
 }
 
 function autoDrain(): string[] {
@@ -1192,13 +1225,30 @@ function registerAuto(on: On) {
       // stay recorded and are reviewed at the next Stop that is not a
       // continuation, so nothing goes unreviewed for being continued.
       await flushNotice($);
+      if ((await $.env.get("NEO_AUTO_REVIEW")) === "0") {
+        autoEdited.clear();
+        return result;
+      }
       if (e.stop_hook_active || !autoEdited.size) return result;
-      const files = [...autoEdited].sort();
+      const top = await $.process.run(["git", "rev-parse", "--show-toplevel"], {
+        cwd: e.cwd, timeoutMs: 10000,
+      });
+      const root = top.stdout.replace(/\r?\n$/, "");
+      if (top.exitCode !== 0 || !root) return result;
+      const head = await $.process.run(["git", "rev-parse", "--verify", "--quiet", "HEAD"], {
+        cwd: root, timeoutMs: 10000,
+      });
+      if (head.exitCode !== 0 && head.exitCode !== 1) return result;
+      const edited = [...autoEdited].sort();
       autoEdited.clear();
-      const diffs: string[] = [];
-      for (const path of files) {
-        const diff = await autoDiffOf($, e.cwd, path);
-        if (diff) diffs.push(diff);
+      const files: string[] = [], diffs: string[] = [];
+      for (const path of edited) {
+        const admitted = await autoDiffOf($, e.cwd, root, path, head.exitCode === 0);
+        if (admitted) {
+          // Keep file identity unambiguous when the session cwd is a subdir.
+          files.push(root + "/" + admitted.path);
+          diffs.push(admitted.diff);
+        }
       }
       // Nothing changed against HEAD (an edit undone): nothing to review.
       if (!diffs.length) return result;
