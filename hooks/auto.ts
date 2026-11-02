@@ -12,8 +12,8 @@ import type { Document } from "./protocol.js";
  * - a plan leaves plan mode: Neo checks it before the work starts.
  *
  * Every run is `learn` mode, so a suggestion Claude applies can later be
- * verified by git and promoted. Cost is bounded by deduplication, not by a
- * switch: one review per distinct set of edits, one diagnosis per distinct
+ * verified by git and promoted. Automatic Stop review can be disabled with `NEO_AUTO_REVIEW=0`.
+ * Otherwise cost is bounded by deduplication: one review per distinct set of edits, one diagnosis per distinct
  * failing command, one check per plan. */
 
 export const AUTO_DEADLINE = 90000;

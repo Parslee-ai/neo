@@ -139,13 +139,22 @@ delivered nothing. `/neo` asked directly still gets the panel when it helps.
   answered 27 (11 before notes), at 61 ms median.
 - **Reviews, diagnoses and plan checks** are real inference on Neo's configured
   provider: they send the diff, error output or plan, plus the source and
-  memory Neo selects, and incur its normal cost. They are bounded by
-  deduplication, not by a switch: one review per distinct set of edits, one
+  memory Neo selects, and incur its normal cost. Automatic Stop reviews can be disabled with
+  `NEO_AUTO_REVIEW=0`; recall, manual requests, diagnoses, plan checks and edit
+  recording keep their own behavior. Otherwise cost is bounded by deduplication: one review per distinct set of edits, one
   diagnosis per distinct failure (command plus error), at most one running and
   six per session, one check per plan. A turn that any Stop hook continued is
   not reviewed then; its edits are kept and reviewed at the next Stop that is
   not a continuation. Only a review with a concrete change continues a
   turn; a diagnosis never does.
+- **Stop review scope.** Only files owned by the session's Git worktree are
+  admitted. Outside notes, sibling worktrees, nested repositories, symlink
+  escapes and ignored new scratch files are excluded before model inference.
+  Tracked docs/configuration and non-ignored new text files, including
+  extensionless scripts, remain reviewable. Git errors never authorize a
+  whole-file fallback. A repository under TMPDIR works normally; temp paths
+  are not globally banned. Reviews compare tracked files against HEAD and
+  owned additions against the empty file, not a snapshot of the turn's start.
 - **Every automatic run is logged** in `~/.neo/sessions/host_events.jsonl`
   as `auto_started` / `auto_finished` with its `kind` and what became of it
   (`failed`, `nothing`, `prose`, `change`; a review reaches Claude only on
@@ -223,6 +232,7 @@ can retry. Project inspector corruption is reported without quarantine/writes.
 ```sh
 claude plugin validate . --json
 claude plugin test .
+bun tests/neo-review-git.integration.ts
 python -m pytest tests/test_workspace.py tests/test_hook.py tests/test_recall.py \
   tests/test_host_edit_ledger.py tests/test_memory_explain.py \
   tests/test_operating_modes.py tests/test_host_adapter_parity.py \
