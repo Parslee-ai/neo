@@ -139,3 +139,4 @@ def test_outside_advise_a_verdict_changes_nothing():
     out, _ = _replay("r13_static_accept.json", OperatingMode.LEARN, verdict="ACCEPT")
     assert out.confidence_basis == CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE
     assert _interpret(out)["action"] == "NO_VERIFIABLE_CHANGE"
+    assert "review_verdict" not in out.metadata        # an unasked verdict is never reported

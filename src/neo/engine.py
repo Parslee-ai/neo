@@ -1593,7 +1593,7 @@ class NeoEngine:
 
         metadata: dict[str, Any] = {"early_exit": early_exit} if early_exit else {}
         metadata["operating_mode"] = neo_input.operating_mode.value
-        if self._model_verdict:
+        if self._model_verdict and neo_input.operating_mode is OperatingMode.ADVISE:
             metadata["review_verdict"] = self._model_verdict   # advise mode's stated verdict (burndown#95)
         metadata["learning_enabled_for_request"] = learning_allowed
         metadata["repository_actions"] = len(self.last_applied_actions)
