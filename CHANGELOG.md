@@ -4,10 +4,10 @@
 
 ### Fixed
 
-- An advise-mode static review that names the file it read with no patch now reports a completed analysis (`confidence_basis: analysis_only`, no score) instead of `no_verifiable_change` with "treat this as no answer". Two real reviews, an ACCEPT and a CHANGES_NEEDED with findings, carried both a substantive verdict and that warning, which left the operator to decide which part to believe (Parslee-ai/burndown#95).
-  - **Findings are kept:** next questions, plan and the suggestion text are unchanged, and no patch is invented.
-  - **Still unverified:** nothing was executed, and the run still says so.
-  - **Outside advise mode** the same shape is still the #199 floor, as is an empty suggestion with no finding text in any mode.
+- An advise-mode static review now states its verdict, and Neo reports it. Two real reviews, an ACCEPT and a CHANGES_NEEDED with findings, named the file they reviewed with no patch, and Neo filed both as `no_verifiable_change` with "treat this as no answer" beside their own verdicts (Parslee-ai/burndown#95). Advise mode now asks the model for a `verdict` block (`ACCEPT`, `CHANGES_NEEDED` or `NO_VERDICT`).
+  - **A stated ACCEPT or CHANGES_NEEDED** makes such a run a completed analysis: `confidence_basis: analysis_only`, no score, findings kept, `metadata.review_verdict` set. The summary no longer counts its findings as changes.
+  - **No verdict, a malformed one, or NO_VERDICT** keeps the run at `no_verifiable_change`. Prose is never read to decide it.
+  - **Still unverified:** nothing was executed, and the run still says so. Outside advise mode nothing changes.
 
 ## [0.62.6] - 2026-11-02
 

@@ -245,6 +245,7 @@ class NeoEngine:
         self._phase_records: list[dict[str, Any]] = []
         self._findings: list[str] = []
         self._model_headline = ""
+        self._model_verdict = ""   # advise-mode review verdict (burndown#95)
         # Simulation traces set aside or cut while parsing this request
         # (`structured_parser.parse_simulation_traces` notes). Reset per request.
         self._trace_notes: list[dict[str, Any]] = []
@@ -543,6 +544,7 @@ class NeoEngine:
         # Neo's headline as the accepted answer's model wrote it; "" until
         # the reasoning phase sets it (`_process_combined`, an accepted panel).
         self._model_headline = ""
+        self._model_verdict = ""   # advise-mode review verdict (burndown#95)
         self._recalled_fact_count = 0
         self.last_applied_actions: list[AppliedAction] = []
 
@@ -1591,6 +1593,8 @@ class NeoEngine:
 
         metadata: dict[str, Any] = {"early_exit": early_exit} if early_exit else {}
         metadata["operating_mode"] = neo_input.operating_mode.value
+        if self._model_verdict:
+            metadata["review_verdict"] = self._model_verdict   # advise mode's stated verdict (burndown#95)
         metadata["learning_enabled_for_request"] = learning_allowed
         metadata["repository_actions"] = len(self.last_applied_actions)
         if self._trace_notes:
@@ -2291,7 +2295,7 @@ Example format:
 
 CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "ps_1" not "p1". dependencies: [0,1] integers not ["ps_1"] strings.
 
-""" + self._headline_instruction()
+""" + self._headline_instruction() + self._verdict_instruction()
             },
             {"role": "user", "content": prompt}
         ]
@@ -2316,6 +2320,7 @@ CRITICAL: Start with <<<. NO text before, between, or after blocks. id format: "
         # Optional: a missing or malformed headline block costs the voiced
         # line, never the answer. `_headline` derives one instead.
         self._model_headline = self._parse_headline(response)
+        self._model_verdict = self._parse_verdict(response)
 
         return plan, simulation_traces, code_suggestions
 
@@ -3297,17 +3302,16 @@ RULES:
         if not scoreable:
             # Two very different runs land here, and the operator needs to be
             # able to tell them apart: one answered without proposing a change,
-            # the other claimed a file and delivered nothing. In advise mode no
-            # change was asked for, so a finding filed against the file it read
-            # is an answer too (burndown#95), not an undelivered patch.
-            advise = (
-                self.context is not None
-                and self.context.operating_mode is OperatingMode.ADVISE
-            )
+            # the other claimed a file and delivered nothing. An advise review
+            # whose model stated ACCEPT or CHANGES_NEEDED answered, so its
+            # findings filed against the file it read are review notes, not an
+            # undelivered patch (burndown#95). Without that verdict, or with
+            # NO_VERDICT, the same shape is still nothing.
+            answered = self._review_answered()
             empty_changes = [
                 s for s in suggestions
                 if not suggestion_is_review_marker(s)
-                and not (advise and suggestion_is_located_review_note(s))
+                and not (answered and suggestion_is_located_review_note(s))
             ]
             basis = (
                 CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE if empty_changes
@@ -3569,6 +3573,10 @@ RULES:
             suffix = "_terse" if terse else ""
 
             target = target_bare = ""
+            if self._review_answered():
+                # review notes are findings, not changes I would make (burndown#95)
+                from neo.models import suggestion_is_scoreable
+                code_suggestions = [s for s in code_suggestions if suggestion_is_scoreable(s)]
             if code_suggestions:
                 files = {s.file_path for s in code_suggestions if s.file_path}
                 if len(files) > 1:
@@ -5129,6 +5137,50 @@ Generate unified diff patches. Keep changes minimal and isolated."""
             ))
 
         return traces
+
+    REVIEW_VERDICTS = ("ACCEPT", "CHANGES_NEEDED", "NO_VERDICT")
+
+    def _verdict_instruction(self) -> str:
+        """Advise mode only: ask for an explicit review verdict (burndown#95).
+
+        A static review that proposes no patch used to be indistinguishable from
+        one that failed to produce a patch: both named a file with an empty diff.
+        The model states which it was; Neo never infers it from prose.
+        """
+        if not (self.context is not None
+                and self.context.operating_mode is OperatingMode.ADVISE):
+            return ""
+        return (
+            "\n\nAlso output a fifth block, the review verdict:\n"
+            "<<<NEO:SCHEMA=v3:KIND=verdict>>>\n"
+            '{"verdict":"ACCEPT|CHANGES_NEEDED|NO_VERDICT","reason":"one sentence"}\n'
+            "<<<END:verdict>>>\n"
+            "ACCEPT or CHANGES_NEEDED only when you reviewed the supplied code and "
+            "reached that judgement; NO_VERDICT when you could not (missing code, "
+            "unclear request). A review with no patch puts its findings in "
+            "next questions or a code entry with file_path \"/\"."
+        )
+
+    def _parse_verdict(self, response: str) -> str:
+        """The verdict block's value when it is well formed, else ""."""
+        block = self._extract_section(response, "verdict")
+        if not block:
+            return ""
+        body = block.split(">>>", 1)[-1].rsplit("<<<END:verdict>>>", 1)[0].strip()
+        try:
+            value = json.loads(body).get("verdict", "")
+        except (ValueError, AttributeError):
+            logger.debug("verdict block unusable: %r", body[:200])
+            return ""
+        return value if value in self.REVIEW_VERDICTS else ""
+
+    def _review_answered(self) -> bool:
+        """An advise run whose model stated a verdict on the code it reviewed."""
+        return (
+            self.context is not None
+            and self.context.operating_mode is OperatingMode.ADVISE
+            and self._model_verdict in ("ACCEPT", "CHANGES_NEEDED")
+        )
 
     def _parse_headline(self, response: str) -> str:
         """The headline block's text if it is fit to show, else ""."""
