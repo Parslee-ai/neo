@@ -1,0 +1,72 @@
+{
+  "plan": [
+    {
+      "description": "Resolve the device and simulator SDK roots before XCFramework cache lookup and include both resolved roots in the cache identity.",
+      "rationale": "The produced iOS slices now depend on xcrun-selected SDKs, but the cache key only records the inherited SDKROOT, DEVELOPER_DIR, and Xcode version. A cache hit can bypass SDK discovery and restore slices built with a different selected SDK.",
+      "dependencies": []
+    },
+    {
+      "description": "Extend the existing XCFramework selftest with a populated-cache case that changes or removes the selected iOS SDK and verifies that stale publication is refused or a distinct cache entry is used.",
+      "rationale": "The new failure cases run with the CI cache disabled, so they do not cover the path where cache restoration occurs before the new xcrun calls.",
+      "dependencies": [
+        0
+      ]
+    },
+    {
+      "description": "Keep the approved target-specific whisper-rs-sys cleans in the post-acceptance verification procedure and report them as one-time recovery rather than automatic invalidation.",
+      "rationale": "SDKROOT is not tracked by the upstream build script, and this candidate intentionally does not add automatic cleaning. Static review cannot claim that contaminated successful Cargo output was rebuilt.",
+      "dependencies": [
+        0,
+        1
+      ]
+    }
+  ],
+  "simulation_traces": [
+    {
+      "input_data": "Cold XCFramework build with xcrun returning a nonzero status for iphoneos",
+      "expected_output": "The build exits nonzero before cargo and publishes no XCFramework.",
+      "reasoning_steps": [
+        "The device slice enters the iOS case.",
+        "The SDKROOT assignment executes xcrun inside the slice subprocess.",
+        "With errexit active, the nonzero command substitution terminates the subprocess.",
+        "The outer build cannot continue to artifact publication."
+      ],
+      "issues_found": []
+    },
+    {
+      "input_data": "Warm XCFramework cache created under one selected Xcode, followed by a run under another installation with the same reported Xcode version and no explicit DEVELOPER_DIR",
+      "expected_output": "The resolved iphoneos and iphonesimulator SDK identities affect the cache key, so slices from the prior SDK selection are not restored.",
+      "reasoning_steps": [
+        "The current cache key records inherited macOS SDKROOT, an empty DEVELOPER_DIR, and xcodebuild version.",
+        "Two installations can therefore have the same recorded settings while xcrun resolves different SDK paths or contents.",
+        "Cache restoration occurs before the per-slice xcrun calls.",
+        "The run can return the old XCFramework without performing SDK discovery.",
+        "The current missing and empty SDK selftests use CI's cache-disabled path and do not expose this behavior.",
+        "**MODIFY: resolved iOS SDK identities are missing from pre-restore cache validation**"
+      ],
+      "issues_found": [
+        "A cache hit can bypass the new SDK lookups and restore slices produced for a different iOS SDK context.",
+        "The selftest does not exercise unavailable or changed SDK resolution with cache restoration enabled."
+      ]
+    }
+  ],
+  "code_suggestions": [
+    {
+      "file_path": "/car-rs/crates/car-ffi-uniffi/apple/build-xcframework.sh",
+      "unified_diff": "",
+      "description": "Revision required before acceptance: resolve only the SDKs required by TARGETS before cache-key computation, reject failed or empty results there, add the resolved device and simulator SDK identities to BUILD_SETTINGS, and reuse those values in the slice subprocesses. Preserve the inherited SDKROOT for macOS and host bindgen. No patch is emitted because the supplied excerpt does not include the complete pre-cache control flow needed to place this safely.",
+      "confidence": 0.94,
+      "tradeoffs": [
+        "SDK discovery becomes required before restoring an iOS-containing cache entry.",
+        "Changing selected SDK roots will create distinct cache entries while leaving cache location, locking, pruning, and publication boundaries unchanged.",
+        "The approved target-specific Cargo clean remains necessary for already cached whisper-rs-sys build-script output because SDKROOT alone does not invalidate it."
+      ]
+    }
+  ],
+  "next_questions": [
+    "Simulation found: A cache hit can bypass the new SDK lookups and restore slices produced for a different iOS SDK context.",
+    "Simulation found: The selftest does not exercise unavailable or changed SDK resolution with cache restoration enabled."
+  ],
+  "confidence": null,
+  "confidence_basis": "no_verifiable_change"
+}
