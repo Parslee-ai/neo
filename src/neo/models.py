@@ -314,6 +314,24 @@ def suggestion_is_review_marker(suggestion: "CodeSuggestion") -> bool:
     }
 
 
+def suggestion_is_located_review_note(suggestion: "CodeSuggestion") -> bool:
+    """True when a suggestion names a file but carries no change, only a finding.
+
+    In advise mode no patch is asked for, so a model that writes "ACCEPT, no
+    patch" or "revision required: ..." against the file it read has answered,
+    not failed to deliver an edit. Burndown#95: two static reviews (R13 ACCEPT,
+    R08 CHANGES_NEEDED) were reported as no_verifiable_change and "treat this as
+    no answer" beside their own substantive verdicts. Only meaningful in advise
+    mode; elsewhere the same shape is the #199 empty patch.
+    """
+    return (
+        not suggestion_is_review_marker(suggestion)
+        and not diff_changes_lines(suggestion.unified_diff)
+        and not (suggestion.code_block or "").strip()
+        and bool((suggestion.description or "").strip())
+    )
+
+
 def suggestion_is_scoreable(suggestion: "CodeSuggestion") -> bool:
     """True when a suggestion proposes a change a confidence score can describe.
 

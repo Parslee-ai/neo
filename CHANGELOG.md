@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- An advise-mode static review that names the file it read with no patch now reports a completed analysis (`confidence_basis: analysis_only`, no score) instead of `no_verifiable_change` with "treat this as no answer". Two real reviews, an ACCEPT and a CHANGES_NEEDED with findings, carried both a substantive verdict and that warning, which left the operator to decide which part to believe (Parslee-ai/burndown#95).
+  - **Findings are kept:** next questions, plan and the suggestion text are unchanged, and no patch is invented.
+  - **Still unverified:** nothing was executed, and the run still says so.
+  - **Outside advise mode** the same shape is still the #199 floor, as is an empty suggestion with no finding text in any mode.
+
 ## [0.62.6] - 2026-11-02
 
 ### Fixed

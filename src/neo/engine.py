@@ -3288,6 +3288,7 @@ RULES:
             CONFIDENCE_BASIS_ANALYSIS_ONLY,
             CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE,
             CONFIDENCE_BASIS_SUGGESTIONS,
+            suggestion_is_located_review_note,
             suggestion_is_review_marker,
             suggestion_is_scoreable,
         )
@@ -3296,9 +3297,17 @@ RULES:
         if not scoreable:
             # Two very different runs land here, and the operator needs to be
             # able to tell them apart: one answered without proposing a change,
-            # the other claimed a file and delivered nothing.
+            # the other claimed a file and delivered nothing. In advise mode no
+            # change was asked for, so a finding filed against the file it read
+            # is an answer too (burndown#95), not an undelivered patch.
+            advise = (
+                self.context is not None
+                and self.context.operating_mode is OperatingMode.ADVISE
+            )
             empty_changes = [
-                s for s in suggestions if not suggestion_is_review_marker(s)
+                s for s in suggestions
+                if not suggestion_is_review_marker(s)
+                and not (advise and suggestion_is_located_review_note(s))
             ]
             basis = (
                 CONFIDENCE_BASIS_NO_VERIFIABLE_CHANGE if empty_changes
