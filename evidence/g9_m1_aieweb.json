@@ -875,7 +875,7 @@
         "lib/ink/lib/diff-engine.ts",
         "components/chat/canvas/components/powertrip-compare-view.tsx",
         "components/share/invite-teammates-section.tsx",
-        ".grace/plans/issue-316.md",
+        ".agent/plans/issue-316.md",
         "docs/patterns.md",
         "docs/solutions/stale-auth-jwt-expiration.md",
         "components/billing/ProductSubscriptionRow.tsx",

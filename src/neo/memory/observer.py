@@ -1373,11 +1373,11 @@ def maybe_autostart_observer() -> None:
 
 # A reaped straggler can stay mid-cycle (synthesis/ingest aren't interruptible)
 # well past its 1s sleep slice, so retry the lock briefly. If it still holds
-# after a SIGTERM grace, escalate to SIGKILL so the kernel drops its flock
+# after a SIGTERM wait, escalate to SIGKILL so the kernel drops its flock
 # inside the window — otherwise we'd concede and exit, leaving the unsupervised
 # straggler as the sole observer.
 _LOCK_ACQUIRE_ATTEMPTS = 10
-_LOCK_ESCALATE_AFTER = 3  # attempts of SIGTERM grace before SIGKILL
+_LOCK_ESCALATE_AFTER = 3  # attempts of SIGTERM wait before SIGKILL
 _LOCK_PATH = os.path.expanduser("~/.neo/observer.lock")
 
 
@@ -1553,7 +1553,7 @@ def _daemon_main(argv: list[str]) -> int:
         if lock.acquire():
             acquired = True
             break
-        # If a straggler is still holding the lock after the SIGTERM grace,
+        # If a straggler is still holding the lock after the SIGTERM wait,
         # escalate to SIGKILL so the kernel releases its flock immediately
         # (safe: saves are atomic). Guaranteeing the lock frees here is what
         # keeps exit-0 reserved for a genuine second live observer.

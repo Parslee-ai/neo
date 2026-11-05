@@ -145,7 +145,7 @@ PROTECTED_TAGS = frozenset({"seed", "community", "synthesized"})
 
 # Dual-buffer consolidation (paper 2603.07670 §9.1). New non-curated
 # facts enter a "hot probation buffer" via the ``probation`` tag. They
-# get half the normal stale-pruning grace period and only become
+# get half the normal stale-pruning window and only become
 # permanent (probation tag removed) after re-verification: either
 # explicit observation (success_count > 0), being re-retrieved
 # (access_count ≥ 2), or surviving the probation window.

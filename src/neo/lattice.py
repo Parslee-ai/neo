@@ -1348,7 +1348,7 @@ class LatticeNode:
         """Run `coro` unless a stop arrives first; True if it completed.
 
         Reconnect waits (a 30 s backoff, three 20 s calls) would otherwise
-        outlast the supervisor's SIGTERM grace and end in a SIGKILL.
+        outlast the supervisor's SIGTERM wait and end in a SIGKILL.
         """
         work = asyncio.ensure_future(coro)
         stop = asyncio.ensure_future(self._stop.wait())
@@ -1866,7 +1866,7 @@ def _run_foreground(root: str, project: str) -> int:
     if node.signalled:
         # A signal mid-answer leaves the engine thread inside a model call;
         # a normal exit would join it and outlast the supervisor's SIGTERM
-        # grace. The answer is abandoned either way.
+        # wait. The answer is abandoned either way.
         pid_file.unlink(missing_ok=True)
         os._exit(code)
     pid_file.unlink(missing_ok=True)
