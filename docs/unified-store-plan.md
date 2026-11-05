@@ -1,21 +1,21 @@
 # Unified Store Plan — one walker, one index, one retrieval front door
 
 **Date:** 2026-08-11
-**Owner:** Keenan Keeling (dispatching via goalpool; Kai shepherds)
+**Owner:** the project owner (dispatching via goalpool; Kai shepherds)
 **Status:** **All ten goals merged ([#216](https://github.com/Parslee-ai/neo/pull/216) closed the climb, 2026-08-13 17:01Z); v0.46.0 is the closing release.** See [Completion ledger](#completion-ledger-2026-08-13).
-**Origin:** 2026-08-11 forensic review of Neo file selection (issues #158/#159/#176/#186/#193–#199) + the 2026-08-10 Keenan/Matt sync.
+**Origin:** 2026-08-11 forensic review of Neo file selection (issues #158/#159/#176/#186/#193–#199) + the 2026-08-10 owner sync.
 
 ## Intent
 
 Unify Neo's file selection so there is exactly one answer to "which files does Neo see": land the open fix queue, then migrate both lanes onto a single maintained, self-freshening store — one walker, one content index, one retrieval front door — so that every Neo invocation, on any language repo, hands the model the right whole files in seconds instead of scanning the world on every call; files you name are guaranteed present; retrieval quality is eval-gated at every stage; and every stage ships as its own working release — no flag-day, Neo never breaks.
 
-## Standing rulings (Keenan, 2026-08-11)
+## Standing rulings (owner, 2026-08-11)
 
 1. **`--include` semantics:** guarantee the named files (whole, or with an explicit marker) AND keep scanning for anything else useful. Never a silent drop.
 2. **The store indexes, disk delivers:** the store holds index artifacts only (freshness stamps, keyword postings, vectors) — never file bodies. Delivery always reads whole files fresh from disk.
 3. **Two query modes survive** (exact keyword + semantic). Unification targets the duplicated walking/exclusion/selection plumbing, not the search styles.
 4. **No flag-day:** every goal leaves Neo releasable.
-5. **Merge authority:** goals open PRs; auto-merge on green gates is authorized (Keenan, 2026-08-11). Jennifer is holding off on further Neo work while this plan executes.
+5. **Merge authority:** goals open PRs; auto-merge on green gates is authorized (owner, 2026-08-11). Jennifer is holding off on further Neo work while this plan executes.
 
 ## Definition of done — metrics
 
@@ -59,7 +59,7 @@ Already done inline (2026-08-11): #192 (eval harness), #186 (gitignore implement
 - Every PR pastes before/after M1 numbers for the three flagship repos and the invariant battery output. A goal that can't show its numbers isn't done.
 - Shepherd (Kai) watches each goal to terminal state; goalpool "done" claims are verified against the DoD, not trusted.
 
-## Review & merge governance (added 2026-08-12, Keenan's option-3 ruling)
+## Review & merge governance (added 2026-08-12, owner's option-3 ruling)
 
 - Parslee-ai/neo is enrolled in the car-pr-review daemon (qa_enabled=false, delegation_enabled=true): every ready PR gets an adversarial review; an approve verdict auto-merges.
 - Goals open their PRs as **DRAFT** and sustain on them. The shepherd verifies the metric evidence (M1/M2 tables, invariant battery) against this plan, then flips the PR ready — `gh pr ready` is the merge decision. The daemon's review is the independent gate after it.

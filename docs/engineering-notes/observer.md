@@ -125,7 +125,7 @@ Detailed engineering notes moved verbatim from `CLAUDE.md` (2026-10-12). `CLAUDE
   on `~/.neo/observer.lock`) for its lifetime, so two observers can never run
   a sweep at once even in the handoff window; a contended daemon exits 0
   (benign no-op, no CAR backoff). If a straggler ignores SIGTERM past the
-  `_LOCK_ESCALATE_AFTER` grace, the daemon escalates to SIGKILL so the kernel
+  `_LOCK_ESCALATE_AFTER` wait, the daemon escalates to SIGKILL so the kernel
   frees the lock — safe because `FactStore._save_file` is atomic (temp +
   `os.replace`), so a hard kill can only leave a stray `.tmp`, never a torn
   fact file. (This is belt-and-suspenders: `store.save()` already serializes
