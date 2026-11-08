@@ -1,6 +1,8 @@
 ![Neo Banner: Imagery from The Matrix film series](https://ik.imagekit.io/xvpgfijuw/parslee/bannerFor__Neo--Github.webp)
 ***
 
+> **Neo is retired (November 2026).** Development continues in [CAR](https://github.com/Parslee-ai/car-releases) ([docs](https://parslee-ai.github.io/car/)). This repository is archived and `neo-reasoner` 0.63.0 is the final release: existing installs keep working but get no fixes. To remove it: `pipx uninstall neo-reasoner`, `/plugin uninstall neo` in Claude Code, and delete `~/.neo`.
+
 
 # Neo
 

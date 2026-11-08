@@ -44,6 +44,7 @@ class NeoEventType(str, Enum):
     PERSONALITY_BEAT = "personality_beat"
     COMPLETED = "completed"
     FAILED = "failed"
+    NOTICE = "notice"
 
 
 # Canonical phase names. Hosts key progress display off these, so they are a

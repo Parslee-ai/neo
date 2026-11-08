@@ -1033,6 +1033,29 @@ def bare_command_hint(prompt):
     return None
 
 
+RETIREMENT_NOTICE = (
+    "Neo is retired and gets no further updates. Its work continues in CAR: "
+    "https://github.com/Parslee-ai/car-releases"
+)
+
+
+def announce_retirement(json_mode: bool, stream=None) -> None:
+    """Say once per run, on stderr, that Neo is retired.
+
+    Under `--json`, stderr is a JSONL event stream, so the notice goes out as a
+    `notice` event rather than prose a host would have to filter back out. The
+    hook, recall, workspace and lattice paths dispatch before this and stay
+    silent: they run on every editor action.
+    """
+    from neo.events import JsonlSink, NeoEvent, NeoEventType
+
+    stream = stream if stream is not None else sys.stderr
+    if json_mode:
+        JsonlSink(stream).emit(NeoEvent(NeoEventType.NOTICE, message=RETIREMENT_NOTICE))
+    else:
+        print(RETIREMENT_NOTICE, file=stream)
+
+
 def main():
     """Main entry point for stdin/stdout interface."""
     # The host-hook recorder fires on every editor tool call, so it dispatches
@@ -1076,6 +1099,8 @@ def main():
 
     # Configure logging early so all subsequent code can log
     _configure_logging(args)
+
+    announce_retirement(json_mode=bool(getattr(args, "json", False)))
 
     # Progress notices are prose for a human. `--json` means the caller is a
     # program, and the JSONL event stream already carries this information in a
