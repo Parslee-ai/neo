@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neo-reasoner"
-version = "0.62.7"
+version = "0.63.0"
 description = "A self-improving code reasoning engine with persistent semantic memory"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["reasoning", "ai", "llm", "code-generation", "cli", "semantic-memory", "embeddings"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 7 - Inactive",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",

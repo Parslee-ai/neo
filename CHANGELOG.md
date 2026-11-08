@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.63.0] - 2026-11-08
+
+### Retired
+
+- Neo is retired; this is the final release. Development continues in CAR (https://github.com/Parslee-ai/car-releases). Every reasoning run now says so once on stderr, as plain text, or as a `notice` event under `--json`. The hook, recall, workspace and lattice paths stay silent. Existing installs keep working but get no fixes. To remove Neo: `pipx uninstall neo-reasoner`, `/plugin uninstall neo` in Claude Code, and delete `~/.neo`.
+
 ## [0.62.7] - 2026-11-05
 
 ### Fixed
